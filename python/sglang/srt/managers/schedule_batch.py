@@ -50,6 +50,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from hip_attn.v1_2 import HiPAttentionConfig, HiPMaskRefreshState
+
     from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -608,6 +610,10 @@ class ScheduleBatch:
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
 
+    # For HiP Attention
+    hip_mask_refresh_state: Optional[HiPMaskRefreshState] = None
+    hip_metadata_cached_stages: Optional[int] = None
+
     @classmethod
     def init_new(
         cls,
@@ -619,7 +625,15 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
+        hip_attention_config: Optional[HiPAttentionConfig] = None,
     ):
+        hip_mask_refresh_state = None
+        if hip_attention_config is not None:
+            from hip_attn.v1_2 import HiPMaskRefreshState
+
+            # For keeping track of HiP attention mask refresh cycles
+            hip_mask_refresh_state = HiPMaskRefreshState(hip_attention_config)
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -633,6 +647,7 @@ class ScheduleBatch:
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             enable_custom_logit_processor=enable_custom_logit_processor,
+            hip_mask_refresh_state=hip_mask_refresh_state,
         )
 
     def batch_size(self):
@@ -1076,6 +1091,9 @@ class ScheduleBatch:
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+        if self.hip_mask_refresh_state is not None:
+            self.hip_metadata_cached_stages = self.hip_mask_refresh_state.update()
+
     def filter_batch(
         self,
         being_chunked_req: Optional[Req] = None,
@@ -1210,6 +1228,7 @@ class ScheduleBatch:
                     else CaptureHiddenMode.NULL
                 )
             ),
+            hip_metadata_cached_stages=self.hip_metadata_cached_stages,
         )
 
     def copy(self):
@@ -1286,6 +1305,9 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # Use cached mask for HiP Attention
+    hip_metadata_cached_stages: Optional[int] = None
 
 
 @triton.jit
