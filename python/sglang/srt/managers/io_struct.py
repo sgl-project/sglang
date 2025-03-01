@@ -44,6 +44,8 @@ class GenerateReqInput:
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
+    # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -150,10 +152,20 @@ class GenerateReqInput:
                 num = self.batch_size * self.parallel_sample_num
 
             if self.image_data is None:
-                self.image_data = [None] * num
+                # self.image_data = [None] * num
+                self.image_data = []
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
+                self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
+                pass
+
+            if self.audio_data is None:
+                # self.audio_data = [None] * num
+                self.audio_data = []
+            elif not isinstance(self.audio_data, list):
+                self.audio_data = [self.audio_data] * num
+            elif isinstance(self.audio_data, list):
                 pass
 
             if self.sampling_params is None:
@@ -203,6 +215,7 @@ class GenerateReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i],
+            audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
@@ -229,8 +242,9 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image inputs
-    image_inputs: dict
+    # The multimodal inputs
+    multimodal_inputs: dict
+    # The audio inputs
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs

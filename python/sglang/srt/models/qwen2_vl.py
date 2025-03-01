@@ -42,7 +42,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultiModalInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -404,7 +404,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
     # Use grid_t * grid_w * grid_h to pad tokens for each image
     # add replaced padding by unique image hash
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInput):
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values
 
@@ -499,9 +499,9 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         image_inputs = None
-        if forward_batch.image_inputs is not None:
+        if forward_batch.multimodal_inputs is not None:
             image_inputs = [
-                img for img in forward_batch.image_inputs if img is not None
+                img for img in forward_batch.multimodal_inputs if img is not None
             ]
 
         if (
@@ -525,7 +525,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             inputs_embeds = self.model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-            for i, image in enumerate(forward_batch.image_inputs):
+            for i, image in enumerate(forward_batch.multimodal_inputs):
                 if image is None:
                     continue
                 start_idx = extend_start_loc_cpu[i]

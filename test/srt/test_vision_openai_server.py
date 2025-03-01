@@ -24,6 +24,10 @@ from sglang.test.test_utils import (
 )
 
 
+def get_test_files_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "test_files")
+
+
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -268,6 +272,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
+            or "hold" in video_response
         )
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
@@ -364,6 +369,77 @@ class TestOpenAIVisionServer(unittest.TestCase):
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
 
+    def prepare_audio_messages(self, prompt, audio_file_name):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                ],
+            }
+        ]
+
+        return messages
+
+    def get_audio_response(self, file, prompt):
+        audio_file_path = os.path.join(get_test_files_dir(), file)
+
+        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+
+        audio_request = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=True,
+        )
+
+        print("-" * 30)
+        audio_response = ""
+        for chunk in audio_request:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                audio_response += content
+                print(content, end="", flush=True)
+        print("-" * 30)
+
+        audio_response = audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+        return audio_response
+
+    def _test_audio_speech_completion(self):
+        audio_response = self.get_audio_response(
+            "audio_speech_trump.mp3",
+            "Please describe what does the person say in the audio.",
+        )
+        assert "thank you" in audio_response
+        assert "it's a privilege to be here" in audio_response
+        assert "business" in audio_response
+        assert "science" in audio_response
+        assert "art" in audio_response
+
+    def _test_audio_ambient_completion(self):
+        audio_response = self.get_audio_response(
+            "audio_bird_song.mp3",
+            "Please listen to the audio snippet carefully and transcribe the content.",
+        )
+        assert "bird" in audio_response
+
+    def test_audio_completion(self):
+        pass
+
 
 class TestQWen2VLServer(TestOpenAIVisionServer):
     @classmethod
@@ -407,6 +483,9 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
         )
         cls.base_url += "/v1"
 
+    def test_audio_chat_completion(self):
+        pass
+
 
 class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     @classmethod
@@ -425,6 +504,7 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.80",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
@@ -486,6 +566,9 @@ class TestMllamaServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+    def test_audio_chat_completion(self):
+        pass
+
 
 class TestMinicpmvServer(TestOpenAIVisionServer):
     @classmethod
@@ -504,6 +587,33 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        pass
+
+
+class TestMinicpmoServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-o-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmo",
+                "--disable-cuda-graph",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
 
 
 if __name__ == "__main__":
