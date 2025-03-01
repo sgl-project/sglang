@@ -101,7 +101,10 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     del model
 
 
-class TestGPTQDynamic(unittest.TestCase):
+# GPTQ with Dynamic Per/Module Quantization Control
+# Leverages GPTQModel (pypi) to produce the `dynamic` models
+# Test GPTQ fallback kernel that is not Marlin
+class TestGPTQModelDynamic(unittest.TestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
     )
@@ -148,7 +151,10 @@ class TestGPTQDynamic(unittest.TestCase):
         check_quant_method(self.MODEL_PATH, use_marlin_kernel=False)
 
 
-class TestGPTQMarlinDynamic(unittest.TestCase):
+# GPTQ with Dynamic Per/Module Quantization Control
+# Leverages GPTQModel (pypi) to produce the `dynamic` models
+# Test Marlin kernel
+class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
     )
@@ -184,7 +190,7 @@ class TestGPTQMarlinDynamic(unittest.TestCase):
         max_tokens = 256
 
         tic = time.time()
-        res = self.run_decode(max_tokens)
+        _ = self.run_decode(max_tokens)
         tok = time.time()
 
         throughput = max_tokens / (tok - tic)
