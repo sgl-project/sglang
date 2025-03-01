@@ -411,4 +411,4 @@ class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
             super().__init__(config, "ALIBI", quant_config)
 
 
-EntryClass = [BaichuanForCausalLM]
+EntryClass = [(BaichuanForCausalLM, "BaiChuan 2")]

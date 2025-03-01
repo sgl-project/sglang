@@ -265,4 +265,4 @@ class LlavaVidForCausalLM(nn.Module):
         return self.image_size // self.patch_size
 
 
-EntryClass = LlavaVidForCausalLM
+EntryClass = (LlavaVidForCausalLM, "LLaVa VID")

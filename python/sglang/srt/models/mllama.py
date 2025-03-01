@@ -957,4 +957,4 @@ class MllamaForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = MllamaForConditionalGeneration
+EntryClass = (MllamaForConditionalGeneration, "Mllama")

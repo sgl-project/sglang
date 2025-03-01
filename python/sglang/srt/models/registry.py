@@ -83,11 +83,19 @@ def import_model_classes():
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
+                        assert isinstance(
+                            tmp, tuple
+                        ), f"No model name specified for EntryClass {tmp}"
+                        tmp = tmp[0]
                         assert (
                             tmp.__name__ not in model_arch_name_to_cls
                         ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
+                    assert isinstance(
+                        entry, tuple
+                    ), f"No model name specified for EntryClass {entry}"
+                    entry = entry[0]
                     assert (
                         entry.__name__ not in model_arch_name_to_cls
                     ), f"Duplicated model implementation for {entry.__name__}"

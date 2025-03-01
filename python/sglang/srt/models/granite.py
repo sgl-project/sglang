@@ -514,4 +514,4 @@ class GraniteForCausalLM(nn.Module):
             return None
 
 
-EntryClass = [GraniteForCausalLM]
+EntryClass = [(GraniteForCausalLM, "IBM Granite 3")]

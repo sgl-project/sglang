@@ -375,4 +375,4 @@ class MiniCPMForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = MiniCPMForCausalLM
+EntryClass = (MiniCPMForCausalLM, "MiniCPM")

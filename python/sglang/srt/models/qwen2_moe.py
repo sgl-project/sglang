@@ -443,4 +443,4 @@ class Qwen2MoeForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = Qwen2MoeForCausalLM
+EntryClass = (Qwen2MoeForCausalLM, "Qwen 2 MoE")

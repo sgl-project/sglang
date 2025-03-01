@@ -424,4 +424,4 @@ class DbrxForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = DbrxForCausalLM
+EntryClass = (DbrxForCausalLM, "DBRX")
