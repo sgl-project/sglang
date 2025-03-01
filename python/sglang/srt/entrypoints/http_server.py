@@ -44,11 +44,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
-    FunctionCallReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    ParseFunctionCallReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -373,7 +373,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 
 @app.post("/function_call")
-async def function_call_request(obj: FunctionCallReqInput, request: Request):
+async def function_call_request(obj: ParseFunctionCallReq, request: Request):
     """
     A native API endpoint to parse function calls from a text.
     """

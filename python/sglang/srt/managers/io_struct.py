@@ -562,7 +562,7 @@ class Tool:
 
 
 @dataclass
-class FunctionCallReqInput:
+class ParseFunctionCallReq:
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
