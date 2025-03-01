@@ -1,15 +1,10 @@
 import re
-from typing import Dict
-
-REASONING_MODELS = ["deepseek-r1"]
+from typing import Dict, Optional
 
 
 def is_reasoning_model(model_name: str) -> bool:
     """Checks if the model is a reasoning model."""
-    for model in REASONING_MODELS:
-        if re.match(f".*{model}.*", model_name, re.IGNORECASE):
-            return True
-    return False
+    return ReasoningParser.detect_reasoning_model_type(model_name) is not None
 
 
 class StreamingParseResult:
@@ -149,13 +144,23 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector
     }
 
-    def __init__(self, model_type: str = None, stream_reasoning: bool = True):
-        if not model_type:
-            raise ValueError("Model type must be specified")
+    @classmethod
+    def detect_reasoning_model_type(cls, model_name: str) -> Optional[str]:
+        """Detects the reasoning model based on the model name."""
+        for model in cls.DetectorMap.keys():
+            if re.match(f".*{model}.*", model_name, re.IGNORECASE):
+                return model
+        return None
 
-        detector_class = self.DetectorMap.get(model_type.lower())
+    def __init__(self, model_name: str = None, stream_reasoning: bool = True):
+        if not model_name:
+            raise ValueError("Model name must be specified")
+
+        detector_class = self.DetectorMap.get(
+            self.detect_reasoning_model_type(model_name)
+        )
         if not detector_class:
-            raise ValueError(f"Unsupported model type: {model_type}")
+            raise ValueError(f"Unsupported reasoning model: {model_name}")
 
         self.detector = detector_class(stream_reasoning=stream_reasoning)
 

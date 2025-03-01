@@ -10,26 +10,29 @@ The contract follows the [DeepSeek API design](https://api-docs.deepseek.com/gui
 ## Supported Models
 
 Currently, SGLang supports the following reasoning models:
+
 - [DeepSeek R1 series](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d): The reasoning content is wrapped with `<think>` and `</think>` tags.
 
 ## Usage
 
 There are two ways to enable reasoning parsing:
 
-1) Enable the reasoning parser when starting the SGLang Server by setting the `--enable-reasoning` and `--reasoning-parser` options. The `--reasoning-parser` option specifies the reasoning parser to extract the reasoning content and final answer.
+1. Enable the reasoning parser when starting the SGLang Server by setting the `--parse-reasoning` and `--reasoning-parser` options. The `--reasoning-parser` option specifies the reasoning parser to extract the reasoning content and final answer.
 
 ```bash
 python -m sglang.launch_server --host 0.0.0.0 \
 --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-14B \
---enable-reasoning --reasoning-parser deepseek-r1
+--parse-reasoning --reasoning-parser deepseek-r1
 ```
 
-2) Specify on a per-request basis by setting the `separate_reasoning` body field on a `/chat/completions` request.
+2. Specify on a per-request basis by setting the `separate_reasoning` body field on a `/v1/chat/completions` request.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" \
 -d '{"messages":[{"role":"user","content":"Compute 1+3"}],"max_tokens":100,"model":"deepseek-r1","stream":true,"separate_reasoning":true}' http://0.0.0.0:30000/v1/chat/completions
 ```
+
+If `--reasoning-parser` is specified it will take presedence in determining the reasoning parser used over looking up known parser using `request.model`.
 
 There is another body param which can be set to buffer the reasoning traces to be sent in one chunk after the closing `</think>` tag, `"stream_reasoning": false`.
 
@@ -38,6 +41,7 @@ There is another body param which can be set to buffer the reasoning traces to b
 Make a request to the reasoning model, get the reasoning content and final answer.
 
 Using OpenAI python api:
+
 ```python
 import openai
 
@@ -84,7 +88,6 @@ reasoning_content
 content
 # '\n\n**Solution:**\n\nWe need to compute the sum of 1 and 3.\n\n1. **Identify the numbers to add:**\n   - Number 1\n   - Number 3\n\n2. **Add the numbers together:**\n   \\[\n   1 + 3 = 4\n   \\]\n\n3. **Final Answer:**\n   \\[\n   \\boxed{4}\n   \\]'
 ```
-
 
 ## Supporting New Reasoning Models
 
