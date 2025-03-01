@@ -74,8 +74,8 @@ def get_server_info(backend: Optional[BaseBackend] = None):
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
-    n: Optional[int] = None,
     min_tokens: Optional[int] = None,
+    n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
