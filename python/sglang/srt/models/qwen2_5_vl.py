@@ -723,8 +723,5 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-
-Qwen2_5_VLForConditionalGeneration.name = "Qwen2VLForConditionalGeneration"
-
+                
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
