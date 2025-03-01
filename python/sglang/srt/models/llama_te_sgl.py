@@ -19,6 +19,7 @@ limitations under the License.
 # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/te_llama/tutorial_accelerate_hf_llama_with_te.html
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -32,6 +33,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    tensor_model_parallel_all_gather
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
@@ -58,6 +60,12 @@ from sglang.utils import get_exception_traceback
 # from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 # from transformer_engine.pytorch.fp8 import fp8_model_init
 
+import transformer_engine.pytorch.cpp_extensions as tex
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+if not tex.device_supports_multicast():
+    os.environ["UB_SKIPMC"] = "1"
+
+MAX_SEQ_LEN = 4096
 
 @contextmanager
 def replace_decoder(te_decoder_cls):
@@ -75,6 +83,39 @@ def replace_decoder(te_decoder_cls):
             original_llama_decoder_cls
         )
 
+@contextmanager
+def sequence_parallel_context(layernorm_mlp, seq_len):
+    """
+    Context manager to temporarily modify LayerNormMLP's parallel configuration
+    based on sequence length.
+    
+    When the sequence length is 1 (decode mode), disable sequence parallel and
+    related optimizations; restore original settings when exiting the context.
+    """
+    # save original settings
+    original_sequence_parallel = layernorm_mlp.sequence_parallel
+    original_ub_overlap_ag = layernorm_mlp.ub_overlap_ag
+    original_ub_overlap_rs = layernorm_mlp.ub_overlap_rs
+    original_ub_bulk_wgrad = layernorm_mlp.ub_bulk_wgrad
+    original_ub_bulk_dgrad = layernorm_mlp.ub_bulk_dgrad
+    
+    if seq_len == 1:  # decode mode
+        # disable SP and SP overlap settings
+        layernorm_mlp.sequence_parallel = False
+        layernorm_mlp.ub_overlap_ag = False
+        layernorm_mlp.ub_overlap_rs = False
+        layernorm_mlp.ub_bulk_wgrad = False
+        layernorm_mlp.ub_bulk_dgrad = False
+    
+    try:
+        yield
+    finally:
+        # restore original settings
+        layernorm_mlp.sequence_parallel = original_sequence_parallel
+        layernorm_mlp.ub_overlap_ag = original_ub_overlap_ag
+        layernorm_mlp.ub_overlap_rs = original_ub_overlap_rs
+        layernorm_mlp.ub_bulk_wgrad = original_ub_bulk_wgrad
+        layernorm_mlp.ub_bulk_dgrad = original_ub_bulk_dgrad
 
 class TELlamaAttention(nn.Module):
     def __init__(
@@ -200,24 +241,32 @@ class TELlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         # TE's LayerNormMLP (combines post_attention_layernorm and MLP)
+        # overlap configuration adapted from
+        # https://github.com/NVIDIA/TransformerEngine/blob/main/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py#L120
+        kwargs = {
+            "params_dtype": torch.bfloat16,
+            "device": "cuda",
+            "tp_group": get_tp_group().device_group,
+            "tp_size": tp_size,
+            "sequence_parallel": True,
+            "ub_overlap_ag": True,
+            "ub_bulk_wgrad": True,
+            "ub_bulk_dgrad": True,
+            "set_parallel_mode": True,
+            "ub_overlap_rs": True,
+            "seq_length": MAX_SEQ_LEN,
+        }
         # We don't need to return_layernorm_output and return_layernorm_output_gathered
         self.layernorm_mlp = te.pytorch.LayerNormMLP(
             hidden_size=self.hidden_size,
             ffn_hidden_size=config.intermediate_size,
             eps=config.rms_norm_eps,
-            # tp_group=tp_group,
-            tp_size=tp_size,
             bias=False,
             return_layernorm_output=False,
             return_layernorm_output_gathered=False,
-            set_parallel_mode=True,
-            ub_bulk_wgrad=True,
-            ub_bulk_dgrad=True,
-            ub_overlap_rs_dgrad=True,
-            ub_overlap_rs=True,
-            ub_overlap_ag=True,
             normalization="RMSNorm",
             activation="swiglu",
+            **kwargs
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -250,9 +299,28 @@ class TELlamaDecoderLayer(nn.Module):
             hidden_states = hidden_states + residual
             residual = hidden_states
 
-        hidden_states = self.layernorm_mlp(
-            hidden_states
-        )
+        seq_len = hidden_states.shape[0]
+        if seq_len > 1: # For prefill phase, split the sequence dimension
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            # Padding sequence
+            if seq_len % MAX_SEQ_LEN != 0:
+                pad_len = MAX_SEQ_LEN - seq_len % MAX_SEQ_LEN
+                pad_tensor = torch.zeros(pad_len, hidden_states.shape[1], device=hidden_states.device,
+                                         dtype=hidden_states.dtype)
+                hidden_states = torch.cat([hidden_states, pad_tensor], dim=0).contiguous()
+            hidden_states_slices = torch.chunk(hidden_states, tp_size, dim=0)
+            hidden_states = hidden_states_slices[tp_rank]
+
+        with sequence_parallel_context(self.layernorm_mlp, seq_len):
+            hidden_states = self.layernorm_mlp(hidden_states)
+
+        if seq_len > 1:
+            # TODO: remove manual all-gather 
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            # Remove padding
+            hidden_states = hidden_states[:seq_len].contiguous()
+        
         return hidden_states, residual
 
 
@@ -267,6 +335,17 @@ class TELlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        tp_size = get_tensor_model_parallel_world_size()
+        if MAX_SEQ_LEN % tp_size != 0:
+            raise ValueError(f"To enable sequence parallel, TE requires MAX_SEQ_LEN {MAX_SEQ_LEN} to be divisible by tp_size {tp_size}")
+
+        te.pytorch.initialize_ub(
+            [MAX_SEQ_LEN, config.hidden_size],
+            tp_size,
+            use_fp8=False,
+            dtype=torch.bfloat16,
+            bootstrap_backend="nccl",
+        )
         # token embedding
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
