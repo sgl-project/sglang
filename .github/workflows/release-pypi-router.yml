@@ -109,3 +109,19 @@ jobs:
         run: |
           pip install twine
           twine upload dist/* --verbose
+
+      - name: Get package version
+        id: get_version
+        run: |
+          VERSION=$(grep -o 'version = "[^"]*"' pyproject.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Calculate SHA-256 hashes locally
+        run: |
+          python ../sglang-repo/scripts/release/calculate_local_hashes.py sglang-router --version ${{ steps.get_version.outputs.version }} --dist-dir dist --output hash.txt
+
+      - name: Upload hash.txt as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sglang-router-hashes
+          path: hash.txt
