@@ -160,11 +160,6 @@ class OpenAI(BaseBackend):
             else:
                 prompt = s.text_
 
-            kwargs = sampling_params.to_openai_kwargs()
-            if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
-                kwargs.pop("max_tokens", None)
-            else:
-                kwargs.pop("max_completion_tokens", None)
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -173,13 +168,13 @@ class OpenAI(BaseBackend):
                 prompt=prompt,
                 **kwargs,
             )
+            # Keep the returned list (or string) as is.
         elif sampling_params.dtype in [str, "str", "string"]:
             assert (
                 not self.is_chat_model
             ), "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
-
             comp = openai_completion(
                 client=self.client,
                 token_usage=self.token_usage,
@@ -189,7 +184,11 @@ class OpenAI(BaseBackend):
                 stop='"',
                 **kwargs,
             )
-            comp = '"' + comp + '"'
+            # Wrap each element in quotes if we have a list.
+            if isinstance(comp, list):
+                comp = ['"' + x + '"' for x in comp]
+            else:
+                comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
             assert (
                 not self.is_chat_model
@@ -206,6 +205,7 @@ class OpenAI(BaseBackend):
                 stop=[" "],
                 **kwargs,
             )
+            # Leave as a list if that's what is returned.
         else:
             raise ValueError(f"Unknown dtype: {sampling_params.dtype}")
 
@@ -254,7 +254,9 @@ class OpenAI(BaseBackend):
                     prompt=s.messages_,
                     **self.spec_kwargs,
                 )
-                if self.spec_pattern_match(comp):
+                # Use a string for pattern matching.
+                comp_for_match = comp[0] if isinstance(comp, list) else comp
+                if self.spec_pattern_match(comp_for_match):
                     break
 
         for term in self.spec_format:
@@ -370,7 +372,7 @@ class OpenAI(BaseBackend):
 
 def openai_completion(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
-):
+) -> Union[str, List[str]]:
     # if "ebnf" is in kwargs, warn and remove
     if "ebnf" in kwargs:
         warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")
@@ -392,9 +394,7 @@ def openai_completion(
                     comp = [c.text for c in ret.choices]
                 else:
                     comp = ret.choices[0].text
-                    if len(ret.choices) == 1:
-                        comp = ret.choices[0].text
-                    else:
+                    if len(ret.choices) > 1:
                         comp = [c.text for c in ret.choices]
 
             token_usage.prompt_tokens += ret.usage.prompt_tokens
