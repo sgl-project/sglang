@@ -1,7 +1,7 @@
-import os
+import os  # noqa: F401
 from typing import List, Optional, Tuple, Union
 
-import sgl_kernel.ops._kernels
+import sgl_kernel.ops._kernels  # noqa: F401
 import torch
 from sgl_kernel.ops.utils import (
     _get_cache_buf,

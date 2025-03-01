@@ -121,4 +121,3 @@ if not is_cuda_available():
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm

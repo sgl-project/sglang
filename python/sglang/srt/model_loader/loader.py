@@ -11,7 +11,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Type, cast
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import gguf
 import huggingface_hub
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoModelForCausalLM, PretrainedConfig
+from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.device_config import DeviceConfig

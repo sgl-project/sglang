@@ -8,7 +8,6 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -18,7 +17,6 @@ from sglang.global_config import global_config
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
-    should_use_tensor_core,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -35,7 +33,6 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-    from flashinfer.cascade import merge_state
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 
