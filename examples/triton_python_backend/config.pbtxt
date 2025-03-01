@@ -1,0 +1,112 @@
+name: "sglang_model"
+backend: "python"
+max_batch_size: 0
+
+model_transaction_policy {
+  decoupled: True
+}
+
+instance_group [
+  {
+    # max concurrent instances
+    count: 1
+    kind: KIND_CPU
+  }
+]
+
+input [
+  {
+    name: "prompt"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+  },
+  {
+    name: "max_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "ignore_eos"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  },
+  {
+    name: "stream"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  },
+  {
+    name: "temperature"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "top_p"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "top_k"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "presence_penalty"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "frequency_penalty"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "repetition_penalty"
+    data_type: TYPE_FP64
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "response"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+  }
+]
+
+parameters {
+  key: "tp"
+  value: {
+    string_value: "1"
+  }
+}
+
+parameters {
+  key: "is_chat"
+  value: {
+    # if True, use chat_completion API
+    # if False, use completion API，by default
+    string_value: "True"
+  }
+}
+
+parameters {
+  key: "enable_prefix_caching"
+  value: {
+    string_value: "True"
+  }
+}
+
+parameters {
+  key: "quant_policy"
+  value: {
+    string_value: "None"
+  }
+}
