@@ -43,3 +43,7 @@ curl -X POST http://localhost:8000/generate_stream  -H "Content-Type: applicatio
 ```
 
 This will send both non-streaming and streaming requests to the server.
+
+### 4. [Token-In-Token-Out for RLHF](./token_in_out.py)
+
+In this example, we launch an SGLang engine and feed inputs for output token_ids generation.
