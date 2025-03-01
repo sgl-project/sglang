@@ -154,6 +154,10 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    #deepseek vl2 related
+    image_seq_mask: Optional[List[torch.Tensor]]=None
+    image_spatial_crop: Optional[List[torch.Tensor]]=None
+    
     # MiniCPMV related
     # All the images in the batch should share the same special image
     # bound token ids.
@@ -182,6 +186,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
@@ -213,6 +219,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
