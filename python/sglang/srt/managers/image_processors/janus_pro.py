@@ -259,18 +259,11 @@ class VLChatProcessor(ProcessorMixin):
         self.num_image_tokens = num_image_tokens
         self.add_special_token = add_special_token
         self.sft_format = sft_format
-        self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
 
         super().__init__(
             image_processor,
             tokenizer,
-            image_tag,
-            num_image_tokens,
-            add_special_token,
-            sft_format,
-            mask_prompt,
-            ignore_id,
             **kwargs,
         )
 
@@ -565,6 +558,4 @@ class JanusProProcessor(image_processor.BaseImageProcessor):
 
 AutoImageProcessor.register(VLMImageProcessorConfig, None, VLMImageProcessor, None)
 AutoProcessor.register(MultiModalityConfig, VLChatProcessor, exist_ok=True)
-
-print("register succeed")
 ImageProcessorMapping = {MultiModalityCausalLM: JanusProProcessor}

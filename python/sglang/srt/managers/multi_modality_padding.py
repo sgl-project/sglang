@@ -2,13 +2,14 @@ from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
 from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.utils import logger
 
 
-class MediaPaddingPattern:
+class DataPaddingPattern:
     """
-    Media tokens (like image tokens) often need special handling during padding
+    Data tokens (like image tokens) often need special handling during padding
     to maintain model compatibility. This class provides the interface for
-    implementing different padding strategies for media tokens
+    implementing different padding strategies for data tokens
     """
 
     @abstractmethod
@@ -16,43 +17,44 @@ class MediaPaddingPattern:
         self, input_ids: List[int], image_inputs: ImageInputs
     ) -> List[int]:
         """
-        Pad the input ids sequence containing media tokens, and replace them with pad_values
+        Pad the input ids sequence containing data tokens, and replace them with pad_values
         """
         pass
 
 
-class MediaPaddingPatternTokenPairs(MediaPaddingPattern):
-    """In this pattern, media tokens should be enclosed by special token pairs (e.g. <image>...</image>, media_token_pairs)
+class DataPaddingPatternTokenPairs(DataPaddingPattern):
+    """In this pattern, data tokens should be enclosed by special token pairs (e.g. <image>...</image>, data_token_pairs)
 
-    This strategy should be applied when media content is marked by start/end token pairs in the input sequence.
+    This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
     """
 
-    def __init__(self, media_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
-        self.media_token_pairs = media_token_pairs
+    def __init__(self, data_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
+        self.data_token_pairs = data_token_pairs
 
     def pad_input_tokens(
         self, input_ids: List[int], image_inputs: ImageInputs
     ) -> List[int]:
         """
-        This function will replace the media-tokens inbetween with pad_values accordingly
+        This function will replace the data-tokens inbetween with pad_values accordingly
         """
         pad_values = image_inputs.pad_values
-        media_token_pairs = self.media_token_pairs
-        if media_token_pairs is None:
-            media_token_pairs = [image_inputs.im_start_id, image_inputs.im_end_id]
-        if media_token_pairs is None:
+        data_token_pairs = self.data_token_pairs
+        image_inputs.image_offsets = []
+        if data_token_pairs is None:
+            data_token_pairs = [image_inputs.im_start_id, image_inputs.im_end_id]
+        if data_token_pairs is None:
             logger.warning(
-                "No media_token_pairs provided, RadixAttention might be influenced."
+                "No data_token_pairs provided, RadixAttention might be influenced."
             )
             return input_ids
-        start_tokens = [s for s, _e in media_token_pairs]
-        end_tokens = [e for _s, e in media_token_pairs]
-        # First start token marks new media
-        media_start_token = start_tokens[0]
+        start_tokens = [s for s, _e in data_token_pairs]
+        end_tokens = [e for _s, e in data_token_pairs]
+        # First start token marks new data
+        data_start_token = start_tokens[0]
 
         padded_ids = []
         last_idx = 0
-        media_idx = -1
+        data_idx = -1
 
         start_indices = [i for i, x in enumerate(input_ids) if x in start_tokens]
         end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens]
@@ -63,11 +65,12 @@ class MediaPaddingPatternTokenPairs(MediaPaddingPattern):
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
-            if input_ids[start_idx] == media_start_token:
-                media_idx += 1
+            if input_ids[start_idx] == data_start_token:
+                data_idx += 1
+                image_inputs.image_offsets += [start_idx]
 
             num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[media_idx]
+            pad_value = pad_values[data_idx]
             padded_ids.extend([pad_value] * num_tokens)
 
             last_idx = end_idx
@@ -78,25 +81,25 @@ class MediaPaddingPatternTokenPairs(MediaPaddingPattern):
         return padded_ids
 
 
-class MediaPaddingPatternSingleToken(MediaPaddingPattern):
-    """In this pattern, media is represented with a special token_id ( image_inputs.im_token_id ), which needs to be expanded to multiple tokens.
+class DataPaddingPatternSingleToken(DataPaddingPattern):
+    """In this pattern, data is represented with a special token_id ( image_inputs.im_token_id ), which needs to be expanded to multiple tokens.
 
-    This strategy should be used when a single media token represents content that should
+    This strategy should be used when a single data token represents content that should
     be expanded to multiple tokens during processing.
     """
 
     def __init__(
-        self, num_media_token_calc_func: Callable[[Tuple[int, int, int]], int]
+        self, num_data_token_calc_func: Callable[[Tuple[int, int, int]], int]
     ) -> None:
-        self.num_media_token_calc_func = num_media_token_calc_func
+        self.num_data_token_calc_func = num_data_token_calc_func
 
     def pad_input_tokens(
         self, input_ids: List[int], image_inputs: ImageInputs
     ) -> List[int]:
         """
         This function will follow the procedure of:
-            1. the media token will be expanded, of which the final number will be calculated by `num_media_token_calc_func`
-            2. the padded media tokens will be replaced with their pad_values
+            1. the data token will be expanded, of which the final number will be calculated by `num_data_token_calc_func`
+            2. the padded data tokens will be replaced with their pad_values
         """
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values
@@ -111,9 +114,7 @@ class MediaPaddingPatternSingleToken(MediaPaddingPattern):
 
         input_ids_with_image = []
         for image_cnt, _ in enumerate(image_grid_thws):
-            num_image_tokens = self.num_media_token_calc_func(
-                image_grid_thws[image_cnt]
-            )
+            num_image_tokens = self.num_data_token_calc_func(image_grid_thws[image_cnt])
             if image_cnt == 0:
                 non_image_tokens = input_ids[: image_indices[image_cnt]]
             else:
