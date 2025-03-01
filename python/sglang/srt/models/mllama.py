@@ -191,7 +191,7 @@ class MllamaVisionEncoderLayer(nn.Module):
             quant_config=None,
             dropout=0.0,
             use_context_forward=False,
-            use_full_precision_softmax=False,
+            softmax_in_single_precision=False,
             flatten_batch=False,
         )
         self.mlp = MllamaVisionMLP(config)

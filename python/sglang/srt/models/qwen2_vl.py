@@ -42,7 +42,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.multi_modality_padding import MediaPaddingPatternSingleToken
+from sglang.srt.managers.multi_modality_padding import DataPaddingPatternSingleToken
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -129,12 +129,12 @@ class Qwen2VisionBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         if attn_implementation == "sdpa":
             use_context_forward = False
-            use_full_precision_softmax = False
+            softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
-            use_full_precision_softmax = False
+            softmax_in_single_precision = False
             use_context_forward = True
         elif attn_implementation == "eager":
-            use_full_precision_softmax = True
+            softmax_in_single_precision = True
             use_context_forward = False
 
         self.attn = VisionAttention(
@@ -143,7 +143,7 @@ class Qwen2VisionBlock(nn.Module):
             projection_size=dim,
             use_qkv_parallel=False,
             use_context_forward=use_context_forward,
-            use_full_precision_softmax=use_full_precision_softmax,
+            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
         )
@@ -434,8 +434,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     # Use grid_t * grid_w * grid_h to pad tokens for each image
     # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        helper = MediaPaddingPatternSingleToken(
-            num_media_token_calc_func=self.calculate_num_image_tokens
+        helper = DataPaddingPatternSingleToken(
+            num_data_token_calc_func=self.calculate_num_image_tokens
         )
         return helper.pad_input_tokens(input_ids, image_inputs)
 

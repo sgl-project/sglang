@@ -47,7 +47,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.multi_modality_padding import MediaPaddingPatternTokenPairs
+from sglang.srt.managers.multi_modality_padding import DataPaddingPatternTokenPairs
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -107,12 +107,12 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.norm2 = Qwen2RMSNorm(dim, eps=1e-6)
         if attn_implementation == "sdpa":
             use_context_forward = False
-            use_full_precision_softmax = False
+            softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
-            use_full_precision_softmax = False
+            softmax_in_single_precision = False
             use_context_forward = True
         elif attn_implementation == "eager":
-            use_full_precision_softmax = True
+            softmax_in_single_precision = True
             use_context_forward = False
 
         self.attn = VisionAttention(
@@ -121,7 +121,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             projection_size=dim,
             use_qkv_parallel=False,
             use_context_forward=use_context_forward,
-            use_full_precision_softmax=use_full_precision_softmax,
+            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
         )
@@ -490,7 +490,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         im_end_id: int = image_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MediaPaddingPatternTokenPairs(media_token_pairs)
+        pattern = DataPaddingPatternTokenPairs(media_token_pairs)
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 

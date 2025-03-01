@@ -50,7 +50,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.multi_modality_padding import MediaPaddingPatternTokenPairs
+from sglang.srt.managers.multi_modality_padding import DataPaddingPatternTokenPairs
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -194,7 +194,7 @@ class Idefics2EncoderLayer(nn.Module):
             quant_config=quant_config,
             dropout=config.attention_dropout,
             use_context_forward=False,
-            use_full_precision_softmax=True,
+            softmax_in_single_precision=True,
             flatten_batch=False,
             prefix=f"{prefix}.self_attn",
         )
@@ -685,10 +685,10 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         pad_values: List[int],
-        im_start_id: torch.Tensor,
-        im_end_id: torch.Tensor,
-        slice_start_id: Optional[torch.Tensor] = None,
-        slice_end_id: Optional[torch.Tensor] = None,
+        im_start_id: int,
+        im_end_id: int,
+        slice_start_id: Optional[int] = None,
+        slice_end_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Returns a tensor indicating the bounds (start and end token ids) of the images
@@ -1111,7 +1111,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         slice_end_id: int = image_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MediaPaddingPatternTokenPairs(media_token_pairs)
+        pattern = DataPaddingPatternTokenPairs(media_token_pairs)
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
