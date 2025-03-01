@@ -120,6 +120,7 @@ class SglSamplingParams:
         return {
             "max_new_tokens": self.max_new_tokens,
             "min_new_tokens": self.min_new_tokens,
+            "n": self.n,
             "stop": self.stop,
             "stop_token_ids": self.stop_token_ids,
             "temperature": self.temperature,
