@@ -630,8 +630,8 @@ class Scheduler:
                 stream=recv_req.stream,
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
-                return_hidden_states=recv_req.return_hidden_states,
                 custom_logit_processor=custom_logit_processor,
+                return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer

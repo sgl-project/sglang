@@ -235,8 +235,8 @@ class Req:
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
-        return_hidden_states: bool = False,
         custom_logit_processor: Optional[str] = None,
+        return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -258,8 +258,8 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
 
-        self.return_hidden_states = return_hidden_states
         self.custom_logit_processor = custom_logit_processor
+        self.return_hidden_states = return_hidden_states
 
         # Memory pool info
         self.req_pool_idx = None
@@ -608,11 +608,11 @@ class ScheduleBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
 
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
+
+    # Whether to return hidden states
+    return_hidden_states: bool = False
 
     @classmethod
     def init_new(
