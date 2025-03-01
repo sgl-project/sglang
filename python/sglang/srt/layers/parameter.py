@@ -16,6 +16,7 @@ __all__ = [
     "ModelWeightParameter",
     "ChannelQuantScaleParameter",
     "GroupQuantScaleParameter",
+    "BlockQuantScaleParameter",
     "PackedColumnParameter",
     "RowvLLMParameter",
 ]
@@ -216,6 +217,15 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     """
     Parameter class for weight scales loaded for weights with
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
+    """
+
+    pass
+
+
+class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
+    """
+    Parameter class for weight scales loaded for weights with
+    block-wise quantization. Uses both column and row parallelism.
     """
 
     pass
