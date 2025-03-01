@@ -237,6 +237,7 @@ class Req:
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
+        schedulable: bool = True,
     ):
         # Input and output info
         self.rid = rid
@@ -341,6 +342,9 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
         self.lora_path = lora_path
+
+        # Whether the request is schedulable
+        self.schedulable = schedulable
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
