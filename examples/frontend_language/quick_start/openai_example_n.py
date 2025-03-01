@@ -4,6 +4,8 @@ export OPENAI_API_KEY=sk-******
 python3 openai_example_chat.py
 """
 
+import json
+
 import sglang as sgl
 
 
@@ -32,6 +34,9 @@ def single():
 
     print("\n-- answer_1 --\n", state["answer_1"])
     print("\n-- answer_2 --\n", state["answer_2"])
+    assert isinstance(state["answer_1"], list)
+    assert len(state["answer_1"]) == 2
+    assert isinstance(state["answer_2"], str)
 
 
 def batch():
@@ -52,6 +57,9 @@ def batch():
         print(s.messages())
         print("\n-- answer_1 --\n", s["answer_1"])
         print("\n-- answer_2 --\n", s["answer_2"])
+        assert isinstance(s["answer_1"], list)
+        assert len(s["answer_1"]) == 2
+        assert isinstance(s["answer_2"], str)
 
 
 if __name__ == "__main__":
