@@ -1037,8 +1037,8 @@ class Scheduler:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            return_hidden_states,
             self.server_args.enable_custom_logit_processor,
+            return_hidden_states,
         )
         new_batch.prepare_for_extend()
 

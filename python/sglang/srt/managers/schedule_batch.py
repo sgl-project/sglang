@@ -624,8 +624,8 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        return_hidden_states: bool,
         enable_custom_logit_processor: bool,
+        return_hidden_states: bool,
     ):
         return cls(
             reqs=reqs,
@@ -639,8 +639,8 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
-            return_hidden_states=return_hidden_states,
             enable_custom_logit_processor=enable_custom_logit_processor,
+            return_hidden_states=return_hidden_states,
         )
 
     def batch_size(self):
