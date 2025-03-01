@@ -56,7 +56,7 @@ if is_in_ci():
     DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 1157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2157"
+    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2857"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
