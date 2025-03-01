@@ -1002,5 +1002,6 @@ class Qwen2_5_VLImageProcessor(BaseImageProcessor):
         return BatchFeature(data=data, tensor_type=return_tensors)
 
 
-AutoImageProcessor.register(Qwen2_5_VLConfig, None, Qwen2_5_VLImageProcessor, None)
-AutoProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+# TODO: remove this file since we now import configs from transformers
+# AutoImageProcessor.register(Qwen2_5_VLConfig, None, Qwen2_5_VLImageProcessor, None)
+# AutoProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
