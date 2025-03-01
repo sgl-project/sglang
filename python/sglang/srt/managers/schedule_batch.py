@@ -625,7 +625,7 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
-        return_hidden_states: bool,
+        return_hidden_states: bool = False,
     ):
         return cls(
             reqs=reqs,
