@@ -585,6 +585,7 @@ class ScheduleBatch:
     extend_num_tokens: int = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
+    decode_start_idx: int = 0
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -1137,9 +1138,11 @@ class ScheduleBatch:
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
+        self.decode_start_idx = len(self.seq_lens)
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
+
         if self.output_ids is not None:
             self.output_ids = torch.concat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
@@ -1210,6 +1213,7 @@ class ScheduleBatch:
                     else CaptureHiddenMode.NULL
                 )
             ),
+            decode_start_idx=self.decode_start_idx,
         )
 
     def copy(self):
@@ -1286,6 +1290,9 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[SpecInfo] = None
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # For mixed chunked prefill
+    decode_start_idx: int = 0
 
 
 @triton.jit

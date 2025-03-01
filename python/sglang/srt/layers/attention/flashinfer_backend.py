@@ -56,6 +56,14 @@ class PrefillMetadata:
     extend_no_prefix: bool
 
 
+@dataclass
+class MixedMetadata:
+    prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
+    decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
+    use_ragged: bool
+    extend_no_prefix: bool
+
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -114,6 +122,8 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
+
+        # mixed mode: one fore prefill, one for decode
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -171,7 +181,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
 
         # Other metadata
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata, MixedMetadata] = (
+            None
+        )
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}
 
@@ -186,6 +198,84 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+        elif forward_batch.forward_mode.is_mixed():
+            # Part 0: prepare
+            extend_bs = forward_batch.decode_start_idx
+            assert extend_bs > 0, f"extent_bs = {extend_bs}"
+            req_pool_indices_extend, req_pool_indices_decode = (
+                forward_batch.req_pool_indices[:extend_bs],
+                forward_batch.req_pool_indices[extend_bs:],
+            )
+            seq_lens_extend, seq_lens_decode = (
+                forward_batch.seq_lens[:extend_bs],
+                forward_batch.seq_lens[extend_bs:],
+            )
+            seq_lens_sum_extend, seq_lens_sum_decode = (
+                forward_batch.seq_lens[:extend_bs].sum().item(),
+                forward_batch.seq_lens[extend_bs:].sum().item(),
+            )
+            assert (
+                seq_lens_sum_extend + seq_lens_sum_decode == forward_batch.seq_lens_sum
+            ), f"{seq_lens_sum_extend} + {seq_lens_sum_ex} != {forward_batch.seq_lens_sum}"
+            prefix_lens_extend = forward_batch.extend_prefix_lens[:extend_bs]
+
+            encoder_lens_extend = (
+                forward_batch.encoder_lens[:extend_bs]
+                if forward_batch.encoder_lens is not None
+                else None
+            )
+            encoder_lens_decode = (
+                (
+                    forward_batch.encoder_lens[extend_bs:]
+                    if forward_batch.encoder_lens is not None
+                    else None
+                ),
+            )
+
+            # Part1: Prefill
+            decode_running_bs = (
+                forward_batch.batch_size - forward_batch.decode_start_idx
+            )
+            extend_tokens = forward_batch.extend_num_tokens - decode_running_bs
+            if extend_tokens >= 4096 and self.num_wrappers == 1:
+                use_ragged = True
+                extend_no_prefix = not any(
+                    forward_batch.extend_prefix_lens_cpu[:extend_bs]
+                )
+            else:
+                use_ragged = False
+                extend_no_prefix = False
+
+            self.indices_updater_prefill.update(
+                req_pool_indices_extend,
+                seq_lens_extend,
+                seq_lens_sum_extend,
+                prefix_lens_extend,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=use_ragged,
+                encoder_lens=encoder_lens_extend,
+                spec_info=None,
+            )
+
+            # Part2: Decode
+            # since the `decode_start_idx` only used in the mixed mode
+            # Manually update it so we do not need change the update method
+            self.indices_updater_decode.decode_start_idx = extend_bs
+            self.indices_updater_decode.update(
+                req_pool_indices_decode,
+                seq_lens_decode,
+                seq_lens_sum_decode,
+                decode_wrappers=self.decode_wrappers,
+                encoder_lens=encoder_lens_decode,
+                spec_info=forward_batch.spec_info,
+            )
+
+            self.forward_metadata = MixedMetadata(
+                self.prefill_wrappers_paged,
+                self.decode_wrappers,
+                use_ragged,
+                extend_no_prefix,
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -378,6 +468,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if forward_batch.forward_mode.is_mixed():
+            return self.forward_mixed(q, k, v, layer, forward_batch, save_kv_cache)
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -436,6 +529,111 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+
+        # Part0: split the prefill and decode
+        decode_running_bs = forward_batch.batch_size - forward_batch.decode_start_idx
+        # each decode request only use one token
+        extend_tokens = forward_batch.extend_num_tokens - decode_running_bs
+
+        q_extend, q_decode = q[:extend_tokens], q[extend_tokens:]
+        k_extend, k_decode = k[:extend_tokens], k[extend_tokens:]
+        v_extend, v_decode = v[:extend_tokens], v[extend_tokens:]
+
+        out_cache_loc_extend = forward_batch.out_cache_loc[:extend_tokens]
+        out_cache_loc_decode = forward_batch.out_cache_loc[extend_tokens:]
+
+        ## Part1: Prefill
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        cache_loc_extend = (
+            out_cache_loc_extend
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc[:extend_tokens]
+        )
+
+        if not self.forward_metadata.use_ragged:
+            if k_extend is not None:
+                assert v_extend is not None
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc_extend, k_extend, v_extend
+                    )
+
+            o = prefill_wrapper_paged.forward(
+                q_extend.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=not layer.is_cross_attention,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=layer.logit_cap,
+            )
+        else:
+            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                q_extend.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_extend.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                v_extend.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+            )
+
+            if self.forward_metadata.extend_no_prefix:
+                o = o1
+            else:
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                    q_extend.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                )
+
+                o, _ = merge_state(o1, s1, o2, s2)
+
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc_extend, k_extend, v_extend
+                )
+
+        o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+        ## Part2: decode
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        cache_loc_decode = (
+            out_cache_loc_decode
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc[extend_tokens:]
+        )
+
+        if k_decode is not None:
+            assert v_decode is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc_decode, k_decode, v_decode
+                )
+
+        o_decode = decode_wrapper.forward(
+            q_decode.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+        )
+        o_decode = o_decode.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+        return torch.cat((o, o_decode), dim=0)
 
     def forward_decode(
         self,
@@ -499,6 +697,9 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+
+        # mixed chunk prefill
+        self.decode_start_idx = 0
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -620,6 +821,53 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx: torch.Tensor,
         spec_info: Optional[SpecInfo],
     ):
+        shift_pos = self.decode_start_idx
+        if shift_pos > 0:
+            if spec_info is None:
+                bs = len(req_pool_indices)
+                kv_indptr[1 + shift_pos] = 0
+                kv_indptr[2 + shift_pos : 2 + shift_pos + bs] = torch.cumsum(
+                    paged_kernel_lens, dim=0
+                )
+                kv_indptr_decode = kv_indptr[1 + shift_pos : 2 + shift_pos + bs].clone()
+
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr_decode,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
+            else:
+                bs, kv_indices, kv_indptr_decode = spec_info.generate_attn_arg_decode(
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    self.req_to_token,
+                )
+
+            wrapper.end_forward()
+
+            kv_last_page_len_decode = self.kv_last_page_len[
+                shift_pos : shift_pos + bs
+            ].clone()
+            wrapper.begin_forward(
+                kv_indptr_decode,
+                kv_indices,
+                kv_last_page_len_decode,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+            )
+            return
+
         if spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -831,6 +1079,7 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+            assert kv_indptr[0] == 0, "the first element should be zero"
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
