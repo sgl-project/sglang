@@ -169,6 +169,7 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
+    flashinfer_mla_disable_ragged: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -721,6 +722,11 @@ class ServerArgs:
             "--enable-flashinfer-mla",
             action="store_true",
             help="Enable FlashInfer MLA optimization",
+        )
+        parser.add_argument(
+            "--flashinfer-mla-disable-ragged",
+            action="store_true",
+            help="Not using ragged prefill wrapper when running flashinfer mla",
         )
 
         # Speculative decoding
