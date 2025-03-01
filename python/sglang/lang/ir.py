@@ -471,8 +471,8 @@ class SglGen(SglExpr):
         self.name = name
         self.sampling_params = SglSamplingParams(
             max_new_tokens=max_new_tokens,
-            n=n,
             min_new_tokens=min_new_tokens,
+            n=n,
             stop=stop,
             stop_token_ids=stop_token_ids,
             temperature=temperature,
