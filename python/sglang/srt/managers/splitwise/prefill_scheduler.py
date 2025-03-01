@@ -141,6 +141,7 @@ class PrefillScheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         # self.spec_algorithm = SpeculativeAlgorithm.from_string(
         #     server_args.speculative_algorithm
         # )
@@ -327,6 +328,10 @@ class PrefillScheduler:
         #     self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         # )
 
+        # TODO: to be removed
+        self.is_mixed_chunk = False
+        self.chunked_prefill_size = None
+
         # Init the grammar backend for constrained generation
         # self.grammar_queue: List[Req] = []
         # if not server_args.skip_tokenizer_init:
@@ -407,7 +412,7 @@ class PrefillScheduler:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
-                (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                # (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (FlushCacheReq, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
@@ -802,13 +807,13 @@ class PrefillScheduler:
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.being_chunked_req:
-                # Move the chunked request out of the batch
-                self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
-                self.tree_cache.cache_unfinished_req(self.being_chunked_req)
-                # being chunked request keeps its rid but will get a new req_pool_idx
-                self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
-                self.batch_is_full = False
+            # if self.being_chunked_req:
+            #     # Move the chunked request out of the batch
+            #     self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
+            #     self.tree_cache.cache_unfinished_req(self.being_chunked_req)
+            #     # being chunked request keeps its rid but will get a new req_pool_idx
+            #     self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
+            #     self.batch_is_full = False
 
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
@@ -827,6 +832,9 @@ class PrefillScheduler:
             # TODO swap out kv cache and put into kv cache send queue
             pass
 
+            ret = None
+
+
             # Run decode
             # if self.running_batch is None:
             #     ret = None
@@ -842,13 +850,16 @@ class PrefillScheduler:
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
-        if self.grammar_queue:
-            self.move_ready_grammar_requests()
+        # if self.grammar_queue:
+        #     self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.being_chunked_req is None:
+        # if (
+            # self.batch_is_full or len(self.waiting_queue) == 0
+        # ) and self.being_chunked_req is None:
+            # return None
+
+        if self.batch_is_full or len(self.waiting_queue) == 0:
             return None
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
@@ -870,31 +881,31 @@ class PrefillScheduler:
             running_bs if self.is_mixed_chunk else 0,
         )
 
-        has_being_chunked = self.being_chunked_req is not None
-        if has_being_chunked:
-            self.being_chunked_req.init_next_round_input()
-            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
+        # has_being_chunked = self.being_chunked_req is not None
+        # if has_being_chunked:
+        #     self.being_chunked_req.init_next_round_input()
+        #     self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
 
-        if self.lora_paths:
-            lora_set = (
-                set([req.lora_path for req in self.running_batch.reqs])
-                if self.running_batch is not None
-                else set([])
-            )
+        # if self.lora_paths:
+        #     lora_set = (
+        #         set([req.lora_path for req in self.running_batch.reqs])
+        #         if self.running_batch is not None
+        #         else set([])
+        #     )
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if (
-                self.lora_paths
-                and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
-                > self.max_loras_per_batch
-            ):
-                self.batch_is_full = True
-                break
+            # if (
+            #     self.lora_paths
+            #     and len(
+            #         lora_set
+            #         | set([req.lora_path for req in adder.can_run_list])
+            #         | set([req.lora_path])
+            #     )
+            #     > self.max_loras_per_batch
+            # ):
+            #     self.batch_is_full = True
+            #     break
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.batch_is_full = True
@@ -924,16 +935,17 @@ class PrefillScheduler:
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if adder.new_being_chunked_req is not None:
-            assert self.being_chunked_req is None
-            self.being_chunked_req = adder.new_being_chunked_req
+        # if adder.new_being_chunked_req is not None:
+        #     assert self.being_chunked_req is None
+        #     self.being_chunked_req = adder.new_being_chunked_req
 
-        if self.being_chunked_req:
-            self.being_chunked_req.is_being_chunked += 1
+        # if self.being_chunked_req:
+        #     self.being_chunked_req.is_being_chunked += 1
 
         # Print stats
         if self.attn_tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
+            # self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
+            self.log_prefill_stats(adder, can_run_list, running_bs, False)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -1061,6 +1073,8 @@ class PrefillScheduler:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
+            # should not goes to this, after prefill it is done
+            raise 
             self.process_batch_result_decode(batch, result)
             if batch.is_empty():
                 self.running_batch = None
@@ -1121,36 +1135,41 @@ class PrefillScheduler:
 
                 if req.is_being_chunked <= 0:
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
 
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                    # force to finish, prefill is done
+                    # cache kv cache to device
+                    self.tree_cache.cache_finished_req(req)
 
-                    if req.return_logprob:
-                        logprob_pt += self.add_logprob_return_values(
-                            i, req, logprob_pt, next_token_ids, logits_output
-                        )
+                    # req.check_finished()
 
-                    if (
-                        self.server_args.return_hidden_states
-                        and logits_output.hidden_states is not None
-                    ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .cpu()
-                            .clone()
-                        )
+                    # if req.finished():
+                    #     self.tree_cache.cache_finished_req(req)
+                    # elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    #     self.tree_cache.cache_unfinished_req(req)
 
-                    if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-                        req.grammar.finished = req.finished()
+                    # if req.return_logprob:
+                    #     logprob_pt += self.add_logprob_return_values(
+                    #         i, req, logprob_pt, next_token_ids, logits_output
+                    #     )
+
+                    # if (
+                    #     self.server_args.return_hidden_states
+                    #     and logits_output.hidden_states is not None
+                    # ):
+                    #     req.hidden_states.append(
+                    #         logits_output.hidden_states[
+                    #             hidden_state_offset : (
+                    #                 hidden_state_offset := hidden_state_offset
+                    #                 + len(req.origin_input_ids)
+                    #             )
+                    #         ]
+                    #         .cpu()
+                    #         .clone()
+                    #     )
+
+                    # if req.grammar is not None:
+                    #     req.grammar.accept_token(next_token_id)
+                    #     req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
@@ -1573,9 +1592,9 @@ class PrefillScheduler:
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
 
-            if not self.spec_algorithm.is_none():
-                self.draft_worker.model_runner.req_to_token_pool.clear()
-                self.draft_worker.model_runner.token_to_kv_pool.clear()
+            # if not self.spec_algorithm.is_none():
+            #     self.draft_worker.model_runner.req_to_token_pool.clear()
+            #     self.draft_worker.model_runner.token_to_kv_pool.clear()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0

@@ -938,6 +938,14 @@ class ServerArgs:
             help="Enable hierarchical cache",
         )
 
+        parser.add_argument(
+            "--server-role",
+            type=str,
+            choices=["mixed", "prefill", "decode"],
+            default=ServerArgs.server_role,
+            help="Enable hierarchical cache",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
