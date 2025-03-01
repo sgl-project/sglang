@@ -115,8 +115,8 @@ def gen(
     return SglGen(
         name,
         max_tokens,
-        n,
         min_tokens,
+        n,
         stop,
         stop_token_ids,
         temperature,
@@ -157,8 +157,8 @@ def gen_int(
     return SglGen(
         name,
         max_tokens,
-        n,
         None,
+        n,
         stop,
         stop_token_ids,
         temperature,
@@ -198,8 +198,8 @@ def gen_string(
     return SglGen(
         name,
         max_tokens,
-        n,
         None,
+        n,
         stop,
         stop_token_ids,
         temperature,
