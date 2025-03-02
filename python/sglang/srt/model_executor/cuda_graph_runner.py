@@ -446,7 +446,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.decode_seq_lens_cpu:
+        if forward_batch.decode_seq_lens_cpu is not None:
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.decode_seq_lens_cpu)
 
         if self.is_encoder_decoder:
