@@ -502,7 +502,7 @@ class SRTRunner:
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
-            output_ids.append(response["output_ids"])
+            # output_ids.append(response["output_ids"])
 
             input_token_logprobs = response["meta_info"]["input_token_logprobs"]
             output_token_logprobs = response["meta_info"]["output_token_logprobs"]

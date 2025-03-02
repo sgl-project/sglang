@@ -377,6 +377,9 @@ class Req:
         self.spec_verify_ct = 0
         self.lora_path = lora_path
 
+        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
+        self.to_abort_message: str = "Unknown error"
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)

@@ -572,7 +572,6 @@ def invoke_fused_moe_kernel(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         even_Ks=even_Ks,
-        no_combine=no_combine,
         **config,
     )
 
