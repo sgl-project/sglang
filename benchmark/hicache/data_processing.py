@@ -282,10 +282,6 @@ def sample_nextqa_requests(
         ],
     }
     """
-    # NOTE: The input len is dependent on how the
-    # vision encoder expand the IMAGE token to embedded image or video
-    # TODO: Remove 144 which is specific for llavavid with mm_spatial_pool_stride=2
-    num_tokens_per_frame = 144
 
     if fixed_output_len is None:
         fixed_output_len = 4096
@@ -329,8 +325,9 @@ def sample_nextqa_requests(
 
             # video input
             base64_data = encode_video_base64(video.path, video.num_frames)
-            # TODO: Support more models than 7B
-            prompt_len += video.num_frames * num_tokens_per_frame
+
+            # NOTE: This will be replaced by the expanded length from the server
+            prompt_len += video.num_frames
 
             # add to content
             content = [

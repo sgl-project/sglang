@@ -226,6 +226,7 @@ async def async_request_sglang_generate(
                 "ignore_eos": not args.disable_ignore_eos,
             },
             "stream": not args.disable_stream,
+            "stream_options": {"include_usage": True},
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "logprob_start_len": -1,
@@ -267,6 +268,8 @@ async def async_request_sglang_generate(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    actual_prompt_len = prompt_len - 1
+                    actual_output_len = 0
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -284,6 +287,20 @@ async def async_request_sglang_generate(
                             # usage summary response without a token so we
                             # want to check a token was generated
                             timestamp = time.perf_counter()
+                            if (
+                                data["meta_info"] is not None
+                                and data["meta_info"]["prompt_tokens"] is not None
+                            ):
+                                actual_prompt_len = int(
+                                    data["meta_info"]["prompt_tokens"]
+                                )
+                            if (
+                                data["meta_info"] is not None
+                                and data["meta_info"]["completion_tokens"] is not None
+                            ):
+                                actual_output_len = int(
+                                    data["meta_info"]["completion_tokens"]
+                                )
                             if data["text"]:
                                 # First token
                                 if ttft == 0.0:
@@ -297,9 +314,8 @@ async def async_request_sglang_generate(
                                 generated_text = data["text"]
                             most_recent_timestamp = timestamp
 
-                    output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
-                    output.output_len.append(output_len)
+                    output.prompt_len.append(actual_prompt_len)  # truncate <s>
+                    output.output_len.append(actual_output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
                     output.latency.append(latency)
@@ -308,7 +324,7 @@ async def async_request_sglang_generate(
                     request_func_input.prompts[prompt_idx] = (
                         prompt,
                         input_len,
-                        output_len,  # changes from max_tokens to output_len
+                        actual_output_len,  # changes from max_tokens to output_len
                     )
                     prompt_idx += 1
                     messages.append(generated_text)
