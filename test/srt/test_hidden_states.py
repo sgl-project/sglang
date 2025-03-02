@@ -16,7 +16,6 @@ class TestHiddenState(unittest.TestCase):
         sampling_params = {
             "temperature": 0,
             "max_new_tokens": 8,
-            "return_hidden_states": True,
         }
 
         engine = sgl.Engine(
@@ -24,7 +23,11 @@ class TestHiddenState(unittest.TestCase):
             random_seed=42,
             skip_tokenizer_init=True,
         )
-        outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        outputs = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
         engine.shutdown()
 
         for output in outputs:
@@ -80,16 +83,9 @@ class TestHiddenState(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sample_completion = {
+        sampling_params = {
             "temperature": 0,
             "max_new_tokens": 8,
-            "return_hidden_states": True,
-        }
-
-        sample_hidden_state = {
-            "temperature": 0,
-            "max_new_tokens": 8,
-            "return_hidden_states": False,
         }
 
         engine = sgl.Engine(
@@ -98,14 +94,20 @@ class TestHiddenState(unittest.TestCase):
             skip_tokenizer_init=True,
         )
         outputs_completion_first_round = engine.generate(
-            input_ids=input_ids, sampling_params=sample_completion
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
         )
         outputs_hidden_state = engine.generate(
-            input_ids=input_ids, sampling_params=sample_hidden_state
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=False,
         )
 
         outputs_completion_last_round = engine.generate(
-            input_ids=input_ids, sampling_params=sample_completion
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
         )
         engine.shutdown()
 
