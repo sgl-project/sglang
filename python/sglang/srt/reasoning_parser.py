@@ -4,14 +4,6 @@ from typing import Dict
 REASONING_MODELS = ["deepseek-r1"]
 
 
-def is_reasoning_model(model_name: str) -> bool:
-    """Checks if the model is a reasoning model."""
-    for model in REASONING_MODELS:
-        if re.match(f".*{model}.*", model_name, re.IGNORECASE):
-            return True
-    return False
-
-
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
@@ -23,41 +15,20 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def __init__(self, stream_reasoning: bool = False):
-        self._buffer = ""
-        self._in_reasoning = False
-        self._current_reasoning = ""
+    def __init__(
+        self,
+        think_start_token: str,
+        think_end_token: str,
+        force_reasoning: bool = False,
+        stream_reasoning: bool = False,
+    ):
+        self.think_start_token = think_start_token
+        self.think_end_token = think_end_token
+        self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
-    def detect_and_parse(self, text: str) -> StreamingParseResult:
-        """Parses the text in one go."""
-        raise NotImplementedError
-
-    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        """Streaming incremental parsing."""
-        raise NotImplementedError
-
-
-class DeepSeekR1Detector(BaseReasoningFormatDetector):
-    """
-    Detector for DeepSeek-R1 model.
-    Assumes reasoning format:
-      (<think>)*(.*)</think>
-    Returns all the text before the </think> tag as `reasoning_text`
-    and the rest of the text as `normal_text`.
-
-    Args:
-        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
-            If True, streams reasoning content as it arrives.
-    """
-
-    def __init__(self, stream_reasoning: bool = False):
-        super().__init__(stream_reasoning=stream_reasoning)
-        self.think_start_token = "<think>"
-        self.think_end_token = "</think>"
-        # DeepSeek-R1 is assumed to be reasoning until `</think>` token
-        # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
-        self._in_reasoning = True
+        self._buffer = ""
+        self._current_reasoning = ""
         self.stripped_think_start = False
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
@@ -132,6 +103,25 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(normal_text=new_text)
 
         return StreamingParseResult()
+
+
+class DeepSeekR1Detector(BaseReasoningFormatDetector):
+    """
+    Detector for DeepSeek-R1 model.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+    Returns all the text before the </think> tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = False):
+        # DeepSeek-R1 is assumed to be reasoning until `</think>` token
+        super().__init__("<think>", "</think>", True, stream_reasoning=stream_reasoning)
+        # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
 class ReasoningParser:

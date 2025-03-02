@@ -74,7 +74,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.reasoning_parser import ReasoningParser, is_reasoning_model
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1105,23 +1105,17 @@ def v1_chat_generate_response(
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
-            model = request[idx].model
             separate_reasoning = request[idx].separate_reasoning
         else:
             tool_choice = request.tool_choice
             tools = request.tools
-            model = request.model
             separate_reasoning = request.separate_reasoning
 
-        if reasoning_parser or (separate_reasoning and is_reasoning_model(model)):
+        if reasoning_parser and separate_reasoning:
             try:
-                parser = ReasoningParser(model, True)
+                parser = ReasoningParser(reasoning_parser, True)
                 parse_result = parser.parse_non_stream(text)
-                text = (
-                    None
-                    if parse_result.normal_text and len(parse_result.normal_text) == 0
-                    else parse_result.normal_text
-                )
+                text = parse_result.normal_text  #! text can not be None
                 reasoning_text = parse_result.reasoning_text
             except Exception as e:
                 logger.error(f"Exception: {e}")
@@ -1162,6 +1156,7 @@ def v1_chat_generate_response(
                     "role": "assistant",
                     "content": text if tool_calls is None else None,
                     "tool_calls": tool_calls,
+                    "reasoning_content": reasoning_text,
                 },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
@@ -1171,8 +1166,6 @@ def v1_chat_generate_response(
                     else None
                 ),
             }
-            if reasoning_text:
-                choice_data["message"]["reasoning_content"] = reasoning_text
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -1321,9 +1314,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     if is_first:
                         # First chunk with role
                         is_first = False
-                        if tokenizer_manager.server_args.reasoning_parser or (
-                            request.separate_reasoning
-                            and is_reasoning_model(request.model)
+                        if (
+                            tokenizer_manager.server_args.reasoning_parser
+                            and request.separate_reasoning
                         ):
                             delta = DeltaMessage(role="assistant", reasoning_content="")
                         else:
@@ -1354,12 +1347,14 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
-                    if tokenizer_manager.server_args.reasoning_parser or (
-                        request.separate_reasoning and is_reasoning_model(request.model)
+                    if (
+                        tokenizer_manager.server_args.reasoning_parser
+                        and request.separate_reasoning
                     ):
                         if index not in reasoning_parser_dict:
                             reasoning_parser_dict[index] = ReasoningParser(
-                                request.model, request.stream_reasoning
+                                tokenizer_manager.server_args.reasoning_parser,
+                                request.stream_reasoning,
                             )
                         reasoning_parser = reasoning_parser_dict[index]
                         parse_result = reasoning_parser.parse_stream_chunk(delta)

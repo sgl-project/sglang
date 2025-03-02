@@ -32,7 +32,6 @@ suites = {
         "test_openai_server.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
-        "test_reasoning_content.py",
         "test_regex_constrained.py",
         "test_release_memory_occupation.py",
         "test_request_length_validation.py",
@@ -58,6 +57,7 @@ suites = {
         "test_w8a8_quantization.py",
         "test_fp8_kernel.py",
         "test_block_int8.py",
+        "test_reasoning_content.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
