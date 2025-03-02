@@ -46,7 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
+from sglang.srt.utils import make_layers
 
 class DeepseekMLP(nn.Module):
 
@@ -337,11 +337,14 @@ class DeepseekModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekDecoderLayer(config, layer_id, quant_config=quant_config)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: DeepseekDecoderLayer(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
+            prefix="",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
