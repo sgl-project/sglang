@@ -33,6 +33,7 @@ suites = {
         "test_no_overlap_scheduler.py",
         "test_openai_server.py",
         "test_penalty.py",
+        "test_fim_completion.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
         "test_regex_constrained.py",
