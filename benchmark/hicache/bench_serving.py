@@ -95,6 +95,7 @@ async def async_request_openai_completions(
             "temperature": 0.0,
             "best_of": 1,
             "stream": not args.disable_stream,
+            "stream_options": {"include_usage": True},
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
@@ -136,6 +137,8 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    actual_prompt_len = prompt_len - 1
+                    actual_output_len = 0
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -151,6 +154,10 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            if data["usage"] is not None and len(data["usage"]) > 0:
+                                actual_prompt_len = data["usage"]["prompt_tokens"]
+                                actual_output_len = data["usage"]["completion_tokens"]
+                                continue
                             delta = data["choices"][0]["delta"]
 
                             if delta.get("content", None):
@@ -166,9 +173,8 @@ async def async_request_openai_completions(
                                 generated_text += delta["content"]
                             most_recent_timestamp = timestamp
 
-                    output_len = len(tokenizer(generated_text).input_ids)
-                    output.prompt_len.append(prompt_len - 1)  # truncate <s>
-                    output.output_len.append(output_len)
+                    output.prompt_len.append(actual_prompt_len)  # truncate <s>
+                    output.output_len.append(actual_output_len)
                     output.generated_text.append(generated_text)
                     output.success = True
                     output.latency.append(latency)
@@ -177,7 +183,7 @@ async def async_request_openai_completions(
                     request_func_input.prompts[prompt_idx] = (
                         prompt,
                         input_len,
-                        output_len,  # changes from max_tokens to output_len
+                        actual_output_len,  # changes from max_tokens to output_len
                     )
                     prompt_idx += 1
                     messages.append(
