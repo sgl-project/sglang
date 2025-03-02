@@ -310,4 +310,3 @@ class SamplingBatchInfo:
 
         self.is_all_greedy |= other.is_all_greedy
         self.need_min_p_sampling |= other.need_min_p_sampling
-        self.return_hidden_states |= other.return_hidden_states
