@@ -33,7 +33,7 @@ except ImportError:
     # outlines.integrations.utils
     from outlines.integrations.utils import convert_json_schema_to_str
 
-from python.sglang.srt.completion_template import (
+from sglang.srt.completion_template import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
