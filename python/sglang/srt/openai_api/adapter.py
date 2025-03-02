@@ -1114,9 +1114,7 @@ def v1_chat_generate_response(
         if reasoning_parser and separate_reasoning:
             try:
                 parser = ReasoningParser(reasoning_parser, True)
-                parse_result = parser.parse_non_stream(text)
-                text = parse_result.normal_text  #! text can not be None
-                reasoning_text = parse_result.reasoning_text
+                reasoning_text, text = parser.parse_non_stream(text)
             except Exception as e:
                 logger.error(f"Exception: {e}")
                 return create_error_response(
@@ -1357,13 +1355,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 request.stream_reasoning,
                             )
                         reasoning_parser = reasoning_parser_dict[index]
-                        parse_result = reasoning_parser.parse_stream_chunk(delta)
-                        if parse_result.reasoning_text:
+                        reasoning_text, delta = reasoning_parser.parse_stream_chunk(
+                            delta
+                        )
+                        if reasoning_text:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(
-                                    reasoning_content=parse_result.reasoning_text
-                                ),
+                                delta=DeltaMessage(reasoning_content=reasoning_text),
                                 finish_reason=(
                                     None
                                     if finish_reason_type
@@ -1377,7 +1375,6 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 model=request.model,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
-                        delta = parse_result.normal_text
                         if (delta and len(delta) == 0) or not delta:
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first

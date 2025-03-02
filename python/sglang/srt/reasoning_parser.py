@@ -151,8 +151,10 @@ class ReasoningParser:
 
     def parse_non_stream(self, full_text: str) -> StreamingParseResult:
         """Non-streaming call: one-time parsing"""
-        return self.detector.detect_and_parse(full_text)
+        ret = self.detector.detect_and_parse(full_text)
+        return ret.reasoning_text, ret.normal_text
 
     def parse_stream_chunk(self, chunk_text: str) -> StreamingParseResult:
         """Streaming call: incremental parsing"""
-        return self.detector.parse_streaming_increment(chunk_text)
+        ret = self.detector.parse_streaming_increment(chunk_text)
+        return ret.reasoning_text, ret.normal_text
