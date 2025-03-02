@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -96,6 +97,8 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
+    reasoning_parser: Optional[str] = None
+    separate_reasoning_default: bool = True
 
     # Data parallelism
     dp_size: int = 1
@@ -613,6 +616,19 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            choices=ReasoningParser.DetectorMap.keys(),
+            default=ServerArgs.reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
+        )
+        parser.add_argument(
+            "--separate-reasoning-default",
+            type=bool,
+            default=ServerArgs.separate_reasoning_default,
+            help="Whether to separate reasoning and normal text by default.",
         )
 
         # Data parallelism

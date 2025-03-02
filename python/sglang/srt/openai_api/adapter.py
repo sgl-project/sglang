@@ -74,6 +74,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -324,6 +325,8 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+                    separate_reasoning_default=tokenizer_manager.server_args.separate_reasoning_default,
                 )
             else:
                 responses = v1_generate_response(
@@ -1045,7 +1048,13 @@ def v1_chat_generate_request(
 
 
 def v1_chat_generate_response(
-    request, ret, to_file=False, cache_report=False, tool_call_parser=None
+    request,
+    ret,
+    to_file=False,
+    cache_report=False,
+    tool_call_parser=None,
+    reasoning_parser=None,
+    separate_reasoning_default=None,
 ):
     choices = []
 
@@ -1099,9 +1108,32 @@ def v1_chat_generate_response(
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
+            separate_reasoning = (
+                request[idx].separate_reasoning
+                if request[idx].separate_reasoning is not None
+                else separate_reasoning_default
+            )
         else:
             tool_choice = request.tool_choice
             tools = request.tools
+            separate_reasoning = (
+                request.separate_reasoning
+                if request.separate_reasoning is not None
+                else separate_reasoning_default
+            )
+
+        if reasoning_parser and separate_reasoning:
+            try:
+                parser = ReasoningParser(reasoning_parser, True)
+                reasoning_text, text = parser.parse_non_stream(text)
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse reasoning related info to json format!",
+                )
+        else:
+            reasoning_text = None
 
         if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
             if finish_reason == "stop":
@@ -1131,8 +1163,9 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": ret_item["text"] if tool_calls is None else None,
+                    "content": text if tool_calls is None else None,
                     "tool_calls": tool_calls,
+                    "reasoning_content": reasoning_text,
                 },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
@@ -1147,8 +1180,9 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=ret_item["text"] if tool_calls is None else None,
+                    content=text if tool_calls is None else None,
                     tool_calls=tool_calls,
+                    reasoning_content=reasoning_text,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
@@ -1215,6 +1249,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
     if adapted_request.stream:
         parser_dict = {}
+        reasoning_parser_dict = {}
 
         async def generate_stream_resp():
             is_firsts = {}
@@ -1281,15 +1316,28 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         choice_logprobs = None
 
                     finish_reason = content["meta_info"]["finish_reason"]
+                    finish_reason_type = (
+                        finish_reason["type"] if finish_reason else None
+                    )
 
                     if is_first:
                         # First chunk with role
                         is_first = False
+                        if tokenizer_manager.server_args.reasoning_parser and (
+                            request.separate_reasoning
+                            if request.separate_reasoning is not None
+                            else tokenizer_manager.server_args.separate_reasoning
+                        ):
+                            delta = DeltaMessage(role="assistant", reasoning_content="")
+                        else:
+                            delta = DeltaMessage(role="assistant", content="")
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant", content=""),
+                            delta=delta,
                             finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
+                                None
+                                if finish_reason_type and len(finish_reason_type) == 0
+                                else finish_reason_type
                             ),
                             matched_stop=(
                                 finish_reason["matched"]
@@ -1309,6 +1357,42 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
+                    if tokenizer_manager.server_args.reasoning_parser and (
+                        request.separate_reasoning
+                        if request.separate_reasoning is not None
+                        else tokenizer_manager.server_args.separate_reasoning
+                    ):
+                        if index not in reasoning_parser_dict:
+                            reasoning_parser_dict[index] = ReasoningParser(
+                                tokenizer_manager.server_args.reasoning_parser,
+                                request.stream_reasoning,
+                            )
+                        reasoning_parser = reasoning_parser_dict[index]
+                        reasoning_text, delta = reasoning_parser.parse_stream_chunk(
+                            delta
+                        )
+                        if reasoning_text:
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(reasoning_content=reasoning_text),
+                                finish_reason=(
+                                    None
+                                    if finish_reason_type
+                                    and len(finish_reason_type) == 0
+                                    else finish_reason_type
+                                ),
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                choices=[choice_data],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                        if (delta and len(delta) == 0) or not delta:
+                            stream_buffers[index] = new_stream_buffer
+                            is_firsts[index] = is_first
+                            continue
+
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
                             parser_dict[index] = FunctionCallParser(
@@ -1326,7 +1410,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                                 index=index,
                                 delta=DeltaMessage(content=normal_text),
                                 finish_reason=(
-                                    finish_reason["type"] if finish_reason else ""
+                                    None
+                                    if finish_reason_type
+                                    and len(finish_reason_type) == 0
+                                    else finish_reason_type
                                 ),
                             )
                             chunk = ChatCompletionStreamResponse(
@@ -1395,7 +1482,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             index=index,
                             delta=DeltaMessage(content=delta),
                             finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
+                                None
+                                if finish_reason_type and len(finish_reason_type) == 0
+                                else finish_reason_type
                             ),
                             matched_stop=(
                                 finish_reason["matched"]
@@ -1463,6 +1552,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+        reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        separate_reasoning_default=tokenizer_manager.server_args.separate_reasoning_default,
     )
 
     return response
