@@ -161,6 +161,12 @@ jobs:
           cd test/srt
           python3 test_moe_ep.py
 
+      - name: Test torch compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_mla_tp.py
+
   performance-test-1-gpu-part-1:
     needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
