@@ -1,5 +1,5 @@
 import re
-from typing import Dict
+from typing import Dict, Tuple
 
 REASONING_MODELS = ["deepseek-r1"]
 
@@ -140,12 +140,12 @@ class ReasoningParser:
 
         self.detector = detector_class(stream_reasoning=stream_reasoning)
 
-    def parse_non_stream(self, full_text: str) -> StreamingParseResult:
+    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> StreamingParseResult:
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
