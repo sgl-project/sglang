@@ -49,7 +49,7 @@ class TestHiddenState(unittest.TestCase):
             with torch.inference_mode():
                 hf_out = model(
                     torch.tensor(
-                        [input_id + output["token_ids"][:-1]], device=model.device
+                        [input_id + output["output_ids"][:-1]], device=model.device
                     ),
                     output_hidden_states=True,
                 )

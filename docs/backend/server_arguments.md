@@ -96,7 +96,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests in a single engine.
 * `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Highly conservative behavior leads to starvation, but low conservativeness leads to slowed-down performance.
 * `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading of model parameters to the CPU.
-* `prefill_only_one_req`: When this flag is turned on, the engine prefills only one request at a time.
 
 ## Other runtime options
 

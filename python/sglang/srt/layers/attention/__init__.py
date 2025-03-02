@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
 class AttentionBackend(ABC):
@@ -31,7 +31,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -44,7 +44,7 @@ class AttentionBackend(ABC):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
@@ -64,7 +64,14 @@ class AttentionBackend(ABC):
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+            return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
         else:
             return self.forward_extend(
                 q,
@@ -72,7 +79,7 @@ class AttentionBackend(ABC):
                 v,
                 layer,
                 forward_batch,
-                save_kv_cache,
+                save_kv_cache=save_kv_cache,
             )
 
     def forward_decode(

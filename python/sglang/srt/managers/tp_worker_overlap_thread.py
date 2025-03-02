@@ -175,7 +175,7 @@ class TpModelWorkerClient:
                 logits_output.next_token_logprobs.tolist()
             )
             if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = (
+                logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
@@ -188,8 +188,7 @@ class TpModelWorkerClient:
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
-            scaling_penalties=sampling_info.scaling_penalties,
-            linear_penalties=sampling_info.linear_penalties,
+            penalizer_orchestrator=None,
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
