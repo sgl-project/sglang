@@ -91,7 +91,7 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
-        max_tokens: int = 2048,
+        max_completion_tokens: int = 2048,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -101,7 +101,7 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_completion_tokens = max_completion_tokens
         self.image_format = "url"
 
     def _handle_image(
@@ -137,7 +137,7 @@ class ChatCompletionSampler(SamplerBase):
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_completion_tokens=self.max_completion_tokens,
                 )
                 return response.choices[0].message.content
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are reruning MMMU

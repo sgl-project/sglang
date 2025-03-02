@@ -24,7 +24,7 @@
 - InternLM 2
 - Exaone 3
 - BaiChuan2
-- MiniCPM / MiniCPM 3 / MiniCPMV
+- MiniCPM / MiniCPM 3 / MiniCPMV / MiniCPM-o
 - XVERSE / XVERSE MoE
 - SmolLM
 - GLM-4
@@ -65,7 +65,7 @@ LLM.
    return True for your model.
 2. **Process Images**: Create a new `ImageProcessor` class that inherits from `BaseImageProcessor` and register this
    processor as your model's dedicated processor. See [
-   `image_processor.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/image_processor.py)
+   `multimodal_processor.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/multimodal_processor.py)
    for more details.
 3. **Handle Image Tokens**: Implement a `pad_input_ids` function for your new model, in which image tokens in the prompt
    should be expanded and replaced with image-hashes, so that SGLang can recognize different images for

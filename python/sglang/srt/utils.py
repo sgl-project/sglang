@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import ctypes
 import dataclasses
@@ -50,6 +49,7 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
@@ -420,9 +420,31 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file: Union[str, bytes]):
-    from PIL import Image
+def load_audio(audio_file: str) -> np.ndarray:
+    import librosa
 
+    sr = 16000
+    mono = True
+    if isinstance(audio_file, bytes):
+        audio, _ = librosa.load(io.BytesIO(audio_file), sr=sr, mono=mono)
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(audio_file, timeout=timeout)
+        audio, _ = librosa.load(io.BytesIO(response.content), sr=sr, mono=mono)
+    elif audio_file.lower().endswith(("wav", "mp3", "flac")):
+        audio, _ = librosa.load(audio_file, sr=sr, mono=mono)
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, _ = librosa.load(BytesIO(base64.b64decode(audio_file)), sr=sr, mono=mono)
+    elif isinstance(audio_file, str):
+        audio, _ = librosa.load(audio_file, sr=sr, mono=mono)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    return audio
+
+
+def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     image = image_size = None
 
     if isinstance(image_file, bytes):
@@ -1453,3 +1475,63 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def get_multimodal_data_bounds(
+    input_ids: torch.Tensor,
+    pad_values: List[int],
+    data_start_id: torch.Tensor,
+    data_end_id: torch.Tensor,
+    slice_start_id: Optional[torch.Tensor] = None,
+    slice_end_id: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
+
+    Returns:
+        [bounds_count, 2]
+    """
+    # All the images in the batch should share the same special image
+    # bound token ids.
+    start_cond = input_ids == data_start_id
+    end_cond = input_ids == data_end_id
+    if slice_start_id is not None:
+        start_cond |= input_ids == slice_start_id
+        end_cond |= input_ids == slice_end_id
+
+    (data_start_tokens,) = torch.where(start_cond)
+    data_start_tokens += 1
+    (data_end_tokens,) = torch.where(end_cond)
+
+    # the im_start_id sometimes can be cached as prefix, but it is needed for the embedding of the images
+    if len(data_start_tokens) != len(data_end_tokens):
+        if (
+            len(data_start_tokens) + 1 == len(data_end_tokens)
+            and input_ids[0] in pad_values
+            and data_end_tokens[0] < data_start_tokens[0]
+        ):
+            data_start_tokens = torch.cat(
+                [
+                    torch.tensor([0], device=data_start_tokens.device),
+                    data_start_tokens,
+                ]
+            )
+    valid_image_nums = min(len(data_start_tokens), len(data_end_tokens))
+
+    if valid_image_nums == 0:
+        return torch.zeros((0, 2), device=input_ids.device)
+
+    # Filter out pairs where start_token >= end_token
+    valid_pairs = []
+    for i in range(valid_image_nums):
+        start_token = data_start_tokens[i]
+        end_token = data_end_tokens[i]
+        if start_token < end_token:
+            valid_pairs.append((start_token, end_token))
+
+    if not valid_pairs:
+        return torch.zeros((0, 2), device=input_ids.device)
+
+    # Convert valid pairs to tensor
+    valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
+    return valid_pairs_tensor
