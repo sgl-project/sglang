@@ -621,7 +621,7 @@ class ServerArgs:
             type=str,
             choices=ReasoningParser.DetectorMap.keys(),
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {REASONING_MODELS}.",
+            help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
         )
 
         # Data parallelism
