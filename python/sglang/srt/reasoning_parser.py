@@ -139,7 +139,7 @@ class ReasoningParser:
 
         self.detector = detector_class(stream_reasoning=stream_reasoning)
 
-    def parse_non_stream(self, full_text: str) -> StreamingParseResult:
+    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
