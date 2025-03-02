@@ -624,3 +624,20 @@ def cublas_grouped_gemm(
             cublas_handle,
             _get_cuda_stream(device),
         )
+
+
+def gemm_fp8_fp8_bf16_nt(
+    lhs: torch.Tensor,
+    lhs_scale: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.empty(
+            (lhs.shape[0], rhs.shape[1]),
+            device=lhs.device,
+            dtype=torch.bfloat16,
+        )
+    torch.ops.sglang.gemm_fp8_fp8_bf16_nt(lhs, lhs_scale, rhs, rhs_scale, out)
+    return out
