@@ -17,6 +17,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 * `stream`: Whether to stream the output. `bool = False`
 * `lora_path`: Path to LoRA weights. `Optional[Union[List[Optional[str]], Optional[str]]] = None`
 * `custom_logit_processor`: Custom logit processor for advanced sampling control. For usage see below. `Optional[Union[List[Optional[str]], str]] = None`
+* `return_hidden_states`: Whether to return hidden states of the model. Note that each time it changes, the cuda graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/hidden_states.py) for more information. `bool = False`
 
 ## Sampling params
 
@@ -55,8 +56,6 @@ Please refer to our dedicated guide on [constrained decoding](https://docs.sglan
 * `ignore_eos`: Don't stop generation when EOS token is sampled. `bool = False`
 * `skip_special_tokens`: Remove special tokens during decoding. `bool = True`
 * `custom_params`: Used when employing `CustomLogitProcessor`. For usage see below. `Optional[List[Optional[Dict[str, Any]]]] = None`
-* `return_hidden_states`: Whether to return hidden states of the model. Note that each time it changes, the cuda graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/hidden_states.py) for more information. `bool = False`
-
 
 ### Custom Logit Processor
 
