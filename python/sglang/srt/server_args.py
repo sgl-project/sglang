@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -96,6 +97,8 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
+    reasoning_parser: Optional[str] = None
+    parse_reasoning: bool = False
 
     # Data parallelism
     dp_size: int = 1
@@ -283,6 +286,13 @@ class ServerArgs:
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+        # Reasoning
+        if self.parse_reasoning:
+            if self.reasoning_parser is None:
+                raise ValueError(
+                    "--reasoning-parser must be specified when --parse-reasoning is set."
+                )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -613,6 +623,18 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            choices=ReasoningParser.DetectorMap.keys(),
+            default=ServerArgs.reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
+        )
+        parser.add_argument(
+            "--parse-reasoning",
+            action="store_true",
+            help=f"Enable reasoning parsing for all /v1/chat/completions requests using the specified --reasoning-parser.",
         )
 
         # Data parallelism
