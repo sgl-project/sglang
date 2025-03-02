@@ -98,6 +98,7 @@ class ServerArgs:
     file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    separate_reasoning_default: bool = True
 
     # Data parallelism
     dp_size: int = 1
@@ -622,6 +623,12 @@ class ServerArgs:
             choices=ReasoningParser.DetectorMap.keys(),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
+        )
+        parser.add_argument(
+            "--separate-reasoning-default",
+            type=bool,
+            default=ServerArgs.separate_reasoning_default,
+            help="Whether to separate reasoning and normal text by default.",
         )
 
         # Data parallelism
