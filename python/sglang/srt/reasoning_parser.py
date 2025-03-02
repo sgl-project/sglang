@@ -144,7 +144,7 @@ class ReasoningParser:
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> StreamingParseResult:
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
