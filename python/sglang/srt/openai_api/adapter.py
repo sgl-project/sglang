@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Set, Any
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -883,6 +883,7 @@ def v1_chat_generate_request(
         #  - stop: Custom stop tokens.
         #  - image_data: None or a list of image strings (URLs or base64 strings).
         #    None skips any image processing in GenerateReqInput.
+        enforced_tag = None
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -896,6 +897,36 @@ def v1_chat_generate_request(
                     ]
                 else:
                     tools = [item.function.model_dump() for item in request.tools]
+
+            if request.tools and request.tool_choice != "none":
+                assert tools is not None
+                tool_call_parser = tokenizer_manager.server_args.tool_call_parser
+                parser = FunctionCallParser(tools, tool_call_parser)
+
+                tool_trigger_set: Set[str] = set()
+                tool_structures: List[Dict[str, Any]] = list()
+
+                for wrapper in parser.structure_infos():
+                    for tool in tools:
+                        info = wrapper(tool["name"])
+
+                        # use schema in strict mode, else accept any tool
+                        if tool.get("use_strict", False):
+                            schema = tool["parameters"]["properties"]
+                        else:
+                            schema = True # accept any valid json
+
+                        tool_structures.append({
+                            "begin": info.begin,
+                            "schema": schema,
+                            "end": info.finish,
+                        })
+                        tool_trigger_set.add(info.trigger)
+
+                enforced_tag = {
+                    "structures": tool_structures,
+                    "triggers": list(tool_trigger_set),
+                }
 
             if chat_template_name is None:
                 openai_compatible_messages = []
@@ -1001,6 +1032,16 @@ def v1_chat_generate_request(
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 request.response_format.model_dump(by_alias=True)
             )
+
+        if enforced_tag is not None:
+            if sampling_params.get("regex") or sampling_params.get("ebnf") or \
+                sampling_params.get("structural_tag") or sampling_params.get("json_schema"):
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+            else:
+                sampling_params["structural_tag"] = json.dumps(enforced_tag)
+
         sampling_params_list.append(sampling_params)
 
         image_data_list.append(image_data)
