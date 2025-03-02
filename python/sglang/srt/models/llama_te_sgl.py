@@ -217,6 +217,15 @@ class TELlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         # tp_group = get_tp_group()
+        ranks = list(range(tp_size))
+        tp_group = torch.distributed.new_group(ranks)
+        te.initialize_ub(
+            shape=[1, self.hidden_size],
+            tp_size=tp_size,
+            use_fp8=False,
+            dtype=torch.bfloat16,
+            bootstrap_backend=opts.bootstrap_backend,
+        )
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -268,6 +277,7 @@ class TELlamaDecoderLayer(nn.Module):
             activation="swiglu",
             **kwargs
         )
+        self.layernorm_mlp.set_tensor_parallel_group(tp_group)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -433,18 +443,11 @@ class TELlamaForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        # 定义权重映射关系
         self.stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
-            # QKV 映射保持不变
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # MLP 映射到 TE 的结构
-            # (".layernorm_mlp.fc1_weight", ".mlp.gate_proj.weight", 0),
-            # (".layernorm_mlp.fc1_weight", ".mlp.up_proj.weight", 1),
-            # (".layernorm_mlp.fc2_weight", ".mlp.down_proj.weight", 2),
-            # (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 3),
         ]
 
     @torch.no_grad()
@@ -472,43 +475,8 @@ class TELlamaForCausalLM(nn.Module):
             return self.config.hidden_size, self.config.hidden_size // (
                 self.config.num_attention_heads // self.config.num_key_value_heads
             )
-        # elif module_name == ".layernorm_mlp.fc1_weight":
-        #     return self.config.hidden_size, 2 * self.config.intermediate_size
-        # elif module_name == ".layernorm_mlp.fc2_weight":
-        #     return self.config.intermediate_size, self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    # def get_hidden_dim(self, module_name):
-    #     # 返回输入维度和输出维度
-    #     if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-    #         return self.config.hidden_size, self.config.hidden_size
-    #     elif module_name == "layernorm_mlp.fc1_weight":
-    #         return self.config.hidden_size, 2 * self.config.intermediate_size
-    #     elif module_name == "layernorm_mlp.fc2_weight":
-    #         return self.config.intermediate_size, self.config.hidden_size
-    #     else:
-    #         raise NotImplementedError()
-
-    # def get_module_name(self, name):
-    #     params_mapping = {
-    #         "q_proj": "qkv_proj",
-    #         "k_proj": "qkv_proj",
-    #         "v_proj": "qkv_proj",
-    #         ".mlp.gate_proj.weight": ".layernorm_mlp.fc1_weight",
-    #         ".mlp.up_proj.weight": ".layernorm_mlp.fc1_weight",
-    #         ".mlp.down_proj.weight": ".layernorm_mlp.fc2_weight",
-    #     }
-    #     return params_mapping.get(name, name)
-
-    # def get_module_name_from_weight_name(self, name):
-    #     for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-    #         if weight_name in name:
-    #             return (
-    #                 name.replace(weight_name, param_name)[: -len(".weight")],
-    #                 num_shard,
-    #             )
-    #     return name[: -len(".weight")], 1
 
     def get_num_params(self):
         params_dict = dict(self.named_parameters())
@@ -519,14 +487,7 @@ class TELlamaForCausalLM(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        # print("\nAll parameter names:")
-        # for name in params_dict.keys():
-        #     print(f"  {name}")
-        # print()  # 添加空行使输出更清晰
-
         for name, loaded_weight in weights:
-            # print(f"name: {name}, loaded_weight_size: {loaded_weight.size()}")
-            # 跳过不需要的权重
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -538,7 +499,6 @@ class TELlamaForCausalLM(nn.Module):
             if name.endswith(".kv_scale") and name not in params_dict:
                 continue
 
-            # 处理 QKV 权重
             if "self_attn.q_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.q_proj.weight", "self_attn.qkv_proj.weight"
@@ -566,7 +526,6 @@ class TELlamaForCausalLM(nn.Module):
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, "v")
             
-            # 处理 TE LayerNormMLP
             elif "post_attention_layernorm.weight" in name:
                 te_name = name.replace(
                     "post_attention_layernorm.weight", "layernorm_mlp.layer_norm_weight"
@@ -612,7 +571,6 @@ class TELlamaForCausalLM(nn.Module):
                 down_chunks = torch.chunk(loaded_weight, tp_size, dim=1)
                 default_weight_loader(param, down_chunks[tp_rank])
             
-            # 处理其他权重
             elif name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
