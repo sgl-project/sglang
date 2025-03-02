@@ -150,6 +150,8 @@ class LogitsMetadata:
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
+            extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+            padded_static_len=forward_batch.padded_static_len,
         )
 
     def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
