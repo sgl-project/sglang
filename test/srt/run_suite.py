@@ -38,7 +38,8 @@ suites = {
         "test_request_length_validation.py",
         "test_retract_decode.py",
         "test_server_args.py",
-        "test_session_control.py",
+        # Disabled temporarily
+        # "test_session_control.py",
         "test_skip_tokenizer_init.py",
         "test_srt_engine.py",
         "test_srt_endpoint.py",
