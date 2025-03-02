@@ -9,13 +9,15 @@ import triton.language as tl
 from deep_gemm import calc_diff, ceil_div, get_col_major_tma_aligned_tensor
 
 
-def construct_grouped(
+def construct_grouped_and_flat_fp8(
     x: torch.Tensor, y: torch.Tensor, num_groups: int, is_masked: bool
 ) -> Tuple[
-    Tuple[torch.Tensor, torch.Tensor],
-    Tuple[torch.Tensor, torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
+    Tuple[torch.Tensor, torch.Tensor],  # grouped x_fp8
+    Tuple[torch.Tensor, torch.Tensor],  # grouped y_fp8
+    Tuple[torch.Tensor, torch.Tensor],  # flat x_fp8
+    Tuple[torch.Tensor, torch.Tensor],  # flat y_fp8
+    torch.Tensor,  # output
+    torch.Tensor,  # reference output
 ]:
     # Verify input shapes
     m, k = x.shape
@@ -26,38 +28,50 @@ def construct_grouped(
 
     # Reshape inputs for grouped processing
     m_per_group = m // num_groups
-    x = x.view(num_groups, m_per_group, k)
-    y = y.unsqueeze(0).expand(num_groups, n, k)
+    x_grouped = x.view(num_groups, m_per_group, k)
+    y_grouped = y.unsqueeze(0).expand(num_groups, n, k)
 
     # Initialize output tensors
     out = torch.empty((num_groups, m_per_group, n), device="cuda", dtype=torch.bfloat16)
-    ref_out = torch.einsum("gmk,gnk->gmn", x, y)
+    ref_out = torch.einsum("gmk,gnk->gmn", x_grouped, y_grouped)
 
-    x_fp8 = (
-        torch.empty_like(x, dtype=torch.float8_e4m3fn),
+    # Quantize grouped tensors
+    x_fp8_grouped = (
+        torch.empty_like(x_grouped, dtype=torch.float8_e4m3fn),
         torch.empty(
             (num_groups, m_per_group, k // 128), device="cuda", dtype=torch.float
         ),
     )
-    y_fp8 = (
-        torch.empty_like(y, dtype=torch.float8_e4m3fn),
+    y_fp8_grouped = (
+        torch.empty_like(y_grouped, dtype=torch.float8_e4m3fn),
         torch.empty(
             (num_groups, (n + 127) // 128, k // 128), device="cuda", dtype=torch.float
         ),
     )
     for i in range(num_groups):
-        x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
-        y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+        x_fp8_grouped[0][i], x_fp8_grouped[1][i] = per_token_cast_to_fp8(x_grouped[i])
+        y_fp8_grouped[0][i], y_fp8_grouped[1][i] = per_block_cast_to_fp8(y_grouped[i])
 
-    # For non-masked input, merge the group and M dims
+    # Quantize flat tensors
+    x_fp8_flat = per_token_cast_to_fp8(x)
+    y_fp8_flat = per_block_cast_to_fp8(y)
+
+    # For non-masked input, merge the group and M dims in output
     if not is_masked:
-        x_fp8 = (x_fp8[0].view(-1, k), per_token_cast_to_fp8(x.view(-1, k))[1])
+        x_fp8_grouped = (
+            x_fp8_grouped[0].view(-1, k),
+            per_token_cast_to_fp8(x_grouped.view(-1, k))[1],
+        )
         out, ref_out = out.view(-1, n), ref_out.view(-1, n)
 
     # Transpose earlier for testing
-    x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+    x_fp8_grouped = (
+        x_fp8_grouped[0],
+        get_col_major_tma_aligned_tensor(x_fp8_grouped[1]),
+    )
+    x_fp8_flat = (x_fp8_flat[0], get_col_major_tma_aligned_tensor(x_fp8_flat[1]))
 
-    return x_fp8, y_fp8, out, ref_out
+    return x_fp8_grouped, y_fp8_grouped, x_fp8_flat, y_fp8_flat, out, ref_out
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -92,32 +106,36 @@ def fp8_gemm_group_triton_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
+    # Pointers to scaling factors
+    a_scale_ptr,
+    b_scale_ptr,
     # Matrix dimensions
     M,
     N,
     K,
     # The stride variables represent how much to increase the ptr by when moving by 1
-    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
-    # by to get the element one row down (A has M rows).
+    # element in a particular dimension.
     stride_am,
-    stride_ak,  #
+    stride_ak,
     stride_bk,
-    stride_bn,  #
+    stride_bn,
     stride_cm,
     stride_cn,
+    # Strides for scaling factors
+    stride_a_scale_m,
+    stride_a_scale_k,
+    stride_b_scale_n,
+    stride_b_scale_k,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """Kernel for computing the matmul C = A x B with FP8 inputs and scaling factors.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    # See above `L2 Cache Optimizations` section for details.
+    # Map program ids to the block of C it should compute
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -128,39 +146,58 @@ def fp8_gemm_group_triton_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    # See above `Pointer Arithmetic` section for details
+    # Create pointers for the first blocks of A and B
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
+    # Calculate indices for scaling factors
+    # For per-token quantization (A), we need one scale per row
+    a_scale_row_idx = offs_am
+    # For per-block quantization (B), we need scales based on block indices
+    b_scale_block_idx_n = pid_n
+
+    # Get pointers to scaling factors
+    # For A: each row has a scale factor for each 128-element block in K dimension
+    a_scale_ptrs = a_scale_ptr + (a_scale_row_idx * stride_a_scale_m)
+    # For B: each 128x128 block has a scale factor
+    b_scale_ptrs = b_scale_ptr + (b_scale_block_idx_n * stride_b_scale_n)
+
+    # Load scaling factors for the current block
+    a_scale = tl.load(a_scale_ptrs)
+    b_scale = tl.load(b_scale_ptrs)
+
+    # Initialize accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Main loop
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
+        # Load the next block of A and B, with masks
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        # We accumulate along the K dimension.
+
+        # Convert FP8 to FP32 for computation
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+
+        # Accumulate
         accumulator = tl.dot(a, b, accumulator)
-        # Advance the ptrs to the next K block.
+
+        # Advance pointers
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator.to(tl.float16)
 
-    # -----------------------------------------------------------
-    # Write back the block of the output matrix C with masks.
+    # Apply scaling factors for dequantization
+    # Use broadcasting to apply scales - reshape for proper broadcasting
+    a_scale_expanded = a_scale[:, None]  # [BLOCK_SIZE_M, 1]
+
+    # Apply scaling to the accumulator
+    scaled_result = accumulator * a_scale_expanded * b_scale
+    c = scaled_result.to(tl.float16)
+
+    # Write back the result
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -168,38 +205,70 @@ def fp8_gemm_group_triton_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def fp8_gemm_group_triton(a, b, num_groups):
-    # Check constraints.
+def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
+    """
+    Perform matrix multiplication with FP8 inputs and proper scaling.
+
+    Args:
+        a_tuple: Tuple of (quantized_tensor, scale_factors) for input A
+        b_tuple: Tuple of (quantized_tensor, scale_factors) for input B
+        num_groups: Number of groups for grouped GEMM
+
+    Returns:
+        Result tensor in BF16 format
+    """
+    # Unpack the tuples
+    a, a_scale = a_tuple
+    b, b_scale = b_tuple
+
+    # Check constraints
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
+
     M, K = a.shape
     N, K = b.shape
+
     # Transpose b to match kernel expectations
     b = b.T.contiguous()
-    # Allocates output.
+
+    # Allocate output
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-    # 1D launch kernel where each block gets its own program.
+
+    # Prepare scale factors
+    # Ensure scales are in the right format and contiguous
+    a_scale = a_scale.contiguous()
+    b_scale = b_scale.contiguous()
+
+    # 1D launch kernel
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+
     fp8_gemm_group_triton_kernel[grid](
         a,
         b,
-        c,  #
+        c,
+        a_scale,
+        b_scale,
         M,
         N,
-        K,  #
+        K,
         a.stride(0),
-        a.stride(1),  #
+        a.stride(1),
         b.stride(0),
-        b.stride(1),  #
+        b.stride(1),
         c.stride(0),
-        c.stride(1),  #
+        c.stride(1),
+        a_scale.stride(0),
+        a_scale.stride(1) if a_scale.dim() > 1 else 0,
+        b_scale.stride(0),
+        b_scale.stride(1) if b_scale.dim() > 1 else 0,
         BLOCK_SIZE_M=128,
         BLOCK_SIZE_N=128,
         BLOCK_SIZE_K=128,
         GROUP_SIZE_M=num_groups,
     )
+
     return c
 
 
@@ -253,7 +322,9 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
     print(f"Shape (m={m}, n={n}, k={k}")
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
-    x_fp8, y_fp8, out, out_torch = construct_grouped(x, y, num_groups, is_masked=False)
+    x_fp8_grouped, y_fp8_grouped, x_fp8_flat, y_fp8_flat, out, out_torch = (
+        construct_grouped_and_flat_fp8(x, y, num_groups, is_masked=False)
+    )
     m_per_group = m // num_groups
     out_deepgemm = out.clone()
     m_indices = torch.arange(0, num_groups, device="cuda", dtype=torch.int)
@@ -262,15 +333,19 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
     )
 
     deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-        (x_fp8[0].clone(), x_fp8[1].clone()),
-        (y_fp8[0].clone(), y_fp8[1].clone()),
+        (x_fp8_grouped[0].clone(), x_fp8_grouped[1].clone()),
+        (y_fp8_grouped[0].clone(), y_fp8_grouped[1].clone()),
         out_deepgemm,
         m_indices,
     )
     torch.cuda.synchronize()
 
-    # without fp8
-    out_triton = fp8_gemm_group_triton(x.clone(), y.clone(), num_groups)
+    # Quantized x and y
+    out_triton = fp8_gemm_group_triton(
+        (x_fp8_flat[0].clone(), x_fp8_flat[1].clone()),
+        (y_fp8_flat[0].clone(), y_fp8_flat[1].clone()),
+        num_groups,
+    )
     torch.cuda.synchronize()
 
     diff_torch_deepgemm = torch.abs(out_torch - out_deepgemm).mean().item()
@@ -326,8 +401,8 @@ def get_benchmark(tp_size):
         )
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
-        x_fp8, y_fp8, out, out_torch = construct_grouped(
-            x, y, num_groups, is_masked=False
+        x_fp8, y_fp8, x_fp8_flat, y_fp8_flat, out, out_torch = (
+            construct_grouped_and_flat_fp8(x, y, num_groups, is_masked=False)
         )
         m_per_group = m // num_groups
         m_indices = torch.arange(0, num_groups, device="cuda", dtype=torch.int)
