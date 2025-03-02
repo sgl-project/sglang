@@ -483,7 +483,7 @@ class FlashInferAttnBackend(AttentionBackend):
             return tuple(t.to(dtype) for t in kv_tuple)
         else:
             return kv_tuple
-    
+
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
             return 0
