@@ -1,7 +1,6 @@
 import re
 from typing import Dict
 
-REASONING_MODELS = ["deepseek-r1"]
 
 
 class StreamingParseResult:
