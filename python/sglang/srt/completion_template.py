@@ -18,7 +18,7 @@ import dataclasses
 import logging
 from enum import auto
 
-from python.sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
 
