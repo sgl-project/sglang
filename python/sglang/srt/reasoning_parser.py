@@ -2,7 +2,6 @@ import re
 from typing import Dict, Tuple
 
 
-
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
