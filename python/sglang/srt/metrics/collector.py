@@ -17,11 +17,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Union
 
-from sglang.srt.disaggregation.metrics import (
-    DisaggregationDecodeMetrics,
-    DisaggregationPrefillMetrics,
-)
-
 
 @dataclass
 class SchedulerStats:
@@ -390,29 +385,3 @@ class TokenizerMetricsCollector:
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
-
-    def observe_disaggregation_prefill_metrics(
-        self, metrics: DisaggregationPrefillMetrics
-    ):
-        self.histogram_prefill_prealloc_duration.labels(**self.labels).observe(
-            metrics.end_prealloc_time - metrics.start_time
-        )
-        self.histogram_prefill_queue_duration.labels(**self.labels).observe(
-            metrics.end_queue_time - metrics.end_prealloc_time
-        )
-        self.histogram_prefill_forward_duration.labels(**self.labels).observe(
-            metrics.end_forward_time - metrics.end_queue_time
-        )
-        self.histogram_prefill_transfer_duration.labels(**self.labels).observe(
-            metrics.end_transfer_time - metrics.end_forward_time
-        )
-
-    def observe_disaggregation_decode_metrics(
-        self, metrics: DisaggregationDecodeMetrics
-    ):
-        self.histogram_decode_prealloc_duration.labels(**self.labels).observe(
-            metrics.end_prealloc_time - metrics.start_time
-        )
-        self.histogram_decode_queue_duration.labels(**self.labels).observe(
-            metrics.end_queue_time - metrics.end_prealloc_time
-        )

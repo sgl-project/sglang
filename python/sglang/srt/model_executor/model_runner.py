@@ -194,6 +194,8 @@ class ModelRunner:
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
+                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
+                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
             }
         )
 
@@ -336,7 +338,6 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
-            decryption_key_file=self.server_args.decryption_key_file,
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()

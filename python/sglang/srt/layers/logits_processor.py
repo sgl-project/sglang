@@ -190,6 +190,9 @@ class LogitsProcessor(nn.Module):
         self.do_tensor_parallel_all_gather = (
             not skip_all_gather and get_tensor_model_parallel_world_size() > 1
         )
+        self.do_tensor_parallel_all_gather_dp_attn = (
+            self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+        )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )

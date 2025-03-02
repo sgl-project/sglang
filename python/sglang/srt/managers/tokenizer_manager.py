@@ -163,7 +163,6 @@ class TokenizerManager:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            override_config_file=server_args.decrypted_config_file,
         )
 
         self.is_generation = self.model_config.is_generation

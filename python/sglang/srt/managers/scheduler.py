@@ -220,7 +220,6 @@ class Scheduler:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            override_config_file=server_args.decrypted_config_file,
         )
         self.is_generation = self.model_config.is_generation
 
@@ -496,7 +495,7 @@ class Scheduler:
         logger.error(
             f"{self.cur_batch.batch_size()=}, "
             f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool_allocator.available_size()=}, "
+            f"{self.token_to_kv_pool.available_size()=}, "
             f"{self.tree_cache.evictable_size()=}, "
         )
         # Wait for some time so that the parent process can print the error.
@@ -821,8 +820,7 @@ class Scheduler:
         running_bs: int,
     ):
         num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         self._largest_prefill_len = max(
             self._largest_prefill_len, adder.log_input_tokens
@@ -857,8 +855,7 @@ class Scheduler:
         self.num_generated_tokens = 0
         num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
         num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
 
         if RECORD_STEP_TIME:
@@ -894,10 +891,6 @@ class Scheduler:
                 f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
-
-        if self.server_args.disaggregation_mode == "decode":
-            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
 
         logger.info(msg)
         if self.enable_metrics:
@@ -946,7 +939,7 @@ class Scheduler:
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool_allocator.available_size()
+                self.token_to_kv_pool.available_size()
                 + self.tree_cache.evictable_size()
             )
             num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0

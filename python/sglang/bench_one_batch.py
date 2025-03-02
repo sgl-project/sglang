@@ -326,7 +326,7 @@ def latency_test_run_once(
 
     # Clear the pools.
     model_runner.req_to_token_pool.clear()
-    model_runner.token_to_kv_pool_allocator.clear()
+    model_runner.token_to_kv_pool.clear()
 
     measurement_results = {
         "run_name": run_name,

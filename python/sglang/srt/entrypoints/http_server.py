@@ -143,6 +143,7 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
+@app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """Check the health of the inference server by generating one token."""
 
@@ -150,8 +151,6 @@ async def health_generate(request: Request) -> Response:
     rid = f"HEALTH_CHECK_{time.time()}"
 
     if _global_state.tokenizer_manager.is_image_gen:
-        raise NotImplementedError()
-    elif _global_state.tokenizer_manager.server_args.is_duplex:
         raise NotImplementedError()
     elif _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
@@ -199,7 +198,6 @@ async def get_model_info():
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
-        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
     }
     return result
 

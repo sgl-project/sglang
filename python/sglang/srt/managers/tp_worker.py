@@ -52,10 +52,6 @@ class TpModelWorker:
     ):
         # Parse args
         self.tp_rank = tp_rank
-        if is_draft_worker:
-            decrypted_config_file = server_args.decrypted_draft_config_file
-        else:
-            decrypted_config_file = server_args.decrypted_config_file
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -71,7 +67,6 @@ class TpModelWorker:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            override_config_file=decrypted_config_file,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,

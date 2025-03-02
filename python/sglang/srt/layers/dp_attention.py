@@ -11,7 +11,7 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    tensor_model_parallel_all_reduce_inplace_try_mscclpp,
+    tensor_model_parallel_all_reduce,
 )
 
 if TYPE_CHECKING:
@@ -175,7 +175,7 @@ def dp_gather(
             global_tokens, group_name=get_tp_group().unique_name
         )
     else:
-        tensor_model_parallel_all_reduce_inplace_try_mscclpp(global_tokens)
+        global_tokens = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def dp_scatter(
