@@ -619,7 +619,7 @@ class ServerArgs:
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=REASONING_MODELS,
+            choices=ReasoningParser.DetectorMap.keys(),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {REASONING_MODELS}.",
         )
