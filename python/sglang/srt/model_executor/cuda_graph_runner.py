@@ -408,13 +408,13 @@ class CudaGraphRunner:
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
         if (
-            forward_batch.sampling_info.return_hidden_states
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.capture_hidden_mode != CaptureHiddenMode.FULL
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
             self.capture()
         elif (
-            not forward_batch.sampling_info.return_hidden_states
+            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
             and self.capture_hidden_mode != hidden_mode_from_spec_info
         ):
             self.capture_hidden_mode = hidden_mode_from_spec_info

@@ -124,6 +124,7 @@ class Engine:
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -146,6 +147,7 @@ class Engine:
             lora_path=lora_path,
             modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
             stream=stream,
         )
         loop = asyncio.get_event_loop()

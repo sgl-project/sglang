@@ -53,9 +53,6 @@ class SamplingBatchInfo:
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
 
-    # Whether any request needs to return hidden states
-    return_hidden_states: bool = False
-
     # Device
     device: str = "cuda"
 
@@ -86,9 +83,6 @@ class SamplingBatchInfo:
             batch.enable_custom_logit_processor  # check the flag first.
             and any(r.custom_logit_processor for r in reqs)  # then check the requests.
         )
-
-        # Check if any request needs to return hidden states
-        return_hidden_states = any(r.sampling_params.return_hidden_states for r in reqs)
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -147,7 +141,6 @@ class SamplingBatchInfo:
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
-            return_hidden_states=return_hidden_states,
         )
         return ret
 
