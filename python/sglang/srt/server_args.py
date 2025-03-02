@@ -619,9 +619,9 @@ class ServerArgs:
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=ReasoningParser.DetectorMap.keys(),
+            choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
+            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
 
         # Data parallelism
