@@ -156,3 +156,7 @@ class ReasoningParser:
     def parse_stream_chunk(self, chunk_text: str) -> StreamingParseResult:
         """Streaming call: incremental parsing"""
         return self.detector.parse_streaming_increment(chunk_text)
+
+
+if __name__ == "__main__":
+    unittest.main()
