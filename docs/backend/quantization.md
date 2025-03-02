@@ -142,5 +142,3 @@ python3 -m sglang.launch_server \
 - [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
-
-
