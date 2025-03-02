@@ -28,7 +28,6 @@ class BaseReasoningFormatDetector:
         self.stream_reasoning = stream_reasoning
 
         self._buffer = ""
-        self._current_reasoning = ""
         self.stripped_think_start = False
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
@@ -62,7 +61,7 @@ class BaseReasoningFormatDetector:
         current_text = self._buffer
 
         # Strip `<think>` token if present
-        if not self.stripped_think_start and current_text.find(self.think_start_token):
+        if not self.stripped_think_start and self.think_start_token in current_text:
             current_text = current_text.replace(self.think_start_token, "")
             self.stripped_think_start = True
 
@@ -70,17 +69,11 @@ class BaseReasoningFormatDetector:
         if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
 
-            if self.stream_reasoning:
-                # Just return the final chunk before the end tag
-                reasoning_text = current_text[:end_idx]
-            else:
-                # Return accumulated reasoning plus final chunk
-                reasoning_text = self._current_reasoning + current_text[:end_idx]
+            reasoning_text = current_text[:end_idx]
 
-            self._in_reasoning = False
-            self._current_reasoning = ""
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
             self._buffer = ""
+            self._in_reasoning = False
+            normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
@@ -93,8 +86,6 @@ class BaseReasoningFormatDetector:
                 self._buffer = ""
                 return StreamingParseResult(reasoning_text=current_text)
             else:
-                # Accumulate content but don't return it yet
-                self._current_reasoning += current_text
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
