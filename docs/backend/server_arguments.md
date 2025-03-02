@@ -52,7 +52,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [encode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
-* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF.
+* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/input_ids.py).
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
@@ -185,3 +185,5 @@ Please consult the documentation below to learn more about the parameters you ma
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
 * `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
 * `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
+* `enable_flashinfer_mla`: The backend for flashinfer MLA wrapper that accelerates deepseek models.
+* `flashinfer_mla_disable_ragged`: Disable usage of ragged prefill wrapper for flashinfer mla attention backend. Should be used when `enable_flashinfer_mla` is turned on.

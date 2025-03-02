@@ -336,6 +336,7 @@ class SamplingBatchInfo:
         self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device
         )
+
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors

@@ -20,19 +20,12 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-import argparse
-import logging
-import sys
-
-import pytest
-import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _decode_softmax_reducev_fwd,
 )
-from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
 
 
 def is_hip():
@@ -230,7 +223,7 @@ def _fwd_grouped_kernel_stage1_rope(
                 other=0.0,
             )  # positional embedding part of keys
 
-            if USE_ROPE and start_n >= cur_batch_seq_len - BLOCK_N:
+            if (USE_ROPE and LAST_SPLIT) and start_n >= cur_batch_seq_len - BLOCK_N:
                 k_pe = tl.where(
                     offs_n[None, :] != (split_kv_end - 1),
                     k_pe,

@@ -44,15 +44,16 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
-    FunctionCallReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    ParseFunctionCallReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -372,7 +373,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 
 
 @app.post("/function_call")
-async def function_call_request(obj: FunctionCallReqInput, request: Request):
+async def function_call_request(obj: ParseFunctionCallReq, request: Request):
     """
     A native API endpoint to parse function calls from a text.
     """
@@ -473,6 +474,32 @@ async def sagemaker_health() -> Response:
 @app.post("/invocations")
 async def sagemaker_chat_completions(raw_request: Request):
     return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+
+
+## Vertex AI API
+@app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
+async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+    if not vertex_req.instances:
+        return []
+    inputs = {}
+    for input_key in ("text", "input_ids", "input_embeds"):
+        if vertex_req.instances[0].get(input_key):
+            inputs[input_key] = [
+                instance.get(input_key) for instance in vertex_req.instances
+            ]
+            break
+    image_data = [
+        instance.get("image_data")
+        for instance in vertex_req.instances
+        if instance.get("image_data") is not None
+    ] or None
+    req = GenerateReqInput(
+        **inputs,
+        image_data=image_data,
+        **(vertex_req.parameters or {}),
+    )
+    ret = await generate_request(req, raw_request)
+    return ORJSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):

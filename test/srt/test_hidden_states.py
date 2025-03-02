@@ -14,15 +14,21 @@ class TestHiddenState(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sampling_params = {"temperature": 0, "max_new_tokens": 8}
+        sampling_params = {
+            "temperature": 0,
+            "max_new_tokens": 8,
+        }
 
         engine = sgl.Engine(
             model_path=model_path,
             random_seed=42,
-            return_hidden_states=True,
             skip_tokenizer_init=True,
         )
-        outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        outputs = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
         engine.shutdown()
 
         for output in outputs:
@@ -70,6 +76,57 @@ class TestHiddenState(unittest.TestCase):
                     atol=atol,
                     rtol=0,
                 )
+            )
+
+    def test_repeatedly_changes_hidden_states(self):
+        prompts = ["Today is", "Today is a sunny day and I like"]
+        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        input_ids = tokenizer(prompts).input_ids
+
+        sampling_params = {
+            "temperature": 0,
+            "max_new_tokens": 8,
+        }
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            random_seed=42,
+            skip_tokenizer_init=True,
+        )
+        outputs_completion_first_round = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
+        outputs_hidden_state = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=False,
+        )
+
+        outputs_completion_last_round = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
+        engine.shutdown()
+
+        for (
+            output_completion_first_round,
+            output_hidden_state,
+            output_completion_last_round,
+        ) in zip(
+            outputs_completion_first_round,
+            outputs_hidden_state,
+            outputs_completion_last_round,
+        ):
+            self.assertEqual(
+                len(output_completion_first_round["meta_info"]["hidden_states"]), 8
+            )
+            self.assertNotIn("hidden_states", output_hidden_state["meta_info"])
+            self.assertEqual(
+                len(output_completion_last_round["meta_info"]["hidden_states"]), 8
             )
 
 
