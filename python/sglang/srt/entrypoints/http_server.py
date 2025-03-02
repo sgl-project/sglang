@@ -697,7 +697,7 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        for _ in range(server_args.dp_size):
+        for i in range(server_args.dp_size):
             res = requests.post(
                 url + request_name,
                 json=json_data,

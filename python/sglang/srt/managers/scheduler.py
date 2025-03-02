@@ -2288,8 +2288,8 @@ def run_scheduler_process(
     pipe_writer,
 ):
     # Config the process
-    kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang::scheduler")
+    # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
+    setproctitle.setproctitle(f"sglang::scheduler_{dp_rank}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
 

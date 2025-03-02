@@ -253,13 +253,11 @@ class TokenizerManager:
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.health_check_communitcator = _Communicator(
+        self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
+        self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.scheduler_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.server_args_communicator = _Communicator(
+        self.set_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -309,11 +307,11 @@ class TokenizerManager:
                 ),
                 (
                     GetInternalStateReqOutput,
-                    self.scheduler_internal_state_communicator.handle_recv,
+                    self.get_internal_state_communicator.handle_recv,
                 ),
                 (
                     SetInternalStateReqOutput,
-                    self.server_args_communicator.handle_recv,
+                    self.set_internal_state_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -772,14 +770,16 @@ class TokenizerManager:
     async def get_internal_state(self) -> Dict[Any, Any]:
         req = GetInternalStateReq()
         res: List[GetInternalStateReqOutput] = (
-            await self.scheduler_internal_state_communicator(req)
+            await self.get_internal_state_communicator(req)
         )
         return res[0].internal_state
 
     async def set_internal_state(
         self, obj: SetInternalStateReq
     ) -> SetInternalStateReqOutput:
-        res: List[SetInternalStateReqOutput] = await self.server_args_communicator(obj)
+        res: List[SetInternalStateReqOutput] = (
+            await self.set_internal_state_communicator(obj)
+        )
         return res[0]
 
     def get_log_request_metadata(self):
