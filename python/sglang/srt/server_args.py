@@ -23,7 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
-from sglang.srt.reasoning_parser import REASONING_MODELS
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -619,9 +619,9 @@ class ServerArgs:
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=REASONING_MODELS,
+            choices=ReasoningParser.DetectorMap.keys(),
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {REASONING_MODELS}.",
+            help=f"Specify the parser for reasoning models, supported parsers are: {ReasoningParser.DetectorMap.keys()}.",
         )
 
         # Data parallelism

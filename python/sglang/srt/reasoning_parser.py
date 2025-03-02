@@ -1,8 +1,6 @@
 import re
 from typing import Dict, Tuple
 
-REASONING_MODELS = ["deepseek-r1"]
-
 
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
