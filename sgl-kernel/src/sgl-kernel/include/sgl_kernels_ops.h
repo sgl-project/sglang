@@ -65,6 +65,14 @@ torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::T
                                       const torch::Tensor& scales_a, const torch::Tensor& scales_b,
                                       const torch::Dtype& out_dtype);
 
+// cutlass_scaled_fp4_mm
+void cutlass_scaled_fp4_mm(torch::Tensor& D, torch::Tensor const& A, torch::Tensor const& B, torch::Tensor const& A_sf,
+                           torch::Tensor const& B_sf, torch::Tensor const& alpha);
+
+// scaled_fp4_quant
+void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale,
+                      torch::Tensor const& input_scale);
+
 // lightning_attention_decode
 void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
                                 const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,

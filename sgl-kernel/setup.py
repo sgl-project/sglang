@@ -103,6 +103,11 @@ sources = [
     "src/sgl-kernel/csrc/speculative_sampling.cu",
     "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
     "src/sgl-kernel/csrc/cublas_grouped_gemm.cu",
+    "src/sgl-kernel/csrc/cutlass_extensions/common.cpp",
+    "src/sgl-kernel/csrc/quantization/fp4/nvfp4_quant_entry.cu",
+    "src/sgl-kernel/csrc/quantization/fp4/nvfp4_quant_kernels.cu",
+    "src/sgl-kernel/csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu",
+    "src/sgl-kernel/csrc/quantization/fp4/nvfp4_scaled_mm_kernels.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
@@ -113,11 +118,16 @@ sources = [
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
 enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
+enable_fp4 = os.getenv("SGL_KERNEL_ENABLE_FP4", "0") == "1"
 enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
+enable_sm100a = os.getenv("SGL_KERNEL_ENABLE_SM100A", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 
 if torch.cuda.is_available():
+    if cuda_version >= (12, 8) and sm_version >= 100:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-DENABLE_NVFP4=1")
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if sm_version >= 90:
@@ -126,8 +136,12 @@ if torch.cuda.is_available():
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
 else:
     # compilation environment without GPU
+    if enable_sm100a:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+    if enable_fp4:
+        nvcc_flags.append("-DENABLE_NVFP4=1")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
