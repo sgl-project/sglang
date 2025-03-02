@@ -12,7 +12,6 @@ suites = {
         "models/test_generation_models.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
-        "sampling/penaltylib",
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_custom_allreduce.py",
@@ -31,6 +30,7 @@ suites = {
         "test_no_chunked_prefill.py",
         "test_no_overlap_scheduler.py",
         "test_openai_server.py",
+        "test_penalty.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
         "test_regex_constrained.py",
@@ -64,9 +64,6 @@ suites = {
         # Disable temporarily
         # "test_nightly_math_eval.py",
     ],
-    "sampling/penaltylib": glob.glob(
-        "sampling/penaltylib/**/test_*.py", recursive=True
-    ),
 }
 
 # Expand suite
@@ -83,7 +80,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=2000,
+        default=1800,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import triton
@@ -46,7 +46,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -112,7 +113,9 @@ class ForwardMode(IntEnum):
 
 class CaptureHiddenMode(IntEnum):
     NULL = auto()
+    # Capture hidden states of all tokens.
     FULL = auto()
+    # Capture a hidden state of the last token.
     LAST = auto()
 
     def need_capture(self):
@@ -148,6 +151,7 @@ class ForwardBatch:
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
 
     # Position information
     positions: torch.Tensor = None
@@ -160,6 +164,7 @@ class ForwardBatch:
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]] = None
@@ -190,9 +195,12 @@ class ForwardBatch:
     can_run_dp_cuda_graph: bool = False
 
     # Speculative decoding
-    spec_info: SpecInfo = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # For padding
+    padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -203,8 +211,13 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-
         device = model_runner.device
+        extend_input_logprob_token_ids_gpu = None
+        if batch.extend_input_logprob_token_ids is not None:
+            extend_input_logprob_token_ids_gpu = (
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            )
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -220,6 +233,7 @@ class ForwardBatch:
             seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
+            token_ids_logprobs=batch.token_ids_logprobs,
             global_num_tokens=batch.global_num_tokens,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
@@ -231,6 +245,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
         if ret.global_num_tokens is not None:
@@ -341,6 +356,7 @@ class ForwardBatch:
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
+
         self.mrope_positions = torch.concat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
@@ -379,7 +395,7 @@ def compute_position_kernel(
     extend_seq_lens,
 ):
     BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
 
     prefix_len = tl.load(extend_prefix_lens + pid)
     seq_len = tl.load(extend_seq_lens + pid)

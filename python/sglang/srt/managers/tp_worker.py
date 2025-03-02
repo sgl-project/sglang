@@ -15,10 +15,13 @@
 
 import logging
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -49,6 +52,10 @@ class TpModelWorker:
     ):
         # Parse args
         self.tp_rank = tp_rank
+        if is_draft_worker:
+            decrypted_config_file = server_args.decrypted_draft_config_file
+        else:
+            decrypted_config_file = server_args.decrypted_config_file
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -64,6 +71,7 @@ class TpModelWorker:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            override_config_file=decrypted_config_file,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -159,7 +167,7 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ):
+    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
