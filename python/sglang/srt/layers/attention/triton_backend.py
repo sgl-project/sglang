@@ -230,9 +230,10 @@ class TritonAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
+        encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
+        **kwargs,
     ):
         assert encoder_lens is None, "Not supported"
 
@@ -308,9 +309,10 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
+        encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInfo],
+        **kwargs,
     ):
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
