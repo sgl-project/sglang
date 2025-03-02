@@ -157,3 +157,26 @@ void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Te
 void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& weights,
                          const std::vector<torch::Tensor>& outputs, const torch::Dtype& out_dtype,
                          int64_t cublas_handle, int64_t cuda_stream);
+
+// VPTQ quantization kernels 
+torch::Tensor vptq_gemm(const torch::Tensor& input,
+                        const torch::Tensor& q_indice,
+                        const torch::Tensor& centroids,
+                        const torch::Tensor& weight_scale,
+                        const torch::Tensor& weight_bias,
+                        const std::vector<int64_t>& g_i_o,
+                        const c10::optional<torch::Tensor>& q_indice_residual,
+                        const c10::optional<torch::Tensor>& residual_centroids,
+                        const c10::optional<torch::Tensor>& q_indice_outliers,
+                        const c10::optional<torch::Tensor>& outliers_centroids,
+                        const c10::optional<torch::Tensor>& invperm,
+                        const c10::optional<torch::Tensor>& bias);
+torch::Tensor vptq_dequant(
+    const torch::Tensor& q_indice, const torch::Tensor& centroids,
+    const torch::Tensor& weight_scale, const torch::Tensor& weight_bias,
+    const std::vector<int64_t>& g_i_o,
+    const c10::optional<torch::Tensor>& q_indice_residual,
+    const c10::optional<torch::Tensor>& residual_centroids,
+    const c10::optional<torch::Tensor>& q_indice_outliers,
+    const c10::optional<torch::Tensor>& outliers_centroids,
+    const c10::optional<torch::Tensor>& invperm);
