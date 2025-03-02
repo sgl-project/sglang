@@ -4,4 +4,3 @@ Multi-Node Deployment
    :maxdepth: 1
 
    deepseek.md
-   reasoning_parser.md
