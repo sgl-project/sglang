@@ -60,7 +60,7 @@ class TestReasoningContentAPI(unittest.TestCase):
             "stream": True,
             "separate_reasoning": False,
         }
-        response = client.chat_completions.create(**payload)
+        response = client.chat.completions.create(**payload)
 
         assert response.status_code == 200
         reasoning_content = ""
@@ -89,7 +89,7 @@ class TestReasoningContentAPI(unittest.TestCase):
             "stream": True,
             "separate_reasoning": True,
         }
-        response = client.chat_completions.create(**payload)
+        response = client.chat.completions.create(**payload)
 
         assert response.status_code == 200
         reasoning_content = ""
@@ -119,7 +119,7 @@ class TestReasoningContentAPI(unittest.TestCase):
             "separate_reasoning": True,
             "stream_reasoning": False,
         }
-        response = client.chat_completions.create(**payload)
+        response = client.chat.completions.create(**payload)
 
         assert response.status_code == 200
         reasoning_content = ""
@@ -149,7 +149,7 @@ class TestReasoningContentAPI(unittest.TestCase):
             "max_tokens": 100,
             "separate_reasoning": False,
         }
-        response = client.chat_completions.create(**payload)
+        response = client.chat.completions.create(**payload)
 
         assert response.status_code == 200
         assert len(response.choices[0].message.reasoning_content) == 0
@@ -169,7 +169,7 @@ class TestReasoningContentAPI(unittest.TestCase):
             "max_tokens": 100,
             "separate_reasoning": True,
         }
-        response = client.chat_completions.create(**payload)
+        response = client.chat.completions.create(**payload)
 
         assert response.status_code == 200
         assert len(response.choices[0].message.reasoning_content) > 0
