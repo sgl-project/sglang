@@ -153,49 +153,46 @@ def fp8_gemm_group_triton_kernel(
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    # Calculate indices for scaling factors
-    # For per-token quantization (A), we need one scale per row
-    a_scale_row_idx = offs_am
-    # For per-block quantization (B), we need scales based on block indices
-    b_scale_block_idx_n = pid_n
-
-    # Get pointers to scaling factors
-    # For A: each row has a scale factor for each 128-element block in K dimension
-    a_scale_ptrs = a_scale_ptr + (a_scale_row_idx * stride_a_scale_m)
-    # For B: each 128x128 block has a scale factor
-    b_scale_ptrs = b_scale_ptr + (b_scale_block_idx_n * stride_b_scale_n)
-
-    # Load scaling factors for the current block
-    a_scale = tl.load(a_scale_ptrs)
-    b_scale = tl.load(b_scale_ptrs)
-
     # Initialize accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Main loop
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_offset = k_block * BLOCK_SIZE_K
+
         # Load the next block of A and B, with masks
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k_offset, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_offset, other=0.0)
+
+        # Calculate indices for scaling factors for this K block
+        a_scale_ptrs = a_scale_ptr + (
+            offs_am * stride_a_scale_m + k_block * stride_a_scale_k
+        )
+        b_scale_ptrs = b_scale_ptr + (
+            pid_n * stride_b_scale_n + k_block * stride_b_scale_k
+        )
+
+        # Load scaling factors for the current block
+        a_scale = tl.load(a_scale_ptrs)[:, None]  # [BLOCK_SIZE_M, 1]
+        b_scale = tl.load(b_scale_ptrs)
 
         # Convert FP8 to FP32 for computation
         a = a.to(tl.float32)
         b = b.to(tl.float32)
 
-        # Accumulate
-        accumulator = tl.dot(a, b, accumulator)
+        # Apply scaling factors to the current block
+        a = a * a_scale
+        b = b * b_scale
+
+        # Accumulate matmul for the current block
+        accumulator += tl.dot(a, b)
 
         # Advance pointers
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # Apply scaling factors for dequantization
-    # Use broadcasting to apply scales - reshape for proper broadcasting
-    a_scale_expanded = a_scale[:, None]  # [BLOCK_SIZE_M, 1]
-
-    # Apply scaling to the accumulator
-    scaled_result = accumulator * a_scale_expanded * b_scale
-    c = scaled_result.to(tl.float16)
+    # Convert to bfloat16 for output
+    c = accumulator.to(tl.bfloat16)
 
     # Write back the result
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -226,13 +223,14 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
     assert a.is_contiguous(), "Matrix A must be contiguous"
 
     M, K = a.shape
-    N, K = b.shape
+    N, K_b = b.shape
+    assert K == K_b, f"Incompatible K dimensions: {K} vs {K_b}"
 
-    # Transpose b to match kernel expectations
+    # Transpose b to match kernel expectations (K,N format)
     b = b.T.contiguous()
 
-    # Allocate output
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    # Allocate output in bfloat16 (not float16)
+    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
 
     # Prepare scale factors
     # Ensure scales are in the right format and contiguous
@@ -243,6 +241,9 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+
+    # Calculate K blocks (128 elements per block)
+    K_blocks = triton.cdiv(K, 128)
 
     fp8_gemm_group_triton_kernel[grid](
         a,
@@ -260,9 +261,9 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
         c.stride(0),
         c.stride(1),
         a_scale.stride(0),
-        a_scale.stride(1) if a_scale.dim() > 1 else 0,
+        1,  # Stride in the K dimension may be 1
         b_scale.stride(0),
-        b_scale.stride(1) if b_scale.dim() > 1 else 0,
+        1 if b_scale.dim() > 1 else 0,
         BLOCK_SIZE_M=128,
         BLOCK_SIZE_N=128,
         BLOCK_SIZE_K=128,
