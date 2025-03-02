@@ -19,6 +19,7 @@ limitations under the License.
 # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/te_llama/tutorial_accelerate_hf_llama_with_te.html
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -32,6 +33,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    tensor_model_parallel_all_gather
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
@@ -58,6 +60,12 @@ from sglang.utils import get_exception_traceback
 # from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 # from transformer_engine.pytorch.fp8 import fp8_model_init
 
+import transformer_engine.pytorch.cpp_extensions as tex
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+if not tex.device_supports_multicast():
+    os.environ["UB_SKIPMC"] = "1"
+
+MAX_SEQ_LEN = 4096
 
 @contextmanager
 def replace_decoder(te_decoder_cls):
@@ -75,6 +83,39 @@ def replace_decoder(te_decoder_cls):
             original_llama_decoder_cls
         )
 
+@contextmanager
+def sequence_parallel_context(layernorm_mlp, seq_len):
+    """
+    Context manager to temporarily modify LayerNormMLP's parallel configuration
+    based on sequence length.
+    
+    When the sequence length is 1 (decode mode), disable sequence parallel and
+    related optimizations; restore original settings when exiting the context.
+    """
+    # save original settings
+    original_sequence_parallel = layernorm_mlp.sequence_parallel
+    original_ub_overlap_ag = layernorm_mlp.ub_overlap_ag
+    original_ub_overlap_rs = layernorm_mlp.ub_overlap_rs
+    original_ub_bulk_wgrad = layernorm_mlp.ub_bulk_wgrad
+    original_ub_bulk_dgrad = layernorm_mlp.ub_bulk_dgrad
+    
+    if seq_len == 1:  # decode mode
+        # disable SP and SP overlap settings
+        layernorm_mlp.sequence_parallel = False
+        layernorm_mlp.ub_overlap_ag = False
+        layernorm_mlp.ub_overlap_rs = False
+        layernorm_mlp.ub_bulk_wgrad = False
+        layernorm_mlp.ub_bulk_dgrad = False
+    
+    try:
+        yield
+    finally:
+        # restore original settings
+        layernorm_mlp.sequence_parallel = original_sequence_parallel
+        layernorm_mlp.ub_overlap_ag = original_ub_overlap_ag
+        layernorm_mlp.ub_overlap_rs = original_ub_overlap_rs
+        layernorm_mlp.ub_bulk_wgrad = original_ub_bulk_wgrad
+        layernorm_mlp.ub_bulk_dgrad = original_ub_bulk_dgrad
 
 class TELlamaAttention(nn.Module):
     def __init__(
@@ -209,25 +250,33 @@ class TELlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         # TE's LayerNormMLP (combines post_attention_layernorm and MLP)
+        # overlap configuration adapted from
+        # https://github.com/NVIDIA/TransformerEngine/blob/main/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py#L120
+        kwargs = {
+            "params_dtype": torch.bfloat16,
+            "device": "cuda",
+            "tp_group": get_tp_group().device_group,
+            "tp_size": tp_size,
+            "sequence_parallel": True,
+            "ub_overlap_ag": True,
+            "ub_bulk_wgrad": True,
+            "ub_bulk_dgrad": True,
+            "set_parallel_mode": True,
+            "ub_overlap_rs": True,
+            "seq_length": MAX_SEQ_LEN,
+        }
+        # We don't need to return_layernorm_output and return_layernorm_output_gathered
         self.layernorm_mlp = te.pytorch.LayerNormMLP(
             hidden_size=self.hidden_size,
             ffn_hidden_size=config.intermediate_size,
             eps=config.rms_norm_eps,
-            tp_group=tp_group,
-            tp_size=tp_size,
             bias=False,
-            return_layernorm_output=True,
-            return_layernorm_output_gathered=True,
-            set_parallel_mode=True,
-            ub_bulk_wgrad=True,
-            ub_bulk_dgrad=True,
-            ub_overlap_rs_dgrad=True,
-            ub_overlap_rs=True,
-            ub_overlap_ag=True,
+            return_layernorm_output=False,
+            return_layernorm_output_gathered=False,
             normalization="RMSNorm",
             activation="swiglu",
+            **kwargs
         )
-        # 立即设置 TP group
         self.layernorm_mlp.set_tensor_parallel_group(tp_group)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -245,18 +294,43 @@ class TELlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
         # Fully Connected with TE
-        # tp_group = get_tp_group()
-        # self.layernorm_mlp.set_tensor_parallel_group(tp_group)
-        hidden_states, residual = self.layernorm_mlp(
-            hidden_states
-        )  # set return_layernorm_output = true
+        tp_group = get_tp_group().device_group
+        self.layernorm_mlp.set_tensor_parallel_group(tp_group)
+        
+        # This code is from rmsnorm forward_native in sglang
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+
+        seq_len = hidden_states.shape[0]
+        if seq_len > 1: # For prefill phase, split the sequence dimension
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            # Padding sequence
+            if seq_len % MAX_SEQ_LEN != 0:
+                pad_len = MAX_SEQ_LEN - seq_len % MAX_SEQ_LEN
+                pad_tensor = torch.zeros(pad_len, hidden_states.shape[1], device=hidden_states.device,
+                                         dtype=hidden_states.dtype)
+                hidden_states = torch.cat([hidden_states, pad_tensor], dim=0).contiguous()
+            hidden_states_slices = torch.chunk(hidden_states, tp_size, dim=0)
+            hidden_states = hidden_states_slices[tp_rank]
+
+        with sequence_parallel_context(self.layernorm_mlp, seq_len):
+            hidden_states = self.layernorm_mlp(hidden_states)
+
+        if seq_len > 1:
+            # TODO: remove manual all-gather 
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            # Remove padding
+            hidden_states = hidden_states[:seq_len].contiguous()
+        
         return hidden_states, residual
 
 
@@ -271,6 +345,17 @@ class TELlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        tp_size = get_tensor_model_parallel_world_size()
+        if MAX_SEQ_LEN % tp_size != 0:
+            raise ValueError(f"To enable sequence parallel, TE requires MAX_SEQ_LEN {MAX_SEQ_LEN} to be divisible by tp_size {tp_size}")
+
+        te.pytorch.initialize_ub(
+            [MAX_SEQ_LEN, config.hidden_size],
+            tp_size,
+            use_fp8=False,
+            dtype=torch.bfloat16,
+            bootstrap_backend="nccl",
+        )
         # token embedding
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -358,18 +443,11 @@ class TELlamaForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        # 定义权重映射关系
         self.stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
-            # QKV 映射保持不变
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # MLP 映射到 TE 的结构
-            # (".layernorm_mlp.fc1_weight", ".mlp.gate_proj.weight", 0),
-            # (".layernorm_mlp.fc1_weight", ".mlp.up_proj.weight", 1),
-            # (".layernorm_mlp.fc2_weight", ".mlp.down_proj.weight", 2),
-            # (".layernorm_mlp.layer_norm_weight", ".post_attention_layernorm.weight", 3),
         ]
 
     @torch.no_grad()
@@ -397,43 +475,8 @@ class TELlamaForCausalLM(nn.Module):
             return self.config.hidden_size, self.config.hidden_size // (
                 self.config.num_attention_heads // self.config.num_key_value_heads
             )
-        # elif module_name == ".layernorm_mlp.fc1_weight":
-        #     return self.config.hidden_size, 2 * self.config.intermediate_size
-        # elif module_name == ".layernorm_mlp.fc2_weight":
-        #     return self.config.intermediate_size, self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    # def get_hidden_dim(self, module_name):
-    #     # 返回输入维度和输出维度
-    #     if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-    #         return self.config.hidden_size, self.config.hidden_size
-    #     elif module_name == "layernorm_mlp.fc1_weight":
-    #         return self.config.hidden_size, 2 * self.config.intermediate_size
-    #     elif module_name == "layernorm_mlp.fc2_weight":
-    #         return self.config.intermediate_size, self.config.hidden_size
-    #     else:
-    #         raise NotImplementedError()
-
-    # def get_module_name(self, name):
-    #     params_mapping = {
-    #         "q_proj": "qkv_proj",
-    #         "k_proj": "qkv_proj",
-    #         "v_proj": "qkv_proj",
-    #         ".mlp.gate_proj.weight": ".layernorm_mlp.fc1_weight",
-    #         ".mlp.up_proj.weight": ".layernorm_mlp.fc1_weight",
-    #         ".mlp.down_proj.weight": ".layernorm_mlp.fc2_weight",
-    #     }
-    #     return params_mapping.get(name, name)
-
-    # def get_module_name_from_weight_name(self, name):
-    #     for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-    #         if weight_name in name:
-    #             return (
-    #                 name.replace(weight_name, param_name)[: -len(".weight")],
-    #                 num_shard,
-    #             )
-    #     return name[: -len(".weight")], 1
 
     def get_num_params(self):
         params_dict = dict(self.named_parameters())
@@ -444,14 +487,7 @@ class TELlamaForCausalLM(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
 
-        # print("\nAll parameter names:")
-        # for name in params_dict.keys():
-        #     print(f"  {name}")
-        # print()  # 添加空行使输出更清晰
-
         for name, loaded_weight in weights:
-            # print(f"name: {name}, loaded_weight_size: {loaded_weight.size()}")
-            # 跳过不需要的权重
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -463,91 +499,84 @@ class TELlamaForCausalLM(nn.Module):
             if name.endswith(".kv_scale") and name not in params_dict:
                 continue
 
-            # 处理 QKV 权重
             if "self_attn.q_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.q_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "q")
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "q")
 
             elif "self_attn.k_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.k_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "k")
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "k")
 
             elif "self_attn.v_proj.weight" in name:
                 qkv_name = name.replace(
                     "self_attn.v_proj.weight", "self_attn.qkv_proj.weight"
                 )
-                if qkv_name in params_dict:
-                    param = params_dict[qkv_name]
-                    # weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    # print(f"param of v_proj and qkv_name: {param}")
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, "v")
-
+                assert qkv_name in params_dict
+                param = params_dict[qkv_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, "v")
+            
             elif "post_attention_layernorm.weight" in name:
                 te_name = name.replace(
                     "post_attention_layernorm.weight", "layernorm_mlp.layer_norm_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # print(f"param of layernorm_weight: {param}")
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    # param.data[:] = loaded_weight
-                    weight_loader(param, loaded_weight)
-                    # weight_loader = param.weight_loader
-                    # weight_loader(param, loaded_weight)
+                param = params_dict[te_name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
 
-            # 处理 TE 的 MLP 权重
+            elif "mlp.up_proj.weight" in name:
+                te_name = name.replace(
+                    "mlp.up_proj.weight", "layernorm_mlp.fc1_weight"
+                )
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                up_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                shard_size = param.size(0) // 2
+                default_weight_loader(
+                    param.narrow(0, shard_size, shard_size), 
+                    up_chunks[tp_rank]
+                )
+
             elif "mlp.gate_proj.weight" in name:
                 te_name = name.replace(
                     "mlp.gate_proj.weight", "layernorm_mlp.fc1_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # print(f"param of fc_weight: {param}")
-                    # print(f"loaded_weight.size(0): {loaded_weight.size(0)}")
-                    # print(f"loaded_weight.size(1): {loaded_weight.size(1)}")
-                    # print(f"self.config.intermediate_size: {self.config.intermediate_size}")
-                    # param.data[:self.config.intermediate_size] = loaded_weight
-                    # weight_loader = param.weight_loader
-                    # weight_loader(param, loaded_weight, 0)
-
-            elif "mlp.up_proj.weight" in name:
-                te_name = name.replace("mlp.up_proj.weight", "layernorm_mlp.fc1_weight")
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    # param.data[loaded_weight.size(0):] = loaded_weight
-
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                gate_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                shard_size = param.size(0) // 2
+                default_weight_loader(
+                    param.narrow(0, 0, shard_size), 
+                    gate_chunks[tp_rank]
+                )
+                
             elif "mlp.down_proj.weight" in name:
                 te_name = name.replace(
                     "mlp.down_proj.weight", "layernorm_mlp.fc2_weight"
                 )
-                if te_name in params_dict:
-                    param = params_dict[te_name]
-                    slice_size = loaded_weight.size(1) // tp_size
-                    start_idx = tp_rank * slice_size
-                    end_idx = (tp_rank + 1) * slice_size
-                    # param.data[:] = loaded_weight[:, start_idx:end_idx]
-
-            # 处理其他权重
+                assert te_name in params_dict
+                param = params_dict[te_name]
+                down_chunks = torch.chunk(loaded_weight, tp_size, dim=1)
+                default_weight_loader(param, down_chunks[tp_rank])
+            
             elif name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
     ) -> Optional[torch.Tensor]:
