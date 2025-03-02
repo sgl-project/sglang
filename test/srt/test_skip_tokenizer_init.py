@@ -17,40 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-_server_process = None
-_base_url = None
-_tokenizer = None
-
-
-def setUpModule():
-    """
-    Launch the server once before all tests and initialize the tokenizer.
-    """
-    global _server_process, _base_url, _tokenizer
-    _server_process = popen_launch_server(
-        DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        DEFAULT_URL_FOR_TEST,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=["--skip-tokenizer-init"],
-    )
-    _base_url = DEFAULT_URL_FOR_TEST
-
-    _tokenizer = AutoTokenizer.from_pretrained(
-        DEFAULT_SMALL_MODEL_NAME_FOR_TEST, use_fast=False
-    )
-    print(">>> setUpModule: Server launched, tokenizer ready")
-
-
-def tearDownModule():
-    """
-    Terminate the server once after all tests have completed.
-    """
-    global _server_process
-    if _server_process is not None:
-        kill_process_tree(_server_process.pid)
-        _server_process = None
-    print(">>> tearDownModule: Server terminated")
-
 
 class TestSkipTokenizerInit(unittest.TestCase):
     @classmethod
@@ -63,6 +29,13 @@ class TestSkipTokenizerInit(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--skip-tokenizer-init", "--stream-output"],
         )
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, use_fast=False
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
     def run_decode(
         self,
@@ -72,19 +45,19 @@ class TestSkipTokenizerInit(unittest.TestCase):
         top_logprobs_num=0,
         n=1,
     ):
-        input_ids = _tokenizer(prompt_text, return_tensors="pt")["input_ids"][
+        input_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"][
             0
         ].tolist()
 
         response = requests.post(
-            _base_url + "/generate",
+            self.base_url + "/generate",
             json={
                 "input_ids": input_ids,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
                     "n": n,
-                    "stop_token_ids": [_tokenizer.eos_token_id],
+                    "stop_token_ids": [self.tokenizer.eos_token_id],
                 },
                 "stream": False,
                 "return_logprob": return_logprob,
@@ -99,7 +72,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
             if item["meta_info"]["finish_reason"]["type"] == "stop":
                 self.assertEqual(
                     item["meta_info"]["finish_reason"]["matched"],
-                    _tokenizer.eos_token_id,
+                    self.tokenizer.eos_token_id,
                 )
             elif item["meta_info"]["finish_reason"]["type"] == "length":
                 self.assertEqual(
@@ -132,6 +105,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
     def run_decode_stream(self, return_logprob=False, top_logprobs_num=0, n=1):
         max_new_tokens = 32
         input_ids = [128000, 791, 6864, 315, 9822, 374]  # The capital of France is
+        requests.post(self.base_url + "/flush_cache")
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -152,6 +126,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
         print(json.dumps(ret))
         output_ids = ret["output_ids"]
 
+        requests.post(self.base_url + "/flush_cache")
         response_stream = requests.post(
             self.base_url + "/generate",
             json={

@@ -1160,7 +1160,6 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
-            enable_overlap_schedule=self.enable_overlap,
         )
 
     def prepare_for_decode(self):

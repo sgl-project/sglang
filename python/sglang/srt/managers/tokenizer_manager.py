@@ -944,6 +944,7 @@ class TokenizerManager:
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
+
                 out_dict = {
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
