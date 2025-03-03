@@ -140,7 +140,11 @@ class TestGPTQModelDynamic(unittest.TestCase):
         tic = time.time()
         result = self.run_decode(max_tokens)
         tok = time.time()
+
         print(f"result = `{result}`")
+
+        assert "paris" in result["text"].lower()
+
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         assert throughput >= 140
@@ -176,7 +180,7 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "My name is",
+                "text": "The capital of France is",
                 "sampling_params": {
                     "max_new_tokens": max_new_tokens,
                 },
@@ -192,6 +196,8 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
         tok = time.time()
 
         print(f"result = `{result}`")
+
+        assert "paris" in result["text"].lower()
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
