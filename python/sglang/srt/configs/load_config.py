@@ -21,6 +21,7 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
+    REMOTE = "remote"
 
 
 @dataclass
