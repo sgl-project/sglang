@@ -261,11 +261,11 @@ class HFRunner:
                             base_model=self.base_model,
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
-                            base_model=self.base_model,
                             tokenizer=self.tokenizer,
                             lora_paths=lora_paths,
                             torch_dtype=torch_dtype,
                             output_str_only=self.output_str_only,
+                            token_ids_logprob=token_ids_logprob,
                         )
                     )
                 elif self.model_type == "embedding":
@@ -425,6 +425,10 @@ class SRTRunner:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
+        chunked_prefill_size: Optional[int] = None,
+        dp_size: int = 1,
+        tokenizer_path: Optional[str] = None,
+        enable_ep_moe: bool = False,
         mem_fraction_static: float = 0.65,
         disable_custom_all_reduce: bool = False,
     ):
@@ -475,10 +479,13 @@ class SRTRunner:
     ):
         if self.is_generation:
             return self.forward_generation_raw(
+                engine=self.engine,
                 prompts=prompts,
                 max_new_tokens=max_new_tokens,
                 lora_paths=lora_paths,
-                engine=self.engine,
+                logprob_start_len=logprob_start_len,
+                top_k=top_k,
+                token_ids_logprob=token_ids_logprob,
             )
         else:
             response = self.engine.encode(prompts)
@@ -526,12 +533,36 @@ class SRTRunner:
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
+            # output_ids.append(response["output_ids"])
+
+            input_token_logprobs = response["meta_info"]["input_token_logprobs"]
+            output_token_logprobs = response["meta_info"]["output_token_logprobs"]
+            # print(i, input_token_logprobs)
+            # print(i, output_token_logprobs)
+            logprobs = response["meta_info"]["input_top_logprobs"]
+            if token_ids_logprob is not None:
+                input_token_ids_logprobs = response["meta_info"][
+                    "input_token_ids_logprobs"
+                ][1:]
+            else:
+                input_token_ids_logprobs = None
+
+            num_prompt_tokens = response["meta_info"]["prompt_tokens"]
+            assert len(input_token_logprobs) == num_prompt_tokens - logprob_start_len
+            assert len(logprobs) == num_prompt_tokens - logprob_start_len
+
+            # The first token logprob has no meaning in sglang.
+            input_token_logprobs = input_token_logprobs[1:]
+            logprobs = logprobs[1:]
+            assert len(input_token_logprobs) == len(logprobs)
+
+            input_token_logprobs_lst.append(
+                input_token_logprobs + [output_token_logprobs[0]]
+            )
+            output_token_logprobs_lst.append(output_token_logprobs)
 
             top_input_logprobs.append(
-                [
-                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["input_top_logprobs"][1:]
-                ]
+                [[tup[0] for tup in x[:NUM_TOP_LOGPROBS]] for x in logprobs]
                 + [
                     [
                         tup[0]
@@ -547,6 +578,30 @@ class SRTRunner:
                     for x in response["meta_info"]["output_top_logprobs"]
                 ]
             )
+            top_output_logprob_idx.append(
+                [
+                    [tup[1] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["output_top_logprobs"]
+                ]
+            )
+            if token_ids_logprob is not None:
+                token_ids_input_logprobs.append(
+                    [[tup[0] for tup in x] for x in input_token_ids_logprobs]
+                    + [
+                        [
+                            tup[0]
+                            for tup in response["meta_info"][
+                                "output_token_ids_logprobs"
+                            ][0]
+                        ]
+                    ]
+                )
+                token_ids_output_logprobs.append(
+                    [
+                        [tup[0] for tup in x]
+                        for x in response["meta_info"]["output_token_ids_logprobs"]
+                    ]
+                )
 
             return ModelOutput(
                 output_strs=output_strs,

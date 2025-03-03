@@ -426,13 +426,14 @@ class ColumnParallelLinear(LinearBase):
         from sglang.srt.layers.parameter import _ColumnvLLMParameter
 
         if isinstance(param, _ColumnvLLMParameter):
-            # FIXME: why would we need this special case?
             param.load_column_parallel_weight(
                 loaded_weight,
                 tp_rank=self.tp_rank,
                 use_presharded_weights=self.use_presharded_weights,
             )
         else:
+            # FIXME: This branch is needed to load deepseek v3 awq.
+            # However, we should fix this and avoid the branching here.
             param.load_column_parallel_weight(loaded_weight)
 
     def forward(self, input_):
