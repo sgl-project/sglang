@@ -655,25 +655,13 @@ class ModelRunner:
 
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
-                max_num_reqs = self.server_args.max_num_reqs
+                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.adjusted_max_total_num_tokens = (
+                self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
+                    + max_num_reqs * self.server_args.speculative_num_steps
                     + 100
                 )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.server_args.max_num_reqs = max_num_reqs
-            self.max_total_num_tokens = self.server_args.adjusted_max_total_num_tokens
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
@@ -690,7 +678,7 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            size=max_num_reqs + 8,  # FIXME(lianmin): fix this after EAGLE is fixed.
+            size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
