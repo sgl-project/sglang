@@ -95,7 +95,7 @@ class Olmo2Attention(nn.Module):
             self.total_num_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -118,7 +118,7 @@ class Olmo2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
         # Attention output projection.
@@ -127,7 +127,7 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
     def _apply_qk_norm(
@@ -183,7 +183,7 @@ class Olmo2MLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
 
         # Activation function.
@@ -195,7 +195,7 @@ class Olmo2MLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
 
     def forward(
@@ -225,11 +225,11 @@ class Olmo2DecoderLayer(nn.Module):
         super().__init__()
         # Attention block.
         self.self_attn = Olmo2Attention(
-            config, layer_id, quant_config, prefix=f"{prefix}.self_attn"
+            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
         )
 
         # MLP block.
-        self.mlp = Olmo2MLP(config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = Olmo2MLP(config, quant_config, prefix=add_prefix("mlp", prefix))
 
         # RMSNorm
         self.post_attention_layernorm = RMSNorm(
@@ -272,7 +272,9 @@ class Olmo2Model(nn.Module):
         self.config = config
 
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -282,7 +284,7 @@ class Olmo2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

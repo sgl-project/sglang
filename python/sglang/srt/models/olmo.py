@@ -76,7 +76,7 @@ class OlmoAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             bias=config.attention_bias,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         # Rotary embeddings.
@@ -93,7 +93,7 @@ class OlmoAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
         # Attention output projection.
@@ -101,7 +101,7 @@ class OlmoAttention(nn.Module):
             self.hidden_size,
             self.hidden_size,
             bias=config.attention_bias,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
     def forward(
@@ -144,7 +144,7 @@ class OlmoMLP(nn.Module):
             [self.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
 
         # Activation function.
@@ -156,7 +156,7 @@ class OlmoMLP(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
 
     def forward(
@@ -189,14 +189,14 @@ class OlmoDecoderLayer(nn.Module):
             config,
             layer_id,
             quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
 
         # MLP block.
         self.mlp = OlmoMLP(
             config,
             quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
         # LayerNorm
@@ -241,7 +241,7 @@ class OlmoModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -251,7 +251,7 @@ class OlmoModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = nn.LayerNorm(
             config.hidden_size, elementwise_affine=False, bias=False

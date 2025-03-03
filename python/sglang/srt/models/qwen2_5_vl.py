@@ -74,21 +74,21 @@ class Qwen2_5_VLMLP(nn.Module):
             hidden_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_proj",
+            prefix=add_prefix("gate_proj", prefix),
         )
         self.up_proj = ColumnParallelLinear(
             in_features,
             hidden_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.up_proj",
+            prefix=add_prefix("up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]
 
@@ -138,14 +138,14 @@ class Qwen2_5_VisionBlock(nn.Module):
             use_full_precision_softmax=use_full_precision_softmax,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen2_5_VLMLP(
             dim,
             intermediate_dim,
             hidden_act=hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
     def forward(
@@ -210,7 +210,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     self.hidden_size,
                     bias=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.0",
+                    prefix=add_prefix("mlp.0", prefix),
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -218,7 +218,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     dim,
                     bias=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.2",
+                    prefix=add_prefix("mlp.2", prefix),
                 ),
             ]
         )
@@ -313,7 +313,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attn_implementation="sdpa",
                     quant_config=quant_config,
-                    prefix=f"{prefix}.blocks.{i}",
+                    prefix=add_prefix(f"blocks.{i}", prefix),
                 )
                 for i in range(depth)
             ]
@@ -323,7 +323,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             context_dim=hidden_size,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.merger",
+            prefix=add_prefix("merger", prefix),
         )
 
     def get_window_index(self, grid_thw):

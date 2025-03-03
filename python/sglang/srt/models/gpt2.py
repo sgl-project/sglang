@@ -63,14 +63,14 @@ class GPT2Attention(nn.Module):
             total_num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_attn",
+            prefix=add_prefix("c_attn", prefix),
         )
         self.c_proj = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -108,14 +108,14 @@ class GPT2MLP(nn.Module):
             intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_fc",
+            prefix=add_prefix("c_fc", prefix),
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.act = get_act_fn(
             config.activation_function, quant_config, intermediate_size
@@ -146,10 +146,12 @@ class GPT2Block(nn.Module):
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(
-            layer_id, config, quant_config, prefix=f"{prefix}.attn"
+            layer_id, config, quant_config, prefix=add_prefix("attn", prefix)
         )
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPT2MLP(inner_dim, config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = GPT2MLP(
+            inner_dim, config, quant_config, prefix=add_prefix("mlp", prefix)
+        )
 
     def forward(
         self,
@@ -191,7 +193,7 @@ class GPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList(
             [
-                GPT2Block(i, config, quant_config, prefix=f"{prefix}.h.{i}")
+                GPT2Block(i, config, quant_config, prefix=add_prefix(f"h.{i}", prefix))
                 for i in range(config.num_hidden_layers)
             ]
         )

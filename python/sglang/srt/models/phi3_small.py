@@ -70,14 +70,14 @@ class Phi3SmallMLP(nn.Module):
             2 * [self.intermediate_size],
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.up_proj",
+            prefix=add_prefix("up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
 
     def forward(self, x):
@@ -141,7 +141,7 @@ class Phi3SmallSelfAttention(nn.Module):
             self.num_key_value_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.dense = RowParallelLinear(
@@ -149,7 +149,7 @@ class Phi3SmallSelfAttention(nn.Module):
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         if getattr(self.config, "rope_scaling", None) is not None:
@@ -202,7 +202,7 @@ class Phi3SmallSelfAttention(nn.Module):
             self.scale,
             num_kv_heads=self.num_kv_heads_per_partion,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -244,12 +244,12 @@ class Phi3SmallDecoderLayer(nn.Module):
             config,
             layer_id,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Phi3SmallMLP(
             config,
             quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
         self.input_layernorm = nn.LayerNorm(
@@ -296,7 +296,7 @@ class Phi3SmallModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -307,7 +307,7 @@ class Phi3SmallModel(nn.Module):
                 quant_config,
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers", prefix),
         )
 
         self.final_layernorm = nn.LayerNorm(

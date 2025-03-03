@@ -57,14 +57,14 @@ class ExaoneGatedMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -131,14 +131,14 @@ class ExaoneAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.out_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
+            prefix=add_prefix("out_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -202,14 +202,14 @@ class ExaoneDecoderLayer(nn.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = ExaoneGatedMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.activation_function,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         rms_norm_eps = config.layer_norm_epsilon
         self.ln_1 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
@@ -258,7 +258,10 @@ class ExaoneModel(nn.Module):
         self.h = nn.ModuleList(
             [
                 ExaoneDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.h.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"h.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

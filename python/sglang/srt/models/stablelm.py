@@ -61,14 +61,14 @@ class StablelmMLP(nn.Module):
             [config.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = SiluAndMul()
 
@@ -128,14 +128,14 @@ class StablelmAttention(nn.Module):
             self.total_num_key_value_heads,
             self.qkv_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -149,7 +149,7 @@ class StablelmAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -176,10 +176,10 @@ class StablelmDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.self_attn = StablelmAttention(
-            config, layer_id=layer_id, prefix=f"{prefix}.self_attn"
+            config, layer_id=layer_id, prefix=add_prefix("self_attn", prefix)
         )
         self.mlp = StablelmMLP(
-            config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
         )
         norm_eps = getattr(config, "norm_eps", getattr(config, "layer_norm_eps", 1e-05))
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=norm_eps)
@@ -219,12 +219,17 @@ class StableLMEpochModel(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
                 StablelmDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

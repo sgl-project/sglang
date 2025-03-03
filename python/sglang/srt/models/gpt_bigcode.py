@@ -71,7 +71,7 @@ class GPTBigCodeAttention(nn.Module):
             total_num_kv_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_attn",
+            prefix=add_prefix("c_attn", prefix),
         )
 
         self.c_proj = RowParallelLinear(
@@ -79,7 +79,7 @@ class GPTBigCodeAttention(nn.Module):
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -87,7 +87,7 @@ class GPTBigCodeAttention(nn.Module):
             scaling=self.scale,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -125,14 +125,14 @@ class GPTBigMLP(nn.Module):
             intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_fc",
+            prefix=add_prefix("c_fc", prefix),
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.act = get_act_fn(
             config.activation_function, quant_config, intermediate_size
@@ -160,10 +160,12 @@ class GPTBigCodeBlock(nn.Module):
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPTBigCodeAttention(
-            layer_id, config, quant_config, prefix=f"{prefix}.attn"
+            layer_id, config, quant_config, prefix=add_prefix("attn", prefix)
         )
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPTBigMLP(inner_dim, config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = GPTBigMLP(
+            inner_dim, config, quant_config, prefix=add_prefix("mlp", prefix)
+        )
 
     def forward(
         self,
@@ -205,12 +207,14 @@ class GPTBigCodeModel(nn.Module):
             self.vocab_size,
             self.embed_dim,
             org_num_embeddings=config.vocab_size,
-            prefix=f"{prefix}.wte",
+            prefix=add_prefix("wte", prefix),
         )
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList(
             [
-                GPTBigCodeBlock(i, config, quant_config, prefix=f"{prefix}.h.{i}")
+                GPTBigCodeBlock(
+                    i, config, quant_config, prefix=add_prefix(f"h.{i}", prefix)
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )

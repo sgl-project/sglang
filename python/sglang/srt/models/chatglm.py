@@ -87,14 +87,14 @@ class GLMAttention(nn.Module):
             self.total_num_kv_heads,
             bias=config.add_bias_linear or config.add_qkv_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.query_key_value",
+            prefix=add_prefix("query_key_value", prefix),
         )
         self.dense = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=config.add_bias_linear,
             quant_config=quant_config,
-            prefix=f"{prefix}.dense",
+            prefix=add_prefix("dense", prefix),
         )
 
         # https://huggingface.co/THUDM/chatglm3-6b-32k/blob/e210410255278dd9d74463cf396ba559c0ef801c/modeling_chatglm.py#L141
@@ -113,7 +113,7 @@ class GLMAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -159,7 +159,7 @@ class GLMMLP(nn.Module):
             [config.ffn_hidden_size] * 2,
             bias=config.add_bias_linear,
             quant_config=quant_config,
-            prefix=f"{prefix}.dense_h_to_4h",
+            prefix=add_prefix("dense_h_to_4h", prefix),
         )
 
         self.activation_func = SiluAndMul()
@@ -170,7 +170,7 @@ class GLMMLP(nn.Module):
             config.hidden_size,
             bias=config.add_bias_linear,
             quant_config=quant_config,
-            prefix=f"{prefix}.dense_4h_to_h",
+            prefix=add_prefix("dense_4h_to_h", prefix),
         )
 
     def forward(self, hidden_states):
@@ -211,7 +211,7 @@ class GLMBlock(nn.Module):
 
         # Self attention.
         self.self_attention = GLMAttention(
-            config, layer_id, quant_config, prefix=f"{prefix}.self_attention"
+            config, layer_id, quant_config, prefix=add_prefix("self_attention", prefix)
         )
         self.hidden_dropout = config.hidden_dropout
 
@@ -221,7 +221,7 @@ class GLMBlock(nn.Module):
         )
 
         # MLP
-        self.mlp = GLMMLP(config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = GLMMLP(config, quant_config, prefix=add_prefix("mlp", prefix))
 
     def forward(
         self,
@@ -283,7 +283,7 @@ class GLMTransformer(nn.Module):
                     config,
                     i,
                     quant_config,
-                    prefix=f"{prefix}.layers.{i}",
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(self.num_layers)
             ]
@@ -326,18 +326,22 @@ class ChatGLMM(nn.Module):
         super().__init__()
 
         self.embedding = VocabParallelEmbedding(
-            config.padded_vocab_size, config.hidden_size, prefix=f"{prefix}.embedding"
+            config.padded_vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embedding", prefix),
         )
 
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
-        self.encoder = GLMTransformer(config, quant_config, prefix=f"{prefix}.encoder")
+        self.encoder = GLMTransformer(
+            config, quant_config, add_prefix("encoder", prefix)
+        )
 
         self.output_layer = ParallelLMHead(
             config.padded_vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.output_layer",
+            prefix=add_prefix("output_layer", prefix),
         )
 
     def forward(

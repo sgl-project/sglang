@@ -73,7 +73,7 @@ class OlmoeMoE(nn.Module):
             num_experts,
             bias=False,
             quant_config=None,
-            prefix=f"{prefix}.gate",
+            prefix=add_prefix("gate", prefix),
         )
 
         self.experts = FusedMoE(
@@ -85,7 +85,7 @@ class OlmoeMoE(nn.Module):
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
-            prefix=f"{prefix}.experts",
+            prefix=add_prefix("experts", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -144,7 +144,7 @@ class OlmoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.q_norm = RMSNorm(hidden_size, eps=1e-5)
         self.k_norm = RMSNorm(hidden_size, eps=1e-5)
@@ -153,7 +153,7 @@ class OlmoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -170,7 +170,7 @@ class OlmoeAttention(nn.Module):
             self.scaling,
             layer_id=layer_id,
             num_kv_heads=self.num_kv_heads,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -212,7 +212,7 @@ class OlmoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
 
         self.mlp = OlmoeMoE(
@@ -221,7 +221,7 @@ class OlmoeDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
@@ -267,7 +267,7 @@ class OlmoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -277,7 +277,7 @@ class OlmoeModel(nn.Module):
                 layer_id=idx,
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 

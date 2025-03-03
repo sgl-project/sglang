@@ -99,14 +99,14 @@ class Qwen2VisionMLP(nn.Module):
             in_features,
             hidden_features,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
             hidden_features,
             in_features,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -154,14 +154,14 @@ class Qwen2VisionBlock(nn.Module):
             use_full_precision_softmax=use_full_precision_softmax,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen2VisionMLP(
             dim,
             mlp_hidden_dim,
             act_layer=act_layer,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
     def forward(
@@ -227,7 +227,7 @@ class Qwen2VisionPatchMerger(nn.Module):
                     self.hidden_size,
                     bias=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.0",
+                    prefix=add_prefix("mlp.0", prefix),
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -235,7 +235,7 @@ class Qwen2VisionPatchMerger(nn.Module):
                     d_model,
                     bias=True,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.2",
+                    prefix=add_prefix("mlp.2", prefix),
                 ),
             ]
         )
@@ -328,7 +328,7 @@ class Qwen2VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attn_implementation="sdpa",
                     quant_config=quant_config,
-                    prefix=f"{prefix}.blocks.{i}",
+                    prefix=add_prefix(f"blocks.{i}", prefix),
                 )
                 for i in range(depth)
             ]
@@ -338,7 +338,7 @@ class Qwen2VisionTransformer(nn.Module):
             context_dim=embed_dim,
             norm_layer=norm_layer,
             quant_config=quant_config,
-            prefix=f"{prefix}.merger",
+            prefix=add_prefix("merger", prefix),
         )
 
     @property

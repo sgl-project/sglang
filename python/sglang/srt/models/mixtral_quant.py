@@ -67,21 +67,21 @@ class MixtralMLP(nn.Module):
             self.ffn_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.w1",
+            prefix=add_prefix("w1", prefix),
         )
         self.w2 = ReplicatedLinear(
             self.ffn_dim,
             self.hidden_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.w2",
+            prefix=add_prefix("w2", prefix),
         )
         self.w3 = ReplicatedLinear(
             self.hidden_dim,
             self.ffn_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.w3",
+            prefix=add_prefix("w3", prefix),
         )
 
         # TODO: Use vllm's SiluAndMul
@@ -129,7 +129,7 @@ class MixtralMoE(nn.Module):
                         config.hidden_size,
                         config.intermediate_size,
                         quant_config=quant_config,
-                        prefix=f"{prefix}.experts.{idx}",
+                        prefix=add_prefix(f"experts.{idx}", prefix),
                     )
                     if idx in self.expert_indicies
                     else None
@@ -142,7 +142,7 @@ class MixtralMoE(nn.Module):
             self.num_total_experts,
             bias=False,
             quant_config=None,
-            prefix=f"{prefix}.gate",
+            prefix=add_prefix("gate", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -210,14 +210,14 @@ class MixtralAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -232,7 +232,7 @@ class MixtralAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -269,12 +269,12 @@ class MixtralDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = MixtralMoE(
             config=config,
             quant_config=quant_config,
-            prefix=f"{prefix}.block_sparse_moe",
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -320,7 +320,7 @@ class MixtralModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
@@ -328,7 +328,7 @@ class MixtralModel(nn.Module):
                     config,
                     i,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

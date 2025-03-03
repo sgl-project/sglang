@@ -58,7 +58,7 @@ class QWenMLP(nn.Module):
             bias=False,
             gather_output=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
@@ -66,7 +66,7 @@ class QWenMLP(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -109,7 +109,7 @@ class QWenAttention(nn.Module):
             self.total_num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_attn",
+            prefix=add_prefix("c_attn", prefix),
         )
         self.c_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -117,7 +117,7 @@ class QWenAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -133,7 +133,7 @@ class QWenAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -171,7 +171,7 @@ class QWenBlock(nn.Module):
             rope_scaling=rope_scaling,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -180,7 +180,7 @@ class QWenBlock(nn.Module):
             config.hidden_size,
             config.intermediate_size // 2,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
 
     def forward(
@@ -222,7 +222,7 @@ class QWenModel(nn.Module):
         self.wte = VocabParallelEmbedding(
             vocab_size,
             config.hidden_size,
-            prefix=f"{prefix}.wte",
+            prefix=add_prefix("wte", prefix),
         )
         self.h = nn.ModuleList(
             [
@@ -230,7 +230,7 @@ class QWenModel(nn.Module):
                     config,
                     i,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.h.{i}",
+                    prefix=add_prefix(f"h.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

@@ -159,14 +159,14 @@ class Idefics2VisionMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -200,13 +200,13 @@ class Idefics2EncoderLayer(nn.Module):
             use_context_forward=False,
             use_full_precision_softmax=True,
             flatten_batch=False,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Idefics2VisionMLP(
             config,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
@@ -257,7 +257,7 @@ class Idefics2Encoder(nn.Module):
                 Idefics2EncoderLayer(
                     config,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -394,7 +394,9 @@ class Idefics2VisionTransformer(nn.Module):
         self.config = config
         self.embeddings = Idefics2VisionEmbeddings(config)
         self.encoder = Idefics2Encoder(
-            config=config, quant_config=quant_config, prefix=f"{prefix}.encoder"
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
         )
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -513,7 +515,7 @@ class BaseResampler(nn.Module):
                 embed_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.kv_proj",
+                prefix=add_prefix("kv_proj", prefix),
             )
         else:
             # Maintain the same return value with ReplicatedLinear.forward

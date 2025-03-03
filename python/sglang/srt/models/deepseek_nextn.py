@@ -57,7 +57,7 @@ class DeepseekModelNextN(nn.Module):
             config.vocab_size,
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -70,7 +70,7 @@ class DeepseekModelNextN(nn.Module):
             0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix=f"{prefix}.decoder",
+            prefix=add_prefix("decoder", prefix),
         )
 
         self.shared_head = nn.Module()

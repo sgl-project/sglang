@@ -162,14 +162,14 @@ class MllamaVisionMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -204,9 +204,9 @@ class MllamaVisionEncoderLayer(nn.Module):
             use_context_forward=False,
             use_full_precision_softmax=False,
             flatten_batch=False,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = MllamaVisionMLP(config, prefix=f"{prefix}.mlp")
+        self.mlp = MllamaVisionMLP(config, prefix=add_prefix("mlp", prefix))
 
         self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(
@@ -254,7 +254,7 @@ class MllamaVisionEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [
                 MllamaVisionEncoderLayer(
-                    config, is_gated, prefix=f"{prefix}.layers.{i}"
+                    config, is_gated, prefix=add_prefix(f"layers.{i}", prefix)
                 )
                 for i in range(num_layers)
             ]
@@ -512,7 +512,7 @@ class MllamaTextCrossAttention(nn.Module):
             self.num_key_value_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.head_dim,
@@ -520,7 +520,7 @@ class MllamaTextCrossAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         # vllm.model_executor.layers.layernorm.RMSNorm has precision issue,
         # use huggingface's instead
@@ -535,7 +535,7 @@ class MllamaTextCrossAttention(nn.Module):
             self.num_local_key_value_heads,
             layer_id=layer_id,
             is_cross_attention=True,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -585,7 +585,7 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=f"{prefix}.cross_attn",
+            prefix=add_prefix("cross_attn", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -596,7 +596,7 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -647,7 +647,7 @@ class MllamaTextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size + 8,
             config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.cross_attention_layers = config.cross_attention_layers
 
@@ -659,7 +659,7 @@ class MllamaTextModel(nn.Module):
                         config,
                         layer_id,
                         quant_config=quant_config,
-                        prefix=f"{prefix}.layers.{layer_id}",
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
                     )
                 )
             else:
@@ -669,7 +669,7 @@ class MllamaTextModel(nn.Module):
                         config,
                         quant_config=quant_config,
                         layer_id=layer_id,
-                        prefix=f"{prefix}.layers.{layer_id}",
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
                     )
                 )
 

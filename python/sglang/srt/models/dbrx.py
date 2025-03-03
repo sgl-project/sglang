@@ -210,14 +210,14 @@ class DbrxAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.Wqkv",
+            prefix=add_prefix("Wqkv", prefix),
         )
         self.out_proj = RowParallelLinear(
             self.d_model,
             self.d_model,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
+            prefix=add_prefix("out_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -249,7 +249,7 @@ class DbrxAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -279,7 +279,10 @@ class DbrxFusedNormAttention(nn.Module):
         super().__init__()
         self.d_model = config.d_model
         self.attn = DbrxAttention(
-            config, layer_id, quant_config=quant_config, prefix=f"{prefix}.attn"
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
         self.norm_1 = nn.LayerNorm(self.d_model)
         self.norm_2 = nn.LayerNorm(self.d_model)
@@ -316,7 +319,7 @@ class DbrxBlock(nn.Module):
             config,
             layer_id,
             quant_config=quant_config,
-            prefix=f"{prefix}.norm_attn_norm",
+            prefix=add_prefix("norm_attn_norm", prefix),
         )
         self.ffn = DbrxExperts(config, quant_config=quant_config)
 
@@ -351,7 +354,10 @@ class DbrxModel(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 DbrxBlock(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.blocks.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{i}", prefix),
                 )
                 for i in range(config.n_layers)
             ]

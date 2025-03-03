@@ -89,14 +89,14 @@ class BaiChuanMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -178,7 +178,7 @@ class BaiChuanAttention(nn.Module):
                 scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
-                prefix=f"{prefix}.attn",
+                prefix=add_prefix("attn", prefix),
             )
         else:
             self.rotary_emb = get_rope(
@@ -194,7 +194,7 @@ class BaiChuanAttention(nn.Module):
                 self.scaling,
                 num_kv_heads=self.num_kv_heads,
                 layer_id=layer_id,
-                prefix=f"{prefix}.attn",
+                prefix=add_prefix("attn", prefix),
             )
 
     def forward(
@@ -234,14 +234,14 @@ class BaiChuanDecoderLayer(nn.Module):
             layer_id=layer_id,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = BaiChuanMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -298,7 +298,7 @@ class BaiChuanModel(nn.Module):
                     layer_id=i,
                     position_embedding=position_embedding,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

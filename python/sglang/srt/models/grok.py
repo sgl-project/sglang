@@ -66,7 +66,7 @@ class Grok1MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
             use_presharded_weights=use_presharded_weights,
         )
         self.down_proj = RowParallelLinear(
@@ -74,7 +74,7 @@ class Grok1MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
             use_presharded_weights=use_presharded_weights,
         )
@@ -120,7 +120,7 @@ class Grok1MoE(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
-            prefix=f"{prefix}.gate",
+            prefix=add_prefix("gate", prefix),
         )
 
         self.router_logit_softcapping = getattr(
@@ -138,7 +138,7 @@ class Grok1MoE(nn.Module):
             tp_size=tp_size,
             activation="gelu",
             use_presharded_weights=use_presharded_weights,
-            prefix=f"{prefix}.experts",
+            prefix=add_prefix("experts", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -200,7 +200,7 @@ class Grok1Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -208,7 +208,7 @@ class Grok1Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -227,7 +227,7 @@ class Grok1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             logit_cap=logit_cap,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -268,7 +268,7 @@ class Grok1DecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
         self.block_sparse_moe = Grok1MoE(
             config=config,
@@ -283,7 +283,7 @@ class Grok1DecoderLayer(nn.Module):
             quant_config=quant_config,
             reduce_results=True,
             use_presharded_weights=use_presharded_weights,
-            prefix=f"{prefix}.block_sparse_moe",
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
         self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -330,7 +330,9 @@ class Grok1Model(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
@@ -339,7 +341,7 @@ class Grok1Model(nn.Module):
                     i,
                     quant_config=quant_config,
                     use_presharded_weights=use_presharded_weights,
-                    prefix=f"{prefix}.layers.{i}",
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]

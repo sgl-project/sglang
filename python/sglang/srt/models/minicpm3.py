@@ -61,14 +61,14 @@ class MiniCPM3MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -135,7 +135,7 @@ class MiniCPM3Attention(nn.Module):
                 self.q_lora_rank,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_a_proj",
+                prefix=add_prefix("q_a_proj", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -143,7 +143,7 @@ class MiniCPM3Attention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_b_proj",
+                prefix=add_prefix("q_b_proj", prefix),
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -151,7 +151,7 @@ class MiniCPM3Attention(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
+                prefix=add_prefix("q_proj", prefix),
             )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -159,7 +159,7 @@ class MiniCPM3Attention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa",
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -167,7 +167,7 @@ class MiniCPM3Attention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj",
+            prefix=add_prefix("kv_b_proj", prefix),
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -175,7 +175,7 @@ class MiniCPM3Attention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
@@ -192,7 +192,7 @@ class MiniCPM3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -286,7 +286,7 @@ class MiniCPM3AttentionMLA(nn.Module):
                 self.q_lora_rank,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_a_proj",
+                prefix=add_prefix("q_a_proj", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -294,7 +294,7 @@ class MiniCPM3AttentionMLA(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_b_proj",
+                prefix=add_prefix("q_b_proj", prefix),
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -302,7 +302,7 @@ class MiniCPM3AttentionMLA(nn.Module):
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
+                prefix=add_prefix("q_proj", prefix),
             )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -310,7 +310,7 @@ class MiniCPM3AttentionMLA(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa",
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -318,7 +318,7 @@ class MiniCPM3AttentionMLA(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj",
+            prefix=add_prefix("kv_b_proj", prefix),
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -326,7 +326,7 @@ class MiniCPM3AttentionMLA(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
@@ -343,7 +343,7 @@ class MiniCPM3AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
-            prefix=f"{prefix}.attn",
+            prefix=add_prefix("attn", prefix),
         )
 
         self.w_kc = None
@@ -449,7 +449,7 @@ class MiniCPM3DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 layer_id=layer_id,
-                prefix=f"{prefix}.self_attn",
+                prefix=add_prefix("self_attn", prefix),
             )
         else:
             self.self_attn = MiniCPM3Attention(
@@ -468,14 +468,14 @@ class MiniCPM3DecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 layer_id=layer_id,
-                prefix=f"{prefix}.self_attn",
+                prefix=add_prefix("self_attn", prefix),
             )
         self.mlp = MiniCPM3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -527,12 +527,15 @@ class MiniCPM3Model(nn.Module):
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
                 MiniCPM3DecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
