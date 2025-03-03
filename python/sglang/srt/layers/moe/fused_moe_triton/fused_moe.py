@@ -26,7 +26,7 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-is_hip_flag = is_hip()
+is_hip_ = is_hip()
 
 
 logger = logging.getLogger(__name__)
@@ -516,6 +516,7 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -678,7 +679,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 32,
                 "num_warps": 8,
-                "num_stages": 2 if is_hip_flag else 4,
+                "num_stages": 2 if is_hip_ else 4,
             }
             if M <= E:
                 config = {
@@ -687,7 +688,7 @@ def get_default_config(
                     "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 1,
                     "num_warps": 4,
-                    "num_stages": 2 if is_hip_flag else 4,
+                    "num_stages": 2 if is_hip_ else 4,
                 }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
@@ -697,7 +698,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": block_shape[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,
-                "num_stages": 2 if is_hip_flag else 3,
+                "num_stages": 2 if is_hip_ else 3,
             }
     else:
         config = {
@@ -846,6 +847,7 @@ def outplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -863,6 +865,7 @@ def outplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        no_combine=no_combine,
     )
 
 
@@ -881,6 +884,7 @@ def outplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -909,8 +913,10 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ):
     if inplace:
+        assert not no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
             hidden_states,
             w1,
@@ -944,6 +950,7 @@ def fused_experts(
             a1_scale,
             a2_scale,
             block_shape,
+            no_combine=no_combine,
         )
 
 
@@ -963,6 +970,7 @@ def fused_experts_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ):
     padded_size = padding_size
     if not use_fp8_w8a8 or not use_int8_w8a8 or block_shape is not None:
@@ -1019,7 +1027,14 @@ def fused_experts_impl(
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
-    if inplace:
+    if no_combine:
+        assert not inplace
+        out_hidden_states = torch.empty(
+            (num_tokens, topk_ids.shape[1], w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    elif inplace:
         out_hidden_states = hidden_states
     else:
         out_hidden_states = torch.empty_like(hidden_states)
@@ -1088,7 +1103,11 @@ def fused_experts_impl(
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
-            intermediate_cache3,
+            (
+                intermediate_cache3
+                if not no_combine and topk_ids.shape[1] != 1
+                else out_hidden_states[begin_chunk_idx:end_chunk_idx]
+            ),
             a2_scale,
             w2_scale,
             curr_topk_weights,
@@ -1106,16 +1125,16 @@ def fused_experts_impl(
             block_shape=block_shape,
         )
 
-        if is_hip_flag:
+        if no_combine:
+            pass
+        elif is_hip_:
             ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
         else:
             if topk_ids.shape[1] == 1:
-                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
-                    intermediate_cache3[:, 0]
-                )
+                pass  # we write directly into out_hidden_states
             elif topk_ids.shape[1] == 2:
                 torch.add(
                     intermediate_cache3[:, 0],
@@ -1153,6 +1172,7 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1222,4 +1242,5 @@ def fused_moe(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        no_combine=no_combine,
     )
