@@ -194,11 +194,19 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor, forward_batch) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> Generator[None, None, torch.Tensor]:
         hidden_states_local = hidden_states
         all_gather_state = all_gather_part_issue(
             hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
         )
+
+        if forward_batch.forward_mode.is_decode():
+            assert self.enable_shared_experts_dp
+            shared_output = self.shared_experts(hidden_states_local)
+
+        # End of prefill stage "extra-tiny" / decode stage "SHARED"
+        yield
+
         hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
 
         num_tokens, hidden_dim = hidden_states.shape
