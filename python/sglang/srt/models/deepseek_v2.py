@@ -979,6 +979,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual
             )
 
+        # TODO They put "MoE routing gate" in "ATTN / ATTN1" stage, but our gate depends on dispatch
+        #      so wait for DeepEP...
+        # End of prefill stage "ATTN" / decode stage "ATTN1"
+        yield
+
         # Fully Connected
         # When enable_shared_experts_dp, the all_gather/slice is moved down to the next level
         if self.enable_dp_attention and ((not self.enable_shared_experts_dp) or isinstance(self.mlp, DeepseekV2Attention)):
