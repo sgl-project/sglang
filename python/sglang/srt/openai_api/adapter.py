@@ -26,8 +26,6 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from sglang.lang.chat_template import get_chat_template_by_model_path
-
 try:
     from outlines.fsm.json_schema import convert_json_schema_to_str
 except ImportError:
@@ -165,17 +163,10 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
-    # check chat-template
-    chat_template = get_chat_template_by_model_path(model_path)
-    if chat_template is not None:
-        official_chat_template = chat_template.name
-        used_chat_template = chat_template_name
-        if official_chat_template != used_chat_template:
-            logger.warning(
-                f"Using a chat_template: '{used_chat_template}', "
-                f"which is different from official chat template: '{official_chat_template}', "
-                f"This discrepancy may lead to performance degradation."
-            )
+    # Check chat-template
+    # TODO:
+    # 1. Do not import any code from sglang.lang
+    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
 
 
 async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str = None):

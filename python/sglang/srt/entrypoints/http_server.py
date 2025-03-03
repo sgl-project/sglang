@@ -438,8 +438,8 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     return Response(status_code=200)
 
 
-@app.post("/function_call")
-async def function_call_request(obj: ParseFunctionCallReq, request: Request):
+@app.post("/parse_function_call")
+async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
     """
     A native API endpoint to parse function calls from a text.
     """
