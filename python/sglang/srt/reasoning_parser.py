@@ -18,7 +18,7 @@ class BaseReasoningFormatDetector:
         think_start_token: str,
         think_end_token: str,
         force_reasoning: bool = False,
-        stream_reasoning: bool = False,
+        stream_reasoning: bool = True,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -107,9 +107,14 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = False):
+    def __init__(self, stream_reasoning: bool = True):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
-        super().__init__("<think>", "</think>", True, stream_reasoning=stream_reasoning)
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+        )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
