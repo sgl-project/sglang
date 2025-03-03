@@ -990,6 +990,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states, forward_batch)
 
+        # End of stage "SHARED"
+        yield
+
         return hidden_states, residual
 
 
