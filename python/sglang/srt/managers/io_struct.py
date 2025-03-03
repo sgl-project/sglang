@@ -158,7 +158,7 @@ class GenerateReqInput:
                 # Expand parallel_sample_num
                 num = self.batch_size * self.parallel_sample_num
 
-            if self.image_data is None:
+            if not self.image_data:
                 self.image_data = [None] * num
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
