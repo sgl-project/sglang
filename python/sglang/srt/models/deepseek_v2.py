@@ -79,6 +79,7 @@ class DeepseekV2MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        use_dp: bool = False,
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
@@ -173,6 +174,7 @@ class DeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                use_dp=enable_shared_experts_dp,
                 reduce_results=False,
             )
 
