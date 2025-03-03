@@ -631,6 +631,7 @@ class Scheduler:
                 lora_path=recv_req.lora_path,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=custom_logit_processor,
+                return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
@@ -683,6 +684,8 @@ class Scheduler:
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            req.origin_input_ids = [0]
+            req.sampling_params.max_new_tokens = 0
             self.waiting_queue.append(req)
             return
 
@@ -708,6 +711,7 @@ class Scheduler:
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
         ):
             assert self.grammar_backend is not None
             if req.sampling_params.json_schema is not None:
@@ -716,6 +720,8 @@ class Scheduler:
                 key = ("regex", req.sampling_params.regex)
             elif req.sampling_params.ebnf is not None:
                 key = ("ebnf", req.sampling_params.ebnf)
+            elif req.sampling_params.structural_tag:
+                key = ("structural_tag", req.sampling_params.structural_tag)
 
             req.grammar = self.grammar_backend.get_cached_value(key)
             if not req.grammar:
@@ -942,9 +948,11 @@ class Scheduler:
                 if self.running_batch is not None
                 else set([])
             )
-
+        return_hidden_states = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if req.return_hidden_states:
+                return_hidden_states = True
             if (
                 self.lora_paths
                 and len(
@@ -1030,6 +1038,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1221,7 +1230,7 @@ class Scheduler:
                             i, req, logprob_pt, next_token_ids, logits_output
                         )
                     if (
-                        req.sampling_params.return_hidden_states
+                        req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
@@ -1328,10 +1337,7 @@ class Scheduler:
                         logits_output.next_token_top_logprobs_idx[i]
                     )
 
-            if (
-                req.sampling_params.return_hidden_states
-                and logits_output.hidden_states is not None
-            ):
+            if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
 
             if req.grammar is not None:
@@ -1457,10 +1463,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            return_hidden_states = any(
-                req.sampling_params.return_hidden_states for req in reqs
-            )
-            output_hidden_states = [] if return_hidden_states else None
+            output_hidden_states = None
 
             if return_logprob:
                 input_token_logprobs_val = []
@@ -1527,7 +1530,9 @@ class Scheduler:
                         output_top_logprobs_val.append(req.output_top_logprobs_val)
                         output_top_logprobs_idx.append(req.output_top_logprobs_idx)
 
-                    if req.sampling_params.return_hidden_states:
+                    if req.return_hidden_states:
+                        if output_hidden_states is None:
+                            output_hidden_states = []
                         output_hidden_states.append(req.hidden_states)
 
             # Send to detokenizer
@@ -1755,8 +1760,9 @@ class Scheduler:
         success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flash_cache_success = self.flush_cache()
+                assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromTensorReqOutput(success, message)
