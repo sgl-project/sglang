@@ -1,9 +1,9 @@
 import logging
+import os
 import time
 from typing import List, Optional, Union
 
 import torch
-import os
 from huggingface_hub import snapshot_download
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -51,8 +51,13 @@ class EAGLEWorker(TpModelWorker):
             if os.path.exists(server_args.speculative_token_map):
                 self.hot_token_id = torch.load(server_args.speculative_token_map)
             else:
-                cache_dir = snapshot_download(os.path.dirname(server_args.speculative_token_map), ignore_patterns=["*.bin", "*.safetensors"])
-                file_path = os.path.join(cache_dir, os.path.basename(server_args.speculative_token_map))
+                cache_dir = snapshot_download(
+                    os.path.dirname(server_args.speculative_token_map),
+                    ignore_patterns=["*.bin", "*.safetensors"],
+                )
+                file_path = os.path.join(
+                    cache_dir, os.path.basename(server_args.speculative_token_map)
+                )
                 self.hot_token_id = torch.load(file_path)
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
@@ -89,6 +94,12 @@ class EAGLEWorker(TpModelWorker):
             else:
                 self.hot_token_id = None
             self.model_runner.model.set_embed_and_head(embed, head)
+        else:
+            if server_args.speculative_token_map is not None:
+                raise NotImplementedError(
+                    "NEXTN does not support speculative-token-map now"
+                )
+            self.hot_token_id = None
         self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
 
         # Create multi-step attn backends and cuda graph runners
