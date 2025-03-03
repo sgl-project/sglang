@@ -34,4 +34,5 @@ def execute_two_batch(inputs, fn, delta_stages: int):
         assert e.value is not None
         output_b = e.value
 
+    assert (output_a is not None) and (output_b is not None)
     return output_a, output_b
