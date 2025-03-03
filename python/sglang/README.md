@@ -8,8 +8,10 @@
 - `bench_one_batch.py`: Benchmark the latency of running a single static batch without a server.
 - `bench_one_batch_server.py`: Benchmark the latency of running a single batch with a server.
 - `bench_serving.py`: Benchmark online serving with dynamic requests.
-- `check_env.py`: Check the environment variables.
+- `check_env.py`: Check the environment variables and dependencies.
 - `global_config.py`: The global configs and constants.
 - `launch_server.py`: The entry point for launching the local server.
 - `llama3_eval.py`: Evaluation of Llama 3 using the Meta Llama dataset.
+- `profiler.py`: Profile a running server.
 - `utils.py`: Common utilities.
+- `version.py`: Version info.

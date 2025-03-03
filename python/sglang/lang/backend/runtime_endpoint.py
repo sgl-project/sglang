@@ -329,7 +329,12 @@ class RuntimeEndpoint(BaseBackend):
 
 def compute_normalized_prompt_logprobs(input_logprobs):
     values = [x[0] for x in input_logprobs if x[0]]
-    return sum(values) / len(values)
+    try:
+        return sum(values) / len(values)
+    except TypeError:
+        print(f"{input_logprobs=}", flush=True)
+        print(f"{input_logprobs[0]=}", flush=True)
+        exit(-1)
 
 
 class Runtime:

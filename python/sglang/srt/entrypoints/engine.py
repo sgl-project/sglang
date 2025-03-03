@@ -121,6 +121,7 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
@@ -142,6 +143,7 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
@@ -179,6 +181,7 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
@@ -195,6 +198,7 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
@@ -226,15 +230,22 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def start_profile(self):
-        self.tokenizer_manager.start_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
         self.tokenizer_manager.stop_profile()
 
     def get_server_info(self):
+        loop = asyncio.get_event_loop()
+        internal_states = loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
+
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
+            **internal_states,
             "version": __version__,
         }
 
@@ -323,6 +334,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -346,12 +358,23 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        if exitcode != 0:
+            logger.warning(
+                "Child process unexpectedly failed with an exit code %d. pid=%d",
+                exitcode,
+                pid,
+            )
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
+
     # Register the signal handler.
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
         logger.error(
-            "Received sigquit from a child proces. It usually means the child failed."
+            "Received sigquit from a child process. It usually means the child failed."
         )
         kill_process_tree(os.getpid())
 

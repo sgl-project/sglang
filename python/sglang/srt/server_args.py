@@ -15,15 +15,21 @@
 
 import argparse
 import dataclasses
+import json
 import logging
+import os
 import random
+import subprocess
 import tempfile
+import uuid
+from pathlib import Path
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
+    create_checksum,
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -43,12 +49,13 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    skip_tokenizer_init: bool = False
     load_format: str = "auto"
-    trust_remote_code: bool = True
+    trust_remote_code: bool = False
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
-    quantization_param_path: nullable_str = None
     quantization: Optional[str] = None
+    quantization_param_path: nullable_str = None
     context_length: Optional[int] = None
     device: str = "cuda"
     served_model_name: Optional[str] = None
@@ -67,7 +74,7 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
-    schedule_policy: str = "lpm"
+    schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     prefill_only_one_req: bool = False
@@ -88,6 +95,7 @@ class ServerArgs:
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
+    log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
@@ -123,11 +131,13 @@ class ServerArgs:
     grammar_backend: Optional[str] = "outlines"
 
     # Speculative decoding
-    speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
     speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 8
-    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 4
+    speculative_num_draft_tokens: int = 8
+    speculative_accept_threshold_single: float = 1.0
+    speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
 
     # Double Sparsity
@@ -169,6 +179,12 @@ class ServerArgs:
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
     flashinfer_mla_disable_ragged: bool = False
+    warmups: Optional[str] = None
+
+    # Debug tensor dumps
+    debug_tensor_dump_output_folder: Optional[str] = None
+    debug_tensor_dump_input_file: Optional[str] = None
+    debug_tensor_dump_inject: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -266,10 +282,10 @@ class ServerArgs:
             self.speculative_algorithm == "EAGLE"
             or self.speculative_algorithm == "NEXTN"
         ):
+            self.disable_overlap_schedule = True
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             self.disable_radix_cache = True
-            self.disable_overlap_schedule = True
             self.chunked_prefill_size = -1
             logger.info(
                 f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
@@ -378,15 +394,6 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
         )
         parser.add_argument(
-            "--quantization-param-path",
-            type=nullable_str,
-            default=None,
-            help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
-        )
-        parser.add_argument(
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
@@ -403,6 +410,15 @@ class ServerArgs:
                 "w8a8_int8",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--context-length",
@@ -578,7 +594,14 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests",
             action="store_true",
-            help="Log the inputs and outputs of all requests.",
+            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=0,
+            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
+            choices=[0, 1, 2],
         )
         parser.add_argument(
             "--show-time-cost",
@@ -742,15 +765,27 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of token sampled from draft model in eagle2 each step.",
+            help="The number of tokens sampled from the draft model in eagle2 each step.",
             choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
             "--speculative-num-draft-tokens",
             type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
+            help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-single",
+            type=float,
+            help="Accept a draft token if its probability in the target model is greater than this threshold.",
+            default=ServerArgs.speculative_accept_threshold_single,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-acc",
+            type=float,
+            help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
+            default=ServerArgs.speculative_accept_threshold_acc,
         )
         parser.add_argument(
             "--speculative-token-map",
@@ -947,6 +982,35 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+
+        # Server warmups
+        parser.add_argument(
+            "--warmups",
+            type=str,
+            required=False,
+            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
+            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+
+        # Debug tensor dumps
+        parser.add_argument(
+            "--debug-tensor-dump-output-folder",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_output_folder,
+            help="The output folder for dumping tensors.",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-input-file",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_input_file,
+            help="The input filename for dumping tensors",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-inject",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_inject,
+            help="Inject the outputs from jax as the input of every layer.",
         )
 
     @classmethod
