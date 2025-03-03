@@ -212,12 +212,6 @@ class DeepseekV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if self.n_shared_experts is not None:
-            if self.enable_shared_experts_dp:
-                shared_output = self.shared_experts(hidden_states_local)
-            else:
-                shared_output = self.shared_experts(hidden_states)
-
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
@@ -232,6 +226,13 @@ class DeepseekV2MoE(nn.Module):
             # TODO HACK do not use fast all_reduce b/c want async_op=True; but will use DeepEP
             # final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
             all_reduce_handle = torch.distributed.all_reduce(final_hidden_states, group=get_tp_group().device_group, async_op=True)
+
+        if forward_batch.forward_mode.is_extend():
+            if self.n_shared_experts is not None:
+                if self.enable_shared_experts_dp:
+                    shared_output = self.shared_experts(hidden_states_local)
+                else:
+                    shared_output = self.shared_experts(hidden_states)
 
         if self.tp_size > 1:
             all_reduce_handle.wait()
