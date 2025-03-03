@@ -423,7 +423,7 @@ def process_result(que, output):
             else:
                 timestamp = time.perf_counter()
                 latency = timestamp - st
-                response = result.as_numpy("answer").item().decode("utf-8")
+                response = result.as_numpy("response").item().decode("utf-8")
                 try:
                     response_dict = json.loads(response)
                     output.generated_text = response_dict["choices"][0]["message"][
@@ -494,7 +494,7 @@ def request_sglang_generate_grpc(
                     "max_tokens",
                     np.array([request_func_input.output_len], dtype=np.int32),
                 ),
-                prepare_tensor("temperature", np.array([0.0], dtype=np.float32)),
+                prepare_tensor("temperature", np.array([0.0], dtype=np.float_)),
                 prepare_tensor(
                     "ignore_eos",
                     np.array([not args.disable_ignore_eos], dtype=np.bool_),

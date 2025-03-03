@@ -267,17 +267,10 @@ class TritonPythonModel:
 
     def execute(self, requests):
         for request in requests:
-            future = asyncio.run_coroutine_threadsafe(
+            asyncio.run_coroutine_threadsafe(
                 self._process_request(self.request_id, request), self.event_loop
             )
-            try:
-                future.result(timeout=30)
-            except Exception as e:
-                print("Task timeout")
-                self.logger.log_error(f"Request {self.request_id} failed: {str(e)}")
-                future.cancel()
-            finally:
-                self.request_id += 1
+            self.request_id += 1
         return None
 
     def finalize(self):
