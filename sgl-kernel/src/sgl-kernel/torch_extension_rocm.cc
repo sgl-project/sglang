@@ -19,7 +19,9 @@ limitations under the License.
 #include "sgl_kernels_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
-  // Custom all-reduce kernels
+  /*
+   * From csrc/allreduce
+   */
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -45,12 +47,16 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
 
   m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   m.def("register_graph_buffers", &register_graph_buffers);
+
   m.def("allocate_meta_buffer", &allocate_meta_buffer);
   m.impl("allocate_meta_buffer", torch::kCUDA, &allocate_meta_buffer);
+
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
-  // moe_align_block_size
+  /*
+   * From csrc/moe
+   */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
