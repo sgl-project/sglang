@@ -128,11 +128,12 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                config.hot_vocab_size if hasattr(config, "hot_vocab_size") else config.vocab_size, 
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+
         self.logits_processor = LogitsProcessor(config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
