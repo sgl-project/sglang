@@ -64,7 +64,7 @@ class LogitsProcessorOutput:
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
-    input_token_logprobs: torch.Tensor = None
+    input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: List = None
     input_top_logprobs_idx: List = None

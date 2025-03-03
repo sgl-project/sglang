@@ -358,7 +358,6 @@ class Scheduler:
         self.cum_spec_accept_count = 0
         self.last_decode_stats_tic = time.time()
         self.return_health_check_ct = 0
-        self.stream_interval = server_args.stream_interval
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
@@ -443,11 +442,6 @@ class Scheduler:
                     # TODO: Add lora name/path in the future,
                 },
             )
-
-        # The largest prefill length of a single request
-        self._largest_prefill_len: int = 0
-        # The largest context length (prefill + generation) of a single request
-        self._largest_prefill_decode_len: int = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -2308,8 +2302,6 @@ def run_scheduler_process(
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
-
-    parent_process = psutil.Process().parent()
 
     # Create a scheduler and run the event loop
     try:
