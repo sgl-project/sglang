@@ -1088,15 +1088,6 @@ class TokenizerManager:
                 state.finished_time - state.created_time,
             )
 
-        if state.prefill_metrics is not None:
-            self.metrics_collector.observe_disaggregation_prefill_metrics(
-                state.prefill_metrics
-            )
-        if state.decode_metrics is not None:
-            self.metrics_collector.observe_disaggregation_decode_metrics(
-                state.decode_metrics
-            )
-
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.created_time, time.time())
