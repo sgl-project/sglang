@@ -47,7 +47,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -75,7 +75,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        assert "man" in text or "person" in text, text
+        assert "cab" in text or "taxi" in text or "SUV" in text, text
+        assert "iron" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -169,7 +171,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        print(text)
+        print(f"LLM response: {text}")
         assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
@@ -433,7 +435,7 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         with self.assertRaises(openai.BadRequestError) as cm:
@@ -504,6 +506,30 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+
+class TestJanusProServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/Janus-Pro-7B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "janus-pro",
+                "--mem-fraction-static",
+                "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
 
 
 if __name__ == "__main__":

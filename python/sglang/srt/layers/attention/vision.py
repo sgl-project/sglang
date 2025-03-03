@@ -74,8 +74,8 @@ class VisionAttention(nn.Module):
         use_context_forward (bool, default to True):
             if ``True``, a flash_attn style attention will be applied
             Otherwise, a full-sequence attention will be applied.
-        use_full_precision_softmax (bool, default to False):
-            if ``True``, the softmax will be performed in full-precision
+        softmax_in_single_precision (bool, default to False):
+            if ``True``, the softmax will be performed in single-precision
             Otherwise, it will be performed in half-precision
 
     """
@@ -89,7 +89,7 @@ class VisionAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
         use_context_forward: bool = True,
-        use_full_precision_softmax: bool = False,
+        softmax_in_single_precision: bool = False,
         flatten_batch: bool = False,
         prefix: str = "",
     ):
@@ -112,7 +112,7 @@ class VisionAttention(nn.Module):
                 head_size=self.head_size,
                 dropout=dropout,
                 flatten_batch=flatten_batch,
-                use_full_precision_softmax=use_full_precision_softmax,
+                softmax_in_single_precision=softmax_in_single_precision,
             )
 
         self.use_qkv_parallel = use_qkv_parallel
@@ -229,12 +229,12 @@ class VisionSdpaAttention(nn.Module):
         head_size: int,
         dropout: float = 0.0,
         flatten_batch: bool = False,
-        use_full_precision_softmax: bool = False,
+        softmax_in_single_precision: bool = False,
     ):
         super().__init__()
         self.head_size = head_size
         self.flatten_batch = flatten_batch
-        self.use_full_precision_softmax = use_full_precision_softmax
+        self.softmax_in_single_precision = softmax_in_single_precision
         self.dropout = dropout
 
     @staticmethod
@@ -318,14 +318,14 @@ class VisionSdpaAttention(nn.Module):
             )
 
         if attention_mask is None:
-            if self.use_full_precision_softmax:
+            if self.softmax_in_single_precision:
                 raise RuntimeError("Empty attention mask")
         else:
             attention_mask = attention_mask.to(device=q.device)
 
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
 
-        if self.use_full_precision_softmax:
+        if self.softmax_in_single_precision:
             scale = self.head_size**-0.5
             k_transposed = rearrange(k, "b h s d -> b h d s")
             attn_weights = torch.matmul(q, k_transposed) * scale
