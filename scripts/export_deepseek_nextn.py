@@ -62,6 +62,8 @@ def export_nextn_layer_parameters(input_dir, output_dir, nextn_layer_id):
                     continue
 
                 for key in matching_keys:
+                    if "embed_tokens" in key or "shared_head.head" in key:
+                        continue
                     new_key = key.replace(prefix, "model.layers.0")
                     params[new_key] = f.get_tensor(key)
 
