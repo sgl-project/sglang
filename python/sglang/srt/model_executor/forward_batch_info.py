@@ -284,7 +284,9 @@ class ForwardBatch:
             ):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
                 )
             else:
                 positions, ret.extend_start_loc = compute_position_torch(

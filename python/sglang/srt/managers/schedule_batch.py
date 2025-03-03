@@ -282,6 +282,8 @@ class Req:
         # If we want to abort the request in the middle of the event loop, set this to true
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_abort = False
+        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
+        self.to_abort_message: str = "Unknown error"
         self.stream = stream
         self.eos_token_ids = eos_token_ids
 
@@ -359,8 +361,6 @@ class Req:
         # The tokens is prefilled but need to be considered as decode tokens
         # and should be updated for the decode logprobs
         self.last_update_decode_tokens = 0
-        # The relative logprob_start_len in an extend batch
-        self.extend_logprob_start_len = 0
 
         # Embedding (return values)
         self.embedding = None
@@ -376,9 +376,6 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
         self.lora_path = lora_path
-
-        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = "Unknown error"
 
     @property
     def seqlen(self):
