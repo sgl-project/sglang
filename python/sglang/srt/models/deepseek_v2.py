@@ -83,16 +83,20 @@ class DeepseekV2MLP(nn.Module):
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-        )
+        if use_dp:
+            TODO
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+            )
+
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
