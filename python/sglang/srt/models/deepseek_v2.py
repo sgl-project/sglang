@@ -85,7 +85,7 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         if use_dp:
             self.gate_up_proj = ReplicatedLinear(
-                hidden_size, intermediate_size, bias=False, quant_config=quant_config
+                hidden_size, TODO, bias=False, quant_config=quant_config
             )
             self.down_proj = ReplicatedLinear(
                 intermediate_size,
