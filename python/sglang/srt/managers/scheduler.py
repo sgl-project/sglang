@@ -1591,6 +1591,10 @@ class Scheduler:
         num_ready_reqs = 0
         for req in self.grammar_queue:
             try:
+                if self.tp_size > 1 and not hasattr(req.grammar, 'result'):
+                    # this request finished on this TP_rank, but not on others
+                    # the futures object has been resolved and no longer has a 'results' method
+                    continue
                 req.grammar = req.grammar.result(timeout=0.05)
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
