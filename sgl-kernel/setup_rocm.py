@@ -44,6 +44,7 @@ include_dirs = [
 sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/custom_all_reduce.hip",
 ]
 
 cxx_flags = ["-O3"]
