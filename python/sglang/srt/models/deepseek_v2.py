@@ -961,7 +961,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Generator[None, None, torch.Tensor]:
+    ) -> Generator[None, None, Tuple[torch.Tensor, torch.Tensor]]:
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
