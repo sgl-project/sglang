@@ -115,17 +115,17 @@ def fp8_gemm_group_triton_kernel(
 ):
     """Kernel for computing the matmul C = A x B with FP8 inputs and scaling factors.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+
+    Note: Block sizes must be multiples of 32 for optimal TMA performance.
     """
     # Map program ids to the block of C it should compute
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_group = tl.program_id(axis=0)  # Group ID
+    pid_n = tl.program_id(axis=1)  # N dimension ID
+
+    # Compute the M block ID within this group
+    group_size_m = min(M - pid_group * GROUP_SIZE_M, GROUP_SIZE_M)
+    pid_m_within_group = tl.program_id(axis=2) % group_size_m
+    pid_m = pid_group * GROUP_SIZE_M + pid_m_within_group
 
     # Create pointers for the first blocks of A and B
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -218,13 +218,18 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
     a_scale = a_scale.contiguous()
     b_scale = b_scale.contiguous()
 
-    # 1D launch kernel
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    # Configure block sizes - must be multiples of 32 for TMA alignment
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
 
-    # Calculate K blocks (128 elements per block)
-    K_blocks = triton.cdiv(K, 128)
+    # Calculate grid dimensions
+    num_pid_m = triton.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = triton.cdiv(N, BLOCK_SIZE_N)
+    num_groups_grid = triton.cdiv(num_pid_m, num_groups)
+
+    # 3D grid launch - (group, n_blocks, m_blocks_per_group)
+    grid = (num_groups_grid, num_pid_n, min(num_groups, num_pid_m))
 
     fp8_gemm_group_triton_kernel[grid](
         a,
@@ -245,9 +250,9 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
         1,  # Stride in the K dimension may be 1
         b_scale.stride(0),
         1 if b_scale.dim() > 1 else 0,
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=128,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=num_groups,
     )
 
@@ -264,48 +269,18 @@ def fp8_gemm_group_deepgemm(x_fp8_grouped, y_fp8_grouped, out, m_indices):
     return out
 
 
-def get_weight_shapes(tp_size):
-    # cannot TP
-    total = [
-        (512 + 64, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (7168, 16384),
-        (7168, 18432),
-    ]
-    # N can TP
-    n_tp = [
-        (18432 * 2, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (24576, 1536),
-        (4096, 7168),
-    ]
-    # K can TP
-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
-
-    weight_shapes = []
-    for t in total:
-        weight_shapes.append(t)
-    for n_t in n_tp:
-        new_t = (n_t[0] // tp_size, n_t[1])
-        weight_shapes.append(new_t)
-    for k_t in k_tp:
-        new_t = (k_t[0], k_t[1] // tp_size)
-        weight_shapes.append(new_t)
-
-    return weight_shapes
-
-
 def create_benchmark_configs(tp_size):
+
+    # for num_groups, m, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168), (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
     configs = []
-    weight_shapes = get_weight_shapes(tp_size)
-    batch_sizes = [2048, 4096]
-    group_sizes = [4, 8]
-    for n, k in weight_shapes:
-        for m in batch_sizes:
-            for num_groups in group_sizes:
-                configs.append((m, n, k, num_groups, tp_size))
+    deep_gemm_configs = [
+        [8192, 7168, 4096, 4],
+        [8192, 2048, 7168, 4],
+        [4096, 7168, 4096, 8],
+        [4096, 2048, 7168, 8],
+    ]
+    for m, n, k, num_groups in deep_gemm_configs:
+        configs.append((m, n, k, num_groups, tp_size))
 
     return configs
 
@@ -429,13 +404,8 @@ def get_benchmark(tp_size):
         flops = 2 * m * n * k  # multiply-adds
         tflops = flops / (ms * 1e-3) / 1e12
 
-        # Print shape-specific results with TFLOPS
-        print(f"Time: {ms:.2f} ms, TFLOPS: {tflops:.2f}")
-        return (
-            ms,
-            max_ms,
-            min_ms,
-        )  # return in seconds for consistency with triton benchmark
+        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
+        return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark
 
