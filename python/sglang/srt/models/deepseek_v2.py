@@ -1081,6 +1081,7 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.enable_two_batch_overlap = global_server_args_dict["enable_two_batch_overlap"]
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1108,7 +1109,7 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        if global_server_args_dict["enable_two_batch_overlap"]:
+        if self.enable_two_batch_overlap:
             assert forward_batch.forward_mode in [ForwardMode.EXTEND, ForwardMode.DECODE]
 
         hidden_states, residual = execute_single_batch(
@@ -1124,6 +1125,7 @@ class DeepseekV2Model(nn.Module):
                 positions=positions, forward_batch=forward_batch,
             ),
             partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
+            enable_two_batch_overlap=self.enable_two_batch_overlap,
             delta_stages=2,
             split_inputs=self._split_inputs, merge_outputs=self._merge_outputs,
         )
