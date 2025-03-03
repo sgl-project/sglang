@@ -32,9 +32,9 @@ from sgl_kernel.ops.gemm import (
 from sgl_kernel.ops.moe import moe_align_block_size
 from sgl_kernel.ops.sampling import (
     min_p_sampling_from_probs,
-    top_k_renorm_probs,
+    top_k_renorm_prob,
     top_k_top_p_sampling_from_probs,
-    top_p_renorm_probs,
+    top_p_renorm_prob,
     top_p_sampling_from_probs,
 )
 from sgl_kernel.ops.speculative import (
