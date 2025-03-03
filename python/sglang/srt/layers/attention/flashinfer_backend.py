@@ -347,6 +347,7 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -1037,6 +1038,7 @@ class FlashInferMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
+                seq_lens_cpu=None,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
