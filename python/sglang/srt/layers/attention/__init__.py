@@ -29,8 +29,9 @@ class AttentionBackend(ABC):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        **kwargs,
+        spec_info: Optional[SpecInfo],
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -41,8 +42,9 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        **kwargs,
+        spec_info: Optional[SpecInfo],
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
