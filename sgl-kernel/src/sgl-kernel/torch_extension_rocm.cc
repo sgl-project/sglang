@@ -20,8 +20,8 @@ limitations under the License.
 
 TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   /*
-  * From csrc/allreduce
-  */
+   * From csrc/allreduce
+   */
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "

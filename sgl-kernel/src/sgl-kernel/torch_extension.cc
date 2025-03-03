@@ -44,8 +44,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   /*
-  * From csrc/allreduce
-  */
+   * From csrc/allreduce
+   */
   m.def(
       "init_custom_ar(int rank_id, int world_size, Tensor rank_data, int[] buffers, int[] tmp_result_buffers, int[] "
       "barrier_in, int[] barrier_out) -> int");

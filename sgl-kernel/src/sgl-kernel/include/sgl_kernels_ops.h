@@ -36,7 +36,6 @@ limitations under the License.
 
 using fptr_t = int64_t;
 
-
 /*
  * From csrc/activation
  */
@@ -48,7 +47,6 @@ void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-
 
 /*
  * From csrc/allreduce
@@ -80,7 +78,6 @@ void register_graph_buffers(fptr_t _fa, const std::vector<std::vector<int64_t>>&
                             const std::vector<std::vector<int64_t>>& offsets);
 #endif
 
-
 /*
  * From csrc/gemm
  */
@@ -99,14 +96,12 @@ void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::ve
                          const std::vector<torch::Tensor>& outputs, const torch::Dtype& out_dtype,
                          int64_t cublas_handle, int64_t cuda_stream);
 
-
 /*
  * From csrc/moe
  */
- void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
                           torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
                           torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer);
-
 
 /*
  * From csrc/speculative
@@ -127,7 +122,6 @@ void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Te
                        at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index, int64_t topk,
                        int64_t depth, int64_t draft_token_num);
 
-
 /*
  * From FlashInfer
  */
@@ -142,8 +136,8 @@ void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional
                         unsigned int top_k_val, int64_t cuda_stream);
 // patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 inline void top_k_renorm_probs_wrapper(at::Tensor probs, at::Tensor renorm_probs,
-                                       std::optional<at::Tensor> maybe_top_k_arr,
-                                       int64_t top_k_val, int64_t cuda_stream) {
+                                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                                       int64_t cuda_stream) {
   top_k_renorm_probs(probs, renorm_probs, maybe_top_k_arr, static_cast<unsigned int>(top_k_val), cuda_stream);
 }
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr,
@@ -158,7 +152,6 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                       at::Tensor cos_sin_cache, at::Tensor pos_ids, bool interleave,
                                       int64_t cuda_stream);
-
 
 /*
  * Other
