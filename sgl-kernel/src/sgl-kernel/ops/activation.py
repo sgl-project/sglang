@@ -1,5 +1,6 @@
 from typing import Optional
 
+import sgl_kernel.ops._kernels
 import torch
 from sgl_kernel.ops.utils import get_cuda_stream
 
