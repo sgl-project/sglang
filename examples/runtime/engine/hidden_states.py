@@ -26,10 +26,11 @@ def main():
         "temperature": 0.8,
         "top_p": 0.95,
         "max_new_tokens": 10,
-        "return_hidden_states": True,
     }
 
-    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    outputs = llm.generate(
+        prompts, sampling_params=sampling_params, return_hidden_states=True
+    )
     for prompt, output in zip(prompts, outputs):
         print("===============================")
         print(
