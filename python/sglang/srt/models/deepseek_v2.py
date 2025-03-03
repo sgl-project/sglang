@@ -18,7 +18,7 @@
 
 import os
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Generator
 
 import torch
 import torch.nn.functional as F
@@ -961,7 +961,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Generator[None, None, torch.Tensor]:
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -1062,7 +1062,7 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
     ):
         for i in range(layer_start, layer_end):
-            hidden_states, residual = self.layers[i](
+            hidden_states, residual = yield from self.layers[i].forward(
                 positions, hidden_states, forward_batch, residual
             )
         return hidden_states, residual
