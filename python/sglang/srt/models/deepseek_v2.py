@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -1031,15 +1032,17 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        hidden_states, residual = self._forward_layers(
-            layer_start=0, layer_end=self.first_k_dense_replace,
+        forward_layers = partial(
+            self._forward_layers,
             hidden_states=hidden_states, residual=residual,
             positions=positions, forward_batch=forward_batch,
         )
-        hidden_states, residual = self._forward_layers(
+
+        hidden_states, residual = forward_layers(
+            layer_start=0, layer_end=self.first_k_dense_replace,
+        )
+        hidden_states, residual = forward_layers(
             layer_start=self.first_k_dense_replace, layer_end=len(self.layers),
-            hidden_states=hidden_states, residual=residual,
-            positions=positions, forward_batch=forward_batch,
         )
 
         if not forward_batch.forward_mode.is_idle():
