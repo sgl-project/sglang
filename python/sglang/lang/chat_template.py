@@ -15,6 +15,7 @@ class ChatTemplate:
     role_prefix_and_suffix: Dict[str, Tuple[str, str]]
     stop_str: List[str] = ()
     image_token: str = "<image>"
+    audio_token: str = "<audio>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
     def get_prefix_and_suffix(
@@ -227,6 +228,22 @@ register_chat_template(
         },
         stop_str=("<|im_end|>", "<|endoftext|>"),
         image_token="(<image>./</image>)",
+    )
+)
+
+# https://huggingface.co/openbmb/MiniCPM-o-2_6
+register_chat_template(
+    ChatTemplate(
+        name="minicpmo",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", " "),
+            "user": ("user:", " "),
+            "assistant": ("assistant:", "</s>"),
+        },
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
+        audio_token="(<audio>./</audio>)",
     )
 )
 
@@ -446,12 +463,6 @@ def match_chat_ml(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_chat_minicpm(model_path: str):
-    if "minicpm" in model_path:
-        return get_chat_template("minicpmv")
-
-
-@register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
     if "yi-vl" in model_path and "llava" not in model_path:
@@ -470,8 +481,10 @@ def match_gemma_it(model_path: str):
 @register_chat_template_matching_function
 def match_openbmb_minicpm(model_path: str):
     model_path = model_path.lower()
-    if "minicpm" in model_path:
+    if "minicpm-v" in model_path:
         return get_chat_template("minicpmv")
+    elif "minicpm-o" in model_path:
+        return get_chat_template("minicpmo")
 
 
 @register_chat_template_matching_function

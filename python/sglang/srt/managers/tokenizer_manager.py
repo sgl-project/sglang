@@ -50,10 +50,6 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -92,6 +88,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+)
+from sglang.srt.managers.multimodal_processor import (
+    get_dummy_image_processor,
+    get_image_processor,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -383,7 +383,7 @@ class TokenizerManager:
 
         if self.is_generation:
             # TODO: also support getting embeddings for multimodal models
-            image_inputs: Dict = await self.image_processor.process_images_async(
+            image_inputs: Dict = await self.image_processor.process_data_async(
                 obj.image_data, input_text or input_ids, obj, self.max_req_input_len
             )
             if image_inputs and "input_ids" in image_inputs:
