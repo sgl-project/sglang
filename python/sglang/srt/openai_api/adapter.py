@@ -174,6 +174,12 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
+    # Check chat-template
+    # TODO:
+    # 1. Do not import any code from sglang.lang
+    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
+
+
 def load_completion_template_for_openai_api(tokenizer_manager, completion_template_arg):
     global completion_template_name
 
@@ -212,7 +218,6 @@ def load_completion_template_for_openai_api(tokenizer_manager, completion_templa
         completion_template_name = template["name"]
     else:
         completion_template_name = completion_template_arg
-
 
 
 async def v1_files_create(
