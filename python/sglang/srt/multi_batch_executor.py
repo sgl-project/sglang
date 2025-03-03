@@ -1,9 +1,11 @@
+import os
 from typing import Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+_ENABLE_PROFILE = bool(int(os.environ.get('SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE', '0')))
 
 def execute_single_batch(inputs, fn):
     generator = fn(**inputs)
