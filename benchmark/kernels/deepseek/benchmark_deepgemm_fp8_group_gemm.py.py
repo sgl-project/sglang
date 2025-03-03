@@ -178,13 +178,14 @@ def fp8_gemm_group_triton_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
+def fp8_gemm_group_triton(a_tuple, b_tuple, c, num_groups):
     """
     Perform matrix multiplication with FP8 inputs and proper scaling.
 
     Args:
         a_tuple: Tuple of (quantized_tensor, scale_factors) for input A
         b_tuple: Tuple of (quantized_tensor, scale_factors) for input B
+        c: Output tensor in BF16 format
         num_groups: Number of groups for grouped GEMM
 
     Returns:
@@ -194,24 +195,8 @@ def fp8_gemm_group_triton(a_tuple, b_tuple, num_groups):
     a, a_scale = a_tuple
     b, b_scale = b_tuple
 
-    # Check constraints
-    assert a.shape[1] == b.shape[1], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"
-
     M, K = a.shape
-    N, K_b = b.shape
-    assert K == K_b, f"Incompatible K dimensions: {K} vs {K_b}"
-
-    # Transpose b to match kernel expectations (K,N format)
-    b = b.T.contiguous()
-
-    # Allocate output in bfloat16 (not float16)
-    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
-
-    # Prepare scale factors
-    # Ensure scales are in the right format and contiguous
-    a_scale = a_scale.contiguous()
-    b_scale = b_scale.contiguous()
+    _, N = b.shape
 
     # Configure block sizes - must be multiples of 32 for TMA alignment
     BLOCK_SIZE_M = 128
@@ -264,22 +249,6 @@ def fp8_gemm_group_deepgemm(x_fp8_grouped, y_fp8_grouped, out, m_indices):
     return out
 
 
-def create_benchmark_configs(tp_size):
-
-    # for num_groups, m, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168), (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
-    configs = []
-    deep_gemm_configs = [
-        [8192, 7168, 4096, 4],
-        [8192, 2048, 7168, 4],
-        [4096, 7168, 4096, 8],
-        [4096, 2048, 7168, 8],
-    ]
-    for m, n, k, num_groups in deep_gemm_configs:
-        configs.append((m, n, k, num_groups, tp_size))
-
-    return configs
-
-
 def calculate_diff(m: int, n: int, k: int, num_groups: int):
     print(f"Shape (m={m}, n={n}, k={k}")
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -302,8 +271,16 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
     )
     torch.cuda.synchronize()
 
-    # Quantized x and y
-    out_triton = fp8_gemm_group_triton(x_fp8_flat, y_fp8_flat, num_groups)
+    # Prepare inputs for Triton
+    a, a_scale = x_fp8_flat
+    b, b_scale = y_fp8_flat
+    b = b.T.contiguous()
+    # Ensure scales are in the right format and contiguous
+    a_scale, b_scale = a_scale.contiguous(), b_scale.contiguous()
+    M, _ = a.shape
+    _, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    out_triton = fp8_gemm_group_triton((a, a_scale), (b, b_scale), c, num_groups)
     torch.cuda.synchronize()
 
     diff_torch_deepgemm = torch.abs(out_torch - out_deepgemm).mean().item()
@@ -337,6 +314,52 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
             f"  - Torch vs Triton: {'✅' if triton_torch_diff < DIFF_THRESHOLD else '❌'}"
             f"  - DeepGEMM vs Triton: {'✅' if deepgemm_triton_diff < DIFF_THRESHOLD else '❌'}"
         )
+
+
+def get_weight_shapes(tp_size):
+    # cannot TP
+    total = [
+        (512 + 64, 7168),
+        ((128 + 64) * 128, 7168),
+        (128 * (128 + 128), 512),
+        (7168, 16384),
+        (7168, 18432),
+    ]
+    # N can TP
+    n_tp = [
+        (18432 * 2, 7168),
+        ((128 + 64) * 128, 7168),
+        (128 * (128 + 128), 512),
+        (24576, 1536),
+        (4096, 7168),
+    ]
+    # K can TP
+    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
+
+    weight_shapes = []
+    for t in total:
+        weight_shapes.append(t)
+    for n_t in n_tp:
+        new_t = (n_t[0] // tp_size, n_t[1])
+        weight_shapes.append(new_t)
+    for k_t in k_tp:
+        new_t = (k_t[0], k_t[1] // tp_size)
+        weight_shapes.append(new_t)
+
+    return weight_shapes
+
+
+def create_benchmark_configs(tp_size):
+    configs = []
+    weight_shapes = get_weight_shapes(tp_size)
+    batch_sizes = [2048, 4096]
+    group_sizes = [4, 8]
+    for n, k in weight_shapes:
+        for m in batch_sizes:
+            for num_groups in group_sizes:
+                configs.append((m, n, k, num_groups, tp_size))
+
+    return configs
 
 
 def get_benchmark(tp_size):
@@ -386,10 +409,21 @@ def get_benchmark(tp_size):
                 quantiles=quantiles,
             )
         elif provider == "triton":
+            # Prepare inputs for Triton
+            # We did it outside of the lambda function to make it fair comparison like deepgemm
+            a, a_scale = x_fp8_flat
+            b, b_scale = y_fp8_flat
+            b = b.T.contiguous()
+            # Ensure scales are in the right format and contiguous
+            a_scale, b_scale = a_scale.contiguous(), b_scale.contiguous()
+            M, _ = a.shape
+            _, N = b.shape
+            c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: fp8_gemm_group_triton(
-                    x_fp8_flat,
-                    y_fp8_flat,
+                    (a, a_scale),
+                    (b, b_scale),
+                    c,
                     num_groups,
                 ),
                 quantiles=quantiles,
@@ -443,6 +477,7 @@ if __name__ == "__main__":
         calculate_diff(8192, 2048, 7168, 4)
         calculate_diff(4096, 7168, 4096, 8)
         calculate_diff(4096, 2048, 7168, 8)
+        calculate_diff(4096, 576, 7168, 8)
 
     # Get the benchmark function with the specified tp_size
     benchmark = get_benchmark(args.tp_size)
