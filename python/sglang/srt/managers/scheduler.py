@@ -150,7 +150,6 @@ class Scheduler:
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
-        self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -250,9 +249,6 @@ class Scheduler:
         if self.model_config.is_multimodal:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for multimodal models.")
-
-        if self.enable_overlap:
-            self.disable_jump_forward = True
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -1024,11 +1020,8 @@ class Scheduler:
                 if self.running_batch is not None
                 else set([])
             )
-        return_hidden_states = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if req.return_hidden_states:
-                return_hidden_states = True
             if (
                 self.lora_paths
                 and len(
@@ -1114,7 +1107,6 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
-            return_hidden_states,
         )
         new_batch.prepare_for_extend()
 
@@ -1167,14 +1159,6 @@ class Scheduler:
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
-
-        # Check for jump-forward
-        if not self.disable_jump_forward and batch.has_grammar:
-            jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
-            self._extend_requests_to_queue(jump_forward_reqs)
-            if batch.is_empty():
-                self.batch_is_full = False
-                return None
 
         if batch.batch_size() < initial_bs:
             self.batch_is_full = False
@@ -1530,8 +1514,6 @@ class Scheduler:
                 prefill (e.g., computing input token logprobs).
         """
         assert output.input_token_logprobs is not None
-        # It is for jump decoding that will be deprecated.
-        assert req.last_update_decode_tokens == 0
         if req.input_token_logprobs is None:
             req.input_token_logprobs = []
         if req.temp_input_top_logprobs_val is None:
@@ -1658,50 +1640,12 @@ class Scheduler:
         self.add_input_logprob_return_values(
             i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
         )
-        if req.last_update_decode_tokens != 0:
-            # Some decode tokens are re-computed in an extend batch
-            req.output_token_logprobs_val.extend(
-                output.input_token_logprobs[
-                    pt
-                    + num_input_logprobs
-                    - 1
-                    - req.last_update_decode_tokens : pt
-                    + num_input_logprobs
-                    - 1
-                ],
-            )
-            req.output_token_logprobs_idx.extend(
-                req.fill_ids[
-                    len(req.fill_ids)
-                    - req.last_update_decode_tokens : len(req.fill_ids)
-                ]
-            )
 
         if req.top_logprobs_num > 0:
-            if req.last_update_decode_tokens != 0:
-                req.output_top_logprobs_val.extend(
-                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
-                )
-                req.output_top_logprobs_idx.extend(
-                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
-                )
-
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
         if req.token_ids_logprob is not None:
-            if req.last_update_decode_tokens != 0:
-                req.output_token_ids_logprobs_val.extend(
-                    output.input_token_ids_logprobs_val[i][
-                        -req.last_update_decode_tokens :
-                    ]
-                )
-                req.output_token_ids_logprobs_idx.extend(
-                    output.input_token_ids_logprobs_idx[i][
-                        -req.last_update_decode_tokens :
-                    ]
-                )
-
             req.output_token_ids_logprobs_val.append(
                 output.next_token_token_ids_logprobs_val[i]
             )
@@ -1719,7 +1663,6 @@ class Scheduler:
         finished_reasons: List[BaseFinishReason] = []
 
         if self.is_generation:
-            vids = []
             decoded_texts = []
             decode_ids_list = []
             read_offsets = []
@@ -1786,7 +1729,6 @@ class Scheduler:
                     finished_reasons.append(
                         req.finished_reason.to_json() if req.finished_reason else None
                     )
-                    vids.append(req.vid)
                     decoded_texts.append(req.decoded_text)
                     decode_ids, read_offset = req.init_incremental_detokenize()
                     decode_ids_list.append(decode_ids)
@@ -1842,7 +1784,6 @@ class Scheduler:
                     BatchTokenIDOut(
                         rids,
                         finished_reasons,
-                        vids,
                         decoded_texts,
                         decode_ids_list,
                         read_offsets,

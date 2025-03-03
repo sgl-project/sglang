@@ -17,7 +17,7 @@ def main():
     llm = sgl.Engine(
         model_path="meta-llama/Llama-2-7b-chat-hf",
         speculative_algorithm="EAGLE",
-        speculative_draft_model_path="lmzheng/sglang-EAGLE-llama2-chat-7B",
+        speculative_draft_model_path="lmsys/sglang-EAGLE-llama2-chat-7B",
         speculative_num_steps=3,
         speculative_eagle_topk=4,
         speculative_num_draft_tokens=16,
