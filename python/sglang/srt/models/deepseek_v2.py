@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -64,6 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.multi_batch_executor import execute_single_batch, execute_two_batch
 from sglang.srt.utils import is_cuda_available, is_hip
 
 is_hip_ = is_hip()
@@ -1031,15 +1033,20 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        hidden_states, residual = self._forward_layers(
-            layer_start=0, layer_end=self.first_k_dense_replace,
-            hidden_states=hidden_states, residual=residual,
-            positions=positions, forward_batch=forward_batch,
+        hidden_states, residual = execute_single_batch(
+            dict(
+                hidden_states=hidden_states, residual=residual,
+                positions=positions, forward_batch=forward_batch,
+            ),
+            partial(self._forward_layers, layer_start=0, layer_end=self.first_k_dense_replace),
         )
-        hidden_states, residual = self._forward_layers(
-            layer_start=self.first_k_dense_replace, layer_end=len(self.layers),
-            hidden_states=hidden_states, residual=residual,
-            positions=positions, forward_batch=forward_batch,
+        hidden_states, residual = execute_two_batch(
+            dict(
+                hidden_states=hidden_states, residual=residual,
+                positions=positions, forward_batch=forward_batch,
+            ),
+            partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
+            delta_stages=TODO,
         )
 
         if not forward_batch.forward_mode.is_idle():
