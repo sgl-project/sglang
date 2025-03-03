@@ -114,7 +114,6 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
