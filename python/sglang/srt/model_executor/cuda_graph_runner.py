@@ -200,6 +200,9 @@ class CudaGraphRunner:
         )
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -448,6 +451,10 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.decode_seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(1)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.decode_seq_lens_cpu)
 
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
@@ -466,6 +473,7 @@ class CudaGraphRunner:
             self.encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            seq_lens_cpu=self.seq_lens_cpu,
         )
 
         # Replay
