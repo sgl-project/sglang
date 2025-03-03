@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -25,7 +27,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    BlockQuantScaleParameter,
+    apply_w8a8_block_fp8_linear,
+    normalize_e4m3fn_to_e4m3fnuz,
+)
 from sglang.srt.utils import is_hip, set_weight_attrs
+
+is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +127,8 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        num_shared_experts: Optional[int] = 0,
+        routed_scaling_factor: Optional[float] = 1.0,
     ):
         super().__init__()
 
@@ -130,6 +141,7 @@ class EPMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
@@ -166,6 +178,18 @@ class EPMoE(torch.nn.Module):
             )
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+            self.routed_scaling_factor = routed_scaling_factor
+
+            self.expert_mask = torch.zeros(
+                (self.num_experts + self.num_shared_experts + 1),
+                device="cuda",
+                dtype=torch.int,
+            )
+            self.expert_mask[self.start_expert_id : self.end_expert_id + 1] = 1
+            self.expert_mask[self.num_experts : -1] = 1
+
+            self.num_experts_per_partition += self.num_shared_experts
 
         self.quant_method.create_weights(
             layer=self,
@@ -181,6 +205,21 @@ class EPMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+            # Matrix multiply.
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+            )
+            return final_hidden_states
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
@@ -347,6 +386,7 @@ class EPMoE(torch.nn.Module):
         ckpt_down_proj_name: str,
         ckpt_up_proj_name: str,
         num_experts: int,
+        num_shared_experts: Optional[int] = 0,
     ) -> List[Tuple[str, str, int, str]]:
         return [
             # (param_name, weight_name, expert_id, shard_id)
@@ -366,6 +406,27 @@ class EPMoE(torch.nn.Module):
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
             ]
+        ] + [
+            (
+                (
+                    "experts.w13_"
+                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
+                    else "experts.w2_"
+                ),
+                (
+                    f"shared_experts.{expert_id}.{weight_name}."
+                    if num_shared_experts >= 2
+                    else f"shared_experts.{weight_name}."
+                ),
+                -num_shared_experts + expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_shared_experts)
+            for shard_id, weight_name in [
+                ("w1", ckpt_gate_proj_name),
+                ("w2", ckpt_down_proj_name),
+                ("w3", ckpt_up_proj_name),
+            ]
         ]
 
     def weight_loader(
@@ -376,9 +437,13 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        if expert_id >= 0 and (
+            expert_id < self.start_expert_id or expert_id > self.end_expert_id
+        ):
             return
-        expert_id = expert_id - self.start_expert_id
+        # expert_id < 0 means shared expert
+        if expert_id >= 0:
+            expert_id = expert_id - self.start_expert_id
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
@@ -730,6 +795,41 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     torch.max(layer.w13_weight_scale, dim=1).values,
                     requires_grad=False,
                 )
+        if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip_:
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
+                if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+                    import aiter
+                    from aiter.ops.shuffle import shuffle_weight
+
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
             return
 
     def apply(
@@ -744,4 +844,49 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        if is_hip_ and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1":
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=layer.correction_bias,
+            )
+
+            # TODO these can be removed when "select_experts" is inplaced op
+            token = x.shape[0]
+            layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
+            layer.ns_topk_ids[:token] = topk_ids
+            topk_ids = layer.total_topk_ids[:token]
+            topk_weights = layer.total_topk_weights[:token]
+
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=layer.activation,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+                expert_mask=layer.expert_mask,
+            )
+        else:
+            raise NotImplementedErrors
