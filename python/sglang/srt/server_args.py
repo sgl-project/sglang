@@ -15,21 +15,15 @@
 
 import argparse
 import dataclasses
-import json
 import logging
-import os
 import random
-import subprocess
 import tempfile
-import uuid
-from pathlib import Path
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils import (
-    create_checksum,
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
@@ -62,7 +56,6 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
-    skip_tokenizer_init: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -102,7 +95,7 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "sglang_storage"
+    file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
@@ -150,7 +143,6 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
@@ -563,7 +555,7 @@ class ServerArgs:
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
-            help="Model download directory.",
+            help="Model download directory for huggingface.",
         )
         parser.add_argument(
             "--base-gpu-id",
@@ -628,9 +620,9 @@ class ServerArgs:
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
-            "--file-storage-pth",
+            "--file-storage-path",
             type=str,
-            default=ServerArgs.file_storage_pth,
+            default=ServerArgs.file_storage_path,
             help="The path of the file storage in backend.",
         )
         parser.add_argument(
@@ -836,11 +828,6 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
-        )
-        parser.add_argument(
-            "--disable-jump-forward",
-            action="store_true",
-            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )

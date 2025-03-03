@@ -158,7 +158,7 @@ class GenerateReqInput:
                 # Expand parallel_sample_num
                 num = self.batch_size * self.parallel_sample_num
 
-            if self.image_data is None:
+            if not self.image_data:
                 self.image_data = [None] * num
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
@@ -376,8 +376,6 @@ class BatchTokenIDOut:
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
-    # The version id to sync decode status with in detokenizer_manager
-    vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
