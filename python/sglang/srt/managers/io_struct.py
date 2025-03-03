@@ -679,6 +679,12 @@ class ParseFunctionCallReq:
 
 
 @dataclass
+class SeparateReasoningReqInput:
+    text: str  # The text to parse.
+    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+
+
+@dataclass
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None

@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SeparateReasoningReqInput,
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -75,6 +76,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
@@ -455,6 +457,26 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
         "calls": [
             call.model_dump() for call in calls
         ],  # Convert pydantic objects to dictionaries
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/separate_reasoning")
+async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+    """
+    A native API endpoint to separate reasoning from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = ReasoningParser(model_type=obj.reasoning_parser)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    response_data = {
+        "reasoning_text": reasoning_text,
+        "text": normal_text,
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
