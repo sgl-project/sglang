@@ -8,6 +8,9 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
     BaseTokenToKVPool,
+    MHATokenToKVPool,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPool,
     MLATokenToKVPoolHost,
     ReqToTokenPool,
 )
@@ -23,7 +26,13 @@ class HiRadixCache(RadixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: BaseTokenToKVPool,
     ):
-        self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        if isinstance(token_to_kv_pool, MHATokenToKVPool):
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(token_to_kv_pool)
+        elif isinstance(token_to_kv_pool, MLATokenToKVPool):
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        else:
+            raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")
+
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host
         )
