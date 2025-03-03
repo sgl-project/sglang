@@ -65,7 +65,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   /*
    * From csrc/attention
    */
-   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
+  m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
   /*
    * From csrc/gemm
