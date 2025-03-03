@@ -86,7 +86,7 @@ class DeepseekV2MLP(nn.Module):
         if use_dp:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config,
-                # TODO is this ok?
+                # TODO is this ok? (or shall we use ReplicatedLinear, etc)
                 tp_rank=0, tp_size=1,
             )
             self.down_proj = ReplicatedLinear(
