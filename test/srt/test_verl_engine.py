@@ -168,9 +168,9 @@ def _run_subprocess(
         hf_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
 
         hf_outputs = HFRunner.forward_generation_raw(
+            base_model=hf_model,
             prompts=_PROMPTS,
             max_new_tokens=_MAX_NEW_TOKENS,
-            base_model=hf_model,
             tokenizer=hf_tokenizer,
             lora_paths=None,
             torch_dtype=_TORCH_DTYPE,
