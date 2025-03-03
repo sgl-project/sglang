@@ -167,7 +167,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import aiter
             from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."

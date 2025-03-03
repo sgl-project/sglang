@@ -1,4 +1,3 @@
-import itertools
 import math
 
 import torch

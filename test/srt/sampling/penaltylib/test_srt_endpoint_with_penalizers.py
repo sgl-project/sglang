@@ -1,4 +1,3 @@
-import json
 import unittest
 from multiprocessing import Process
 

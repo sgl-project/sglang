@@ -14,11 +14,9 @@
 # ==============================================================================
 
 import multiprocessing
-import os
 import sys
 from pathlib import Path
 
-import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 

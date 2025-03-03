@@ -45,7 +45,7 @@ try:
     if ops.use_vllm_custom_allreduce and not is_hip():
         ops.meta_size()
     else:
-        import sgl_kernel
+        pass
     custom_ar = True
 except Exception:
     # For CPUs

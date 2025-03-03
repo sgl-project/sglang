@@ -8,7 +8,7 @@ if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
         "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
         mode=ctypes.RTLD_GLOBAL,
     )
-from .version import __version__
+from .version import __version__  # noqa: F401
 
 if torch.version.hip is not None:
     from sgl_kernel.ops import (

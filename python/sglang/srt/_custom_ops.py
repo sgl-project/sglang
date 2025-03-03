@@ -1,10 +1,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
-import contextlib
 import functools
-import importlib
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import List, Tuple
 
 import torch
 import torch.library
@@ -17,7 +15,7 @@ if not is_hpu():
     # Remove vllm dependency for custom allreduce on ROCm
     if use_vllm_custom_allreduce and not is_hip():
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError as e:
             logger.warning("Failed to import from vllm._C with %r", e)
     else:

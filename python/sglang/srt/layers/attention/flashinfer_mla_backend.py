@@ -34,7 +34,8 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-    from flashinfer.cascade import merge_state
+
+from flashinfer.cascade import merge_state
 
 
 @dataclass

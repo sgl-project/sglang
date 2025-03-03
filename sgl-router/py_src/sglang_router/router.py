@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List
 
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router

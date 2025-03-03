@@ -15,42 +15,28 @@
 import argparse
 import asyncio
 import json
-import os
 import random
 import resource
 import sys
 import time
 import traceback
-import warnings
 from argparse import ArgumentParser
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
-import requests
 from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
+from transformers import PreTrainedTokenizerBase
 
 from sglang.bench_serving import (
     AIOHTTP_TIMEOUT,
-    SHAREGPT_URL,
-    BenchmarkMetrics,
     RequestFuncInput,
     RequestFuncOutput,
     calculate_metrics,
-    check_chat_template,
-    get_model,
     get_request,
     get_tokenizer,
-    parse_request_rate_range,
     remove_prefix,
     sample_random_requests,
 )
