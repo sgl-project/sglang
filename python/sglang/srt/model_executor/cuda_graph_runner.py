@@ -113,7 +113,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33))
+                capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
             else:
                 capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
         else:
