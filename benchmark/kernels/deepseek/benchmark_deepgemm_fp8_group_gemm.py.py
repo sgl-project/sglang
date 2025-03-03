@@ -484,4 +484,3 @@ if __name__ == "__main__":
 
     print(f"Running performance benchmark for TP size = {args.tp_size}...")
     benchmark.run(print_data=True, save_path=args.save_path)
-xl
