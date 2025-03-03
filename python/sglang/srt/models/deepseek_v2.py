@@ -680,6 +680,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input[..., self.kv_lora_rank :] = q_pe
         k_input[..., self.kv_lora_rank :] = k_pe
 
+        # End of decode stage "ATTN-0"
+        if TODO:
+            yield
+
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
