@@ -681,7 +681,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., self.kv_lora_rank :] = k_pe
 
         # End of decode stage "ATTN-0"
-        if TODO:
+        if forward_batch.forward_mode.is_decode():
             yield
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
