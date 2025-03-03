@@ -65,7 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.multi_batch_executor import execute_single_batch, execute_two_batch
+from sglang.srt.multi_batch_executor import execute_single_batch, execute_two_batch, execute_maybe_two_batch
 from sglang.srt.utils import is_cuda_available, is_hip
 
 is_hip_ = is_hip()
@@ -1118,14 +1118,15 @@ class DeepseekV2Model(nn.Module):
             ),
             partial(self._forward_layers, layer_start=0, layer_end=self.first_k_dense_replace),
         )
-        hidden_states, residual = self._merge_outputs(*execute_two_batch(
-            *self._split_inputs(
+        hidden_states, residual = execute_maybe_two_batch(
+            dict(
                 hidden_states=hidden_states, residual=residual,
                 positions=positions, forward_batch=forward_batch,
             ),
             partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
             delta_stages=2,
-        ))
+            split_inputs=self._split_inputs, merge_outputs=self._merge_outputs,
+        )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)

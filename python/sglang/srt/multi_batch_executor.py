@@ -8,6 +8,17 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _ENABLE_PROFILE = bool(int(os.environ.get('SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE', '0')))
 
+def execute_maybe_two_batch(
+        inputs, fn, delta_stages: int, enable_two_batch: bool,
+        split_inputs, merge_outputs,
+):
+    if enable_two_batch:
+        inputs_a, inputs_b = split_inputs(**inputs)
+        output_a, output_b = execute_two_batch(inputs_a, inputs_b, fn, delta_stages=delta_stages)
+        return merge_outputs(output_a, output_b)
+    else:
+        return execute_single_batch(inputs, fn)
+
 def execute_single_batch(inputs, fn):
     generator = fn(**inputs)
     while True:
