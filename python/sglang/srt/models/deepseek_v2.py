@@ -854,8 +854,20 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
-
 def all_gather(
+    input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
+):
+    return all_gather_part_wait(
+        all_gather_part_issue(
+            input_tensor=input_tensor,
+            forward_batch=forward_batch,
+            rank=rank,
+            world_size=world_size,
+            group=group
+        ),
+    )
+
+def all_gather_part_issue(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
     if world_size == 1:
@@ -870,6 +882,7 @@ def all_gather(
 
     group.all_gather_into_tensor(forward_batch.gathered_buffer, padded_tensor)
 
+def all_gather_part_wait():
     gathered_tensors = torch.concat(
         [
             forward_batch.gathered_buffer[i * max_len : i * max_len + all_lens[i]]
