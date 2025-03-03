@@ -703,8 +703,10 @@ class ScheduleBatch:
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
             raise RuntimeError(
-                "Out of memory. "
-                "Please set a smaller number for `--max-running-requests`."
+                "alloc_req_slots runs out of memory. "
+                "Please set a smaller number for `--max-running-requests`. "
+                f"{self.req_to_token_pool.available_size()=}, "
+                f"{num_reqs=}, "
             )
         return req_pool_indices
 

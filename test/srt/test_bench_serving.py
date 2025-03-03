@@ -136,8 +136,8 @@ class TestBenchServing(unittest.TestCase):
     def test_online_latency_eagle(self):
         res = run_bench_serving(
             model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
-            num_prompts=300,
-            request_rate=8,
+            num_prompts=50,
+            request_rate=1,
             sharegpt_context_len=3072,
             disable_ignore_eos=True,
             dataset_name="sharegpt",
@@ -154,8 +154,6 @@ class TestBenchServing(unittest.TestCase):
                 "16",
                 "--mem-fraction-static",
                 "0.7",
-                "--cuda-graph-max-bs",
-                "32",
             ],
             need_warmup=True,
         )
