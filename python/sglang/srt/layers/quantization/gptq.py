@@ -9,7 +9,6 @@ from vllm.model_executor.layers.quantization.gptq_marlin import (
     GPTQMarlinMoEMethod,
 )
 from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_marlin_supported,
 )
@@ -276,13 +275,15 @@ class GPTQMarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
-            if layer.num_experts > 32:
-                # For MoEs with many experts the moe_wna16 kernel is faster
-                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-                    layer, prefix
-                )
-            else:
-                return GPTQMarlinMoEMethod(self)
+            return GPTQMarlinMoEMethod(self)
+            # TODO: re-enable after SGLang syncs with vllm >= 0.7.3
+            # if layer.num_experts > 32:
+            #     # For MoEs with many experts the moe_wna16 kernel is faster
+            #     return MoeWNA16Config.from_config(self.full_config).get_quant_method(
+            #         layer, prefix
+            #     )
+            # else:
+            #     return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 
     @classmethod
