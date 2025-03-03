@@ -33,6 +33,7 @@ suites = {
         "test_penalty.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
+        "test_reasoning_content.py",
         "test_regex_constrained.py",
         "test_release_memory_occupation.py",
         "test_request_length_validation.py",
