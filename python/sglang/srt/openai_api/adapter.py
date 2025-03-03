@@ -1113,7 +1113,9 @@ def v1_chat_generate_response(
 
         if reasoning_parser and separate_reasoning:
             try:
-                parser = ReasoningParser(reasoning_parser, True)
+                parser = ReasoningParser(
+                    model_type=reasoning_parser, stream_reasoning=False
+                )
                 reasoning_text, text = parser.parse_non_stream(text)
             except Exception as e:
                 logger.error(f"Exception: {e}")
