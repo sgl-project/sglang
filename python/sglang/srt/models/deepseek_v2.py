@@ -98,7 +98,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, _forward_batch = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -173,7 +173,11 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, forward_batch) -> torch.Tensor:
+        hidden_states, start_idx, end_idx = all_gather(
+            hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+        )
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
@@ -189,7 +193,9 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
+        final_hidden_states = final_hidden_states[start_idx:end_idx]
+        return final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -948,10 +954,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, start_idx, end_idx = all_gather(
                 hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, forward_batch)
             hidden_states = hidden_states[start_idx:end_idx]
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         return hidden_states, residual
 
