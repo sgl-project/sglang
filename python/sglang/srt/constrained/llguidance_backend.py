@@ -48,7 +48,7 @@ class GuidanceGrammar(BaseGrammarObject):
         self.finished = False
         self.bitmask = None
 
-    def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         if len(self.pending_ff_tokens) > 0:
             s = self.llguidance_tokenizer.decode_str(self.pending_ff_tokens)
             ff_tokens = self.pending_ff_tokens

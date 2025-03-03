@@ -52,7 +52,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
-    def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         s = self.matcher.find_jump_forward_string()
         if s:
             return [], s
