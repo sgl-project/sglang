@@ -2,6 +2,7 @@ import os
 from typing import Optional
 
 import torch
+from torch._dynamo.eval_frame import null_context
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -17,8 +18,8 @@ def execute_single_batch(inputs, fn):
 
 
 def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
-    generator_a = _WrappedGenerator(fn(**inputs_a))
-    generator_b = _WrappedGenerator(fn(**inputs_b))
+    generator_a = _WrappedGenerator('a', fn(**inputs_a))
+    generator_b = _WrappedGenerator('b', fn(**inputs_b))
 
     for _ in range(delta_stages):
         generator_a.next()
@@ -35,17 +36,27 @@ def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
 
 
 class _WrappedGenerator:
-    def __init__(self, generator):
+    def __init__(self, debug_name: str, generator):
+        self._debug_name = debug_name
         self._generator = generator
+        self._count = 0
         self.output = None
 
     def next(self):
         assert not self.done
+
+        if _ENABLE_PROFILE:
+            ctx = torch.profiler.record_function(f'Gen-{self._debug_name}{self._count}')
+        else:
+            ctx = null_context()
+
         try:
             next(self._generator)
         except StopIteration as e:
             assert e.value is not None
             self.output = e.value
+
+        self._count += 1
 
     @property
     def done(self):
