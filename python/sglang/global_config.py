@@ -34,11 +34,9 @@ class GlobalConfig:
         self.skip_special_tokens_in_output = True
         self.spaces_between_special_tokens_in_out = True
 
-        # Interpreter optimization configs
+        # Language frontend interpreter optimization configs
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
-
-        self.enable_flashinfer_mla = False
 
 
 global_config = GlobalConfig()
