@@ -15,34 +15,21 @@ def execute_single_batch(inputs, fn):
 
 
 def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
-    output_a = output_b = None
-
-    generator_a = fn(**inputs_a)
-    generator_b = fn(**inputs_b)
+    generator_a = _WrappedGenerator(fn(**inputs_a))
+    generator_b = _WrappedGenerator(fn(**inputs_b))
 
     for _ in range(delta_stages):
-        next(generator_a)
+        generator_a.next()
 
-    while output_a is None:
-        try:
-            next(generator_a)
-        except StopIteration as e:
-            assert e.value is not None
-            output_a = e.value
+    while not generator_a.done:
+        generator_a.next()
+        generator_b.next()
 
-        next(generator_b)
+    for _ in range(delta_stages):
+        generator_b.next()
 
-    for _ in range(delta_stages - 1):
-        next(generator_b)
-
-    try:
-        next(generator_b)
-    except StopIteration as e:
-        assert e.value is not None
-        output_b = e.value
-
-    assert (output_a is not None) and (output_b is not None)
-    return output_a, output_b
+    assert generator_a.done and generator_b.done
+    return generator_a.output, generator_b.output
 
 
 class _WrappedGenerator:
@@ -56,3 +43,7 @@ class _WrappedGenerator:
         except StopIteration as e:
             assert e.value is not None
             self.output = e.value
+
+    @property
+    def done(self):
+        return self.output is not None
