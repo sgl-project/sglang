@@ -858,6 +858,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             not global_server_args_dict["disable_mla"]
             and global_server_args_dict["enable_dp_attention"]
         )
+        self.enable_shared_experts_dp = global_server_args_dict["enable_two_batch_overlap"]
         if self.enable_dp_attention:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
