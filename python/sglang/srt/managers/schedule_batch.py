@@ -67,6 +67,7 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
+    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
 }
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,7 @@ class Req:
         input_embeds: Optional[List[List[float]]] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
+        return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
@@ -255,7 +257,9 @@ class Req:
 
         # Sampling info
         self.sampling_params = sampling_params
+
         self.custom_logit_processor = custom_logit_processor
+        self.return_hidden_states = return_hidden_states
 
         # Memory pool info
         self.req_pool_idx = None
@@ -607,7 +611,7 @@ class ScheduleBatch:
     # Enable custom logit processor
     enable_custom_logit_processor: bool = False
 
-    # Return hidden states
+    # Whether to return hidden states
     return_hidden_states: bool = False
 
     @classmethod
@@ -1157,6 +1161,7 @@ class ScheduleBatch:
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
+        self.return_hidden_states |= other.return_hidden_states
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)

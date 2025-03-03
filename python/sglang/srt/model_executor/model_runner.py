@@ -17,7 +17,8 @@ import gc
 import json
 import logging
 import time
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -34,6 +35,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -55,10 +57,12 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -113,9 +117,9 @@ class ModelRunner:
             if self.server_args.device != "cpu":
                 if server_args.enable_flashinfer_mla:
                     logger.info(
-                        "FlashInfer MLA optimization is turned on. Use flashinfer backend for DeepseekV3ForCausalLM."
+                        "MLA optimization is turned on. Use flashinfer mla backend."
                     )
-                    self.server_args.attention_backend = "flashinfer"
+                    self.server_args.attention_backend = "flashinfer_mla"
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     self.server_args.attention_backend = "triton"
@@ -178,6 +182,7 @@ class ModelRunner:
                 "device": server_args.device,
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
                 "disable_radix_cache": server_args.disable_radix_cache,
+                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
             }
         )
 
@@ -258,6 +263,7 @@ class ModelRunner:
                 rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
+                timeout=self.server_args.dist_timeout,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
             initialize_dp_attention(
@@ -512,8 +518,21 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        self.model.load_weights(named_tensors)
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        load_format: Optional[str] = None,
+    ):
+        named_tensors = [
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
+            for name, tensor in named_tensors
+        ]
+        if load_format == "direct":
+            _model_load_weights_direct(self.model, named_tensors)
+        elif load_format is None:
+            self.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
     def get_weights_by_name(
@@ -703,6 +722,8 @@ class ModelRunner:
                 self.attn_backend = TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer_mla":
+            self.attn_backend = FlashInferMLAAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -832,3 +853,26 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+
+def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    params_dict = dict(model.named_parameters())
+    for name, tensor in named_tensors:
+        default_weight_loader(params_dict[name], tensor)
+
+
+def _unwrap_tensor(tensor, tp_rank):
+    if isinstance(tensor, LocalSerializedTensor):
+        return tensor.get(tp_rank)
+    return tensor
+
+
+@dataclass
+class LocalSerializedTensor:
+    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
+    The i-th element in the list corresponds to i-th rank's GPU."""
+
+    values: List[bytes]
+
+    def get(self, rank: int):
+        return MultiprocessingSerializer.deserialize(self.values[rank])

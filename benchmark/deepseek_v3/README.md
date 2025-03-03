@@ -6,14 +6,6 @@ Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model
 
 For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/references/deepseek.html).
 
-## Hardware Recommendation
-
-- 8 x NVIDIA H200 GPUs
-
-If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
-
-For running on AMD MI300X, use this as a reference. [Running DeepSeek-R1 on a single NDv5 MI300X VM](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/running-deepseek-r1-on-a-single-ndv5-mi300x-vm/4372726)
-
 ## Installation & Launch
 
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
@@ -83,6 +75,8 @@ print(response)
 For example, there are two H20 nodes, each with 8 GPUs. The first node's IP is `10.0.0.1`, and the second node's IP is `10.0.0.2`. Please **use the first node's IP** for both commands.
 
 If the command fails, try setting the `GLOO_SOCKET_IFNAME` parameter. For more information, see [Common Environment Variables](https://pytorch.org/docs/stable/distributed.html#common-environment-variables).
+
+If the multi nodes support NVIDIA InfiniBand and encounter hanging issues during startup, consider adding the parameter `export NCCL_IB_GID_INDEX=3`. For more information, see [this](https://github.com/sgl-project/sglang/issues/3516#issuecomment-2668493307).
 
 ```bash
 # node 1
@@ -179,6 +173,29 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
+```
+
+
+### Example: Serving with 8 A100/A800 with AWQ Quantization
+
+AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+
+```bash
+python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
+```
+
+### Example: Serving on any cloud or Kubernetes with SkyPilot
+
+SkyPilot helps find cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
+
+To serve on multiple nodes:
+
+```bash
+git clone https://github.com/skypilot-org/skypilot.git
+# Serve on 2 H100/H200x8 nodes
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
+# Serve on 4 A100x8 nodes
+sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B-A100.yaml --retry-until-up
 ```
 
 #### Troubleshooting

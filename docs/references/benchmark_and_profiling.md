@@ -71,13 +71,28 @@ apt install nsight-systems-cli
 2. To profile a server, e.g.
 
 ```bash
-# server
-# set the delay and duration times according to needs
+# launch the server, set the delay and duration times according to needs
+# after the duration time has been used up, server will be killed by nsys
+
 nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node -o sglang.out --delay 60 --duration 70 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-radix-cache
 
 # client
 python3 -m sglang.bench_serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
 ```
+
+In practice, we recommend users to set `--duration` argument to a large value. Whenever user wants the server to stop profiling. Firstly run:
+
+```bash
+nsys sessions list
+```
+
+to get the session id in the form of `profile-XXXXX`, then run:
+
+```bash
+nsys stop --session=profile-XXXXX
+```
+
+to manually kill the profiler and generate `nsys-rep` files instantly.
 
 3. Use NVTX to annotate code regions, e.g. to see their execution time.
 

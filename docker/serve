@@ -1,0 +1,31 @@
+#!/bin/bash
+
+echo "Starting server"
+
+SERVER_ARGS="--host 0.0.0.0 --port 8080"
+
+if [ -n "$TENSOR_PARALLEL_DEGREE" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --tp-size ${TENSOR_PARALLEL_DEGREE}"
+fi
+
+if [ -n "$DATA_PARALLEL_DEGREE" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --dp-size ${DATA_PARALLEL_DEGREE}"
+fi
+
+if [ -n "$EXPERT_PARALLEL_DEGREE" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --ep-size ${EXPERT_PARALLEL_DEGREE}"
+fi
+
+if [ -n "$MEM_FRACTION_STATIC" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --mem-fraction-static ${MEM_FRACTION_STATIC}"
+fi
+
+if [ -n "$QUANTIZATION" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --quantization ${QUANTIZATION}"
+fi
+
+if [ -n "$CHUNKED_PREFILL_SIZE" ]; then
+    SERVER_ARGS="${SERVER_ARGS} --chunked-prefill-size ${CHUNKED_PREFILL_SIZE}"
+fi
+
+python3 -m sglang.launch_server --model-path /opt/ml/model $SERVER_ARGS

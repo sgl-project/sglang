@@ -34,8 +34,23 @@ limitations under the License.
     return PyModule_Create(&module);                                                                  \
   }
 
-// trt_reduce
 using fptr_t = int64_t;
+#ifdef USE_ROCM
+fptr_t init_custom_ar(torch::Tensor& meta, torch::Tensor& rank_data, const std::vector<std::string>& handles,
+                      const std::vector<int64_t>& offsets, int64_t rank, bool full_nvlink);
+void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
+void dispose(fptr_t _fa);
+int64_t meta_size();
+void register_buffer(fptr_t _fa, torch::Tensor& t, const std::vector<std::string>& handles,
+                     const std::vector<int64_t>& offsets);
+std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_graph_buffers(fptr_t _fa, const std::vector<std::string>& handles,
+                            const std::vector<std::vector<int64_t>>& offsets);
+torch::Tensor allocate_meta_buffer(int64_t size);
+torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+#else
+// trt_reduce
 fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, torch::Tensor& rank_data, const std::vector<fptr_t>& buffers,
                       const std::vector<fptr_t>& tmp_result_buffers, const std::vector<fptr_t>& barrier_in,
                       const std::vector<fptr_t>& barrier_out);
@@ -44,6 +59,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa, const std::vector<std::vector<int64_t>>& handles,
                             const std::vector<std::vector<int64_t>>& offsets);
+#endif
 
 // moe_align_block_size
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
@@ -152,3 +168,8 @@ void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Te
 // sgl_per_token_group_quant_fp8
 void sgl_per_token_group_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size,
                                    double eps, double fp8_min, double fp8_max);
+
+// cublas grouped gemm
+void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& weights,
+                         const std::vector<torch::Tensor>& outputs, const torch::Dtype& out_dtype,
+                         int64_t cublas_handle, int64_t cuda_stream);

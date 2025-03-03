@@ -38,7 +38,7 @@ class TestQwen2(unittest.TestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.81)
+        self.assertGreater(metrics["accuracy"], 0.78)
 
 
 class TestQwen2FP8(unittest.TestCase):

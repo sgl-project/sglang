@@ -544,7 +544,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 image_hashes = [image_hash]
                 image_sizes = [image_size]
                 image_grid_thws = [image_grid_thw]
-        elif isinstance(image_data, str):
+        elif isinstance(image_data, str) or isinstance(image_data, bytes):
             # A single image
             pixel_values, image_hash, image_size, image_grid_thw = (
                 await self._process_single_image(image_data)
@@ -553,6 +553,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             image_sizes = [image_size]
             image_grid_thws = [image_grid_thw]
         else:
+
             raise ValueError(f"Invalid image data: {image_data}")
 
         return {
