@@ -1,13 +1,14 @@
 import ctypes
 import os
 
+import torch
+
 if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
     ctypes.CDLL(
         "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
         mode=ctypes.RTLD_GLOBAL,
     )
 
-import torch
 from sgl_kernel.ops.activation import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
