@@ -584,9 +584,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                         positions, hidden_states, forward_batch
                     )
                 else:
+                    # TODO handle this branch?
                     return self.forward_absorb(positions, hidden_states, forward_batch)
             else:
-                return self.forward_absorb(positions, hidden_states, forward_batch)
+                output = yield from self.forward_absorb(positions, hidden_states, forward_batch)
+                return output
 
     def forward_normal(
         self,
@@ -635,7 +637,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Generator[None, None, torch.Tensor]:
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
@@ -970,7 +972,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            hidden_states = self.self_attn(
+            # TODO handle the disable-MLA case
+            hidden_states = yield from self.self_attn.forward(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
