@@ -35,16 +35,22 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
+flashinfer = root / "3rdparty" / "flashinfer"
 operator_namespace = "sgl_kernels"
 include_dirs = [
     root / "src" / "sgl-kernel" / "include",
     root / "src" / "sgl-kernel" / "csrc",
+    flashinfer.resolve() / "include",
+    flashinfer.resolve() / "include" / "gemm",
+    flashinfer.resolve() / "csrc",
 ]
 
 sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/custom_all_reduce.hip",
+    "src/sgl-kernel/csrc/eagle_utils.cu",
+    "src/sgl-kernel/csrc/speculative_sampling.cu",
 ]
 
 cxx_flags = ["-O3"]

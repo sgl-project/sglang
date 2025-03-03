@@ -24,8 +24,11 @@
 namespace flashinfer {
 
 namespace sampling {
-
+#if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
+using namespace hipcub;
+#else
 using namespace cub;
+#endif
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM, BlockReduceAlgorithm REDUCE_ALGORITHM,
           uint32_t VEC_SIZE, bool DETERMINISTIC, typename DType, typename IdType>
@@ -128,7 +131,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* acce
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC, DType>(
-        i, d, [&](DType x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
+        i, d, 0, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
       break;
     }
@@ -171,8 +174,8 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* output_t
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         auto kernel = TreeSpeculativeSamplingTargetOnly<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, DETERMINISTIC,
                                                         DType, IdType>;
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});
   return cudaSuccess;
 }
