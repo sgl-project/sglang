@@ -174,8 +174,14 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* output_t
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
         auto kernel = TreeSpeculativeSamplingTargetOnly<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, DETERMINISTIC,
                                                         DType, IdType>;
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+#if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
+        FLASHINFER_CUDA_CALL(hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+#else
+        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+#endif
       })});
   return cudaSuccess;
 }
