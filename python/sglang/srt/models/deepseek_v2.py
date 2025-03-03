@@ -985,7 +985,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, start_idx, end_idx = all_gather(
                 hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
             )
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = yield from self.mlp.forward(hidden_states, forward_batch)
             hidden_states = hidden_states[start_idx:end_idx]
         else:
             hidden_states = self.mlp(hidden_states, forward_batch)
