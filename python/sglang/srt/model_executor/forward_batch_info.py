@@ -152,9 +152,6 @@ class ForwardBatch:
     # Position information
     positions: torch.Tensor = None
 
-    # For decode
-    decode_seq_lens_cpu: Optional[torch.Tensor] = None
-
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
@@ -259,8 +256,6 @@ class ForwardBatch:
         if ret.forward_mode.is_decode():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
-            if ret.decode_seq_lens_cpu is None:
-                ret.decode_seq_lens_cpu = batch.decode_seq_lens
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
