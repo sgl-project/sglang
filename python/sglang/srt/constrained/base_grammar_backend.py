@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -93,7 +93,7 @@ class CacheEntry:
 class BaseGrammarBackend(ABC):
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: dict[Tuple[str, str], CacheEntry] = {}
+        self.cache: Dict[Tuple[str, str], CacheEntry] = {}
         self.cache_lock = Lock()
 
     def _not_supported(self, key_type: str, key_string: str) -> None:
