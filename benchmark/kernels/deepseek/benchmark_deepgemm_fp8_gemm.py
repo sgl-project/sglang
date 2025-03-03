@@ -211,6 +211,7 @@ def get_benchmark(tp_size):
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
         y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
+        # Preprocess data before benchmarking
         x_fp8, x_scale = per_token_cast_to_fp8(x)
         y_fp8, y_scale = per_block_cast_to_fp8(y)
         x_scale_col_major = get_col_major_tma_aligned_tensor(x_scale.clone())
