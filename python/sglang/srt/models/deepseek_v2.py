@@ -45,6 +45,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import enable_moe_align_block_size_triton
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
@@ -128,9 +129,11 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        enable_shared_experts_dp: bool,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
+        self.enable_shared_experts_dp = enable_shared_experts_dp
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -174,14 +177,20 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, forward_batch) -> torch.Tensor:
+        hidden_states_partial = hidden_states
         hidden_states, start_idx, end_idx = all_gather(
             hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
         )
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
         if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            if self.enable_shared_experts_dp:
+                shared_output = self.shared_experts(hidden_states_partial)
+            else:
+                shared_output = self.shared_experts(hidden_states)
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
@@ -911,7 +920,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config, enable_shared_experts_dp=self.enable_shared_experts_dp)
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
