@@ -18,7 +18,9 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+import torch
 
 from sglang.srt.server_args import ServerArgs
 
@@ -27,8 +29,59 @@ logger = logging.getLogger(__name__)
 
 class BaseGrammarObject(ABC):
     @abstractmethod
-    def copy(self):
-        pass
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
+        """
+        Try to jump forward in the grammar.
+
+        Returns:
+            A jump forward helper which may be used in `jump_forward_str_state`.
+            None if the jump forward is not possible.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        """
+        Jump forward for the grammar.
+
+        Returns:
+            A tuple of the jump forward string and the next state of the grammar
+            (which can be used in `jump_and_retokenize` if needed).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ) -> None:
+        """
+        Jump forward occurs, and update the grammar state if needed.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def copy(self) -> "BaseGrammarObject":
+        raise NotImplementedError
 
 
 @dataclass
@@ -52,7 +105,7 @@ class BaseGrammarBackend(ABC):
         """
         This function should not be reached in any case.
         """
-        raise ValueError(f"Invalid key_type: {key_type}")
+        raise ValueError(f"Invalid key_type: {key_type}={key_string}")
 
     @abstractmethod
     def dispatch_json(self, key_string: str) -> Optional[BaseGrammarObject]:
