@@ -1151,7 +1151,7 @@ class DeepseekV2Model(nn.Module):
     @staticmethod
     def _split_inputs(
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[Dict, Dict]:
