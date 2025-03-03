@@ -777,6 +777,7 @@ class ServerArgs:
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
         )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
