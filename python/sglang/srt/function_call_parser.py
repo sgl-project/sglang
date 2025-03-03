@@ -333,7 +333,14 @@ class Qwen25Detector(BaseFormatDetector):
         match_result_list = re.findall(pattern, text, re.DOTALL)
         calls = []
         for match_result in match_result_list:
-            match_result = json.loads(match_result)
+            match_result = match_result.strip()
+            try:
+                match_result = json.loads(match_result)
+            except json.JSONDecodeError:
+                match = re.search(r"\{\{(.*?)\}\}", match_result)
+                if match:
+                    match_result = match_result[1:-1]
+                    match_result = json.loads(match_result)
             calls.extend(self.parse_base_json(match_result, tools))
         return calls
 
