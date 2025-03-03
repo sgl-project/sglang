@@ -1155,6 +1155,7 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[Dict, Dict]:
+        # TODO check real values...
         return TODO
 
     @staticmethod
