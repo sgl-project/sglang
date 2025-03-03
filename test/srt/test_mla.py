@@ -62,7 +62,7 @@ class TestDeepseekV3(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
-            other_args.extend(["--cuda-graph-max-bs", "2"])
+            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
