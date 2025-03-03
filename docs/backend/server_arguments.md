@@ -146,6 +146,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `speculative_num_steps`: How many draft passes we run before verifying.
 * `speculative_num_draft_tokens`: The number of tokens proposed in a draft.
 * `speculative_eagle_topk`: The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1).
+* `speculative_token_map`: Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1).
 
 
 ## Double Sparsity
