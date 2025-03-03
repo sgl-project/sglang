@@ -272,7 +272,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
-        self.new_being_chunked_req = None
+        self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
 
@@ -327,7 +327,7 @@ class PrefillAdder:
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
-    def add_being_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req):
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -354,7 +354,7 @@ class PrefillAdder:
         finally:
             self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -403,6 +403,7 @@ class PrefillAdder:
             self.rem_chunk_tokens is None
             or req.extend_input_len <= self.rem_chunk_tokens
         ):
+            # Non-chunked prefill
             self.can_run_list.append(req)
             self._prefill_one_req(
                 0,
@@ -418,14 +419,14 @@ class PrefillAdder:
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_being_chunked_req = req
+            self.new_chunked_req = req
             self._prefill_one_req(0, trunc_len, 0)
 
         return self.budget_state()
 
-    def add_one_req(self, req: Req):
+    def add_one_req(self, req: Req, has_chunked_req: bool):
         if req.sampling_params.ignore_eos and self.tree_cache.disable:
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
@@ -443,14 +444,7 @@ class PrefillAdder:
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                self.rem_chunk_tokens is None
-                or input_tokens <= self.rem_chunk_tokens
-                or (
-                    req.return_logprob
-                    and req.logprob_start_len != len(req.origin_input_ids) - 1
-                )
-            ):
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
@@ -470,8 +464,9 @@ class PrefillAdder:
 
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+
                 self.can_run_list.append(req)
-                self.new_being_chunked_req = req
+                self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
 

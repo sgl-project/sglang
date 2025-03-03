@@ -109,11 +109,15 @@ def set_torch_compile_config():
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
+
     if capture_bs is None:
-        if server_args.disable_cuda_graph_padding:
-            capture_bs = list(range(1, 33)) + [64, 128]
+        if server_args.speculative_algorithm is None:
+            if server_args.disable_cuda_graph_padding:
+                capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            else:
+                capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
         else:
-            capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            capture_bs = list(range(1, 33))
 
     if is_hip_:
         capture_bs += [i * 8 for i in range(21, 33)]
@@ -130,6 +134,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
                 )
             )
         )
+
     capture_bs = [
         bs
         for bs in capture_bs
@@ -385,9 +390,6 @@ class CudaGraphRunner:
 
             run_once()
 
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
 
@@ -401,12 +403,11 @@ class CudaGraphRunner:
         global_graph_memory_pool = graph.pool()
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
+    def recapture_if_needed(self, forward_batch: ForwardBatch):
+        # If the capture_hidden_mode changes, we need to recapture the graph
         hidden_mode_from_spec_info = getattr(
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
-        # If the capture_hidden_mode changes, we need to recapture the graph
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.capture_hidden_mode != CaptureHiddenMode.FULL
@@ -419,6 +420,9 @@ class CudaGraphRunner:
         ):
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
+
+    def replay(self, forward_batch: ForwardBatch):
+        self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
