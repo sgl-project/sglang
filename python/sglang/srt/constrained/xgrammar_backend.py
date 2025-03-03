@@ -130,7 +130,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def _from_context(self, ctx: CompiledGrammar) -> XGrammarGrammar:
         matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
-        return XGrammarGrammar(matcher, self.vocab_size, ctx)
+        return XGrammarGrammar(matcher, self.vocab_size, ctx, self.override_stop_tokens)
 
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
