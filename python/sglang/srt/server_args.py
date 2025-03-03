@@ -272,10 +272,11 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "NEXTN"
-        ):
+        if self.speculative_algorithm == "NEXTN":
+            # NEXTN shares the same implementation of EAGLE
+            self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "EAGLE":
             self.disable_overlap_schedule = True
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
