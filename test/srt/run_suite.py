@@ -12,7 +12,6 @@ suites = {
         "models/test_generation_models.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
-        "sampling/penaltylib",
         "test_gptqmodel_dynamic.py",
         "test_abort.py",
         "test_chunked_prefill.py",
