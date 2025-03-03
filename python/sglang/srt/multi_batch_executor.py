@@ -14,7 +14,6 @@ def execute_single_batch(inputs, fn):
             return e.value
 
 
-
 def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
     output_a = output_b = None
 
@@ -44,3 +43,16 @@ def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
 
     assert (output_a is not None) and (output_b is not None)
     return output_a, output_b
+
+
+class _WrappedGenerator:
+    def __init__(self, generator):
+        self._generator = generator
+        self.output = None
+
+    def next(self):
+        try:
+            next(self._generator)
+        except StopIteration as e:
+            assert e.value is not None
+            self.output = e.value
