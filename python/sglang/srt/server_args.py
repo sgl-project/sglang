@@ -1051,6 +1051,12 @@ class ServerArgs:
                 else:
                     self.lora_paths[lora_path] = lora_path
 
+    # TODO tmeporary do this for discussion. e.g. shall we make it ServerArgs option?
+    #      or shall we make it implicitly derived from two_batch_overlap?
+    @property
+    def enable_dp_attention_shared_experts_dp(self):
+        return self.enable_two_batch_overlap
+
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
