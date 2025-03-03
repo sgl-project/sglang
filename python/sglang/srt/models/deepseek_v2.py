@@ -195,7 +195,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, forward_batch) -> torch.Tensor:
-        hidden_states_partial = hidden_states
+        hidden_states_local = hidden_states
         hidden_states, start_idx, end_idx = all_gather(
             hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
         )
@@ -205,7 +205,7 @@ class DeepseekV2MoE(nn.Module):
 
         if self.n_shared_experts is not None:
             if self.enable_shared_experts_dp:
-                shared_output = self.shared_experts(hidden_states_partial)
+                shared_output = self.shared_experts(hidden_states_local)
             else:
                 shared_output = self.shared_experts(hidden_states)
 
