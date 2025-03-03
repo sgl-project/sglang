@@ -403,6 +403,7 @@ class PrefillAdder:
             self.rem_chunk_tokens is None
             or req.extend_input_len <= self.rem_chunk_tokens
         ):
+            # Non-chunked prefill
             self.can_run_list.append(req)
             self._prefill_one_req(
                 0,
@@ -443,14 +444,7 @@ class PrefillAdder:
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                self.rem_chunk_tokens is None
-                or input_tokens <= self.rem_chunk_tokens
-                or (
-                    req.return_logprob
-                    and req.logprob_start_len != len(req.origin_input_ids) - 1
-                )
-            ):
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)

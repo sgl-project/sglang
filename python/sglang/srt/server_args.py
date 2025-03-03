@@ -281,8 +281,6 @@ class ServerArgs:
             self.speculative_algorithm == "EAGLE"
             or self.speculative_algorithm == "NEXTN"
         ):
-            if self.max_running_requests is None:
-                self.max_running_requests = 32
             self.disable_overlap_schedule = True
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
