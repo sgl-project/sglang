@@ -80,7 +80,6 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-            allow_jump_forward=not server_args.disable_jump_forward,
         )
     elif server_args.grammar_backend == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
