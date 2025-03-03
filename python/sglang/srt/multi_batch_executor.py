@@ -1,3 +1,10 @@
+from typing import Optional
+
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
 def execute_single_batch(inputs, fn):
     generator = fn(**inputs)
     while True:
@@ -8,19 +15,7 @@ def execute_single_batch(inputs, fn):
 
 
 
-def execute_two_batch(inputs, fn, delta_stages: int):
-    inputs_a, inputs_b = _split_inputs(inputs)
-    output_a, output_b = _execute_two_batch_raw(inputs_a, inputs_b, fn, delta_stages)
-    return _merge_outputs(output_a, output_b)
-
-def _split_inputs(inputs):
-    return TODO
-
-def _merge_outputs(output_a, output_b):
-    return TODO
-
-
-def _execute_two_batch_raw(inputs_a, inputs_b, fn, delta_stages: int):
+def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
     output_a = output_b = None
 
     generator_a = fn(**inputs_a)

@@ -1040,14 +1040,14 @@ class DeepseekV2Model(nn.Module):
             ),
             partial(self._forward_layers, layer_start=0, layer_end=self.first_k_dense_replace),
         )
-        hidden_states, residual = execute_two_batch(
-            dict(
+        hidden_states, residual = self._merge_outputs(*execute_two_batch(
+            *self._split_inputs(
                 hidden_states=hidden_states, residual=residual,
                 positions=positions, forward_batch=forward_batch,
             ),
             partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
             delta_stages=2,
-        )
+        ))
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -1066,6 +1066,21 @@ class DeepseekV2Model(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
         return hidden_states, residual
+
+    @staticmethod
+    def _split_inputs(
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[Dict, Dict]:
+        return TODO
+
+    @staticmethod
+    def _merge_outputs(output_a, output_b):
+        hidden_states_a, residual_a = output_a
+        hidden_states_b, residual_b = output_b
+        return TODO
 
 class DeepseekV2ForCausalLM(nn.Module):
 
