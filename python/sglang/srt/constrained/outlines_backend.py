@@ -115,7 +115,6 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         self,
         tokenizer,
         whitespace_pattern: bool,
-        allow_jump_forward: bool,
     ):
         super().__init__()
 
@@ -140,7 +139,6 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             self.outlines_tokenizer.vocabulary = (
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
-        self.allow_jump_forward = allow_jump_forward
         self.whitespace_pattern = whitespace_pattern
 
     def init_value_impl(self, key: Tuple[str, str]) -> OutlinesGrammar:
@@ -172,10 +170,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
             return None
 
-        if self.allow_jump_forward:
-            jump_forward_map = OutlinesJumpForwardMap(regex)
-        else:
-            jump_forward_map = None
+        jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
 
 

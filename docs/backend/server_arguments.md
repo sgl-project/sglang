@@ -68,7 +68,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ### API configuration
 
 * `api_key`: Sets an API key for the server and the OpenAI-compatible API.
-* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `file_storage_path`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
 ## Parallelism
@@ -162,7 +162,6 @@ Please consult the documentation below to learn more about the parameters you ma
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
 
 * `disable_radix_cache`: Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching.
-* `disable_jump_forward`: Disable [jump-forward](https://lmsys.org/blog/2024-02-05-compressed-fsm/#our-method-jump-forward-decoding-with-a-compressed-finite-state-machine) for outlines grammar backend.
 * `disable_cuda_graph`: Disable [cuda graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward. Use if encountering uncorrectable CUDA ECC errors.
 * `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
 * `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.

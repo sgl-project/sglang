@@ -106,7 +106,6 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config

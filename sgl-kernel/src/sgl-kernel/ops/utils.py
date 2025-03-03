@@ -18,8 +18,8 @@ from typing import Dict, Tuple
 import torch
 
 
-def _get_cuda_stream(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
+def get_cuda_stream() -> int:
+    return torch.cuda.current_stream().cuda_stream
 
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}

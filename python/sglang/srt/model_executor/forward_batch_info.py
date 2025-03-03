@@ -41,7 +41,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention import AttentionBackend
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -284,7 +284,9 @@ class ForwardBatch:
             ):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
                 )
             else:
                 positions, ret.extend_start_loc = compute_position_torch(

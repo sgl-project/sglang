@@ -198,8 +198,6 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-        print(f"{scheduler_info=}")
-
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)
         self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
@@ -222,7 +220,6 @@ class DataParallelController:
                         TokenizedEmbeddingReqInput,
                     ),
                 ):
-                    logger.info("dispatching")
                     self.dispatching(recv_req)
                 else:
                     # Send other control messages to first worker of tp group
