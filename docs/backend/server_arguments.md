@@ -52,7 +52,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [encode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
-* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/input_ids.py).
+* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/token_in_token_out_llm.py).
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
@@ -68,7 +68,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ### API configuration
 
 * `api_key`: Sets an API key for the server and the OpenAI-compatible API.
-* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `file_storage_path`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
 ## Parallelism
@@ -96,7 +96,6 @@ Please consult the documentation below to learn more about the parameters you ma
 * `schedule_policy`: The scheduling policy to control the processing order of waiting prefill requests in a single engine.
 * `schedule_conservativeness`: Can be used to decrease/increase the conservativeness of the server when taking new requests. Highly conservative behavior leads to starvation, but low conservativeness leads to slowed-down performance.
 * `cpu_offload_gb`: Reserve this amount of RAM in GB for offloading of model parameters to the CPU.
-* `prefill_only_one_req`: When this flag is turned on, the engine prefills only one request at a time.
 
 ## Other runtime options
 
@@ -133,7 +132,6 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `attention_backend`: The backend for attention computation and KV cache management.
 * `sampling_backend`: The backend for sampling.
-* `enable_flashinfer_mla`: The backend for flashinfer MLA wrapper that accelerates deepseek models. (In Experiment Stage)
 
 ## Constrained Decoding
 
@@ -147,6 +145,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `speculative_num_steps`: How many draft passes we run before verifying.
 * `speculative_num_draft_tokens`: The number of tokens proposed in a draft.
 * `speculative_eagle_topk`: The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1).
+* `speculative_token_map`: Optional, the path to the high frequency token list of [FR-Spec](https://arxiv.org/html/2502.14856v1), used for accelerating [Eagle](https://arxiv.org/html/2406.16858v1).
 
 
 ## Double Sparsity
@@ -163,7 +162,6 @@ Please consult the documentation below to learn more about the parameters you ma
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
 
 * `disable_radix_cache`: Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching.
-* `disable_jump_forward`: Disable [jump-forward](https://lmsys.org/blog/2024-02-05-compressed-fsm/#our-method-jump-forward-decoding-with-a-compressed-finite-state-machine) for outlines grammar backend.
 * `disable_cuda_graph`: Disable [cuda graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward. Use if encountering uncorrectable CUDA ECC errors.
 * `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
 * `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.
@@ -186,3 +184,5 @@ Please consult the documentation below to learn more about the parameters you ma
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
 * `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
 * `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
+* `enable_flashinfer_mla`: The backend for flashinfer MLA wrapper that accelerates deepseek models.
+* `flashinfer_mla_disable_ragged`: Disable usage of ragged prefill wrapper for flashinfer mla attention backend. Should be used when `enable_flashinfer_mla` is turned on.
