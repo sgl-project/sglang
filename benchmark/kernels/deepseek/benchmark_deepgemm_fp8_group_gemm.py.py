@@ -153,20 +153,15 @@ def fp8_gemm_group_triton_kernel(
             pid_n * stride_b_scale_n + k_block * stride_b_scale_k
         )
 
+        # Perform matrix multiplication in FP8
+        res = tl.dot(a, b)
+
         # Load scaling factors for the current block
         a_scale = tl.load(a_scale_ptrs)[:, None]  # [BLOCK_SIZE_M, 1]
         b_scale = tl.load(b_scale_ptrs)
 
-        # Convert FP8 to FP32 for computation
-        a = a.to(tl.float32)
-        b = b.to(tl.float32)
-
-        # Apply scaling factors to the current block
-        a = a * a_scale
-        b = b * b_scale
-
-        # Accumulate matmul for the current block
-        accumulator += tl.dot(a, b)
+        # Apply scaling factors to the accumulated result
+        accumulator += res * a_scale * b_scale
 
         # Advance pointers
         a_ptrs += BLOCK_SIZE_K * stride_ak
