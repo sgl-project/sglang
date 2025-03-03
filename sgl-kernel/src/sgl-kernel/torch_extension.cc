@@ -63,6 +63,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("register_graph_buffers", torch::kCUDA, &register_graph_buffers);
 
   /*
+   * From csrc/attention
+   */
+   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
+
+  /*
    * From csrc/gemm
    */
   m.def(
@@ -163,11 +168,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
-
-  /*
-   * Other
-   */
-  m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 }
 
 REGISTER_EXTENSION(_kernels)
