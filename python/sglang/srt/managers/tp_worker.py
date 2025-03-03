@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -49,6 +50,8 @@ class TpModelWorker:
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_rank = tp_rank
@@ -77,6 +80,8 @@ class TpModelWorker:
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -154,7 +159,7 @@ class TpModelWorker:
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
-            self.model_runner.token_to_kv_pool,
+            self.model_runner.token_to_kv_pool_allocator,
         )
 
     def forward_batch_generation(
