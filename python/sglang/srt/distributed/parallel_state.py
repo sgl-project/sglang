@@ -435,18 +435,20 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor, async_op=None):
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        # TODO hack (will use DeepEP thus no worries about this later)
+        if (pynccl_comm is not None and not pynccl_comm.disabled) and (async_op is None):
             pynccl_comm.all_gather(output, input)
         else:
             torch.distributed.all_gather_into_tensor(
-                output, input, group=self.device_group
+                output, input, group=self.device_group,
+                async_op=async_op,
             )
 
-    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
-            self._all_gather_into_tensor(output, input)
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor, async_op=None):
+        if (not supports_custom_op()) or (async_op is not None):
+            self._all_gather_into_tensor(output, input, async_op=async_op)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
