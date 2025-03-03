@@ -1028,12 +1028,17 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+
         residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
+        for i in range(config.first_k_dense_replace):
+            hidden_states, residual = self.layers[i](
                 positions, hidden_states, forward_batch, residual
             )
+        for i in range(config.first_k_dense_replace, len(self.layers)):
+            hidden_states, residual = self.layers[i](
+                positions, hidden_states, forward_batch, residual
+            )
+
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
