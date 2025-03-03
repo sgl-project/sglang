@@ -655,12 +655,11 @@ class ModelRunner:
 
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
+                self.server_args.adjusted_max_total_num_tokens = (
                     self.max_total_num_tokens
                     # draft
                     + max_num_reqs
@@ -673,8 +672,8 @@ class ModelRunner:
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
+            self.max_total_num_tokens = self.server_args.adjusted_max_total_num_tokens
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
