@@ -1,5 +1,5 @@
 """
-This example demonstrates how to provide tokenized ids as input instead of text prompt
+This example demonstrates how to provide tokenized ids to LLM as input instead of text prompt, i.e. a token-in-token-out workflow.
 """
 
 import sglang as sgl
@@ -24,14 +24,13 @@ def main():
     token_ids_list = [tokenizer.encode(prompt) for prompt in prompts]
 
     # Create an LLM.
-    # You can also specify `skip_tokenizer_init=True`, but it requires explicit detokenization at the end
-    llm = sgl.Engine(model_path=MODEL_PATH)
+    llm = sgl.Engine(model_path=MODEL_PATH, skip_tokenizer_init=True)
 
     outputs = llm.generate(input_ids=token_ids_list, sampling_params=sampling_params)
     # Print the outputs.
     for prompt, output in zip(prompts, outputs):
         print("===============================")
-        print(f"Prompt: {prompt}\nGenerated Text: {output['text']}")
+        print(f"Prompt: {prompt}\nGenerated token ids: {output['token_ids']}")
 
 
 # The __main__ condition is necessary here because we use "spawn" to create subprocesses
