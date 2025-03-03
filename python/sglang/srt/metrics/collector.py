@@ -13,6 +13,7 @@
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
 
+import time
 from dataclasses import dataclass
 from typing import Dict, Union
 
@@ -35,19 +36,20 @@ class SchedulerMetricsCollector:
         from prometheus_client import Gauge
 
         self.labels = labels
+        self.last_log_time = time.time()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests.",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
             documentation="The number of used tokens.",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         self.token_usage = Gauge(
@@ -61,14 +63,14 @@ class SchedulerMetricsCollector:
             name="sglang:gen_throughput",
             documentation="The generation throughput (token/s).",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
-            multiprocess_mode="sum",
+            multiprocess_mode="mostrecent",
         )
 
         self.cache_hit_rate = Gauge(
@@ -97,6 +99,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self.last_log_time = time.time()
 
 
 class TokenizerMetricsCollector:
@@ -130,12 +133,15 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
             buckets=[
                 0.1,
-                0.25,
+                0.3,
                 0.5,
-                0.75,
+                0.7,
+                0.9,
                 1,
                 2,
-                5,
+                4,
+                6,
+                8,
                 10,
                 20,
                 40,
@@ -151,24 +157,56 @@ class TokenizerMetricsCollector:
             documentation="Histogram of time per output token in seconds.",
             labelnames=labels.keys(),
             buckets=[
+                0.002,
                 0.005,
-                0.01,
+                0.010,
+                0.020,
+                0.030,
+                0.040,
+                0.050,
+                0.060,
+                0.070,
+                0.080,
+                0.090,
+                0.100,
+                0.150,
+                0.200,
+                0.300,
+                0.400,
+                0.600,
+                0.800,
+                1.000,
+                2.000,
+            ],
+        )
+
+        self.histogram_inter_token_latency_seconds = Histogram(
+            name="sglang:inter_token_latency_seconds",
+            documentation="Histogram of inter-token latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.002,
+                0.004,
+                0.006,
+                0.008,
+                0.010,
                 0.015,
-                0.02,
+                0.020,
                 0.025,
-                0.03,
-                0.04,
-                0.05,
+                0.030,
+                0.035,
+                0.040,
+                0.050,
                 0.075,
-                0.1,
-                0.15,
-                0.2,
-                0.3,
-                0.4,
-                0.5,
-                0.75,
-                1.0,
-                2.5,
+                0.100,
+                0.150,
+                0.200,
+                0.300,
+                0.400,
+                0.500,
+                0.750,
+                1.000,
+                2.000,
             ],
         )
 
@@ -178,11 +216,43 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
             buckets=[
                 0.1,
-                0.25,
-                0.5,
+                0.2,
+                0.4,
+                0.8,
                 1,
                 2,
                 5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                100,
+                150,
+                200,
+                250,
+                300,
+                350,
+                500,
+                1000,
+            ],
+        )
+
+        self.histogram_prefill_prealloc_duration = Histogram(
+            name="sglang:prefill_prealloc_duration_seconds",
+            documentation="Histogram of prefill prealloc duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.1,
+                0.3,
+                0.5,
+                0.7,
+                0.9,
+                1,
+                2,
+                4,
+                6,
+                8,
                 10,
                 20,
                 40,
@@ -193,23 +263,125 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        self.histogram_prefill_queue_duration = Histogram(
+            name="sglang:prefill_queue_duration_seconds",
+            documentation="Histogram of prefill queue duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.1,
+                0.3,
+                0.5,
+                0.7,
+                0.9,
+                2,
+                4,
+                8,
+                16,
+                64,
+            ],
+        )
+
+        self.histogram_prefill_forward_duration = Histogram(
+            name="sglang:prefill_forward_duration_seconds",
+            documentation="Histogram of prefill forward duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.1,
+                0.3,
+                0.5,
+                0.7,
+                0.9,
+                2,
+                4,
+                8,
+                16,
+                64,
+            ],
+        )
+
+        self.histogram_prefill_transfer_duration = Histogram(
+            name="sglang:prefill_transfer_duration_seconds",
+            documentation="Histogram of prefill transfer duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.050,
+                0.100,
+                0.150,
+                0.200,
+                0.300,
+                0.400,
+                0.500,
+                1.000,
+                2.000,
+            ],
+        )
+
+        self.histogram_decode_prealloc_duration = Histogram(
+            name="sglang:decode_prealloc_duration_seconds",
+            documentation="Histogram of decode prealloc duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.1,
+                0.3,
+                0.5,
+                0.7,
+                0.9,
+                2,
+                4,
+                8,
+                16,
+                64,
+            ],
+        )
+
+        self.histogram_decode_queue_duration = Histogram(
+            name="sglang:decode_queue_duration_seconds",
+            documentation="Histogram of decode queue duration in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.1,
+                0.3,
+                0.5,
+                0.7,
+                0.9,
+                2,
+                4,
+                8,
+                16,
+                64,
+            ],
+        )
+
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
 
-    def _log_counter(self, counter, data: Union[int, float]) -> None:
-        # Convenience function for logging to counter.
-        counter.labels(**self.labels).inc(data)
-
-    def observe_one_finished_request(self, prompt_tokens: int, generation_tokens: int):
+    def observe_one_finished_request(
+        self,
+        prompt_tokens: int,
+        generation_tokens: int,
+        e2e_latency: float,
+    ):
         self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
         self.num_requests_total.labels(**self.labels).inc(1)
+        self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
+        if generation_tokens >= 1:
+            self.histogram_time_per_output_token.labels(**self.labels).observe(
+                e2e_latency / generation_tokens
+            )
 
-    def observe_time_to_first_token(self, value: Union[float, int]):
-        self._log_histogram(self.histogram_time_to_first_token, value)
+    def observe_time_to_first_token(self, value: float):
+        self.histogram_time_to_first_token.labels(**self.labels).observe(value)
 
-    def observe_time_per_output_token(self, value: Union[float, int]):
-        self._log_histogram(self.histogram_time_per_output_token, value)
+    def observe_inter_token_latency(self, internval: float, num_new_tokens: int):
+        adjusted_interval = internval / num_new_tokens
 
-    def observe_e2e_request_latency(self, value: Union[float, int]):
-        self._log_histogram(self.histogram_e2e_request_latency, value)
+        # A faster version of the Histogram::observe which observes multiple values at the same time.
+        # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
+        his = self.histogram_inter_token_latency_seconds.labels(**self.labels)
+        his._sum.inc(internval)
+
+        for i, bound in enumerate(his._upper_bounds):
+            if adjusted_interval <= bound:
+                his._buckets[i].inc(num_new_tokens)
+                break
