@@ -434,9 +434,14 @@ def process_result(que, output):
                 response = result.as_numpy("response").item().decode("utf-8")
                 try:
                     response_dict = json.loads(response)
-                    output.generated_text = response_dict["choices"][0]["message"][
-                        "content"
-                    ]
+                    if "delta" in response_dict["choices"][0]:
+                        output.generated_text += response_dict["choices"][0]["delta"][
+                            "content"
+                        ]
+                    else:
+                        output.generated_text = response_dict["choices"][0]["message"][
+                            "content"
+                        ]
                     output.full_text = response
                 except Exception as e:
                     output.generated_text += response
