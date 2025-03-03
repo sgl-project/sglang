@@ -882,7 +882,21 @@ def all_gather_part_issue(
 
     group.all_gather_into_tensor(forward_batch.gathered_buffer, padded_tensor)
 
-def all_gather_part_wait():
+    return dict(
+        forward_batch=forward_batch,
+        all_lens=all_lens,
+        max_len=max_len,
+        rank=rank,
+        world_size=world_size,
+    )
+
+def all_gather_part_wait(state: Dict):
+    forward_batch = state['forward_batch']
+    all_lens = state['all_lens']
+    max_len = state['max_len']
+    rank = state['rank']
+    world_size = state['world_size']
+
     gathered_tensors = torch.concat(
         [
             forward_batch.gathered_buffer[i * max_len : i * max_len + all_lens[i]]
