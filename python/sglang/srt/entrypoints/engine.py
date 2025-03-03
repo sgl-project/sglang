@@ -504,7 +504,7 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
-        
+
     if server_args.completion_template:
         load_completion_template_for_openai_api(
             tokenizer_manager, server_args.completion_template
