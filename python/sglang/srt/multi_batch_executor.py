@@ -38,6 +38,7 @@ class _WrappedGenerator:
         self.output = None
 
     def next(self):
+        assert not self.done
         try:
             next(self._generator)
         except StopIteration as e:
