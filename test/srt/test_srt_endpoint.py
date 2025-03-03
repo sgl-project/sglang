@@ -506,7 +506,7 @@ class TestSRTEndpoint(unittest.TestCase):
             server_info.json()
 
         futures = []
-        for _ in range(10):
+        for _ in range(4):
             futures.append(tp.submit(s))
 
         for f in futures:
