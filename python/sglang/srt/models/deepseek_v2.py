@@ -63,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multi_batch_executor import execute_single_batch, execute_two_batch
 from sglang.srt.utils import is_cuda_available, is_hip
@@ -1046,7 +1046,10 @@ class DeepseekV2Model(nn.Module):
                 positions=positions, forward_batch=forward_batch,
             ),
             partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
-            delta_stages=TODO,
+            delta_stages={
+                ForwardMode.EXTEND: TODO,
+                ForwardMode.DECODE: TODO,
+            }[forward_batch.forward_mode],
         )
 
         if not forward_batch.forward_mode.is_idle():
