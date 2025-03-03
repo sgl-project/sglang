@@ -229,7 +229,9 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            # TODO HACK do not use fast all_reduce b/c want async_op=True; but will use DeepEP
+            # final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            all_reduce_handle = torch.distributed.all_reduce(final_hidden_states, group=get_tp_group().device_group, async_op=True)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
         final_hidden_states = final_hidden_states[start_idx:end_idx]
