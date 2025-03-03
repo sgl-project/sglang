@@ -1046,10 +1046,7 @@ class DeepseekV2Model(nn.Module):
                 positions=positions, forward_batch=forward_batch,
             ),
             partial(self._forward_layers, layer_start=self.first_k_dense_replace, layer_end=len(self.layers)),
-            delta_stages={
-                ForwardMode.EXTEND: TODO,
-                ForwardMode.DECODE: TODO,
-            }[forward_batch.forward_mode],
+            delta_stages=2,
         )
 
         if not forward_batch.forward_mode.is_idle():
