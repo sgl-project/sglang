@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
@@ -287,6 +288,17 @@ class EPMoE(torch.nn.Module):
 
         if self.activation == "silu":
             silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                self.w2_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        elif self.activation == "gelu":
+            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
                 gateup_output,
                 down_input,
                 gateup_output.shape[1],

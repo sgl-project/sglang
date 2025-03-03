@@ -125,6 +125,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -138,6 +140,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             activation=activation,
+            inplace=inplace,
+            no_combine=no_combine,
         )
 
     def forward_cuda(
@@ -153,6 +157,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -171,6 +177,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
+            assert not no_combine, "unsupported"
 
             return fused_experts_ck(
                 hidden_states=x,
@@ -186,8 +193,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2=layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=True,
+                inplace=inplace and not no_combine,
                 activation=activation,
+                no_combine=no_combine,
             )
 
     def forward_cpu(
@@ -202,6 +210,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        inplace: bool = True,
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -241,6 +250,7 @@ class FusedMoE(torch.nn.Module):
         reduce_results: Whether to all all_reduce on the output of the layer
         renomalize: Whether to renormalize the logits in the fused_moe kernel
         quant_config: Quantization configure.
+        inplace: suggestion to compute inplace (modify input activation).
     """
 
     def __init__(
@@ -262,6 +272,8 @@ class FusedMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
         use_presharded_weights: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
     ):
         super().__init__()
 
@@ -285,6 +297,9 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.activation = activation
+        self.use_presharded_weights = use_presharded_weights
+        self.inplace = inplace
+        self.no_combine = no_combine
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -304,7 +319,6 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
-        self.use_presharded_weights = use_presharded_weights
 
     def _load_per_tensor_weight_scale(
         self,
@@ -598,6 +612,8 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
+            inplace=self.inplace,
+            no_combine=self.no_combine,
         )
 
         if self.reduce_results and self.tp_size > 1:

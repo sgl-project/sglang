@@ -30,7 +30,9 @@ class TestSRTBackend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.backend = sgl.Runtime(
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
+        )
         sgl.set_default_backend(cls.backend)
 
     @classmethod
