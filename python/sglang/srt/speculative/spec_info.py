@@ -28,7 +28,3 @@ class SpeculativeAlgorithm(IntEnum):
         if name is not None:
             name = name.upper()
         return name_map[name]
-
-
-class SpecInfo:
-    pass

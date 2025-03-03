@@ -82,8 +82,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SessionParams,
-    SetInternalStateReq,
-    SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -257,9 +255,6 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -308,10 +303,6 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
-                ),
-                (
-                    SetInternalStateReqOutput,
-                    self.set_internal_state_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -773,14 +764,6 @@ class TokenizerManager:
             await self.get_internal_state_communicator(req)
         )
         return res[0].internal_state
-
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
-        res: List[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
-        return res[0]
 
     def get_log_request_metadata(self):
         max_length = None
