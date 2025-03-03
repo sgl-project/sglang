@@ -265,7 +265,8 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             if (
                 model_runner.server_args.attention_backend != "torch_native"
-                and model_runner.server_args.speculative_algorithm != "NEXTN"
+                # TODO: Fix triton kernel illegal memory access for EAGLE
+                and model_runner.server_args.speculative_algorithm != "EAGLE"
             ):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
