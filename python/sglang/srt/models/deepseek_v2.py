@@ -227,6 +227,9 @@ class DeepseekV2MoE(nn.Module):
             # final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
             all_reduce_handle = torch.distributed.all_reduce(final_hidden_states, group=get_tp_group().device_group, async_op=True)
 
+        # End of prefill stage "extra-tiny" / decode stage "SHARED"
+        yield
+
         if forward_batch.forward_mode.is_extend():
             if self.n_shared_experts is not None:
                 if self.enable_shared_experts_dp:
@@ -1104,6 +1107,9 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+
+        if global_server_args_dict["enable_two_batch_overlap"]:
+            assert forward_batch.forward_mode in [ForwardMode.EXTEND, ForwardMode.DECODE]
 
         hidden_states, residual = execute_single_batch(
             dict(
