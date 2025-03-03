@@ -1029,20 +1029,36 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-
         residual = None
-        self._forward_partial_layers(layer_start=0, layer_end=self.first_k_dense_replace)
-        self._forward_partial_layers(layer_start=self.first_k_dense_replace, layer_end=len(self.layers))
+
+        hidden_states, residual = self._forward_partial_layers(
+            layer_start=0, layer_end=self.first_k_dense_replace,
+            hidden_states=hidden_states, residual=residual,
+            positions=positions, forward_batch=forward_batch,
+        )
+        hidden_states, residual = self._forward_partial_layers(
+            layer_start=self.first_k_dense_replace, layer_end=len(self.layers),
+            hidden_states=hidden_states, residual=residual,
+            positions=positions, forward_batch=forward_batch,
+        )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def _forward_partial_layers(self, layer_start: int, layer_end: int):
+    def _forward_partial_layers(
+        self,
+        layer_start: int, layer_end: int,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         for i in range(layer_start, layer_end):
             hidden_states, residual = self.layers[i](
                 positions, hidden_states, forward_batch, residual
             )
+        return hidden_states, residual
 
 class DeepseekV2ForCausalLM(nn.Module):
 
