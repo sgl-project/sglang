@@ -23,6 +23,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         set_custom_all_reduce,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+    from sglang.srt.layers.quantization import get_dynamic_override
     from sglang.srt.model_loader import get_model
     from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -61,9 +62,6 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
-    )
-    from vllm.model_executor.layers.quantization.utils.gptq_utils import (
-        get_dynamic_override,
     )
 
     from sglang.srt.layers.linear import UnquantizedLinearMethod
@@ -140,9 +138,9 @@ class TestGPTQModelDynamic(unittest.TestCase):
         max_tokens = 256
 
         tic = time.time()
-        res = self.run_decode(max_tokens)
+        result = self.run_decode(max_tokens)
         tok = time.time()
-        print(res["text"])
+        print(f"result = `{result}`")
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
         assert throughput >= 140
@@ -178,7 +176,7 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "The capital of France is",
+                "text": "My name is",
                 "sampling_params": {
                     "max_new_tokens": max_new_tokens,
                 },
@@ -190,8 +188,10 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
         max_tokens = 256
 
         tic = time.time()
-        _ = self.run_decode(max_tokens)
+        result = self.run_decode(max_tokens)
         tok = time.time()
+
+        print(f"result = `{result}`")
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
