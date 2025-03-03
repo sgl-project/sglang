@@ -1031,12 +1031,12 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
 
-        hidden_states, residual = self._forward_partial_layers(
+        hidden_states, residual = self._forward_layers(
             layer_start=0, layer_end=self.first_k_dense_replace,
             hidden_states=hidden_states, residual=residual,
             positions=positions, forward_batch=forward_batch,
         )
-        hidden_states, residual = self._forward_partial_layers(
+        hidden_states, residual = self._forward_layers(
             layer_start=self.first_k_dense_replace, layer_end=len(self.layers),
             hidden_states=hidden_states, residual=residual,
             positions=positions, forward_batch=forward_batch,
@@ -1046,7 +1046,7 @@ class DeepseekV2Model(nn.Module):
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def _forward_partial_layers(
+    def _forward_layers(
         self,
         layer_start: int, layer_end: int,
         hidden_states: torch.Tensor,
