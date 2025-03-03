@@ -797,6 +797,8 @@ class Fp8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -819,6 +821,7 @@ class Fp8MoEMethod:
             from aiter.fused_moe import fused_experts_ck
 
             assert activation == "silu", f"{activation=} is not supported."
+            assert not no_combine, f"{no_combine=} is not supported."
 
             return fused_experts_ck(
                 x,
@@ -849,7 +852,7 @@ class Fp8MoEMethod:
                 layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=True,
+                inplace=inplace and not no_combine,
                 activation=activation,
                 use_fp8_w8a8=True,
                 w1_scale=(
@@ -865,6 +868,7 @@ class Fp8MoEMethod:
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+                no_combine=no_combine,
             )
 
 
