@@ -441,14 +441,14 @@ class GroupCoordinator:
         if (pynccl_comm is not None and not pynccl_comm.disabled) and (async_op is None):
             pynccl_comm.all_gather(output, input)
         else:
-            torch.distributed.all_gather_into_tensor(
+            return torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group,
                 async_op=async_op,
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor, async_op=None):
         if (not supports_custom_op()) or (async_op is not None):
-            self._all_gather_into_tensor(output, input, async_op=async_op)
+            return self._all_gather_into_tensor(output, input, async_op=async_op)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
