@@ -138,6 +138,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 8
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_token_map: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -776,7 +777,6 @@ class ServerArgs:
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
         )
-        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -787,6 +787,12 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-token-map",
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
         )
 
         # Double Sparsity
