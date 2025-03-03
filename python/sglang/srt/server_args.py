@@ -62,7 +62,6 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
-    skip_tokenizer_init: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -563,7 +562,7 @@ class ServerArgs:
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
-            help="Model download directory.",
+            help="Model download directory for huggingface.",
         )
         parser.add_argument(
             "--base-gpu-id",
