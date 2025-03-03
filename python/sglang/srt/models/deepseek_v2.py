@@ -1161,7 +1161,11 @@ class DeepseekV2Model(nn.Module):
     def _merge_outputs(output_a, output_b):
         hidden_states_a, residual_a = output_a
         hidden_states_b, residual_b = output_b
-        return TODO
+
+        hidden_states = torch.concat([hidden_states_a, hidden_states_b], dim=0)
+        residual = torch.concat([residual_a, residual_b], dim=0)
+
+        return hidden_states, residual
 
 class DeepseekV2ForCausalLM(nn.Module):
 
