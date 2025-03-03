@@ -1003,6 +1003,7 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1030,11 +1031,11 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
 
         residual = None
-        for i in range(config.first_k_dense_replace):
+        for i in range(self.first_k_dense_replace):
             hidden_states, residual = self.layers[i](
                 positions, hidden_states, forward_batch, residual
             )
-        for i in range(config.first_k_dense_replace, len(self.layers)):
+        for i in range(self.first_k_dense_replace, len(self.layers)):
             hidden_states, residual = self.layers[i](
                 positions, hidden_states, forward_batch, residual
             )
