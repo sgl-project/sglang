@@ -1600,12 +1600,10 @@ class Scheduler:
             # Sync across TP ranks to make sure they have the same number of ready requests
             tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
             torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+                tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
             )
-            num_ready_reqs_max = tensor.item()
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-            num_ready_reqs = num_ready_reqs_max
+            # take min across tensors
+            num_ready_reqs = tensor.item()
 
         self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
