@@ -1918,7 +1918,7 @@ class Scheduler:
         if local_batch is None:
             local_split_token_index, local_split_seq_index = 0, 0
         else:
-            local_split_token_index, local_split_seq_index = compute_middle_split_token_and_seq_index()
+            local_split_token_index, local_split_seq_index = local_batch.compute_middle_split_token_and_seq_index()
 
         # TODO merge these and above
         local_split_token_index = torch.tensor([local_split_token_index], dtype=torch.int64)

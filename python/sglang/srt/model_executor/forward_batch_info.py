@@ -365,27 +365,6 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    # TODO maybe move
-    def compute_middle_split_token_and_seq_index(self):
-        num_tokens = self.input_ids.shape[0]
-
-        if self.forward_mode.is_extend():
-            split_token_index, split_seq_index = 0, 0
-            for extend_seq_len in self.extend_seq_lens_cpu:
-                split_token_index += extend_seq_len
-                split_seq_index += 1
-                if split_token_index >= num_tokens // 2:
-                    break
-        elif self.forward_mode.is_decode():
-            split_token_index = split_seq_index = num_tokens // 2
-        else:
-            raise NotImplementedError
-
-        if split_token_index == 0 or split_token_index == num_tokens:
-            return None, None
-
-        return split_token_index, split_seq_index
-
     def filter_batch(
         self,
         *,
