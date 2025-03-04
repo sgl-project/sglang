@@ -80,8 +80,11 @@ class DeepseekV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         use_dp: bool = False,
         reduce_results: bool = True,
+        enable_all_gather_and_slice: bool = False,
     ) -> None:
         super().__init__()
+        self.enable_all_gather_and_slice = enable_all_gather_and_slice
+
         if use_dp:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config,
@@ -113,10 +116,19 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, _forward_batch=None):
+    def forward(self, x, forward_batch=None):
+        if self.enable_all_gather_and_slice:
+            x, start_idx, end_idx = all_gather(
+                x, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+            )
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+
+        if self.enable_all_gather_and_slice:
+            x = x[start_idx:end_idx]
+
         return x
 
 
@@ -145,8 +157,10 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         enable_shared_experts_dp: bool,
         quant_config: Optional[QuantizationConfig] = None,
+        enable_all_gather_and_slice: bool = False,
     ):
         super().__init__()
+        self.enable_all_gather_and_slice = enable_all_gather_and_slice
         self.enable_shared_experts_dp = enable_shared_experts_dp
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -195,9 +209,11 @@ class DeepseekV2MoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, forward_batch) -> torch.Tensor:
         hidden_states_partial = hidden_states
-        hidden_states, start_idx, end_idx = all_gather(
-            hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-        )
+
+        if self.enable_all_gather_and_slice:
+            hidden_states, start_idx, end_idx = all_gather(
+                hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+            )
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -222,9 +238,13 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
-        final_hidden_states = final_hidden_states[start_idx:end_idx]
+
+        if self.enable_all_gather_and_slice:
+            final_hidden_states = final_hidden_states[start_idx:end_idx]
+
         if self.enable_shared_experts_dp:
             final_hidden_states = final_hidden_states + shared_output
+
         return final_hidden_states
 
 
