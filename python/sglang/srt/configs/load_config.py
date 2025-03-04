@@ -21,6 +21,7 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
+    JAX = "jax"
 
 
 @dataclass
@@ -42,13 +43,15 @@ class LoadConfig:
     ignore_patterns: The list of patterns to ignore when loading the model.
         Default to "original/**/*" to avoid repeated loading of llama's
         checkpoints.
-
+    decryption_key_file: If set, decrypts the output files with a password read
+        from this file (after PBKDF2).
     """
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
     download_dir: Optional[str] = None
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
+    decryption_key_file: Optional[str] = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

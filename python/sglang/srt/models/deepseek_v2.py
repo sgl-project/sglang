@@ -520,10 +520,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         def no_absorb() -> bool:
             if global_server_args_dict["enable_flashinfer_mla"]:
-                # Flashinfer MLA: Only do not use absorb when prefilling/extending without radix cache
+                # Flashinfer MLA: Do not absorb when enabling ragged prefill
                 return (
-                    global_server_args_dict["disable_radix_cache"]
+                    not global_server_args_dict["flashinfer_mla_disable_ragged"]
                     and forward_batch.forward_mode.is_extend()
+                    and forward_batch.extend_prefix_lens.sum() == 0
                 )
             else:
                 # Triton: Use normal computation for prefill and use weight absorption for extend/decode
@@ -1177,6 +1178,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if is_hip_:
                         self_attn.w_scale *= 2.0
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
