@@ -394,6 +394,7 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
     ):
+        print(f'hi {self=}')
         output_dict = dict()
 
         for key in [
@@ -411,7 +412,6 @@ class ForwardBatch:
             "req_to_token_pool",
             "token_to_kv_pool",
             "attn_backend",
-            "gathered_buffer",
             "can_run_dp_cuda_graph",
             "spec_info",
             "spec_algorithm",
@@ -424,15 +424,9 @@ class ForwardBatch:
             dict(
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
+                # TODO improve (we may not need this large); but if we use DeepEP maybe not need this buffer at all
+                gathered_buffer=self.gathered_buffer.clone(),
             )
-        )
-
-        # TODO unify with init_new's handling
-        max_len = max(ret.global_num_tokens)
-        output_dict['gathered_buffer'] = torch.zeros(
-            (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
-            dtype=model_runner.dtype,
-            device=device,
         )
 
         for field in dataclasses.fields(ForwardBatch):
