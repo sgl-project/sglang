@@ -1167,8 +1167,8 @@ class DeepseekV2Model(nn.Module):
             start_seq_index=0, end_seq_index=split_seq_index,
         )
         forward_batch_b = forward_batch.filter_batch(
-            start_token_index=split_token_index, end_token_index=TODO,
-            start_seq_index=split_seq_index, end_seq_index=TODO,
+            start_token_index=split_token_index, end_token_index=forward_batch.input_ids.shape[0],
+            start_seq_index=split_seq_index, end_seq_index=forward_batch.batch_size,
         )
 
         return TODO
