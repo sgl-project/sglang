@@ -41,6 +41,8 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
+    from hip_attn.v1_2 import HiPMetadataCachePool
+
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -189,6 +191,10 @@ class ForwardBatch:
     token_to_kv_pool: BaseTokenToKVPool = None
     attn_backend: AttentionBackend = None
 
+    # For HiP attention
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
+    hip_metadata_cached_stages: Optional[int] = None
+
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
@@ -302,6 +308,17 @@ class ForwardBatch:
         if model_runner.model_is_mrope:
             ret._compute_mrope_positions(model_runner, batch)
 
+        # Init HiP attention information
+        if model_runner.hip_metadata_cache_pool is not None:
+            ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
+            if isinstance(batch.hip_metadata_cached_stages, int) and (
+                batch.hip_metadata_cached_stages < 0
+            ):
+                ret.hip_metadata_cache_pool.reset_decode_phase()
+                ret.hip_metadata_cached_stages = 0
+            else:
+                ret.hip_metadata_cached_stages = batch.hip_metadata_cached_stages
+
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
@@ -365,6 +382,18 @@ class ForwardBatch:
             axis=1,
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
+
+    def on_model_start(self):
+        self.token_to_kv_pool.on_model_start(self)
+
+    def on_model_end(self):
+        self.token_to_kv_pool.on_model_end(self)
+
+    def on_layer_start(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_start(self, layer_id)
+
+    def on_layer_end(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_end(self, layer_id)
 
 
 def compute_position_triton(

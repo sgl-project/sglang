@@ -219,6 +219,7 @@ class Scheduler:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            is_context_extended=server_args.enable_hip_attention,
         )
         self.is_generation = self.model_config.is_generation
 
@@ -1107,6 +1108,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         new_batch.prepare_for_extend()
 
@@ -1871,6 +1873,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
