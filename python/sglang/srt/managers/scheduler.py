@@ -1886,33 +1886,22 @@ class Scheduler:
                 break
 
         if self.server_args.enable_dp_attention:
-            if self.attn_tp_size > 1:
-                # Sync across attn TP ranks to make sure they have the same number of ready requests
-                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-                torch.distributed.all_reduce(
-                    tensor,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=self.attn_tp_cpu_group,
-                )
-                num_ready_reqs_max = tensor.item()
-                for i in range(num_ready_reqs, num_ready_reqs_max):
-                    self.grammar_queue[i].grammar = self.grammar_queue[
-                        i
-                    ].grammar.result()
-                num_ready_reqs = num_ready_reqs_max
+            tp_size = self.attn_tp_size
+            tp_group = self.attn_tp_cpu_group
         else:
-            if self.tp_size > 1:
-                # Sync across TP ranks to make sure they have the same number of ready requests
-                tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-                torch.distributed.all_reduce(
-                    tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-                )
-                num_ready_reqs_max = tensor.item()
-                for i in range(num_ready_reqs, num_ready_reqs_max):
-                    self.grammar_queue[i].grammar = self.grammar_queue[
-                        i
-                    ].grammar.result()
-                num_ready_reqs = num_ready_reqs_max
+            tp_size = self.tp_size
+            tp_group = self.tp_cpu_group
+
+        if tp_size > 1:
+            # Sync across TP ranks to make sure they have the same number of ready requests
+            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
+            num_ready_reqs_max = tensor.item()
+            for i in range(num_ready_reqs, num_ready_reqs_max):
+                self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
+            num_ready_reqs = num_ready_reqs_max
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]

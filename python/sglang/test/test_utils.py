@@ -501,6 +501,7 @@ def get_benchmark_args(
     request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
+    seed: int = 0,
     pd_seperated: bool = False,
 ):
     return SimpleNamespace(
@@ -524,7 +525,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
-        seed=0,
+        seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
         apply_chat_template=False,
@@ -549,6 +550,7 @@ def run_bench_serving(
     disable_stream=False,
     disable_ignore_eos=False,
     need_warmup=False,
+    seed: int = 0,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -572,6 +574,7 @@ def run_bench_serving(
         request_rate=request_rate,
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
+        seed=seed,
     )
 
     try:

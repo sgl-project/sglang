@@ -13,15 +13,13 @@
 # ==============================================================================
 
 import multiprocessing as mp
-import os
 import unittest
 from typing import List
 
 import torch
-from utils import *
+from utils import BACKENDS, TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l, is_in_ci
+from sglang.test.test_utils import is_in_ci
 
 MULTI_LORA_MODELS = [
     LoRAModelCase(
