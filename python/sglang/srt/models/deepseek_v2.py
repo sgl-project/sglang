@@ -1238,9 +1238,9 @@ class DeepseekV2Model(nn.Module):
                 layer_start=self.first_k_dense_replace,
                 layer_end=len(self.layers),
             ),
-            # enable_two_batch_overlap=self.enable_two_batch_overlap,
+            enable_two_batch_overlap=self.enable_two_batch_overlap,
             # TODO hack!
-            enable_two_batch_overlap=False,
+            # enable_two_batch_overlap=False,
             delta_stages=2,
             split_inputs=self._split_inputs,
             merge_outputs=self._merge_outputs,
