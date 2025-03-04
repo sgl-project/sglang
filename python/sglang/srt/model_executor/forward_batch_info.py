@@ -370,7 +370,7 @@ class ForwardBatch:
         num_tokens = self.input_ids.shape[0]
 
         if self.forward_mode.is_extend():
-            split_token_index, split_seq_index = 0
+            split_token_index, split_seq_index = 0, 0
             for extend_seq_len in self.extend_seq_lens_cpu:
                 split_token_index += extend_seq_len
                 split_seq_index += 1
