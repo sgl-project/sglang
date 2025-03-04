@@ -55,6 +55,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -112,7 +113,7 @@ class BenchArgs:
             type=str,
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
-                 '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
 
     @classmethod
@@ -194,10 +195,10 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req = reqs[i]
-        req.fill_ids += input_ids[i][bench_args.cut_len:]
+        req.fill_ids += input_ids[i][bench_args.cut_len :]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                             i, : bench_args.cut_len
-                             ]
+            i, : bench_args.cut_len
+        ]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
     return reqs
 
@@ -261,9 +262,12 @@ def decode(input_token_ids, batch, model_runner):
 def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
     if model_runner.server_args.enable_dp_attention:
         Scheduler.prepare_dp_attn_batch_raw(
-            batch, tp_size=model_runner.tp_size,
-            tp_cpu_group=model_runner.tp_group.cpu_group, get_idle_batch=None,
-            disable_cuda_graph=model_runner.server_args.disable_cuda_graph)
+            batch,
+            tp_size=model_runner.tp_size,
+            tp_cpu_group=model_runner.tp_group.cpu_group,
+            get_idle_batch=None,
+            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+        )
 
 
 def correctness_test(
