@@ -411,7 +411,6 @@ class ForwardBatch:
         for key in [
             "req_pool_indices",
             "seq_lens",
-            "extend_num_tokens",
             "extend_seq_lens",
             "extend_prefix_lens",
             "extend_start_loc",
