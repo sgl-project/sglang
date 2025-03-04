@@ -329,7 +329,7 @@ class ForwardBatch:
                 end_token_index=split_token_index,
                 start_seq_index=0,
                 end_seq_index=split_seq_index,
-                output_attn_backend=TODO,
+                output_attn_backend=model_runner.attn_backend_child_a,
                 output_global_num_tokens=ret.global_split_token_index,
             )
             ret.tbo_child_b = ret.filter_batch(
@@ -337,7 +337,7 @@ class ForwardBatch:
                 end_token_index=ret.input_ids.shape[0],
                 start_seq_index=split_seq_index,
                 end_seq_index=ret.batch_size,
-                output_attn_backend=TODO,
+                output_attn_backend=model_runner.attn_backend_child_b,
                 output_global_num_tokens=[
                     rank_num_tokens - rank_split_token_index
                     for rank_split_token_index, rank_num_tokens in zip(
