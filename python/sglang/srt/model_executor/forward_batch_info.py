@@ -394,6 +394,7 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
     ):
+        device = self.input_ids.device
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
 
@@ -448,9 +449,9 @@ class ForwardBatch:
         assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
 
-        keep_indices = TODO
+        keep_indices = list(range(start_seq_index, end_seq_index))
         keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
+            device, non_blocking=True
         )
 
         output_dict.update(
