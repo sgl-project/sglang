@@ -384,6 +384,18 @@ class ForwardBatch:
 
         return split_token_index
 
+    def filter_batch(self, start_token_index: int, end_token_index: int):
+        start_seq_index, end_seq_index = TODO
+
+        output_dict = dict(
+            batch_size=end_seq_index - start_seq_index,
+        )
+
+        for key in ['forward_mode']:
+            output_dict[key] = getattr(self, key)
+
+        return ForwardBatch(**output_dict)
+
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
