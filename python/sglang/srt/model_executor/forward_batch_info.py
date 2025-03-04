@@ -394,8 +394,6 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
     ):
-        print(f'hi {self=}')
-       
         num_tokens = self.input_ids.shape[0]
         output_dict = dict()
 
@@ -421,6 +419,9 @@ class ForwardBatch:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
+            # TODO this may be changed together w/ gathered_buffer
+            #      but again with DeepEP we may not need this, so just hack it now
+            "global_num_tokens",
         ]:
             output_dict[key] = getattr(self, key)
 
