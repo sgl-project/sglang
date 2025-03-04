@@ -1914,12 +1914,21 @@ class Scheduler:
             group=tp_cpu_group,
         )
 
-        # TODO probably merge this and above `all_gather` into one to save time
+        # TODO merge these and above
         local_split_token_index = torch.tensor([TODO], dtype=torch.int64)
         global_split_token_index = torch.empty(tp_size, dtype=torch.int64)
         torch.distributed.all_gather_into_tensor(
             global_split_token_index,
             local_split_token_index,
+            group=tp_cpu_group,
+        )
+
+        # TODO again, merge
+        local_split_seq_index = torch.tensor([TODO], dtype=torch.int64)
+        global_split_seq_index = torch.empty(tp_size, dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            global_split_seq_index,
+            local_split_seq_index,
             group=tp_cpu_group,
         )
 
@@ -1929,6 +1938,7 @@ class Scheduler:
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens.tolist()
             local_batch.global_split_token_index = global_split_token_index.tolist()
+            local_batch.global_split_seq_index = global_split_seq_index.tolist()
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
