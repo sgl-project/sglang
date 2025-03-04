@@ -424,7 +424,8 @@ class ForwardBatch:
             dict(
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
-                # TODO improve (we may not need this large); but if we use DeepEP maybe not need this buffer at all
+                # TODO improve (we may not need this large, and also not always clone);a
+                #      but if we use DeepEP maybe not need this buffer at all
                 gathered_buffer=self.gathered_buffer.clone(),
             )
         )
