@@ -37,7 +37,7 @@ runtime_common = [
     "uvloop",
     "xgrammar==0.1.14",
     "ninja",
-    "transformers==4.48.3",
+    "transformers==4.49.0",
     "llguidance>=0.6.15"
 ]
 srt = [
