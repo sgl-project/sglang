@@ -418,8 +418,11 @@ class ForwardBatch:
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
             "image_inputs",
+            "lora_paths",
         ]:
             old_value = getattr(self, key)
+            if old_value is None:
+                continue
             assert len(old_value) == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
