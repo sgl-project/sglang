@@ -53,7 +53,7 @@ def setup_class(cls, backend: str):
 class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=False)
+        setup_class(cls, backend="outlines")
 
     @classmethod
     def tearDownClass(cls):
