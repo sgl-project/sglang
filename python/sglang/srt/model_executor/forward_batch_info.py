@@ -323,11 +323,15 @@ class ForwardBatch:
             split_seq_index = ret.global_split_seq_index[tp_rank]
 
             ret.tbo_child_a = ret.filter_batch(
+                start_token_index=0,
+                end_token_index=split_token_index,
                 start_seq_index=0,
                 end_seq_index=split_seq_index,
                 output_global_num_tokens=ret.global_split_token_index,
             )
             ret.tbo_child_b = ret.filter_batch(
+                start_token_index=split_token_index,
+                end_token_index=ret.input_ids.shape[0],
                 start_seq_index=split_seq_index,
                 end_seq_index=ret.batch_size,
                 output_global_num_tokens=[

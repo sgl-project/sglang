@@ -1242,7 +1242,7 @@ class DeepseekV2Model(nn.Module):
             # TODO hack!
             # enable_two_batch_overlap=False,
             delta_stages=2,
-            split_inputs=partial(self._split_inputs, tp_rank=self.tp_rank),
+            split_inputs=self._split_inputs,
             merge_outputs=self._merge_outputs,
         )
 
@@ -1272,15 +1272,12 @@ class DeepseekV2Model(nn.Module):
         residual: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        tp_rank: int,
     ) -> Optional[Tuple[Dict, Dict]]:
         output_a = DeepseekV2Model._filter_inputs(
             hidden_states=hidden_states,
             residual=residual,
             positions=positions,
             forward_batch=forward_batch,
-            start_token_index=0,
-            end_token_index=split_token_index,
             child_mode='a',
         )
         output_b = DeepseekV2Model._filter_inputs(
@@ -1288,8 +1285,6 @@ class DeepseekV2Model(nn.Module):
             residual=residual,
             positions=positions,
             forward_batch=forward_batch,
-            start_token_index=split_token_index,
-            end_token_index=forward_batch.input_ids.shape[0],
             child_mode='b',
         )
 
