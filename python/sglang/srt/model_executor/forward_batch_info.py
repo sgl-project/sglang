@@ -395,7 +395,7 @@ class ForwardBatch:
         end_seq_index: int,
     ):
         num_tokens = self.input_ids.shape[0]
-        num_seqs = TODO
+        num_seqs = self.batch_size
 
         output_dict = dict()
 
