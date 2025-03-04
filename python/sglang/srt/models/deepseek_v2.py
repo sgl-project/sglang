@@ -1274,13 +1274,6 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         tp_rank: int,
     ) -> Optional[Tuple[Dict, Dict]]:
-        if any(x == -1 for x in forward_batch.global_split_token_index):
-            _log(f'split_inputs decides to NOT split since {forward_batch.global_split_token_index=}')
-            return None
-
-        split_token_index = forward_batch.global_split_token_index[tp_rank]
-        split_seq_index = forward_batch.global_split_seq_index[tp_rank]
-
         output_a = DeepseekV2Model._filter_inputs(
             hidden_states=hidden_states,
             residual=residual,
@@ -1289,9 +1282,6 @@ class DeepseekV2Model(nn.Module):
             start_token_index=0,
             end_token_index=split_token_index,
             child_mode='a',
-            # start_seq_index=0,
-            # end_seq_index=split_seq_index,
-            # output_global_num_tokens=forward_batch.global_split_token_index,
         )
         output_b = DeepseekV2Model._filter_inputs(
             hidden_states=hidden_states,
@@ -1301,16 +1291,6 @@ class DeepseekV2Model(nn.Module):
             start_token_index=split_token_index,
             end_token_index=forward_batch.input_ids.shape[0],
             child_mode='b',
-            # start_seq_index=split_seq_index,
-            # end_seq_index=forward_batch.batch_size,
-            # output_global_num_tokens=[
-            #     rank_num_tokens - rank_split_token_index
-            #     for rank_split_token_index, rank_num_tokens in zip(
-            #         forward_batch.global_split_token_index,
-            #         forward_batch.global_num_tokens,
-            #         strict=True,
-            #     )
-            # ]
         )
 
         _log(

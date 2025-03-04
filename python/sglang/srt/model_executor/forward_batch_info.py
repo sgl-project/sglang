@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -313,10 +313,33 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
-           
+
         # TODO maybe move
-        ret.tbo_child_a = ret.filter_batch(TODO)
-        ret.tbo_child_b = ret.filter_batch(TODO)
+        # ====================================================================================
+        enable_tbo = all(x != -1 for x in ret.global_split_token_index)
+        tp_rank = get_tensor_model_parallel_rank()
+        if enable_tbo:
+            split_token_index = ret.global_split_token_index[tp_rank]
+            split_seq_index = ret.global_split_seq_index[tp_rank]
+
+            ret.tbo_child_a = ret.filter_batch(
+                start_seq_index=0,
+                end_seq_index=split_seq_index,
+                output_global_num_tokens=ret.global_split_token_index,
+            )
+            ret.tbo_child_b = ret.filter_batch(
+                start_seq_index=split_seq_index,
+                end_seq_index=ret.batch_size,
+                output_global_num_tokens=[
+                    rank_num_tokens - rank_split_token_index
+                    for rank_split_token_index, rank_num_tokens in zip(
+                        ret.global_split_token_index,
+                        ret.global_num_tokens,
+                        strict=True,
+                    )
+                ]
+            )
+        # ====================================================================================
 
         return ret
 
