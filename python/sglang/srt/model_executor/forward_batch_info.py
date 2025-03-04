@@ -376,6 +376,7 @@ class ForwardBatch:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
+        output_global_num_tokens: List[int],
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
@@ -428,14 +429,12 @@ class ForwardBatch:
         assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
 
-        global_num_tokens = TODO
-
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
-                global_num_tokens=global_num_tokens,
+                global_num_tokens=output_global_num_tokens,
                 # TODO improve (we may not need this large, and also not always clone);a
                 #      but if we use DeepEP maybe not need this buffer at all
                 gathered_buffer=self.gathered_buffer.clone(),

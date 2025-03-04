@@ -1298,6 +1298,7 @@ class DeepseekV2Model(nn.Module):
                 end_token_index=end_token_index,
                 start_seq_index=start_seq_index,
                 end_seq_index=end_seq_index,
+                output_global_num_tokens=TODO,
             ),
         )
 
