@@ -32,7 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -407,8 +406,8 @@ class Scheduler:
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Tell whether the current running batch is full so that we can skip
@@ -1032,10 +1031,10 @@ class Scheduler:
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.batch_is_full = True
@@ -1321,7 +1320,7 @@ class Scheduler:
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    self.token_to_kv_pool.free(batch.out_cache_loc[j: j + 1])
                     continue
 
                 if req.is_chunked <= 0:
@@ -1357,10 +1356,10 @@ class Scheduler:
                     ):
                         req.hidden_states.append(
                             logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
+                            hidden_state_offset: (
+                                hidden_state_offset := hidden_state_offset
+                                                       + len(req.origin_input_ids)
+                            )
                             ]
                             .cpu()
                             .clone()
@@ -1455,7 +1454,7 @@ class Scheduler:
 
             if self.enable_overlap and req.finished():
                 # Free the one delayed token
-                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
+                self.token_to_kv_pool.free(batch.out_cache_loc[i: i + 1])
                 continue
 
             if batch.spec_algorithm.is_none():
@@ -1554,8 +1553,8 @@ class Scheduler:
         assert isinstance(output.input_token_logprobs, tuple)
         input_token_logprobs: Tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[
-            logprob_pt : logprob_pt + num_input_logprobs
-        ]
+                               logprob_pt: logprob_pt + num_input_logprobs
+                               ]
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
@@ -1586,7 +1585,7 @@ class Scheduler:
             req.input_token_logprobs_val.pop()
 
             # Compute input_token_logprobs_idx
-            input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
+            input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len:]
             # Clip the padded hash values from image tokens.
             # Otherwise, it will lead to detokenization errors.
             input_token_logprobs_idx = [
@@ -1662,28 +1661,28 @@ class Scheduler:
             # Some decode tokens are re-computed in an extend batch
             req.output_token_logprobs_val.extend(
                 output.input_token_logprobs[
-                    pt
-                    + num_input_logprobs
-                    - 1
-                    - req.last_update_decode_tokens : pt
-                    + num_input_logprobs
-                    - 1
+                pt
+                + num_input_logprobs
+                - 1
+                - req.last_update_decode_tokens: pt
+                                                 + num_input_logprobs
+                                                 - 1
                 ],
             )
             req.output_token_logprobs_idx.extend(
                 req.fill_ids[
-                    len(req.fill_ids)
-                    - req.last_update_decode_tokens : len(req.fill_ids)
+                len(req.fill_ids)
+                - req.last_update_decode_tokens: len(req.fill_ids)
                 ]
             )
 
         if req.top_logprobs_num > 0:
             if req.last_update_decode_tokens != 0:
                 req.output_top_logprobs_val.extend(
-                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
+                    output.input_top_logprobs_val[i][-req.last_update_decode_tokens:]
                 )
                 req.output_top_logprobs_idx.extend(
-                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
+                    output.input_top_logprobs_idx[i][-req.last_update_decode_tokens:]
                 )
 
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
@@ -1693,12 +1692,12 @@ class Scheduler:
             if req.last_update_decode_tokens != 0:
                 req.output_token_ids_logprobs_val.extend(
                     output.input_token_ids_logprobs_val[i][
-                        -req.last_update_decode_tokens :
+                    -req.last_update_decode_tokens:
                     ]
                 )
                 req.output_token_ids_logprobs_idx.extend(
                     output.input_token_ids_logprobs_idx[i][
-                        -req.last_update_decode_tokens :
+                    -req.last_update_decode_tokens:
                     ]
                 )
 
@@ -1774,10 +1773,10 @@ class Scheduler:
                     # TODO(lianmin): this is wrong for speculative decoding because len(req.output_ids) does not
                     # always increase one-by-one.
                     or (
-                        not req.stream
-                        and len(req.output_ids) % 50 == 0
-                        and not self.model_config.is_multimodal_gen
-                    )
+                    not req.stream
+                    and len(req.output_ids) % 50 == 0
+                    and not self.model_config.is_multimodal_gen
+                )
                 ):
                     if self.draft_worker and req.finished():
                         self.draft_worker.finish_request(req)
@@ -1915,11 +1914,21 @@ class Scheduler:
             group=tp_cpu_group,
         )
 
+        # TODO probably merge this and above `all_gather` into one to save time
+        local_split_token_index = torch.tensor([TODO], dtype=torch.int64)
+        global_split_token_index = torch.empty(tp_size, dtype=torch.int64)
+        torch.distributed.all_gather_into_tensor(
+            global_split_token_index,
+            local_split_token_index,
+            group=tp_cpu_group,
+        )
+
         if local_batch is None and global_num_tokens.max().item() > 0:
             local_batch = get_idle_batch()
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens.tolist()
+            local_batch.global_split_token_index = global_split_token_index.tolist()
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:

@@ -620,6 +620,7 @@ class ScheduleBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
+    global_split_token_index: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
 
