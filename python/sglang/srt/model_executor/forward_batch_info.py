@@ -399,12 +399,15 @@ class ForwardBatch:
             output_dict[key] = getattr(self, key)[start_token_index:end_token_index]
 
         for key in [
-            'forward_mode',
+            'forward_mode', 'return_logprob', 'req_to_token_pool', 'token_to_kv_pool', 'attn_backend',
+            'gathered_buffer', 'can_run_dp_cuda_graph', 'spec_info', 'spec_algorithm', 'capture_hidden_mode',
+            'padded_static_len',
         ]:
             output_dict[key] = getattr(self, key)
 
         output_dict.update(dict(
             batch_size=end_seq_index - start_seq_index,
+            seq_lens_sum=output_dict['seq_lens'].sum().item(),
         ))
 
         return ForwardBatch(**output_dict)
