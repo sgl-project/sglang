@@ -369,7 +369,7 @@ class ForwardBatch:
         if self.forward_mode.is_extend():
             return TODO
         elif self.forward_mode.is_decode():
-            return TODO
+            return self.input_ids.shape[0] // 2
         else:
             raise NotImplementedError
 
