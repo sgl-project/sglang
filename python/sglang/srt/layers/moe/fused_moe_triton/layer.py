@@ -29,6 +29,9 @@ import logging
 
 is_hip_ = is_hip()
 
+if is_hip_:
+    from aiter import ck_moe
+
 logger = logging.getLogger(__name__)
 
 
@@ -173,18 +176,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            import aiter
-            from aiter.fused_moe import fused_experts_ck
-
-            assert activation == "silu", f"{activation=} is not supported."
             assert not no_combine, "unsupported"
-
-            return fused_experts_ck(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
+            return ck_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                None,
+                None,
+                None,
+                None,
+                32,
+                None,
+                activation,
             )
         else:
             return fused_experts(
