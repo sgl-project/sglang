@@ -225,11 +225,11 @@ class DeepseekV2MoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> Generator[None, None, torch.Tensor]:
         hidden_states_local = hidden_states
-        
+
         if self.enable_all_gather_and_slice:
-	        all_gather_state = all_gather_part_issue(
-	            hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-	        )
+            all_gather_state = all_gather_part_issue(
+                hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+            )
 
         if forward_batch.forward_mode.is_decode():
             assert self.enable_shared_experts_dp
@@ -239,7 +239,7 @@ class DeepseekV2MoE(nn.Module):
         yield
 
         if self.enable_all_gather_and_slice:
-        	hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
+            hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -264,14 +264,14 @@ class DeepseekV2MoE(nn.Module):
         yield
 
         if forward_batch.forward_mode.is_extend():
-	        if self.n_shared_experts is not None:
-	            if self.enable_shared_experts_dp:
-	                if forward_batch.forward_mode.is_idle():
-	                    shared_output = None
-	                else:
-	                    shared_output = self.shared_experts(hidden_states_partial)
-	            else:
-	                shared_output = self.shared_experts(hidden_states)
+            if self.n_shared_experts is not None:
+                if self.enable_shared_experts_dp:
+                    if forward_batch.forward_mode.is_idle():
+                        shared_output = None
+                    else:
+                        shared_output = self.shared_experts(hidden_states_local)
+                else:
+                    shared_output = self.shared_experts(hidden_states)
 
         if self.tp_size > 1:
             all_reduce_handle.wait()
