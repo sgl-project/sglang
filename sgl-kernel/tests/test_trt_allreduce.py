@@ -7,9 +7,9 @@ import unittest
 from typing import Any, List, Optional
 
 import ray
+import sgl_kernel.ops.allreduce as custom_ops
 import torch
 import torch.distributed as dist
-from sgl_kernel import ops as custom_ops
 from torch.distributed import ProcessGroup
 from vllm import _custom_ops as vllm_ops
 
