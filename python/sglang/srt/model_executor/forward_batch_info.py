@@ -489,6 +489,8 @@ class ForwardBatch:
                 global_num_tokens=output_global_num_tokens,
                 gathered_buffer=gathered_buffer,
                 attn_backend=output_attn_backend,
+                tbo_parent_start_token_index=start_token_index,
+                tbo_parent_end_token_index=end_token_index,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
                 # No longer used
