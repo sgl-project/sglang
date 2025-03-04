@@ -141,24 +141,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
-    def init_value_impl(self, key: Tuple[str, str]) -> OutlinesGrammar:
-        key_type, key_string = key
-        if key_type == "json":
-            try:
-                regex = build_regex_from_object(
-                    key_string,
-                    whitespace_pattern=self.whitespace_pattern,
-                )
-            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
-                logger.warning(
-                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
-                )
-                return None
-        elif key_type == "regex":
-            regex = key_string
-        else:
-            raise ValueError(f"Invalid key_type: {key_type}")
-
+    def _compile_regex(self, regex: str) -> Optional[OutlinesGrammar]:
         try:
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1
@@ -172,6 +155,25 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
 
         jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
+
+    def dispatch_ebnf(self, key_string: str):
+        return super().dispatch_ebnf(key_string)
+
+    def dispatch_structural_tag(self, key_string: str):
+        return super().dispatch_structural_tag(key_string)
+
+    def dispatch_json(self, key_string: str):
+        try:
+            regex = build_regex_from_object(
+                key_string,
+                whitespace_pattern=self.whitespace_pattern,
+            )
+        except (NotImplementedError, json.decoder.JSONDecodeError) as e:
+            logger.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
+        return self._compile_regex(regex)
+
+    def dispatch_regex(self, key_string: str):
+        return self._compile_regex(key_string)
 
 
 def build_regex_from_object(
