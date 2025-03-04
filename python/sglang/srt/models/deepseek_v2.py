@@ -1148,6 +1148,7 @@ class DeepseekV2Model(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
@@ -1247,8 +1248,8 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Optional[Tuple[Dict, Dict]]:
-        split_token_index = forward_batch.global_split_token_index[TODO]
-        split_seq_index = forward_batch.global_split_seq_index[TODO]
+        split_token_index = forward_batch.global_split_token_index[self.tp_rank]
+        split_seq_index = forward_batch.global_split_seq_index[self.tp_rank]
         if split_token_index is None:
             return None
 
