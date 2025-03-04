@@ -30,7 +30,13 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import ChatGLMConfig, DbrxConfig, ExaoneConfig, Qwen2_5_VLConfig,DeepseekVL2Config
+from sglang.srt.configs import (
+    ChatGLMConfig,
+    DbrxConfig,
+    DeepseekVL2Config,
+    ExaoneConfig,
+    Qwen2_5_VLConfig,
+)
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -43,6 +49,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
+
 
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
