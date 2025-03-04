@@ -34,6 +34,7 @@ from einops import rearrange
 from transformers import AutoModel, Qwen2VLConfig
 from transformers.activations import ACT2FN
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
@@ -41,7 +42,6 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
-from transformers.models.qwen2_5_vl import Qwen2_5_VLProcessor
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
