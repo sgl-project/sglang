@@ -1,9 +1,8 @@
 import os
 
 import torch
-from torch._dynamo.eval_frame import null_context
-
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from torch._dynamo.eval_frame import null_context
 
 _ENABLE_PROFILE = bool(
     int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
@@ -44,15 +43,22 @@ def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
     generator_a = _WrappedGenerator("a", fn(**inputs_a))
     generator_b = _WrappedGenerator("b", fn(**inputs_b))
 
-    for _ in range(delta_stages):
-        generator_a.next()
-
+    print('hack: run generator_a to the end, this is NOT OVERLAP')
     while not generator_a.done:
         generator_a.next()
+    print('hack: run generator_b to the end, this is NOT OVERLAP')
+    while not generator_b.done:
         generator_b.next()
 
-    for _ in range(delta_stages):
-        generator_b.next()
+    # for _ in range(delta_stages):
+    #     generator_a.next()
+    #
+    # while not generator_a.done:
+    #     generator_a.next()
+    #     generator_b.next()
+    #
+    # for _ in range(delta_stages):
+    #     generator_b.next()
 
     assert generator_a.done and generator_b.done
     return generator_a.output, generator_b.output
