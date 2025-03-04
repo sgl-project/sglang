@@ -395,6 +395,8 @@ class ForwardBatch:
         end_seq_index: int,
     ):
         print(f'hi {self=}')
+       
+        num_tokens = self.input_ids.shape[0]
         output_dict = dict()
 
         for key in [
@@ -404,7 +406,9 @@ class ForwardBatch:
             "seq_lens",
             "out_cache_loc",
         ]:
-            output_dict[key] = getattr(self, key)[start_token_index:end_token_index]
+            old_value = getattr(self, key)
+            assert old_value.shape[0] == num_tokens
+            output_dict[key] = old_value[start_token_index:end_token_index]
 
         for key in [
             "forward_mode",
