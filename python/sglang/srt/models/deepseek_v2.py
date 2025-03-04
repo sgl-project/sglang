@@ -1162,6 +1162,15 @@ class DeepseekV2Model(nn.Module):
         if split_token_index is None:
             return None
 
+        forward_batch_a = forward_batch.filter_batch(
+            start_token_index=0, end_token_index=split_token_index,
+            start_seq_index=0, end_seq_index=split_seq_index,
+        )
+        forward_batch_b = forward_batch.filter_batch(
+            start_token_index=split_token_index, end_token_index=TODO,
+            start_seq_index=split_seq_index, end_seq_index=TODO,
+        )
+
         return TODO
 
     @staticmethod
