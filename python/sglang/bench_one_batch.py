@@ -55,11 +55,11 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -112,7 +112,7 @@ class BenchArgs:
             type=str,
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
-            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+                 '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
 
     @classmethod
@@ -194,10 +194,10 @@ def prepare_extend_inputs_for_correctness_test(
 ):
     for i in range(len(reqs)):
         req = reqs[i]
-        req.fill_ids += input_ids[i][bench_args.cut_len :]
+        req.fill_ids += input_ids[i][bench_args.cut_len:]
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-            i, : bench_args.cut_len
-        ]
+                             i, : bench_args.cut_len
+                             ]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
     return reqs
 
@@ -238,6 +238,9 @@ def extend(reqs, model_runner):
         enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
+    if TODO:
+        Scheduler.prepare_dp_attn_batch_raw(batch, tp_size=TODO, tp_cpu_group=TODO, get_idle_batch=None,
+                                            disable_cuda_graph=TODO)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output = model_runner.forward(forward_batch)
