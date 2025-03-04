@@ -1247,7 +1247,8 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Optional[Tuple[Dict, Dict]]:
-        split_token_index, split_seq_index = TODO
+        split_token_index = forward_batch.global_split_token_index[TODO]
+        split_seq_index = forward_batch.global_split_seq_index[TODO]
         if split_token_index is None:
             return None
 
