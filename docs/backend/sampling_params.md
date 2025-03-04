@@ -1,125 +1,74 @@
-# Sampling Parameters in SGLang Runtime
-This doc describes the sampling parameters of the SGLang Runtime.
-It is the low-level endpoint of the runtime.
-If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](../backend/openai_api_completions.ipynb).
+# Sampling Parameters
 
-The `/generate` endpoint accepts the following arguments in the JSON format. You can code examples below.
+This doc describes the sampling parameters of the SGLang Runtime. It is the low-level endpoint of the runtime.
 
-```python
-@dataclass
-class GenerateReqInput:
-    # The input prompt. It can be a single prompt or a batch of prompts.
-    text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/sglang/srt/utils.py:load_image.
-    image_data: Optional[Union[List[str], str]] = None
-    # The sampling_params. See descriptions below.
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
-    # Whether to return logprobs.
-    return_logprob: Optional[Union[List[bool], bool]] = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
-    logprob_start_len: Optional[Union[List[int], int]] = None
-    # If return logprobs, the number of top logprobs to return at each position.
-    top_logprobs_num: Optional[Union[List[int], int]] = None
-    # If return logprobs, the token ids to return logprob for.
-    token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to detokenize tokens in text in the returned logprobs.
-    return_text_in_logprobs: bool = False
-    # Whether to stream output.
-    stream: bool = False
+If you want a high-level endpoint that can automatically handle chat templates, consider using the [OpenAI Compatible API](./openai_api_completions.ipynb).
 
-    # The modalities of the image data [image, multi-images, video]
-    modalities: Optional[List[str]] = None
-    # LoRA related
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+## `/generate` Endpoint
 
-    # Custom logit processor for advanced sampling control. Must be a serialized instance
-    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
-    # Use the processor's `to_str()` method to generate the serialized string.
-    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](./native_api.ipynb).
 
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-```
+* `prompt: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
+* `input_ids: Optional[Union[List[List[int]], List[int]]] = None` Alternative to `text`. Specify the input as token IDs instead of text.
+* `sampling_params: Optional[Union[List[Dict], Dict]] = None` The sampling parameters as described in the sections below.
+* `return_logprob: Optional[Union[List[bool], bool]] = None` Whether to return log probabilities for tokens.
+* `logprob_start_len: Optional[Union[List[int], int]] = None` If returning log probabilities, specifies the start position in the prompt. Default is "-1" which returns logprobs only for output tokens.
+* `top_logprobs_num: Optional[Union[List[int], int]] = None` If returning log probabilities, specifies the number of top logprobs to return at each position.
+* `stream: bool = False` Whether to stream the output.
+* `lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None` Path to LoRA weights.
+* `custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None` Custom logit processor for advanced sampling control. For usage see below.
+* `return_hidden_states: bool = False` Whether to return hidden states of the model. Note that each time it changes, the cuda graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/hidden_states.py) for more information.
 
-The `sampling_params` follows this format
+## Sampling params
 
-```python
-# The maximum number of output tokens
-max_new_tokens: int = 128,
-# Stop when hitting any of the strings in this list
-stop: Optional[Union[str, List[str]]] = None,
-# Stop when hitting any of the token_ids in this list
-stop_token_ids: Optional[List[int]] = [],
-# Sampling temperature
-temperature: float = 1.0,
-# Top-p sampling
-top_p: float = 1.0,
-# Top-k sampling
-top_k: int = -1,
-# Min-p sampling
-min_p: float = 0.0,
-# Do parallel sampling and return `n` outputs.
-n: int = 1,
+### Core Parameters
 
-## Structured Outputs
-# Only one of the below three can be set for a request.
+* `max_new_tokens: int = 128` The maximum output length measured in tokens.
+* `stop: Optional[Union[str, List[str]]] = None` One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled.
+* `stop_token_ids: Optional[List[int]] = []` Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
+* `temperature: float = 1.0` [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity.
+* `top_p: float = 1.0` [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
+* `top_k: int = -1` [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
+* `min_p: float = 0.0` [Min-p](https://github.com/huggingface/transformers/issues/27670) samples from tokens with probability larger than `min_p * highest_token_probability`.
 
-# Constrain the output to follow a given JSON schema.
-json_schema: Optional[str] = None,
-# Constrain the output to follow a given regular expression.
-regex: Optional[str] = None,
-# Constrain the output to follow a given EBNF grammar.
-ebnf: Optional[str] = None,
+### Penalizers
 
-## Penalties
+To use penalizers you will need to `--disable-overlap`. Please note that this might degrade performance.
 
-# Float that penalizes new tokens based on their frequency in the generated text so far.
-# Values > 0 encourage the model to use new tokens, while values < 0 encourage the model to
-# repeat tokens. Must be -2 <= value <= 2. Setting to 0 (default) will disable this penalty.
-frequency_penalty: float = 0.0,
-# Float that penalizes new tokens based on whether they appear in the generated text so far.
-# Values > 0 encourage the model to use new tokens, while values < 0 encourage the model to repeat
-# tokens. Must be -2 <= value <= 2. Setting to 0 (default) will disable this penalty.
-presence_penalty: float = 0.0,
-# Guides inference to generate at least this number of tokens by penalizing logits of tokenizer's
-# EOS token and `stop_token_ids` to -inf, until the output token reaches given length.
-# Note that any of the `stop` string can be generated before reaching `min_new_tokens`, as it is
-# difficult to infer the correct token ID by given `stop` strings.
-# Must be 0 <= value < max_new_tokens. Setting to 0 (default) will disable this penalty.
-min_new_tokens: int = 0,
+* `frequency_penalty: float = 0.0`: Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token.
+* `presence_penalty: float = 0.0`: Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured.
+* `repetition_penalty: float = 0.0`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `2` encourages sampling of new tokens. The penalization scales multiplicatively.
+* `min_new_tokens: int = 0`: Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior for example if the distribution is highly skewed towards these tokens.
 
-# Whether to ignore EOS token
-ignore_eos: bool = False,
-# Whether to skip the special tokens during detokenization
-skip_special_tokens: bool = True,
-# Whether to add spaces between special tokens during detokenization
-spaces_between_special_tokens: bool = True,
+### Constrained decoding
 
-## Custom Parameters for Custom Logit Processor.
-# A dictionary of custom parameters for the custom logit processor.
-# The custom logit processor takes a list of dictionaries as input, where each
-# dictionary is the custom parameters for one token in a batch of the input.
-# See also python/sglang/srt/sampling/custom_logit_processor.py
-custom_params: Optional[Dict[str, Any]] = None,
-```
+Please refer to our dedicated guide on [constrained decoding](./structured_outputs.ipynb) for the following parameters.
+
+* `json_schema: Optional[str] = None`: JSON schema for structured outputs.
+* `regex: Optional[str] = None`: Regex for structured outputs.
+* `ebnf: Optional[str] = None`: EBNF for structured outputs.
+
+### Other options
+
+* `n: int = 1`: Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeat the same prompts for several times offer better control and efficiency.)
+* `spaces_between_special_tokens: bool = True`: Whether or not to add spaces between special tokens during detokenization.
+* `no_stop_trim: bool = False`: Don't trim stop words or EOS token from the generated text.
+* `ignore_eos: bool = False`: Don't stop generation when EOS token is sampled.
+* `skip_special_tokens: bool = True`: Remove special tokens during decoding.
+* `custom_params: Optional[List[Optional[Dict[str, Any]]]] = None`: Used when employing `CustomLogitProcessor`. For usage see below.
 
 ## Examples
 
 ### Normal
-Launch a server
+
+Launch a server:
+
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
 ```
 
-Send a request
+Send a request:
+
 ```python
 import requests
 
@@ -136,8 +85,12 @@ response = requests.post(
 print(response.json())
 ```
 
+Detailed example in [send request](./send_request.ipynb).
+
 ### Streaming
-Send a request and stream the output
+
+Send a request and stream the output:
+
 ```python
 import requests, json
 
@@ -167,19 +120,24 @@ for chunk in response.iter_lines(decode_unicode=False):
 print("")
 ```
 
+Detailed example in [openai compatible api](https://docs.sglang.ai/backend/openai_api_completions.html#id2).
+
 ### Multi modal
 
-Launch a server
+Launch a server:
+
 ```
 python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --chat-template chatml-llava
 ```
 
-Download an image
+Download an image:
+
 ```
 curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
 ```
 
-Send a request
+Send a request:
+
 ```python
 import requests
 
@@ -200,9 +158,13 @@ print(response.json())
 ```
 
 The `image_data` can be a file name, a URL, or a base64 encoded string. See also `python/sglang/srt/utils.py:load_image`.
+
 Streaming is supported in a similar manner as [above](#streaming).
 
+Detailed example in [openai api vision](./openai_api_vision.ipynb).
+
 ### Structured Outputs (JSON, Regex, EBNF)
+
 You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request.
 
 SGLang supports two grammar backends:
@@ -272,6 +234,8 @@ response = requests.post(
 )
 print(response.json())
 ```
+
+Detailed example in [structured outputs](./structured_outputs.ipynb).
 ### Custom Logit Processor
 Launch a server with `--enable-custom-logit-processor` flag on.
 ```
