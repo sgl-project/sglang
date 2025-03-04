@@ -236,7 +236,7 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> Generator[None, None, torch.Tensor]:
         hidden_states_local = hidden_states
-        _log(f'{hidden_states_local.shape=}')
+        # _log(f'{hidden_states_local.shape=}')
 
         if self.enable_all_gather_and_slice:
             all_gather_state = all_gather_part_issue(
@@ -255,7 +255,7 @@ class DeepseekV2MoE(nn.Module):
 
         if self.enable_all_gather_and_slice:
             hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
-            _log(f'after all-gather {hidden_states.shape=}')
+            # _log(f'after all-gather {hidden_states.shape=}')
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -293,12 +293,12 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
 
         if self.enable_all_gather_and_slice:
-            _log(f'slice before {final_hidden_states.shape=}')
+            # _log(f'slice before {final_hidden_states.shape=}')
             final_hidden_states = final_hidden_states[start_idx:end_idx]
-            _log(f'slice after {final_hidden_states.shape=}')
+            # _log(f'slice after {final_hidden_states.shape=}')
 
         if self.enable_shared_experts_dp and shared_output is not None:
-            _log(f'add-shared-output before {final_hidden_states.shape=} {shared_output.shape=}')
+            # _log(f'add-shared-output before {final_hidden_states.shape=} {shared_output.shape=}')
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
@@ -1105,7 +1105,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Generator[None, None, Tuple[torch.Tensor, torch.Tensor]]:
-        _log(f'Layer.forward start index={self.self_attn.layer_id}')
+        # _log(f'Layer.forward start index={self.self_attn.layer_id}')
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -1135,7 +1135,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp.forward(hidden_states, forward_batch)
 
-        _log(f'Layer.forward end index={self.self_attn.layer_id}')
+        # _log(f'Layer.forward end index={self.self_attn.layer_id}')
         return hidden_states, residual
 
 
@@ -1188,7 +1188,7 @@ class DeepseekV2Model(nn.Module):
                 ForwardMode.DECODE,
             ]
 
-        _log('execute_single_batch start')
+        # _log('execute_single_batch start')
         hidden_states, residual = execute_single_batch(
             dict(
                 hidden_states=hidden_states,
@@ -1202,7 +1202,7 @@ class DeepseekV2Model(nn.Module):
                 layer_end=self.first_k_dense_replace,
             ),
         )
-        _log('execute_maybe_two_batch start')
+        # _log('execute_maybe_two_batch start')
         hidden_states, residual = execute_maybe_two_batch(
             dict(
                 hidden_states=hidden_states,
@@ -1299,8 +1299,8 @@ class DeepseekV2Model(nn.Module):
         end_seq_index: int,
         output_global_num_tokens: List[int],
     ) -> Dict:
-        _log(
-            f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
+        # _log(
+        #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
         return dict(
             hidden_states=hidden_states[start_token_index:end_token_index],
             residual=residual[start_token_index:end_token_index],
@@ -1356,7 +1356,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        _log(f'CausalLM.forward {input_ids.shape=} {forward_batch=}')
+        # _log(f'CausalLM.forward {input_ids.shape=} {forward_batch=}')
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
