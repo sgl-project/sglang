@@ -1338,6 +1338,8 @@ class ScheduleBatch:
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
+            global_split_token_index=self.global_split_token_index,
+            global_split_seq_index=self.global_split_seq_index,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             extend_num_tokens=self.extend_num_tokens,
@@ -1434,6 +1436,8 @@ class ModelWorkerBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]]
+    global_split_token_index: Optional[List[int]]
+    global_split_seq_index: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     can_run_dp_cuda_graph: bool
 

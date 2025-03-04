@@ -191,6 +191,8 @@ class ForwardBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
+    global_split_token_index: Optional[List[int]] = None
+    global_split_seq_index: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
 
@@ -235,6 +237,8 @@ class ForwardBatch:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             global_num_tokens=batch.global_num_tokens,
+            global_split_token_index=batch.global_split_token_index,
+            global_split_seq_index=batch.global_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
