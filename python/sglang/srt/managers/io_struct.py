@@ -376,8 +376,6 @@ class BatchTokenIDOut:
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
-    # The version id to sync decode status with in detokenizer_manager
-    vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
@@ -678,6 +676,12 @@ class ParseFunctionCallReq:
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
+
+
+@dataclass
+class SeparateReasoningReqInput:
+    text: str  # The text to parse.
+    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass
