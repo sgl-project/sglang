@@ -397,7 +397,7 @@ class BlockInt8MoEMethod:
             layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=inplace and not no_combine,
+            inplace=inplace,
             activation=activation,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
