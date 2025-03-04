@@ -208,6 +208,10 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # TODO beautify
+    child_a: Optional['ForwardBatch'] = None
+    child_b: Optional['ForwardBatch'] = None
+
     @classmethod
     def init_new(
         cls,
