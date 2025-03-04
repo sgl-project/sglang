@@ -405,7 +405,7 @@ class ForwardBatch:
             "out_cache_loc",
         ]:
             old_value = getattr(self, key)
-            assert old_value.shape[0] == num_tokens
+            assert old_value.shape[0] == num_tokens, f'{key=} {old_value=} {num_tokens=} {self=}'
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         for key in [
