@@ -313,6 +313,10 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
+           
+        # TODO maybe move
+        ret.tbo_child_a = ret.filter_batch(TODO)
+        ret.tbo_child_b = ret.filter_batch(TODO)
 
         return ret
 
