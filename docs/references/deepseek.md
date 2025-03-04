@@ -131,6 +131,10 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Usage**: turn on by default for DeepSeek V3 models.
 
+### Reasoning Content for DeepSeek R1
+
+See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
+
 ## FAQ
 
 1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
