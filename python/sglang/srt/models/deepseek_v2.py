@@ -1217,7 +1217,7 @@ class DeepseekV2Model(nn.Module):
             ),
             enable_two_batch_overlap=self.enable_two_batch_overlap,
             delta_stages=2,
-            split_inputs=self._split_inputs,
+            split_inputs=partial(self._split_inputs, tp_rank=self.tp_rank),
             merge_outputs=self._merge_outputs,
         )
 
@@ -1247,9 +1247,10 @@ class DeepseekV2Model(nn.Module):
         residual: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        tp_rank: int,
     ) -> Optional[Tuple[Dict, Dict]]:
-        split_token_index = forward_batch.global_split_token_index[self.tp_rank]
-        split_seq_index = forward_batch.global_split_seq_index[self.tp_rank]
+        split_token_index = forward_batch.global_split_token_index[tp_rank]
+        split_seq_index = forward_batch.global_split_seq_index[tp_rank]
         if split_token_index is None:
             return None
 
