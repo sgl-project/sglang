@@ -422,6 +422,8 @@ class ForwardBatch:
             # TODO this may be changed together w/ gathered_buffer
             #      but again with DeepEP we may not need this, so just hack it now
             "global_num_tokens",
+            # TODO only used by qwen2-vl, thus not checked
+            "mrope_positions",
         ]:
             output_dict[key] = getattr(self, key)
 
