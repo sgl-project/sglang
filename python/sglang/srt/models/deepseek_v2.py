@@ -1302,12 +1302,7 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
-        start_token_index: int,
-        end_token_index: int,
         child_mode: str,
-        # start_seq_index: int,
-        # end_seq_index: int,
-        # output_global_num_tokens: List[int],
     ) -> Dict:
         # _log(
         #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
