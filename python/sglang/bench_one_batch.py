@@ -259,7 +259,7 @@ def decode(input_token_ids, batch, model_runner):
 
 
 def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
-    if TODO:
+    if model_runner.server_args.enable_dp_attention:
         Scheduler.prepare_dp_attn_batch_raw(
             batch, tp_size=model_runner.tp_size,
             tp_cpu_group=model_runner.tp_group.cpu_group, get_idle_batch=None,
