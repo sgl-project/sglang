@@ -387,12 +387,25 @@ class ForwardBatch:
     def filter_batch(self, start_token_index: int, end_token_index: int):
         start_seq_index, end_seq_index = TODO
 
-        output_dict = dict(
-            batch_size=end_seq_index - start_seq_index,
-        )
+        output_dict = dict()
 
-        for key in ['forward_mode']:
+        for key in [
+            'input_ids',
+            'positions',
+            'req_pool_indices',
+            'seq_lens',
+            'out_cache_loc',
+        ]:
+            output_dict[key] = getattr(self, key)[start_token_index:end_token_index]
+
+        for key in [
+            'forward_mode',
+        ]:
             output_dict[key] = getattr(self, key)
+
+        output_dict.update(dict(
+            batch_size=end_seq_index - start_seq_index,
+        ))
 
         return ForwardBatch(**output_dict)
 
