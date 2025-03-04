@@ -85,6 +85,11 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.enable_all_gather_and_slice = enable_all_gather_and_slice
 
+        if enable_all_gather_and_slice:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
         if use_dp:
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config,
