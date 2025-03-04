@@ -488,6 +488,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         last_idx = 0
         image_idx = -1
         image_inputs.image_offsets = []
+        image_inputs.image_pad_len = []
 
         # Get all special token IDs
         im_start_id = image_inputs.im_start_id
@@ -520,6 +521,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
             # Add pad_ids
             new_input_ids.extend(pad_ids)
+            image_inputs.image_pad_len.append(num_tokens)
 
             # Update last_idx to after end token
             last_idx = end_idx
@@ -564,15 +566,27 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         image_inputs = None
+        need_vision = True
         if forward_batch.image_inputs is not None:
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.image_offsets and im.image_pad_len:
+                    max_image_offset.append(
+                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
+                    )
+                else:
+                    max_image_offset.append(-1)
+            start_positions = positions[forward_batch.extend_start_loc][0].cpu().numpy()
+            need_vision = (start_positions <= np.array(max_image_offset)).any()
 
         if (
             forward_batch.forward_mode.is_decode()
             or image_inputs is None
             or len(image_inputs) == 0
+            or not need_vision
         ):
             inputs_embeds = self.model.embed_tokens(input_ids)
         else:
