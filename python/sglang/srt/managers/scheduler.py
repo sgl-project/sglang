@@ -42,7 +42,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
-    BatchMultimodalDecodeReq,
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
@@ -104,7 +103,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
-    kill_itself_when_parent_died,
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
