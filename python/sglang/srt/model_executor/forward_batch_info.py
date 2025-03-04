@@ -434,7 +434,7 @@ class ForwardBatch:
             assert (
                 getattr(self, field.name) is None
                 or output_dict.get(field.name) is not None
-            ), f"Field {field.name} has value, but is not yet supported (value: {output_dict[field.name]})"
+            ), f"Field {field.name} has value, but is not yet supported (value: {getattr(self, field.name)})"
 
         return ForwardBatch(**output_dict)
 
