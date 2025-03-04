@@ -366,12 +366,19 @@ class ForwardBatch:
 
     # TODO maybe move
     def compute_split_token_index(self):
+        num_tokens = self.input_ids.shape[0]
+
         if self.forward_mode.is_extend():
-            return TODO
+            raw = TODO
         elif self.forward_mode.is_decode():
-            return self.input_ids.shape[0] // 2
+            raw = num_tokens // 2
         else:
             raise NotImplementedError
+
+        if raw == 0 or raw == num_tokens:
+            return None
+
+        return raw
 
 
 def compute_position_triton(
