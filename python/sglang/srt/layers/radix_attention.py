@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 from torch import nn
 
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -52,6 +53,8 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        orig_context_len: Optional[int] = None,
+        rope: Optional[RotaryEmbedding] = None,
         quant_config: Optional[QuantizationConfig] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
@@ -80,6 +83,25 @@ class RadixAttention(nn.Module):
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
+
+        self.orig_context_len = orig_context_len
+
+        # Store RoPE for context extension
+        if rope is not None:
+            if isinstance(rope, (list, tuple)):
+                _, self.rope_cos, self.rope_sin = rope
+            else:
+                assert isinstance(rope, RotaryEmbedding)
+                if hasattr(rope, "repeated_cos_sin_cache"):
+                    self.rope_cos, self.rope_sin = rope.repeated_cos_sin_cache
+                else:
+                    cos_sin = rope.cos_sin_cache
+                    cos, sin = cos_sin.chunk(2, dim=-1)
+                    self.rope_cos = cos.repeat(1, 2)
+                    self.rope_sin = sin.repeat(1, 2)
+                    rope.repeated_cos_sin_cache = (self.rope_cos, self.rope_sin)
+        else:
+            self.rope_cos = self.rope_sin = None
 
     def forward(
         self,

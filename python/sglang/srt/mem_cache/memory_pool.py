@@ -36,6 +36,7 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,90 @@ class KVCache(abc.ABC):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         raise NotImplementedError()
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+
+    def on_model_start(self, forward_batch: ForwardBatch):
+        pass
+
+    def on_model_end(self, forward_batch: ForwardBatch):
+        pass
+
+    def on_layer_start(self, forward_batch: ForwardBatch, layer_id: int):
+        pass
+
+    def on_layer_end(self, forward_batch: ForwardBatch, layer_id: int):
+        pass
+
+
+class TokenToKVPoolAllocator:
+    """An allocator managing the indices to kv cache data."""
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+    ):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.page_size = 1
+
+        self.free_slots = None
+        self.is_not_in_free_group = True
+        self.free_group = []
+        self.clear()
+
+        self._kvcache = kvcache
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def alloc(self, need_size: int):
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.free_slots = torch.cat((self.free_slots, free_index))
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
+
+    def backup_state(self):
+        return self.free_slots
+
+    def restore_state(self, free_slots):
+        self.free_slots = free_slots
+
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
+        self.is_not_in_free_group = True
+        self.free_group = []
 
 
 class MHATokenToKVPool(KVCache):

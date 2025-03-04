@@ -54,6 +54,7 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -81,6 +82,7 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
@@ -499,6 +501,10 @@ class ModelRunner:
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
+        elif server_args.enable_hip_attention:
+            logger.info("HIP attention is turned on.")
+            server_args.attention_backend = "hip_attention"
+
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
@@ -674,6 +680,19 @@ class ModelRunner:
             )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
+
+        if self.server_args.enable_hip_attention:
+            orig_context_length = get_context_length(self.model_config.hf_config)
+            if self.server_args.context_length is None:
+                self.server_args.context_length = orig_context_length
+            update_context_length(
+                self.model_config.hf_config, self.server_args.context_length
+            )
+            self.model_config.hf_config.orig_context_len = orig_context_length
+            logger.info(
+                f"Update model config for HiP context extension "
+                f"{orig_context_length} -> {self.server_args.context_length}."
+            )
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
@@ -1223,7 +1242,12 @@ class ModelRunner:
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."
                 )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            if self.server_args.enable_hip_offload:
+                self.max_total_num_tokens = max_total_tokens
+            else:
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens, max_total_tokens
+                )
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
@@ -1318,6 +1342,21 @@ class ModelRunner:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
+        elif (
+            self.server_args.enable_hip_attention
+            and self.server_args.enable_hip_offload
+        ):
+            self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                max_token_size=self.max_total_num_tokens,
+                max_mask_cache_token_size=self.server_args.hip_max_mask_cache_token_size,
+                max_sa_cache_token_size=self.server_args.hip_max_sa_cache_token_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=torch.device(self.gpu_id),
+                hip_config=self.server_args.hip_attention_config,
+            )
         else:
             if self.is_hybrid:
                 self.token_to_kv_pool = SWAKVPool(
@@ -1391,6 +1430,21 @@ class ModelRunner:
         else:
             assert self.is_draft_worker
 
+        self.hip_metadata_cache_pool = None
+        if self.server_args.enable_hip_attention:
+            from hip_attn.v1_2 import HiPMetadataCachePool
+
+            self.hip_metadata_cache_pool = HiPMetadataCachePool(
+                self.max_total_num_tokens,
+                query_head_num=(
+                    self.model_config.num_attention_heads // self.server_args.tp_size
+                ),
+                layer_num=self.model_config.num_hidden_layers,
+                context_length=self.model_config.context_len,
+                device=self.device,
+                hip_config=self.server_args.hip_attention_config,
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -1463,7 +1517,13 @@ class ModelRunner:
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
-        if backend_str == "flashinfer":
+        if backend_str == "hip_attention":
+            from sglang.srt.layers.attention.hip_radix_attention import (
+                HiPRadixAttentionBackend,
+            )
+
+            self.attn_backend = HiPRadixAttentionBackend(self)
+        elif backend_str == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
