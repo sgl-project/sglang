@@ -197,7 +197,12 @@ class GPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList(
             [
-                GPT2Block(i, config, quant_config=quant_config, prefix=add_prefix(f"h.{i}", prefix))
+                GPT2Block(
+                    i,
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"h.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
