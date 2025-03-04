@@ -42,3 +42,20 @@ jobs:
       run: |
         pip install twine
         python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+
+    - name: Get package version
+      id: get_version
+      working-directory: sgl-kernel
+      run: |
+        VERSION=$(grep -o 'version = "[^"]*"' pyproject.toml | head -1 | cut -d'"' -f2)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Calculate SHA-256 hashes locally
+      run: |
+        python scripts/release/calculate_local_hashes.py sgl-kernel --version ${{ steps.get_version.outputs.version }} --dist-dir sgl-kernel/dist --output hash.txt
+
+    - name: Upload hash.txt as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: sgl-kernel-hashes
+        path: hash.txt
