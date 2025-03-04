@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -429,15 +431,22 @@ class ForwardBatch:
         assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
 
+        # TODO improve, e.g. unify w/ `init_raw`
+        max_len = max(output_global_num_tokens)
+        tp_size = get_tensor_model_parallel_world_size()
+        gathered_buffer = torch.zeros(
+            (max_len * tp_size, self.gathered_buffer.shape[1]),
+            dtype=self.gathered_buffer.dtype,
+            device=self.gathered_buffer.device,
+        )
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
                 global_num_tokens=output_global_num_tokens,
-                # TODO improve (we may not need this large, and also not always clone);a
-                #      but if we use DeepEP maybe not need this buffer at all
-                gathered_buffer=self.gathered_buffer.clone(),
+                gathered_buffer=gathered_buffer,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
                 # No longer used
