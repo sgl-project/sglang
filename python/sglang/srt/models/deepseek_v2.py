@@ -1105,6 +1105,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Generator[None, None, Tuple[torch.Tensor, torch.Tensor]]:
+        _log(f'Layer.forward start index={self.self_attn.layer_id}')
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -1134,6 +1135,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp.forward(hidden_states, forward_batch)
 
+        _log(f'Layer.forward end index={self.self_attn.layer_id}')
         return hidden_states, residual
 
 
@@ -1340,6 +1342,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        _log(f'CausalLM.forward {input_ids.shape=} {forward_batch=}')
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
