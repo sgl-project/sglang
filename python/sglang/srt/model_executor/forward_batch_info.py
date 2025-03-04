@@ -454,9 +454,6 @@ class ForwardBatch:
             device, non_blocking=True
         )
 
-        sampling_info = self.sampling_info.clone()
-        sampling_info.filter_batch(keep_indices=keep_indices, keep_indices_device=keep_indices_device)
-
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
@@ -465,14 +462,15 @@ class ForwardBatch:
                 # TODO improve (we may not need this large, and also not always clone);a
                 #      but if we use DeepEP maybe not need this buffer at all
                 gathered_buffer=self.gathered_buffer.clone(),
-                sampling_info=sampling_info,
+                # TODO make it none because seems not used. should check whether really not used
+                sampling_info=None,
             )
         )
 
         for field in dataclasses.fields(ForwardBatch):
-            assert (
-                getattr(self, field.name) is None
-                or output_dict.get(field.name) is not None
+            assert not (
+                getattr(self, field.name) is not None
+                and field.name not in output_dict
             ), f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
 
         return ForwardBatch(**output_dict)
