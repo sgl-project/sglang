@@ -980,15 +980,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        # When enable_shared_experts_dp, the all_gather/slice is moved down to the next level
-        if self.enable_dp_attention and ((not self.enable_shared_experts_dp) or isinstance(self.mlp, DeepseekV2MLP)):
-            hidden_states, start_idx, end_idx = all_gather(
-                hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-            )
-            hidden_states = self.mlp(hidden_states, forward_batch)
-            hidden_states = hidden_states[start_idx:end_idx]
-        else:
-            hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
         return hidden_states, residual
 
