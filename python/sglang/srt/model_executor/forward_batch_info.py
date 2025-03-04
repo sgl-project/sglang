@@ -421,9 +421,6 @@ class ForwardBatch:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            # TODO this may be changed together w/ gathered_buffer
-            #      but again with DeepEP we may not need this, so just hack it now
-            "global_num_tokens",
             # TODO only used by qwen2-vl, thus not checked
             "mrope_positions",
         ]:
@@ -431,11 +428,6 @@ class ForwardBatch:
 
         assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
-
-        keep_indices = list(range(start_seq_index, end_seq_index))
-        keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
 
         output_dict.update(
             dict(
