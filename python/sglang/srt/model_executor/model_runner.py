@@ -41,6 +41,8 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+from sglang.srt.layers.attention.aiter_decode_backend import AiterDecodeAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -734,6 +736,10 @@ class ModelRunner:
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
             self.attn_backend = FlashInferAttnBackend(self)
+        elif self.server_args.attention_backend == "aiter":
+            self.attn_backend = AiterAttnBackend(self)
+        elif self.server_args.attention_backend == "aiter_decode":
+            self.attn_backend = AiterDecodeAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
