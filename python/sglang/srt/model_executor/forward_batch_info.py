@@ -382,7 +382,7 @@ class ForwardBatch:
             raise NotImplementedError
 
         if split_token_index == 0 or split_token_index == num_tokens:
-            return None
+            return None, None
 
         return split_token_index, split_seq_index
 
