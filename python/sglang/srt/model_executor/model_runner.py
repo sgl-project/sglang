@@ -263,9 +263,7 @@ class ModelRunner:
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            # TODO(liangan1): Just use gloo to bypass the initilization fail
-            # Need to use xccl for xpu backend in the future
-            backend = "gloo"
+            backend = "xccl"
         elif self.device == "hpu":
             backend = "hccl"
         elif self.device == "cpu":

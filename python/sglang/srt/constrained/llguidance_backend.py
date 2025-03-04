@@ -48,7 +48,7 @@ class GuidanceGrammar(BaseGrammarObject):
         self.finished = False
         self.bitmask = None
 
-    def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         if len(self.pending_ff_tokens) > 0:
             s = self.llguidance_tokenizer.decode_str(self.pending_ff_tokens)
             ff_tokens = self.pending_ff_tokens
@@ -125,22 +125,27 @@ class GuidanceBackend(BaseGrammarBackend):
         )
         self.llguidance_tokenizer = llguidance.hf.from_tokenizer(self.tokenizer, None)
 
-    def init_value_impl(self, key: Tuple[str, str]) -> GuidanceGrammar:
-        mode, value = key
-        if mode == "json":
-            json_schema = value
-            compiler = llguidance.JsonCompiler(
-                whitespace_flexible=self.whitespace_flexible
-            )
-            serialized_grammar = compiler.compile(json_schema)
-        elif mode == "regex":
-            compiler = llguidance.RegexCompiler()
-            serialized_grammar = compiler.compile(regex=value)
-        elif mode == "ebnf":
-            compiler = llguidance.LarkCompiler()
-            serialized_grammar = compiler.compile(any_to_lark(value))
-
+    def _from_serialized(self, serialized_grammar) -> GuidanceGrammar:
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
             serialized_grammar=serialized_grammar,
         )
+
+    def dispatch_json(self, key_string: str) -> GuidanceGrammar:
+        json_schema = key_string
+        compiler = llguidance.JsonCompiler(whitespace_flexible=self.whitespace_flexible)
+        serialized_grammar = compiler.compile(json_schema)
+        return self._from_serialized(serialized_grammar)
+
+    def dispatch_regex(self, key_string: str) -> GuidanceGrammar:
+        compiler = llguidance.RegexCompiler()
+        serialized_grammar = compiler.compile(regex=key_string)
+        return self._from_serialized(serialized_grammar)
+
+    def dispatch_ebnf(self, key_string: str) -> GuidanceGrammar:
+        compiler = llguidance.LarkCompiler()
+        serialized_grammar = compiler.compile(any_to_lark(key_string))
+        return self._from_serialized(serialized_grammar)
+
+    def dispatch_structural_tag(self, key_string: str):
+        return super().dispatch_structural_tag(key_string)
