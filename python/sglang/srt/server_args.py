@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_port_available,
+    is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -291,6 +292,9 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        if is_remote_url(self.model_path):
+            self.load_format = "remote"
 
         # AMD-specific Triton attention KV splits default number
         if is_hip():

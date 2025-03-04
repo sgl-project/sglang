@@ -1466,3 +1466,26 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def is_remote_url(url: str) -> bool:
+    """
+    Check if the URL is a remote URL of the format:
+    <connector_type>://<host>:<port>/<model_name>
+    """
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    return m is not None
+
+
+def parse_connector_type(url: str) -> str:
+    """
+    Parse the connector type from the URL of the format:
+    <connector_type>://<path>
+    """
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    if m is None:
+        return ""
+
+    return m.group(1)
