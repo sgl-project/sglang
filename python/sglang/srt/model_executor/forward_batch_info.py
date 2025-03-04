@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -337,20 +336,20 @@ class ForwardBatch:
                 if image_inputs is None:
                     # text only
                     mrope_positions = [
-                        [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
-                        ]
-                    ] * 3
+                                          [
+                                              pos
+                                              for pos in range(
+                                              extend_prefix_len, extend_prefix_len + extend_seq_len
+                                          )
+                                          ]
+                                      ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ],
+                                         extend_start_loc: extend_start_loc + extend_seq_len
+                                         ],
                             image_grid_thw=image_inputs.image_grid_thws,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
@@ -432,7 +431,7 @@ class ForwardBatch:
             assert (
                 getattr(self, field.name) is None
                 or output_dict.get(field.name) is not None
-            ), f"Field {field.name} has value, but is not yet supported"
+            ), f"Field {field.name} has value, but is not yet supported (value: {output_dict[field.name]})"
 
         return ForwardBatch(**output_dict)
 
