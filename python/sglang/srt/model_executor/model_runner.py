@@ -734,9 +734,12 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
+        self.attn_backend = self._create_attention_backend()
+
+    def _create_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
-            self.attn_backend = FlashInferAttnBackend(self)
+            return FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
@@ -747,13 +750,13 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             if self.server_args.enable_double_sparsity:
-                self.attn_backend = DoubleSparseAttnBackend(self)
+                return DoubleSparseAttnBackend(self)
             else:
-                self.attn_backend = TritonAttnBackend(self)
+                return TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
-            self.attn_backend = TorchNativeAttnBackend(self)
+            return TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer_mla":
-            self.attn_backend = FlashInferMLAAttnBackend(self)
+            return FlashInferMLAAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
