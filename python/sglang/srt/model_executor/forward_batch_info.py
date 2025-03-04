@@ -395,18 +395,26 @@ class ForwardBatch:
         end_seq_index: int,
     ):
         num_tokens = self.input_ids.shape[0]
+        num_seqs = TODO
+
         output_dict = dict()
 
         for key in [
             "input_ids",
             "positions",
-            "req_pool_indices",
-            "seq_lens",
             "out_cache_loc",
         ]:
             old_value = getattr(self, key)
             assert old_value.shape[0] == num_tokens, f'{key=} {old_value=} {num_tokens=} {self=}'
             output_dict[key] = old_value[start_token_index:end_token_index]
+
+        for key in [
+            "req_pool_indices",
+            "seq_lens",
+        ]:
+            old_value = getattr(self, key)
+            assert old_value.shape[0] == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
+            output_dict[key] = old_value[start_seq_index:end_seq_index]
 
         for key in [
             "forward_mode",
