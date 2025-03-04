@@ -10,12 +10,12 @@ _ENABLE_PROFILE = bool(
 
 
 def execute_maybe_two_batch(
-    inputs,
-    fn,
-    delta_stages: int,
-    enable_two_batch_overlap: bool,
-    split_inputs,
-    merge_outputs,
+        inputs,
+        fn,
+        delta_stages: int,
+        enable_two_batch_overlap: bool,
+        split_inputs,
+        merge_outputs,
 ):
     # TODO maybe optimize these nested `if`s
     if enable_two_batch_overlap:
@@ -43,22 +43,22 @@ def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
     generator_a = _WrappedGenerator("a", fn(**inputs_a))
     generator_b = _WrappedGenerator("b", fn(**inputs_b))
 
-    print('hack: run generator_a to the end, this is NOT OVERLAP')
-    while not generator_a.done:
-        generator_a.next()
-    print('hack: run generator_b to the end, this is NOT OVERLAP')
-    while not generator_b.done:
-        generator_b.next()
-
-    # for _ in range(delta_stages):
-    #     generator_a.next()
-    #
+    # print('hack: run generator_a to the end, this is NOT OVERLAP')
     # while not generator_a.done:
     #     generator_a.next()
+    # print('hack: run generator_b to the end, this is NOT OVERLAP')
+    # while not generator_b.done:
     #     generator_b.next()
-    #
-    # for _ in range(delta_stages):
-    #     generator_b.next()
+
+    for _ in range(delta_stages):
+        generator_a.next()
+
+    while not generator_a.done:
+        generator_a.next()
+        generator_b.next()
+
+    for _ in range(delta_stages):
+        generator_b.next()
 
     assert generator_a.done and generator_b.done
     return generator_a.output, generator_b.output
