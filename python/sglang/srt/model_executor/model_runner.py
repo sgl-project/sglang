@@ -810,8 +810,10 @@ class ModelRunner:
 
     def forward_decode(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
-        self.attn_backend_child_a.init_forward_metadata(forward_batch.tbo_child_a)
-        self.attn_backend_child_b.init_forward_metadata(forward_batch.tbo_child_b)
+        if (x := forward_batch.tbo_child_a) is not None:
+            self.attn_backend_child_a.init_forward_metadata(x)
+        if (x := forward_batch.tbo_child_b) is not None:
+            self.attn_backend_child_b.init_forward_metadata(x)
 
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
@@ -819,8 +821,10 @@ class ModelRunner:
 
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
-        self.attn_backend_child_a.init_forward_metadata(forward_batch.tbo_child_a)
-        self.attn_backend_child_b.init_forward_metadata(forward_batch.tbo_child_b)
+        if (x := forward_batch.tbo_child_a) is not None:
+            self.attn_backend_child_a.init_forward_metadata(x)
+        if (x := forward_batch.tbo_child_b) is not None:
+            self.attn_backend_child_b.init_forward_metadata(x)
 
         if self.is_generation:
             if forward_batch.input_embeds is None:
