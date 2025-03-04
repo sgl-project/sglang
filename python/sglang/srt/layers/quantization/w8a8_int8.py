@@ -230,6 +230,8 @@ class W8A8Int8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -253,12 +255,12 @@ class W8A8Int8MoEMethod:
             layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=inplace,
             activation=activation,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            # per_channel=True,
+            no_combine=no_combine,
         )
