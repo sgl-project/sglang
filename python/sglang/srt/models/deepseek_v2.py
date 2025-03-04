@@ -236,6 +236,7 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> Generator[None, None, torch.Tensor]:
         hidden_states_local = hidden_states
+        _log(f'{hidden_states_local.shape=}')
 
         if self.enable_all_gather_and_slice:
             all_gather_state = all_gather_part_issue(
@@ -254,6 +255,7 @@ class DeepseekV2MoE(nn.Module):
 
         if self.enable_all_gather_and_slice:
             hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
+            _log(f'after all-gather {hidden_states.shape=}')
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -291,9 +293,12 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
 
         if self.enable_all_gather_and_slice:
+            _log(f'slice before {final_hidden_states.shape=}')
             final_hidden_states = final_hidden_states[start_idx:end_idx]
+            _log(f'slice after {final_hidden_states.shape=}')
 
         if self.enable_shared_experts_dp and shared_output is not None:
+            _log(f'add-shared-output before {final_hidden_states.shape=} {shared_output.shape=}')
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
@@ -1180,6 +1185,7 @@ class DeepseekV2Model(nn.Module):
                 ForwardMode.DECODE,
             ]
 
+        _log('execute_single_batch start')
         hidden_states, residual = execute_single_batch(
             dict(
                 hidden_states=hidden_states,
@@ -1193,6 +1199,7 @@ class DeepseekV2Model(nn.Module):
                 layer_end=self.first_k_dense_replace,
             ),
         )
+        _log('execute_maybe_two_batch start')
         hidden_states, residual = execute_maybe_two_batch(
             dict(
                 hidden_states=hidden_states,
