@@ -24,8 +24,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -176,8 +175,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -217,7 +215,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-9
+          "le": 1e-09
         },
         "legend": {
           "show": true
@@ -260,8 +258,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -412,8 +409,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -453,7 +449,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-9
+          "le": 1e-09
         },
         "legend": {
           "show": true
@@ -497,8 +493,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -599,8 +594,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -696,8 +690,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -797,8 +790,7 @@
     {
       "datasource": {
         "default": true,
-        "type": "prometheus",
-        "uid": "aeboq3sqk89vkd"
+        "type": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -908,8 +900,7 @@
           "value": "127.0.0.1:30000"
         },
         "datasource": {
-          "type": "prometheus",
-          "uid": "aeboq3sqk89vkd"
+          "type": "prometheus"
         },
         "definition": "label_values(instance)",
         "hide": 0,
@@ -936,8 +927,7 @@
           "value": "meta-llama/Llama-3.1-8B-Instruct"
         },
         "datasource": {
-          "type": "prometheus",
-          "uid": "aeboq3sqk89vkd"
+          "type": "prometheus"
         },
         "definition": "label_values(model_name)",
         "hide": 0,
@@ -966,7 +956,7 @@
   "timepicker": {},
   "timezone": "browser",
   "title": "SGLang Dashboard",
-  "uid": "ddyp55uq7brpcc",
+  "uid": "sglang-dashboard",
   "version": 5,
   "weekStart": ""
 }
