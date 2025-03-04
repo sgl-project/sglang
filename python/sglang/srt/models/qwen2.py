@@ -48,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_layers, make_layers_with_previous_layer
 
 Qwen2Config = None
 
@@ -97,6 +97,7 @@ class Qwen2MLP(nn.Module):
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        config: Qwen2Config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -105,6 +106,7 @@ class Qwen2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
+        previous_layer: Optional["Qwen2Attention"] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -147,19 +149,27 @@ class Qwen2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
+        if previous_layer is None:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
+        else:
+            assert self.head_dim == previous_layer.head_dim
+            self.rotary_emb = previous_layer.rotary_emb
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -172,7 +182,13 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if (forward_batch.hip_metadata_cache_pool is None) or (
+            not forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -184,14 +200,22 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        previous_layer: Optional["Qwen2DecoderLayer"] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and getattr(
+            config, "original_max_position_embeddings", None
+        ):
+            rope_scaling["original_max_position_embeddings"] = (
+                config.original_max_position_embeddings
+            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         self.self_attn = Qwen2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -200,6 +224,9 @@ class Qwen2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            previous_layer=(
+                previous_layer.self_attn if previous_layer is not None else None
+            ),
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
@@ -310,7 +337,9 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        forward_batch.on_model_start()
         for i in range(self.start_layer, self.end_layer):
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -318,6 +347,9 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

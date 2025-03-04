@@ -52,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_layers, make_layers_with_previous_layer
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        previous_layer: Optional["LlamaAttention"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -173,6 +174,10 @@ class LlamaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -185,7 +190,14 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -198,6 +210,7 @@ class LlamaDecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        previous_layer: Optional["LlamaDecoderLayer"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -229,6 +242,9 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
+            previous_layer=(
+                previous_layer.self_attn if previous_layer is not None else None
+            ),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -327,9 +343,12 @@ class LlamaModel(nn.Module):
             deferred_norm = None
 
         aux_hidden_states = []
+
+        forward_batch.on_model_start()
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -337,6 +356,8 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

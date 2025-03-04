@@ -241,6 +241,7 @@ def extend(reqs, model_runner):
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         enable_custom_logit_processor=False,
+        hip_attention_config=model_runner.server_args.hip_attention_config,
     )
     batch.prepare_for_extend()
     _maybe_prepare_dp_attn_batch(batch, model_runner)
