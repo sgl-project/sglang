@@ -1425,6 +1425,38 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def configure_ipv6(server_args):
+    addr = server_args.dist_init_addr
+    end = addr.find("]")
+    if end == -1:
+        raise ValueError("invalid IPv6 address format: missing ']'")
+
+    host = addr[: end + 1]
+
+    # this only validates the address without brackets: we still need the below checks.
+    # if it's invalid, immediately raise an error so we know it's not formatting issues.
+    if not is_valid_ipv6_address(host[1:end]):
+        raise ValueError(f"invalid IPv6 address: {host}")
+
+    port_str = None
+    if len(addr) > end + 1:
+        if addr[end + 1] == ":":
+            port_str = addr[end + 2 :]
+        else:
+            raise ValueError("received IPv6 address format: expected ':' after ']'")
+
+    if not port_str:
+        raise ValueError(
+            "a port must be specified in IPv6 address (format: [ipv6]:port)"
+        )
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
+    return port, host
+
+
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
