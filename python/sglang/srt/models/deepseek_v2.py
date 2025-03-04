@@ -232,8 +232,8 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if forward_batch.forward_mode.is_decode():
-            assert self.enable_shared_experts_dp
-            shared_output = self.shared_experts(hidden_states_local)
+            shared_output = self._forward_shared_experts(forward_batch, hidden_states=hidden_states,
+                                                         hidden_states_local=hidden_states_local)
 
         # End of prefill stage "extra-tiny" / decode stage "SHARED"
         yield
@@ -264,14 +264,8 @@ class DeepseekV2MoE(nn.Module):
         yield
 
         if forward_batch.forward_mode.is_extend():
-            if self.n_shared_experts is not None:
-                if self.enable_shared_experts_dp:
-                    if forward_batch.forward_mode.is_idle():
-                        shared_output = None
-                    else:
-                        shared_output = self.shared_experts(hidden_states_local)
-                else:
-                    shared_output = self.shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(forward_batch, hidden_states=hidden_states,
+                                                         hidden_states_local=hidden_states_local)
 
         if self.tp_size > 1:
             all_reduce_handle.wait()
@@ -285,6 +279,18 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
+
+    def _forward_shared_experts(self, forward_batch, hidden_states, hidden_states_local):
+        if self.n_shared_experts is None:
+            return None
+
+        if self.enable_shared_experts_dp:
+            if forward_batch.forward_mode.is_idle():
+                return None
+            else:
+                return self.shared_experts(hidden_states_local)
+        else:
+            return self.shared_experts(hidden_states)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
