@@ -72,10 +72,13 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
+    from hip_attn.v1_2 import HiPAttentionConfig, HiPMaskRefreshState
+
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -955,6 +958,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
     ] = None
 
+    # For HiP Attention
+    hip_mask_refresh_state: Optional[HiPMaskRefreshState] = None
+    hip_metadata_cached_stages: Optional[int] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -974,8 +981,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
+        hip_attention_config: Optional[HiPAttentionConfig] = None,
         chunked_req: Optional[Req] = None,
     ):
+        hip_mask_refresh_state = None
+        if hip_attention_config is not None:
+            from hip_attn.v1_2 import HiPMaskRefreshState
+
+            # For keeping track of HiP attention mask refresh cycles
+            hip_mask_refresh_state = HiPMaskRefreshState(hip_attention_config)
+
         return_logprob = any(req.return_logprob for req in reqs)
 
         is_hybrid = False
@@ -1001,6 +1016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            hip_mask_refresh_state=hip_mask_refresh_state,
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
         )
@@ -1677,6 +1693,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
 
+        if self.hip_mask_refresh_state is not None:
+            self.hip_metadata_cached_stages = self.hip_mask_refresh_state.update()
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -1846,6 +1865,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            hip_metadata_cached_stages=self.hip_metadata_cached_stages,
             launch_done=self.launch_done,
             is_prefill_only=self.is_prefill_only,
         )
@@ -1988,6 +2008,9 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+
+    # Use cached mask for HiP Attention
+    hip_metadata_cached_stages: Optional[int] = None
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
