@@ -1100,7 +1100,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         yield
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        if isinstance(self.mlp, DeepseekV2MoE):
+            hidden_states = yield from self.mlp.forward(hidden_states, forward_batch)
+        else:
+            hidden_states = self.mlp.forward(hidden_states, forward_batch)
 
         return hidden_states, residual
 
