@@ -411,9 +411,16 @@ class ForwardBatch:
         for key in [
             "req_pool_indices",
             "seq_lens",
+            "extend_num_tokens",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+            "extend_prefix_lens_cpu",
+            "extend_seq_lens_cpu",
+            "extend_logprob_start_lens_cpu",
         ]:
             old_value = getattr(self, key)
-            assert old_value.shape[0] == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
+            assert len(old_value) == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
         for key in [
