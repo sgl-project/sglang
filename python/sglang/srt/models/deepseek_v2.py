@@ -1306,12 +1306,15 @@ class DeepseekV2Model(nn.Module):
     ) -> Dict:
         # _log(
         #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
+        # TODO improve, e.g. make it `children`?
+        output_forward_batch = {'a': forward_batch.tbo_child_a, 'b': forward_batch.tbo_child_b}[child_mode]
+        start_token_index = output_forward_batch.tbo_parent_start_token_index
+        end_token_index = output_forward_batch.tbo_parent_end_token_index
         return dict(
             hidden_states=hidden_states[start_token_index:end_token_index],
             residual=residual[start_token_index:end_token_index],
             positions=positions[start_token_index:end_token_index],
-            # TODO improve, e.g. make it `children`?
-            forward_batch={'a': forward_batch.tbo_child_a, 'b': forward_batch.tbo_child_b}[child_mode],
+            forward_batch=output_forward_batch,
         )
 
     @staticmethod

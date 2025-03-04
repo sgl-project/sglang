@@ -209,6 +209,8 @@ class ForwardBatch:
     mrope_positions: torch.Tensor = None
 
     # TODO beautify
+    tbo_parent_start_token_index: Optional[int] = None
+    tbo_parent_end_token_index: Optional[int] = None
     tbo_child_a: Optional['ForwardBatch'] = None
     tbo_child_b: Optional['ForwardBatch'] = None
 
