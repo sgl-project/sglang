@@ -98,7 +98,7 @@ class Engine:
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
-        # Shutdown the subprocesses automatically when the program exists
+        # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
         # Launch subprocesses
@@ -121,8 +121,10 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -141,9 +143,11 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
             stream=stream,
         )
         loop = asyncio.get_event_loop()
@@ -177,6 +181,7 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
@@ -193,6 +198,7 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
@@ -224,15 +230,22 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def start_profile(self):
-        self.tokenizer_manager.start_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
         self.tokenizer_manager.stop_profile()
 
     def get_server_info(self):
+        loop = asyncio.get_event_loop()
+        internal_states = loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
+
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
+            **internal_states,
             "version": __version__,
         }
 
@@ -271,10 +284,18 @@ class Engine:
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        """Update weights from distributed source."""
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+    ):
+        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
+        to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
+            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
+            load_format=load_format,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -313,6 +334,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -330,18 +352,29 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.1.post2",
+            "0.2.2.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
         )
+
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        if exitcode != 0:
+            logger.warning(
+                "Child process unexpectedly failed with an exit code %d. pid=%d",
+                exitcode,
+                pid,
+            )
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
 
     # Register the signal handler.
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
         logger.error(
-            "Received sigquit from a child proces. It usually means the child failed."
+            "Received sigquit from a child process. It usually means the child failed."
         )
         kill_process_tree(os.getpid())
 
@@ -384,7 +417,10 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         )
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
-            gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),

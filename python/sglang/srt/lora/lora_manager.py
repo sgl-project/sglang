@@ -76,9 +76,7 @@ class LoRAManager:
         self.hf_target_names: Set[str] = set()
         for name, path in self.lora_paths.items():
             self.configs[name] = LoRAConfig(path)
-            self.hf_target_names = set(self.hf_target_names) | set(
-                self.configs[name].target_modules
-            )
+            self.hf_target_names.update(self.configs[name].target_modules)
 
         # Target lora weight names for lora_a and lora_b modules repectively.
         # e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj")}

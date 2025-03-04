@@ -39,7 +39,7 @@ Again, please go through the entire documentation to confirm your system is usin
 
 ## Installing SGLang
 
-For general installation instructions, see the official [SGLang Installation Docs](https://docs.sglang.ai/start/install.html). Below are the AMD-specific steps summarized for convenience.
+For general installation instructions, see the official [SGLang Installation Docs](../start/install.md). Below are the AMD-specific steps summarized for convenience.
 
 ### Install from Source
 
@@ -123,6 +123,8 @@ drun -p 30000:30000 \
     --host 0.0.0.0 \
     --port 30000
 ```
+
+[Running DeepSeek-R1 on a single NDv5 MI300X VM](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/running-deepseek-r1-on-a-single-ndv5-mi300x-vm/4372726) could also be a good reference.
 
 ### Running Llama3.1
 
