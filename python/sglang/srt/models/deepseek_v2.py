@@ -220,7 +220,10 @@ class DeepseekV2MoE(nn.Module):
 
         if self.n_shared_experts is not None:
             if self.enable_shared_experts_dp:
-                shared_output = self.shared_experts(hidden_states_partial)
+                if forward_batch.forward_mode.is_idle():
+                    shared_output = None
+                else:
+                    shared_output = self.shared_experts(hidden_states_partial)
             else:
                 shared_output = self.shared_experts(hidden_states)
 
@@ -231,7 +234,7 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-        if not self.enable_shared_experts_dp:
+        if not self.enable_shared_experts_dp and shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1:
@@ -242,7 +245,7 @@ class DeepseekV2MoE(nn.Module):
         if self.enable_all_gather_and_slice:
             final_hidden_states = final_hidden_states[start_idx:end_idx]
 
-        if self.enable_shared_experts_dp:
+        if self.enable_shared_experts_dp and shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
