@@ -1151,6 +1151,7 @@ class DeepseekV2Model(nn.Module):
             )
         return hidden_states, residual
 
+    # TODO maybe optimize these
     @staticmethod
     def _split_inputs(
         hidden_states: torch.Tensor,
@@ -1172,6 +1173,24 @@ class DeepseekV2Model(nn.Module):
         )
 
         return TODO
+
+    @staticmethod
+    def _filter_inputs(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *, start_token_index: int, end_token_index: int, start_seq_index: int, end_seq_index: int,
+    ) -> Dict:
+        return dict(
+            hidden_states=hidden_states[start_token_index:end_token_index],
+            residual=residual[start_token_index:end_token_index],
+            positions=positions[start_token_index:end_token_index],
+            forward_batch=forward_batch.filter_batch(
+                start_token_index=start_token_index, end_token_index=end_token_index,
+                start_seq_index=start_seq_index, end_seq_index=end_seq_index,
+            ),
+        )
 
     @staticmethod
     def _merge_outputs(output_a, output_b):
