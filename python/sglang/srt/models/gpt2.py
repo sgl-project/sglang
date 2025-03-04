@@ -17,14 +17,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple, Type
 
 import torch
 from torch import nn
 from transformers import GPT2Config
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.activation import NewGELU
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -98,6 +98,7 @@ class GPT2MLP(nn.Module):
         self,
         intermediate_size: int,
         config: GPT2Config,
+        act_layer: Type[nn.Module] = NewGELU,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -117,9 +118,7 @@ class GPT2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("c_proj", prefix),
         )
-        self.act = get_act_fn(
-            config.activation_function, quant_config, intermediate_size
-        )
+        self.act = act_layer()
 
     def forward(
         self,
@@ -137,6 +136,7 @@ class GPT2Block(nn.Module):
         self,
         layer_id: int,
         config: GPT2Config,
+        act_layer: Type[nn.Module] = NewGELU,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -150,7 +150,11 @@ class GPT2Block(nn.Module):
         )
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = GPT2MLP(
-            inner_dim, config, quant_config, prefix=add_prefix("mlp", prefix)
+            inner_dim,
+            config,
+            act_layer=act_layer,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
 
     def forward(
@@ -193,7 +197,7 @@ class GPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList(
             [
-                GPT2Block(i, config, quant_config, prefix=add_prefix(f"h.{i}", prefix))
+                GPT2Block(i, config, quant_config=quant_config, prefix=add_prefix(f"h.{i}", prefix))
                 for i in range(config.num_hidden_layers)
             ]
         )
