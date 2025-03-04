@@ -448,6 +448,11 @@ class ForwardBatch:
         assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
 
+        keep_indices = TODO
+        keep_indices_device = torch.tensor(keep_indices, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
@@ -456,6 +461,8 @@ class ForwardBatch:
                 # TODO improve (we may not need this large, and also not always clone);a
                 #      but if we use DeepEP maybe not need this buffer at all
                 gathered_buffer=self.gathered_buffer.clone(),
+                sampling_info=self.sampling_info.filter_batch(keep_indices=keep_indices,
+                                                              keep_indices_device=keep_indices_device),
             )
         )
 
