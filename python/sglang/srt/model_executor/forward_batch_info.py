@@ -427,6 +427,14 @@ class ForwardBatch:
             )
         )
 
+        # TODO unify with init_new's handling
+        max_len = max(ret.global_num_tokens)
+        output_dict['gathered_buffer'] = torch.zeros(
+            (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+            dtype=model_runner.dtype,
+            device=device,
+        )
+
         for field in dataclasses.fields(ForwardBatch):
             assert (
                 getattr(self, field.name) is None
