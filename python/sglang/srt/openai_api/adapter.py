@@ -1124,7 +1124,7 @@ def v1_chat_generate_response(
                 finish_reason = "tool_calls"
             try:
                 parser = FunctionCallParser(tools, tool_call_parser)
-                full_normal_text, call_info_list = parser.parse_non_stream(text)
+                text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
                         id=str(call_info.tool_index),
