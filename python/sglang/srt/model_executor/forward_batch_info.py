@@ -491,6 +491,8 @@ class ForwardBatch:
                 attn_backend=output_attn_backend,
                 tbo_parent_start_token_index=start_token_index,
                 tbo_parent_end_token_index=end_token_index,
+                tbo_child_a=None,
+                tbo_child_b=None,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
                 # No longer used
