@@ -6,7 +6,7 @@
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
 ```
-- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Router](https://docs.sglang.ai/router/router.html) for data parallelism.
+- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Router](../router/router.md) for data parallelism.
 ```
 python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
 ```
@@ -49,8 +49,8 @@ Please consult the documentation below to learn more about the parameters you ma
 * `kv_cache_dtype`: Dtype of the kv cache, defaults to the `dtype`.
 * `context_length`: The number of tokens our model can process *including the input*. Note that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
-* `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.html#Chat-Template).
-* `is_embedding`: Set to true to perform [embedding](https://docs.sglang.ai/backend/openai_api_embeddings.html) / [encode](https://docs.sglang.ai/backend/native_api.html#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api.html#Classify-(reward-model)) tasks.
+* `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template).
+* `is_embedding`: Set to true to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
 * `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/token_in_token_out_llm.py).
 * `json_model_override_args`: Override model config with the provided JSON.
@@ -68,7 +68,7 @@ Please consult the documentation below to learn more about the parameters you ma
 ### API configuration
 
 * `api_key`: Sets an API key for the server and the OpenAI-compatible API.
-* `file_storage_pth`: Directory for storing uploaded or generated files from API calls.
+* `file_storage_path`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
 ## Parallelism
@@ -79,7 +79,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 ### Data parallelism
 
-* `dp_size`: Will be deprecated. The number of data-parallel copies of the model. [SGLang router](https://docs.sglang.ai/router/router.html) is recommended instead of the current naive data parallel.
+* `dp_size`: Will be deprecated. The number of data-parallel copies of the model. [SGLang router](../router/router.md) is recommended instead of the current naive data parallel.
 * `load_balance_method`: Will be deprecated. Load balancing strategy for data parallel requests.
 
 ### Expert parallelism
@@ -162,7 +162,6 @@ Please consult the documentation below to learn more about the parameters you ma
 *Note: We recommend to stay with the defaults and only use these options for debugging for best possible performance.*
 
 * `disable_radix_cache`: Disable [Radix](https://lmsys.org/blog/2024-01-17-sglang/) backend for prefix caching.
-* `disable_jump_forward`: Disable [jump-forward](https://lmsys.org/blog/2024-02-05-compressed-fsm/#our-method-jump-forward-decoding-with-a-compressed-finite-state-machine) for outlines grammar backend.
 * `disable_cuda_graph`: Disable [cuda graph](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) for model forward. Use if encountering uncorrectable CUDA ECC errors.
 * `disable_cuda_graph_padding`: Disable cuda graph when padding is needed. In other case still use cuda graph.
 * `disable_outlines_disk_cache`: Disable disk cache for outlines grammar backend.

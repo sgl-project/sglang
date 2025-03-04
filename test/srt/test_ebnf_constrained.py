@@ -46,7 +46,6 @@ class TestEBNFConstrained(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "xgrammar", disable_overlap=False)
-        cls.check_jump_forward = False
 
     @classmethod
     def tearDownClass(cls):
@@ -236,13 +235,6 @@ class TestEBNFConstrained(unittest.TestCase):
             prompt=prompt,
             n=3,
         )
-
-
-class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=False)
-        cls.check_jump_forward = False
 
 
 if __name__ == "__main__":

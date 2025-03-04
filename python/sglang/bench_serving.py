@@ -393,7 +393,7 @@ async def async_request_sglang_generate(
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
-                                generated_text = data["text"]
+                                last_output_len = output_len
 
                     output.generated_text = generated_text
                     output.success = True
