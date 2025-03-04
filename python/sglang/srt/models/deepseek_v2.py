@@ -956,19 +956,25 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
+
+        enable_all_gather_and_slice = self.enable_dp_attention
         if is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config,
-                                     enable_shared_experts_dp=self.enable_shared_experts_dp)
+            self.mlp = DeepseekV2MoE(
+                config=config, quant_config=quant_config,
+                enable_shared_experts_dp=self.enable_shared_experts_dp,
+                enable_all_gather_and_slice=enable_all_gather_and_slice,
+            )
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                enable_all_gather_and_slice=enable_all_gather_and_slice,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
