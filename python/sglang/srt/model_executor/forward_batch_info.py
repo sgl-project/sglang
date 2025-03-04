@@ -447,6 +447,9 @@ class ForwardBatch:
                 gathered_buffer=self.gathered_buffer.clone(),
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
+                # No longer used
+                global_split_token_index=None,
+                global_split_seq_index=None,
             )
         )
 
