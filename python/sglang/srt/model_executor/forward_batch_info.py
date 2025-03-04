@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
@@ -432,13 +431,16 @@ class ForwardBatch:
         extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
 
         # TODO improve, e.g. unify w/ `init_raw`
-        max_len = max(output_global_num_tokens)
-        tp_size = get_tensor_model_parallel_world_size()
-        gathered_buffer = torch.zeros(
-            (max_len * tp_size, self.gathered_buffer.shape[1]),
-            dtype=self.gathered_buffer.dtype,
-            device=self.gathered_buffer.device,
-        )
+        if output_global_num_tokens is not None:
+            max_len = max(output_global_num_tokens)
+            tp_size = get_tensor_model_parallel_world_size()
+            gathered_buffer = torch.zeros(
+                (max_len * tp_size, self.gathered_buffer.shape[1]),
+                dtype=self.gathered_buffer.dtype,
+                device=self.gathered_buffer.device,
+            )
+        else:
+            gathered_buffer = None
 
         output_dict.update(
             dict(
