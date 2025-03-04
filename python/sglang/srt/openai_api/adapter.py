@@ -1147,7 +1147,7 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": text if tool_calls is None else None,
+                    "content": text,
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text,
                 },
@@ -1164,7 +1164,7 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if tool_calls is None else None,
+                    content=text,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text,
                 ),

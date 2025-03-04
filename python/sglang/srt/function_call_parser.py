@@ -408,7 +408,9 @@ class Llama32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<|python_tag|>"
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[Function]
+    ) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
@@ -441,7 +443,9 @@ class MultiFormatParser:
         """
         self.detectors = detectors
 
-    def parse_once(self, text: str, tools: List[Function]):
+    def parse_once(
+        self, text: str, tools: List[Function]
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing: Loop through detectors until there are no new matches or text is exhausted
         Return: (final_text, all_calls)
@@ -461,7 +465,9 @@ class MultiFormatParser:
         # leftover_text is the normal text not consumed by any Detector
         return final_normal_text, final_calls
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Function]):
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Function]
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing: Feed new_text to each detector's parse_streaming_increment
         and merge their produced normal_text/calls to return.
@@ -512,7 +518,7 @@ class FunctionCallParser:
         self.multi_format_parser = MultiFormatParser(detectors)
         self.tools = tools
 
-    def parse_non_stream(self, full_text: str):
+    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Non-streaming call: one-time parsing
         """
@@ -521,7 +527,7 @@ class FunctionCallParser:
         )
         return full_normal_text, calls
 
-    def parse_stream_chunk(self, chunk_text: str):
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming call: incremental parsing
         """
