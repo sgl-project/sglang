@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -336,20 +337,20 @@ class ForwardBatch:
                 if image_inputs is None:
                     # text only
                     mrope_positions = [
-                                          [
-                                              pos
-                                              for pos in range(
-                                              extend_prefix_len, extend_prefix_len + extend_seq_len
-                                          )
-                                          ]
-                                      ] * 3
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len, extend_prefix_len + extend_seq_len
+                            )
+                        ]
+                    ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                         extend_start_loc: extend_start_loc + extend_seq_len
-                                         ],
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
                             image_grid_thw=image_inputs.image_grid_thws,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
@@ -386,33 +387,52 @@ class ForwardBatch:
 
         return split_token_index, split_seq_index
 
-    def filter_batch(self, *, start_token_index: int, end_token_index: int, start_seq_index: int, end_seq_index: int):
+    def filter_batch(
+        self,
+        *,
+        start_token_index: int,
+        end_token_index: int,
+        start_seq_index: int,
+        end_seq_index: int,
+    ):
         output_dict = dict()
 
         for key in [
-            'input_ids',
-            'positions',
-            'req_pool_indices',
-            'seq_lens',
-            'out_cache_loc',
+            "input_ids",
+            "positions",
+            "req_pool_indices",
+            "seq_lens",
+            "out_cache_loc",
         ]:
             output_dict[key] = getattr(self, key)[start_token_index:end_token_index]
 
         for key in [
-            'forward_mode', 'return_logprob', 'req_to_token_pool', 'token_to_kv_pool', 'attn_backend',
-            'gathered_buffer', 'can_run_dp_cuda_graph', 'spec_info', 'spec_algorithm', 'capture_hidden_mode',
-            'padded_static_len',
+            "forward_mode",
+            "return_logprob",
+            "req_to_token_pool",
+            "token_to_kv_pool",
+            "attn_backend",
+            "gathered_buffer",
+            "can_run_dp_cuda_graph",
+            "spec_info",
+            "spec_algorithm",
+            "capture_hidden_mode",
+            "padded_static_len",
         ]:
             output_dict[key] = getattr(self, key)
 
-        output_dict.update(dict(
-            batch_size=end_seq_index - start_seq_index,
-            seq_lens_sum=output_dict['seq_lens'].sum().item(),
-        ))
+        output_dict.update(
+            dict(
+                batch_size=end_seq_index - start_seq_index,
+                seq_lens_sum=output_dict["seq_lens"].sum().item(),
+            )
+        )
 
         for field in dataclasses.fields(ForwardBatch):
-            assert getattr(self, field.name) is None or output_dict.get(field.name) is not None, \
-                f'Field {field.name} has value, but is not yet supported'
+            assert (
+                getattr(self, field.name) is None
+                or output_dict.get(field.name) is not None
+            ), f"Field {field.name} has value, but is not yet supported"
 
         return ForwardBatch(**output_dict)
 

@@ -1,22 +1,31 @@
 import os
 
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch._dynamo.eval_frame import null_context
 
-_ENABLE_PROFILE = bool(int(os.environ.get('SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE', '0')))
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+_ENABLE_PROFILE = bool(
+    int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
+)
 
 
 def execute_maybe_two_batch(
-    inputs, fn, delta_stages: int, enable_two_batch_overlap: bool,
-    split_inputs, merge_outputs,
+    inputs,
+    fn,
+    delta_stages: int,
+    enable_two_batch_overlap: bool,
+    split_inputs,
+    merge_outputs,
 ):
     # TODO maybe optimize these nested `if`s
     if enable_two_batch_overlap:
         splitted_inputs = split_inputs(**inputs)
         if splitted_inputs is not None:
             inputs_a, inputs_b = splitted_inputs
-            output_a, output_b = execute_two_batch(inputs_a, inputs_b, fn, delta_stages=delta_stages)
+            output_a, output_b = execute_two_batch(
+                inputs_a, inputs_b, fn, delta_stages=delta_stages
+            )
             return merge_outputs(output_a, output_b)
 
     return execute_single_batch(inputs, fn)
@@ -32,8 +41,8 @@ def execute_single_batch(inputs, fn):
 
 
 def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
-    generator_a = _WrappedGenerator('a', fn(**inputs_a))
-    generator_b = _WrappedGenerator('b', fn(**inputs_b))
+    generator_a = _WrappedGenerator("a", fn(**inputs_a))
+    generator_b = _WrappedGenerator("b", fn(**inputs_b))
 
     for _ in range(delta_stages):
         generator_a.next()
@@ -60,7 +69,7 @@ class _WrappedGenerator:
         assert not self.done
 
         if _ENABLE_PROFILE:
-            ctx = torch.profiler.record_function(f'Gen-{self._debug_name}{self._count}')
+            ctx = torch.profiler.record_function(f"Gen-{self._debug_name}{self._count}")
         else:
             ctx = null_context()
 
