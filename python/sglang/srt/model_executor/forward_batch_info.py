@@ -417,6 +417,7 @@ class ForwardBatch:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
+            "image_inputs",
         ]:
             old_value = getattr(self, key)
             assert len(old_value) == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
