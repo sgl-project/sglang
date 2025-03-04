@@ -435,10 +435,15 @@ class ForwardBatch:
         ]:
             output_dict[key] = getattr(self, key)
 
+        assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, \
+            f'{_compute_extend_num_tokens(self.input_ids, self.forward_mode)=} {self=}'
+        extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
+
         output_dict.update(
             dict(
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
+                extend_num_tokens=extend_num_tokens,
                 # TODO improve (we may not need this large, and also not always clone);a
                 #      but if we use DeepEP maybe not need this buffer at all
                 gathered_buffer=self.gathered_buffer.clone(),
@@ -452,6 +457,14 @@ class ForwardBatch:
             ), f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
 
         return ForwardBatch(**output_dict)
+
+
+def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
+    if forward_mode.is_extend():
+        return input_ids.shape[0]
+    elif forward_mode.is_decode():
+        return None
+    raise NotImplementedError
 
 
 def compute_position_triton(
