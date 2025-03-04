@@ -49,6 +49,10 @@ class SamplingParams:
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
+        boosted_tokens: Optional[List[int]] = None,
+        max_boost_fraction: float = 0.0,
+        ramp_tokens: int = 0,
+        boost_type: str = "linear",
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
@@ -74,6 +78,10 @@ class SamplingParams:
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
+        self.boosted_tokens = boosted_tokens if boosted_tokens is not None else []
+        self.max_boost_fraction = max_boost_fraction
+        self.ramp_tokens = ramp_tokens
+        self.boost_type = boost_type
         self.custom_params = custom_params
 
         # Process some special cases
@@ -115,6 +123,18 @@ class SamplingParams:
             raise ValueError(
                 f"min_new_tokens must be in (0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
+            )
+        if not 0.0 <= self.max_boost_fraction <= 1.0:
+            raise ValueError(
+                f"max_boost_fraction must be in [0, 1], got {self.max_boost_fraction}."
+            )
+        if self.ramp_tokens < 0:
+            raise ValueError(
+                f"ramp_tokens must be non-negative, got {self.ramp_tokens}."
+            )
+        if self.boost_type not in ["linear", "heaviside", "tanh"]:
+            raise ValueError(
+                f"boost_type must be one of ['linear', 'heaviside', 'tanh'], got {self.boost_type}."
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
