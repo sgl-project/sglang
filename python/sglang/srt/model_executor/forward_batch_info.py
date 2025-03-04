@@ -377,7 +377,6 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
     ):
-        device = self.input_ids.device
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
 
