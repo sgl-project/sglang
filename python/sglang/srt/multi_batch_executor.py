@@ -80,7 +80,8 @@ class _WrappedGenerator:
             ctx = null_context()
 
         try:
-            next(self._generator)
+            with ctx:
+                next(self._generator)
         except StopIteration as e:
             assert e.value is not None
             self.output = e.value
