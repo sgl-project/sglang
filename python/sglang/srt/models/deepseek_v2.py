@@ -42,7 +42,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import enable_moe_align_block_size_triton
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    enable_moe_align_block_size_triton,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
@@ -82,13 +84,25 @@ class DeepseekV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         use_dp: bool = False,
         reduce_results: bool = True,
+        enable_all_gather_and_slice: bool = False,
     ) -> None:
         super().__init__()
+        self.enable_all_gather_and_slice = enable_all_gather_and_slice
+
+        if enable_all_gather_and_slice:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
         if use_dp:
             self.gate_up_proj = MergedColumnParallelLinear(
-                hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config,
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
                 # TODO is this ok? (or shall we use ReplicatedLinear, etc)
-                tp_rank=0, tp_size=1,
+                tp_rank=0,
+                tp_size=1,
             )
             self.down_proj = ReplicatedLinear(
                 intermediate_size,
@@ -98,7 +112,10 @@ class DeepseekV2MLP(nn.Module):
             )
         else:
             self.gate_up_proj = MergedColumnParallelLinear(
-                hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
@@ -115,10 +132,19 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, _forward_batch=None):
+    def forward(self, x, forward_batch=None):
+        if self.enable_all_gather_and_slice:
+            x, start_idx, end_idx = all_gather(
+                x, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+            )
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+
+        if self.enable_all_gather_and_slice:
+            x = x[start_idx:end_idx]
+
         return x
 
 
@@ -147,10 +173,14 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         enable_shared_experts_dp: bool,
         quant_config: Optional[QuantizationConfig] = None,
+        enable_all_gather_and_slice: bool = False,
     ):
         super().__init__()
+        self.enable_all_gather_and_slice = enable_all_gather_and_slice
         self.enable_shared_experts_dp = enable_shared_experts_dp
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = get_tp_group()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -195,9 +225,11 @@ class DeepseekV2MoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> Generator[None, None, torch.Tensor]:
         hidden_states_local = hidden_states
-        all_gather_state = all_gather_part_issue(
-            hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-        )
+        
+        if self.enable_all_gather_and_slice:
+	        all_gather_state = all_gather_part_issue(
+	            hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+	        )
 
         if forward_batch.forward_mode.is_decode():
             assert self.enable_shared_experts_dp
@@ -206,7 +238,8 @@ class DeepseekV2MoE(nn.Module):
         # End of prefill stage "extra-tiny" / decode stage "SHARED"
         yield
 
-        hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
+        if self.enable_all_gather_and_slice:
+        	hidden_states, start_idx, end_idx = all_gather_part_wait(all_gather_state)
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -218,7 +251,7 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-        if not self.enable_shared_experts_dp:
+        if not self.enable_shared_experts_dp and shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1:
@@ -231,19 +264,26 @@ class DeepseekV2MoE(nn.Module):
         yield
 
         if forward_batch.forward_mode.is_extend():
-            if self.n_shared_experts is not None:
-                if self.enable_shared_experts_dp:
-                    shared_output = self.shared_experts(hidden_states_local)
-                else:
-                    shared_output = self.shared_experts(hidden_states)
+	        if self.n_shared_experts is not None:
+	            if self.enable_shared_experts_dp:
+	                if forward_batch.forward_mode.is_idle():
+	                    shared_output = None
+	                else:
+	                    shared_output = self.shared_experts(hidden_states_partial)
+	            else:
+	                shared_output = self.shared_experts(hidden_states)
 
         if self.tp_size > 1:
             all_reduce_handle.wait()
 
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
-        final_hidden_states = final_hidden_states[start_idx:end_idx]
-        if self.enable_shared_experts_dp:
+
+        if self.enable_all_gather_and_slice:
+            final_hidden_states = final_hidden_states[start_idx:end_idx]
+
+        if self.enable_shared_experts_dp and shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+
         return final_hidden_states
 
 
@@ -953,7 +993,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             not global_server_args_dict["disable_mla"]
             and global_server_args_dict["enable_dp_attention"]
         )
-        self.enable_shared_experts_dp = global_server_args_dict["enable_two_batch_overlap"]
+        self.enable_shared_experts_dp = global_server_args_dict[
+            "enable_two_batch_overlap"
+        ]
         if self.enable_dp_attention:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
@@ -995,19 +1037,26 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_id=layer_id,
             )
+
+        enable_all_gather_and_slice = self.enable_dp_attention
         if is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config,
-                                     enable_shared_experts_dp=self.enable_shared_experts_dp)
+            self.mlp = DeepseekV2MoE(
+                config=config,
+                quant_config=quant_config,
+                enable_shared_experts_dp=self.enable_shared_experts_dp,
+                enable_all_gather_and_slice=enable_all_gather_and_slice,
+            )
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                enable_all_gather_and_slice=enable_all_gather_and_slice,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1045,29 +1094,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         yield
 
         # Fully Connected
-        # When enable_shared_experts_dp, the all_gather/slice is moved down to the next level
-        # TODO optimize these `if`, just a quick hack now
-        if self.enable_dp_attention:
-            if self.enable_shared_experts_dp:
-                if isinstance(self.mlp, DeepseekV2MLP):
-                    hidden_states, start_idx, end_idx = all_gather(
-                        hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-                    )
-                    hidden_states = self.mlp(hidden_states, forward_batch)
-                    hidden_states = hidden_states[start_idx:end_idx]
-                else:
-                    hidden_states = yield from self.mlp.forward(hidden_states, forward_batch)
-            else:
-                hidden_states, start_idx, end_idx = all_gather(
-                    hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
-                )
-                hidden_states = self.mlp(hidden_states, forward_batch)
-                hidden_states = hidden_states[start_idx:end_idx]
-        else:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-
-        # End of stage "SHARED"
-        yield
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
         return hidden_states, residual
 

@@ -1883,6 +1883,22 @@ class Scheduler:
             )
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_dp_attn_batch_raw(
+            local_batch,
+            tp_size=self.tp_size,
+            tp_cpu_group=self.tp_cpu_group,
+            get_idle_batch=self.get_idle_batch,
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+        )
+
+    @staticmethod
+    def prepare_dp_attn_batch_raw(
+        local_batch: ScheduleBatch,
+        tp_size: int,
+        tp_cpu_group,
+        get_idle_batch,
+        disable_cuda_graph: bool,
+    ):
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
@@ -1892,21 +1908,21 @@ class Scheduler:
             num_tokens = local_batch.extend_num_tokens
 
         local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
-        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
+        global_num_tokens = torch.empty(tp_size, dtype=torch.int64)
         torch.distributed.all_gather_into_tensor(
             global_num_tokens,
             local_num_tokens,
-            group=self.tp_cpu_group,
+            group=tp_cpu_group,
         )
 
         if local_batch is None and global_num_tokens.max().item() > 0:
-            local_batch = self.get_idle_batch()
+            local_batch = get_idle_batch()
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens.tolist()
 
             # Check forward mode for cuda graph
-            if not self.server_args.disable_cuda_graph:
+            if not disable_cuda_graph:
                 forward_mode_state = torch.tensor(
                     (1 if local_batch.forward_mode.is_decode_or_idle() else 0),
                     dtype=torch.int32,
@@ -1914,7 +1930,7 @@ class Scheduler:
                 torch.distributed.all_reduce(
                     forward_mode_state,
                     op=torch.distributed.ReduceOp.MIN,
-                    group=self.tp_cpu_group,
+                    group=tp_cpu_group,
                 )
                 local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
 
