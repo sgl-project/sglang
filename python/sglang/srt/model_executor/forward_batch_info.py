@@ -209,8 +209,8 @@ class ForwardBatch:
     mrope_positions: torch.Tensor = None
 
     # TODO beautify
-    child_a: Optional['ForwardBatch'] = None
-    child_b: Optional['ForwardBatch'] = None
+    tbo_child_a: Optional['ForwardBatch'] = None
+    tbo_child_b: Optional['ForwardBatch'] = None
 
     @classmethod
     def init_new(

@@ -18,7 +18,7 @@
 
 import os
 from functools import partial
-from typing import Any, Dict, Generator, Iterable, Optional, Tuple, List
+from typing import Any, Dict, Generator, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1341,7 +1341,7 @@ class DeepseekV2Model(nn.Module):
             residual=residual[start_token_index:end_token_index],
             positions=positions[start_token_index:end_token_index],
             # TODO improve, e.g. make it `children`?
-            forward_batch={'a': forward_batch.child_a, 'b': forward_batch.child_b}[child_mode],
+            forward_batch={'a': forward_batch.tbo_child_a, 'b': forward_batch.tbo_child_b}[child_mode],
         )
 
     @staticmethod
