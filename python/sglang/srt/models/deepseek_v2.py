@@ -1288,9 +1288,10 @@ class DeepseekV2Model(nn.Module):
             forward_batch=forward_batch,
             start_token_index=0,
             end_token_index=split_token_index,
-            start_seq_index=0,
-            end_seq_index=split_seq_index,
-            output_global_num_tokens=forward_batch.global_split_token_index,
+            child_mode='a',
+            # start_seq_index=0,
+            # end_seq_index=split_seq_index,
+            # output_global_num_tokens=forward_batch.global_split_token_index,
         )
         output_b = DeepseekV2Model._filter_inputs(
             hidden_states=hidden_states,
@@ -1299,16 +1300,17 @@ class DeepseekV2Model(nn.Module):
             forward_batch=forward_batch,
             start_token_index=split_token_index,
             end_token_index=forward_batch.input_ids.shape[0],
-            start_seq_index=split_seq_index,
-            end_seq_index=forward_batch.batch_size,
-            output_global_num_tokens=[
-                rank_num_tokens - rank_split_token_index
-                for rank_split_token_index, rank_num_tokens in zip(
-                    forward_batch.global_split_token_index,
-                    forward_batch.global_num_tokens,
-                    strict=True,
-                )
-            ]
+            child_mode='b',
+            # start_seq_index=split_seq_index,
+            # end_seq_index=forward_batch.batch_size,
+            # output_global_num_tokens=[
+            #     rank_num_tokens - rank_split_token_index
+            #     for rank_split_token_index, rank_num_tokens in zip(
+            #         forward_batch.global_split_token_index,
+            #         forward_batch.global_num_tokens,
+            #         strict=True,
+            #     )
+            # ]
         )
 
         _log(
@@ -1327,9 +1329,10 @@ class DeepseekV2Model(nn.Module):
         *,
         start_token_index: int,
         end_token_index: int,
-        start_seq_index: int,
-        end_seq_index: int,
-        output_global_num_tokens: List[int],
+        child_mode: str,
+        # start_seq_index: int,
+        # end_seq_index: int,
+        # output_global_num_tokens: List[int],
     ) -> Dict:
         # _log(
         #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
@@ -1337,7 +1340,8 @@ class DeepseekV2Model(nn.Module):
             hidden_states=hidden_states[start_token_index:end_token_index],
             residual=residual[start_token_index:end_token_index],
             positions=positions[start_token_index:end_token_index],
-            forward_batch=TODO,
+            # TODO improve, e.g. make it `children`?
+            forward_batch={'a': forward_batch.child_a, 'b': forward_batch.child_b}[child_mode],
         )
 
     @staticmethod
