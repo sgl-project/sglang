@@ -687,7 +687,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        _log(f'MLA[{self.layer_id}].forward_normal start {hidden_states[:, 0].tolist()=}')
+        # _log(f'MLA[{self.layer_id}].forward_normal start {hidden_states[:, 0].tolist()=}')
 
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
@@ -713,8 +713,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim:] = k_pe
 
-        _log(
-            f'MLA[{self.layer_id}].forward_normal middle_1 {torch.isnan(q).sum()=} {torch.isnan(k).sum()=} {torch.isnan(v).sum()=}')
+        # _log(
+        #     f'MLA[{self.layer_id}].forward_normal middle_1 {torch.isnan(q).sum()=} {torch.isnan(k).sum()=} {torch.isnan(v).sum()=}')
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
         latent_cache[:, :, self.kv_lora_rank:] = k_pe
@@ -725,9 +725,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        _log(f'MLA[{self.layer_id}].forward_normal middle_2 {torch.isnan(attn_output).sum()=} {attn_output.shape=}')
+        # _log(f'MLA[{self.layer_id}].forward_normal middle_2 {torch.isnan(attn_output).sum()=} {attn_output.shape=}')
         output, _ = self.o_proj(attn_output)
-        _log(f'MLA[{self.layer_id}].forward_normal after {output[:, 0].tolist()=}')
+        # _log(f'MLA[{self.layer_id}].forward_normal after {output[:, 0].tolist()=}')
         return output
 
     def forward_absorb(
@@ -736,7 +736,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Generator[None, None, torch.Tensor]:
-        _log(f'MLA[{self.layer_id}].forward_absorb start {hidden_states[:, 0].tolist()=}')
+        # _log(f'MLA[{self.layer_id}].forward_absorb start {hidden_states[:, 0].tolist()=}')
 
         q_len = hidden_states.shape[0]
         q_input = hidden_states.new_empty(
@@ -780,8 +780,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input[..., self.kv_lora_rank:] = q_pe
         k_input[..., self.kv_lora_rank:] = k_pe
 
-        _log(
-            f'MLA[{self.layer_id}].forward_normal middle_1 {torch.isnan(q_input).sum()=} {torch.isnan(k_input).sum()=} {torch.isnan(v_input).sum()=}')
+        # _log(
+        #     f'MLA[{self.layer_id}].forward_normal middle_1 {torch.isnan(q_input).sum()=} {torch.isnan(k_input).sum()=} {torch.isnan(v_input).sum()=}')
 
         # End of decode stage "ATTN-0"
         if forward_batch.forward_mode.is_decode():
@@ -810,10 +810,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        _log(f'MLA[{self.layer_id}].forward_normal middle_2 {torch.isnan(attn_output).sum()=} {attn_output.shape=}')
+        # _log(f'MLA[{self.layer_id}].forward_normal middle_2 {torch.isnan(attn_output).sum()=} {attn_output.shape=}')
         output, _ = self.o_proj(attn_output)
 
-        _log(f'MLA[{self.layer_id}].forward_normal after {output[:, 0].tolist()=}')
+        # _log(f'MLA[{self.layer_id}].forward_normal after {output[:, 0].tolist()=}')
         return output
 
     def forward_absorb_fused_mla_rope(
@@ -1134,16 +1134,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            _log(
-                f'Layer[{self.self_attn.layer_id}].forward after self.self_attn.forward {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
+            # _log(
+            #     f'Layer[{self.self_attn.layer_id}].forward after self.self_attn.forward {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-            _log(
-                f'Layer[{self.self_attn.layer_id}].forward after self.post_attention_layernorm {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
+            # _log(
+            #     f'Layer[{self.self_attn.layer_id}].forward after self.post_attention_layernorm {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
 
-        _log(
-            f'Layer[{self.self_attn.layer_id}].forward after-attn {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
+        # _log(
+        #     f'Layer[{self.self_attn.layer_id}].forward after-attn {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
 
         # TODO They put "MoE routing gate" in "ATTN / ATTN1" stage, but our gate depends on dispatch
         #      so wait for DeepEP...
@@ -1156,7 +1156,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp.forward(hidden_states, forward_batch)
 
-        _log(f'Layer[{self.self_attn.layer_id}].forward end {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
+        # _log(f'Layer[{self.self_attn.layer_id}].forward end {hidden_states[:, 0].tolist()=} {residual[:, 0].tolist()=}')
 
         # _log(f'Layer.forward end index={self.self_attn.layer_id}')
         return hidden_states, residual
@@ -1288,10 +1288,10 @@ class DeepseekV2Model(nn.Module):
             child_mode='b',
         )
 
-        _log(
-            f'split_inputs {forward_batch.input_ids.tolist()=} {output_a["forward_batch"].input_ids.tolist()=} {output_b["forward_batch"].input_ids.tolist()=}')
-        _log(
-            f'split_inputs (input){forward_batch=} {output_a=} {output_b=}')
+        # _log(
+        #     f'split_inputs {forward_batch.input_ids.tolist()=} {output_a["forward_batch"].input_ids.tolist()=} {output_b["forward_batch"].input_ids.tolist()=}')
+        # _log(
+        #     f'split_inputs (input){forward_batch=} {output_a=} {output_b=}')
 
         return output_a, output_b
 
@@ -1359,7 +1359,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        _log(f'CausalLM.forward {input_ids=} {positions=}')
+        # _log(f'CausalLM.forward {input_ids=} {positions=}')
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
