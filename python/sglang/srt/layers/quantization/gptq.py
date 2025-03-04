@@ -3,16 +3,6 @@ from fractions import Fraction
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-from vllm.model_executor.layers.quantization.gptq_marlin import (
-    GPTQMarlinLinearMethod,
-    GPTQMarlinMoEMethod,
-)
-from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    check_marlin_supported,
-)
-from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase
@@ -121,6 +111,8 @@ class GPTQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["GPTQLinearMethod"]:
+        from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
@@ -272,6 +264,11 @@ class GPTQMarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from vllm.model_executor.layers.quantization.gptq_marlin import (
+            GPTQMarlinLinearMethod,
+            GPTQMarlinMoEMethod,
+        )
+
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
@@ -293,6 +290,11 @@ class GPTQMarlinConfig(QuantizationConfig):
         group_size = quant_config.get("group_size")
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
+
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            check_marlin_supported,
+        )
+        from vllm.platforms import current_platform
 
         if not current_platform.is_cuda():
             return False
@@ -405,6 +407,8 @@ class MarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["MarlinLinearMethod"]:
+        from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
