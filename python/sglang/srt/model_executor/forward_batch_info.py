@@ -386,9 +386,7 @@ class ForwardBatch:
 
         return split_token_index, split_seq_index
 
-    def filter_batch(self, start_token_index: int, end_token_index: int):
-        start_seq_index, end_seq_index = TODO
-
+    def filter_batch(self, *, start_token_index: int, end_token_index: int, start_seq_index: int, end_seq_index: int):
         output_dict = dict()
 
         for key in [
