@@ -18,7 +18,7 @@
 
 import os
 from functools import partial
-from typing import Any, Dict, Generator, Iterable, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, Optional, Tuple, List
 
 import torch
 import torch.nn.functional as F
@@ -1299,6 +1299,8 @@ class DeepseekV2Model(nn.Module):
         end_seq_index: int,
         output_global_num_tokens: List[int],
     ) -> Dict:
+        _log(
+            f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
         return dict(
             hidden_states=hidden_states[start_token_index:end_token_index],
             residual=residual[start_token_index:end_token_index],
