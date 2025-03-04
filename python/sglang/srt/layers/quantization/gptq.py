@@ -6,7 +6,6 @@ import torch
 from vllm.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -269,6 +268,7 @@ class GPTQMarlinConfig(QuantizationConfig):
             GPTQMarlinMoEMethod,
         )
 
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
