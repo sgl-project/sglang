@@ -1915,7 +1915,13 @@ class Scheduler:
         )
 
         # TODO merge these and above
-        local_split_token_index = torch.tensor([TODO], dtype=torch.int64)
+        if local_batch is None:
+            local_split_token_index, local_split_seq_index = 0, 0
+        else:
+            local_split_token_index, local_split_seq_index = compute_middle_split_token_and_seq_index()
+
+        # TODO merge these and above
+        local_split_token_index = torch.tensor([local_split_token_index], dtype=torch.int64)
         global_split_token_index = torch.empty(tp_size, dtype=torch.int64)
         torch.distributed.all_gather_into_tensor(
             global_split_token_index,
@@ -1924,7 +1930,7 @@ class Scheduler:
         )
 
         # TODO again, merge
-        local_split_seq_index = torch.tensor([TODO], dtype=torch.int64)
+        local_split_seq_index = torch.tensor([local_split_seq_index], dtype=torch.int64)
         global_split_seq_index = torch.empty(tp_size, dtype=torch.int64)
         torch.distributed.all_gather_into_tensor(
             global_split_seq_index,
