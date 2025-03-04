@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1375,7 +1377,7 @@ class ScheduleBatch:
 
         if self.forward_mode.is_extend():
             split_token_index, split_seq_index = 0, 0
-            for extend_seq_len in self.extend_lens:
+            for extend_seq_len in self.extend_lens[:-1]:
                 split_token_index += extend_seq_len
                 split_seq_index += 1
                 if split_token_index >= num_tokens // 2:
@@ -1385,8 +1387,10 @@ class ScheduleBatch:
         else:
             raise NotImplementedError
 
+        print(
+            f'[TP{get_tensor_model_parallel_rank()}] compute_middle_split_token_and_seq_index {num_tokens=} {split_token_index=} {self.input_ids.tolist()=} {self.forward_mode=}')
         if split_token_index == 0 or split_token_index == num_tokens:
-            return None, None
+            return -1, -1
 
         return split_token_index, split_seq_index
 
