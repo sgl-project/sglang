@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -97,6 +98,7 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    reasoning_parser: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
@@ -270,10 +272,11 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "NEXTN"
-        ):
+        if self.speculative_algorithm == "NEXTN":
+            # NEXTN shares the same implementation of EAGLE
+            self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "EAGLE":
             self.disable_overlap_schedule = True
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
@@ -629,6 +632,13 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            choices=list(ReasoningParser.DetectorMap.keys()),
+            default=ServerArgs.reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
 
         # Data parallelism
