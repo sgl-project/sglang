@@ -114,10 +114,18 @@ sources = [
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
 enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
 enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
+enable_blackwell = os.getenv("SGL_KERNEL_ENABLE_BLACKWELL", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 
 if torch.cuda.is_available():
+    if cuda_version >= (12, 8):
+        if sm_version >= 100:
+            nvcc_flags.append("-gencode=arch=compute_100,code=sm_100")
+            nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        if sm_version >= 120:
+            nvcc_flags.append("-gencode=arch=compute_120,code=sm_120")
+            nvcc_flags.append("-gencode=arch=compute_120a,code=sm_120a")
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if sm_version >= 90:
@@ -126,6 +134,11 @@ if torch.cuda.is_available():
         nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
 else:
     # compilation environment without GPU
+    if enable_blackwell:
+        nvcc_flags.append("-gencode=arch=compute_100,code=sm_100")
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-gencode=arch=compute_120,code=sm_120")
+        nvcc_flags.append("-gencode=arch=compute_120a,code=sm_120a")
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if enable_fp8:
