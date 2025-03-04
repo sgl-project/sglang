@@ -1337,13 +1337,7 @@ class DeepseekV2Model(nn.Module):
             hidden_states=hidden_states[start_token_index:end_token_index],
             residual=residual[start_token_index:end_token_index],
             positions=positions[start_token_index:end_token_index],
-            forward_batch=forward_batch.filter_batch(
-                start_token_index=start_token_index,
-                end_token_index=end_token_index,
-                start_seq_index=start_seq_index,
-                end_seq_index=end_seq_index,
-                output_global_num_tokens=output_global_num_tokens,
-            ),
+            forward_batch=TODO,
         )
 
     @staticmethod

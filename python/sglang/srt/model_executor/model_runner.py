@@ -809,6 +809,7 @@ class ModelRunner:
         tensor_parallel(self.model, device_mesh)
 
     def forward_decode(self, forward_batch: ForwardBatch):
+        TODO_split_batch
         self.attn_backend.init_forward_metadata(forward_batch)
         self.attn_backend_child_a.init_forward_metadata(forward_batch.child_a)
         self.attn_backend_child_b.init_forward_metadata(forward_batch.child_b)
@@ -817,6 +818,7 @@ class ModelRunner:
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
+        TODO_split_batch
         self.attn_backend.init_forward_metadata(forward_batch)
         self.attn_backend_child_a.init_forward_metadata(forward_batch.child_a)
         self.attn_backend_child_b.init_forward_metadata(forward_batch.child_b)
