@@ -735,6 +735,8 @@ class ModelRunner:
 
     def init_attention_backend(self):
         self.attn_backend = self._create_attention_backend()
+        self.attn_backend_child_a = self._create_attention_backend()
+        self.attn_backend_child_b = self._create_attention_backend()
 
     def _create_attention_backend(self):
         """Init attention kernel backend."""
@@ -808,12 +810,16 @@ class ModelRunner:
 
     def forward_decode(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
+        self.attn_backend_child_a.init_forward_metadata(forward_batch.child_a)
+        self.attn_backend_child_b.init_forward_metadata(forward_batch.child_b)
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
+        self.attn_backend_child_a.init_forward_metadata(forward_batch.child_a)
+        self.attn_backend_child_b.init_forward_metadata(forward_batch.child_b)
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(
