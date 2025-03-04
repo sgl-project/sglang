@@ -1387,8 +1387,8 @@ class ScheduleBatch:
         else:
             raise NotImplementedError
 
-        print(
-            f'[TP{get_tensor_model_parallel_rank()}] compute_middle_split_token_and_seq_index {num_tokens=} {split_token_index=} {self.input_ids.tolist()=} {self.forward_mode=}')
+        # print(
+        #     f'[TP{get_tensor_model_parallel_rank()}] compute_middle_split_token_and_seq_index {num_tokens=} {split_token_index=} {self.input_ids.tolist()=} {self.forward_mode=}')
         if split_token_index == 0 or split_token_index == num_tokens:
             return -1, -1
 
