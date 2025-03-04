@@ -365,7 +365,7 @@ class ForwardBatch:
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
     # TODO maybe move
-    def compute_split_token_index(self):
+    def compute_middle_split_token_index(self):
         num_tokens = self.input_ids.shape[0]
 
         if self.forward_mode.is_extend():
