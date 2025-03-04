@@ -1,6 +1,7 @@
 """
 python3 -m unittest test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
 python3 -m unittest test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
+python3 -m unittest test_json_constrained.TestJSONConstrainedLLGuidanceBackend.test_json_generate
 """
 
 import json
@@ -30,6 +31,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
                 "population": {"type": "integer"},
             },
             "required": ["name", "population"],
+            "additionalProperties": False,
         }
     )
 
@@ -55,7 +57,6 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="outlines", disable_overlap=False)
-        cls.check_jump_forward = False
 
     @classmethod
     def tearDownClass(cls):
@@ -130,20 +131,6 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
 
         with ThreadPoolExecutor(len(json_schemas)) as executor:
             list(executor.map(self.run_decode, json_schemas))
-
-
-class TestJumpForwardOutlinesBackend(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=True)
-        cls.check_jump_forward = True
-
-
-class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, backend="xgrammar", disable_overlap=False)
-        cls.check_jump_forward = False
 
 
 if __name__ == "__main__":

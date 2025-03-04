@@ -43,7 +43,7 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 8192
 ```
-The quantization and limited context length (`--dtype half --context-length 8192`) are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). A detailed explanation can be found in [Server Arguments](https://docs.sglang.ai/backend/server_arguments.html).
+The quantization and limited context length (`--dtype half --context-length 8192`) are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). A detailed explanation can be found in [Server Arguments](../backend/server_arguments.md).
 
 After launching the engine, refer to [Chat completions](https://docs.sglang.ai/backend/openai_api_completions.html#Usage) to test the usability.
 * * * * *
@@ -66,7 +66,7 @@ This enables TorchAO's int4 weight-only quantization with a 128-group size. The 
 * * * * *
 Structured output with XGrammar
 -------------------------------
-Please refer to [SGLang doc structured output](https://docs.sglang.ai/backend/structured_outputs.html).
+Please refer to [SGLang doc structured output](../backend/structured_outputs.ipynb).
 * * * * *
 
 Thanks to the support from [shahizat](https://github.com/shahizat).

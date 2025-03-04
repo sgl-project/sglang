@@ -109,14 +109,22 @@ def set_torch_compile_config():
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
+
     if capture_bs is None:
-        if server_args.disable_cuda_graph_padding:
-            capture_bs = list(range(1, 33)) + [64, 128]
+        if server_args.speculative_algorithm is None:
+            if server_args.disable_cuda_graph_padding:
+                capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            else:
+                capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
         else:
-            capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            capture_bs = list(range(1, 33))
+
+    if is_hip_:
+        capture_bs += [i * 8 for i in range(21, 33)]
+
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very samll. We add more values here to make sure we capture the maximum bs.
+        # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs = list(
             sorted(
                 set(
@@ -126,14 +134,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
                 )
             )
         )
+
     capture_bs = [
         bs
         for bs in capture_bs
         if bs <= model_runner.req_to_token_pool.size
         and bs <= server_args.cuda_graph_max_bs
     ]
-    if is_hip_:
-        capture_bs += [i * 8 for i in range(21, 33)]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -173,6 +180,7 @@ class CudaGraphRunner:
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.capture_forward_mode = ForwardMode.DECODE
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         if model_runner.spec_algorithm.is_eagle():
             if self.model_runner.is_draft_worker:
@@ -333,6 +341,10 @@ class CudaGraphRunner:
             gathered_buffer = None
 
         spec_info = self.get_spec_info(num_tokens)
+        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+            self.capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -353,15 +365,7 @@ class CudaGraphRunner:
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.model_runner.server_args.return_hidden_states
-                else (
-                    spec_info.capture_hidden_mode
-                    if spec_info
-                    else CaptureHiddenMode.NULL
-                )
-            ),
+            capture_hidden_mode=self.capture_hidden_mode,
         )
 
         # Attention backend
@@ -386,9 +390,6 @@ class CudaGraphRunner:
 
             run_once()
 
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
 
@@ -402,8 +403,27 @@ class CudaGraphRunner:
         global_graph_memory_pool = graph.pool()
         return graph, out
 
+    def recapture_if_needed(self, forward_batch: ForwardBatch):
+        # If the capture_hidden_mode changes, we need to recapture the graph
+        hidden_mode_from_spec_info = getattr(
+            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        )
+        if (
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and self.capture_hidden_mode != CaptureHiddenMode.FULL
+        ):
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+            self.capture()
+        elif (
+            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
+            and self.capture_hidden_mode != hidden_mode_from_spec_info
+        ):
+            self.capture_hidden_mode = hidden_mode_from_spec_info
+            self.capture()
+
     def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
+        self.recapture_if_needed(forward_batch)
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 

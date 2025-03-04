@@ -138,6 +138,7 @@ class TestBenchServing(unittest.TestCase):
             model=DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
             num_prompts=50,
             request_rate=1,
+            sharegpt_context_len=3072,
             disable_ignore_eos=True,
             dataset_name="sharegpt",
             other_server_args=[
@@ -148,22 +149,23 @@ class TestBenchServing(unittest.TestCase):
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
-                "8",
+                "4",
                 "--speculative-num-draft-tokens",
-                "64",
+                "16",
                 "--mem-fraction-static",
                 "0.7",
-                "--cuda-graph-max-bs",
-                "32",
             ],
+            need_warmup=True,
         )
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_online_latency_eagle\n"
                 f'median_e2e_latency_ms : {res["median_e2e_latency_ms"]:.2f} ms\n'
+                f'accept_length : {res["accept_length"]:.2f} \n'
             )
-            self.assertLess(res["median_e2e_latency_ms"], 450)
+            self.assertLess(res["median_e2e_latency_ms"], 700)
+            self.assertGreater(res["accept_length"], 2.50)
 
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
