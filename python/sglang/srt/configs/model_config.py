@@ -14,6 +14,7 @@
 
 import json
 import logging
+import math
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -43,6 +44,7 @@ class ModelConfig:
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        override_config_file: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
@@ -50,11 +52,16 @@ class ModelConfig:
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
         self.hf_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
@@ -63,6 +70,9 @@ class ModelConfig:
             self.hf_config.architectures, is_embedding
         )
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
+        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
+        self.is_audio_model = is_audio_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -70,7 +80,9 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
+                if get_bool_env_var(
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="False"
+                ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
@@ -103,7 +115,20 @@ class ModelConfig:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+
+            # Handle rope scaling with yarn
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -389,6 +414,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
+        or "Qwen2ForRewardModel" in model_architectures
     ):
         return False
     else:
@@ -401,6 +427,8 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaQwenForCausalLM" in model_architectures
         or "LlavaMistralForCausalLM" in model_architectures
         or "LlavaVidForCausalLM" in model_architectures
+        or "Grok1VForCausalLM" in model_architectures
+        or "Grok1AForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
         or "Qwen2_5_VLForConditionalGeneration" in model_architectures
@@ -411,5 +439,23 @@ def is_multimodal_model(model_architectures: List[str]):
         return False
 
 
+def is_multimodal_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_image_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_audio_model(model_architectures: List[str]):
+    return False
+
+
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
+
+
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
 
-from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
@@ -15,7 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -232,7 +232,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         assert encoder_lens is None, "Not supported"
 
@@ -310,7 +310,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
@@ -474,7 +474,7 @@ class TritonMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
                 self.speculative_num_steps,

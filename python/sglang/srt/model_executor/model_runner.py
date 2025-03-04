@@ -13,11 +13,15 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+import collections
+import datetime
 import gc
 import json
 import logging
+import os
 import time
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -34,6 +38,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -55,10 +60,13 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -69,8 +77,13 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 
 class ModelRunner:
@@ -113,9 +126,9 @@ class ModelRunner:
             if self.server_args.device != "cpu":
                 if server_args.enable_flashinfer_mla:
                     logger.info(
-                        "FlashInfer MLA optimization is turned on. Use flashinfer backend for DeepseekV3ForCausalLM."
+                        "MLA optimization is turned on. Use flashinfer mla backend."
                     )
-                    self.server_args.attention_backend = "flashinfer"
+                    self.server_args.attention_backend = "flashinfer_mla"
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     self.server_args.attention_backend = "triton"
@@ -176,8 +189,13 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "device": server_args.device,
+                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
+                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
                 "disable_radix_cache": server_args.disable_radix_cache,
+                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
+                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
+                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
             }
         )
 
@@ -193,6 +211,18 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        # Handle the case where some of models don't finish loading.
+        try:
+            dist.monitored_barrier(
+                group=get_tp_group().cpu_group,
+                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                wait_all_ranks=True,
+            )
+        except RuntimeError:
+            raise ValueError(
+                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+            ) from None
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -258,6 +288,7 @@ class ModelRunner:
                 rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
+                timeout=self.server_args.dist_timeout,
             )
             initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
             initialize_dp_attention(
@@ -512,8 +543,21 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
-        self.model.load_weights(named_tensors)
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        load_format: Optional[str] = None,
+    ):
+        named_tensors = [
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
+            for name, tensor in named_tensors
+        ]
+        if load_format == "direct":
+            _model_load_weights_direct(self.model, named_tensors)
+        elif load_format is None:
+            self.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
     def get_weights_by_name(
@@ -606,6 +650,9 @@ class ModelRunner:
                 4096,
             )
 
+        if SGLANG_CI_SMALL_KV_SIZE:
+            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
@@ -636,6 +683,7 @@ class ModelRunner:
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
+
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
@@ -703,6 +751,8 @@ class ModelRunner:
                 self.attn_backend = TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "flashinfer_mla":
+            self.attn_backend = FlashInferMLAAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -737,9 +787,13 @@ class ModelRunner:
             return
 
         tic = time.time()
-        logger.info("Capture cuda graph begin. This can take up to several minutes.")
+        logger.info(
+            f"Capture cuda graph begin. This can take up to several minutes. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
         self.cuda_graph_runner = CudaGraphRunner(self)
-        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
+        logger.info(
+            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
@@ -799,11 +853,10 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-    def sample(
-        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
+    def _preprocess_logits(
+        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+    ):
         # Apply logit bias
-        sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
             # in process_batch_result of the last batch.
@@ -812,15 +865,77 @@ class ModelRunner:
         else:
             # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
             sampling_info.update_regex_vocab_mask()
-            sampling_info.update_penalties()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+    def update_output_logprobs(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[int],
+        next_token_ids: torch.Tensor,
+        *,
+        num_tokens_per_req: List[int],
+    ):
+        """Update the logits_output's output logprob based on next_token_ids
+
+        Args:
+            logits_output: The logits output from the model forward
+            sampling_info: Sampling info for logprob calculation
+            top_logprobs_nums: Number of logprobs per request.
+            next_token_ids: Next token ids.
+            num_tokens_per_req: The number of tokens per request.
+
+        Returns:
+            A list of next_token_ids
+        """
+        self._preprocess_logits(logits_output, sampling_info)
+        # We should repeat top_logprobs_nums to match num_tokens_per_req.
+        top_logprobs_nums_repeat_interleaved = []
+        token_ids_logprobs_repeat_interleaved = []
+        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
+            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
+        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
+            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
+        self.sampler(
+            logits_output,
+            sampling_info,
+            True,
+            top_logprobs_nums_repeat_interleaved,
+            token_ids_logprobs_repeat_interleaved,
+            batch_next_token_ids=next_token_ids,
+        )
+
+    def sample(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Sample and compute logprobs and update logits_output.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+
+        Returns:
+            A list of next_token_ids
+        """
+        # For duplex models with multiple output streams.
+        if isinstance(logits_output, tuple):
+            return torch.stack(
+                [self.sample(values, forward_batch) for values in logits_output],
+                axis=-1,
+            )
+
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
-            sampling_info,
+            forward_batch.sampling_info,
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
         )
         return next_token_ids
 
@@ -832,3 +947,26 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+
+def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    params_dict = dict(model.named_parameters())
+    for name, tensor in named_tensors:
+        default_weight_loader(params_dict[name], tensor)
+
+
+def _unwrap_tensor(tensor, tp_rank):
+    if isinstance(tensor, LocalSerializedTensor):
+        return tensor.get(tp_rank)
+    return tensor
+
+
+@dataclass
+class LocalSerializedTensor:
+    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
+    The i-th element in the list corresponds to i-th rank's GPU."""
+
+    values: List[bytes]
+
+    def get(self, rank: int):
+        return MultiprocessingSerializer.deserialize(self.values[rank])
