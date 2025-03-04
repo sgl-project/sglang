@@ -1,8 +1,9 @@
-from typing import List
-
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer, _TokenIDs
+from sglang.srt.sampling.penaltylib.orchestrator import (
+    BatchedPenalizerOrchestrator,
+    _BatchedPenalizer,
+)
 
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
@@ -10,9 +11,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     Min new tokens penalizer penalizes tokens based on the length of the output.
     """
 
-    min_new_tokens: torch.Tensor = None
-    stop_token_penalties: torch.Tensor = None
-    len_output_tokens: torch.Tensor = None
+    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
+        self.orchestrator = orchestrator
+        self._is_prepared = False
 
     def _is_required(self) -> bool:
         return any(
@@ -47,7 +48,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             padding_value=self.orchestrator.vocab_size,
         )
         self.stop_token_penalties = torch.zeros(
-            size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size + 1),
+            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
             dtype=torch.float32,
             device=self.orchestrator.device,
         ).scatter_add_(
@@ -64,31 +65,22 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         ]
 
         self.len_output_tokens = torch.zeros(
-            size=(self.orchestrator.batch_size(), 1),
+            size=(len(self.orchestrator.reqs()), 1),
             dtype=torch.int32,
             device=self.orchestrator.device,
         )
 
-    def _teardown(self):
-        self.min_new_tokens = None
-        self.stop_token_penalties = None
-        self.len_output_tokens = None
-
-    def _cumulate_input_tokens(self, input_ids: _TokenIDs):
-        pass
-
-    def _cumulate_output_tokens(self, output_ids: _TokenIDs):
+    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
 
-    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
+    def _apply(self, logits: torch.Tensor):
         mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)
         logits[mask] += self.stop_token_penalties[mask]
-        return logits
 
-    def _filter(self, indices_to_keep: List[int], indices_tensor_to_keep: torch.Tensor):
-        self.min_new_tokens = self.min_new_tokens[indices_tensor_to_keep]
-        self.stop_token_penalties = self.stop_token_penalties[indices_tensor_to_keep]
-        self.len_output_tokens = self.len_output_tokens[indices_tensor_to_keep]
+    def _filter(self, keep_indices: torch.Tensor):
+        self.min_new_tokens = self.min_new_tokens[keep_indices]
+        self.stop_token_penalties = self.stop_token_penalties[keep_indices]
+        self.len_output_tokens = self.len_output_tokens[keep_indices]
 
     def _merge(self, their: "BatchedMinNewTokensPenalizer"):
         self.min_new_tokens = torch.cat(

@@ -56,11 +56,13 @@ class TestEnableMetrics(unittest.TestCase):
                 "sglang:gen_throughput",
                 "sglang:num_queue_reqs",
                 "sglang:cache_hit_rate",
+                "sglang:spec_accept_length",
                 "sglang:prompt_tokens_total",
                 "sglang:generation_tokens_total",
                 "sglang:num_requests_total",
                 "sglang:time_to_first_token_seconds",
                 "sglang:time_per_output_token_seconds",
+                "sglang:inter_token_latency_seconds",
                 "sglang:e2e_request_latency_seconds",
             ]
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+
+import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
@@ -12,7 +14,7 @@ if TYPE_CHECKING:
 
 
 class ChunkCacheEntry:
-    def __init__(self, rid, value):
+    def __init__(self, rid: str, value: torch.Tensor):
         self.rid = rid
         self.value = value
 
@@ -24,6 +26,7 @@ class ChunkCache(BasePrefixCache):
         self.disable = True
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
+        self.entries: Dict[str, ChunkCacheEntry] = {}
 
         self.reset()
 
@@ -53,11 +56,8 @@ class ChunkCache(BasePrefixCache):
         if req.rid in self.entries:
             del self.entries[req.rid]
 
-    def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        if token_ids is None:
-            token_id_len = len(req.fill_ids)
-        else:
-            token_id_len = len(token_ids)
+    def cache_unfinished_req(self, req: Req):
+        token_id_len = len(req.fill_ids)
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :token_id_len
@@ -85,6 +85,9 @@ class ChunkCache(BasePrefixCache):
 
     def evictable_size(self):
         return 0
+
+    def pretty_print(self):
+        return ""
 
     def protected_size(self):
         return 0

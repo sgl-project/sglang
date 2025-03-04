@@ -4,6 +4,13 @@ import os
 
 
 class GlobalConfig:
+    """
+    Store some global constants.
+
+    See also python/sglang/srt/managers/schedule_batch.py::global_server_args_dict, which stores
+    many global runtime arguments as well.
+    """
+
     def __init__(self):
         # Verbosity level
         # 0: do not output anything
@@ -34,11 +41,9 @@ class GlobalConfig:
         self.skip_special_tokens_in_output = True
         self.spaces_between_special_tokens_in_out = True
 
-        # Interpreter optimization configs
+        # Language frontend interpreter optimization configs
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
-
-        self.enable_flashinfer_mla = False
 
 
 global_config = GlobalConfig()

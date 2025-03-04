@@ -457,7 +457,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            )
+            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
 
         # Copy the data.
         if not self.use_presharded_weights:
