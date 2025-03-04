@@ -206,9 +206,9 @@ class LogitsProcessor(nn.Module):
 
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
-        self.debug_tensor_dump_output_folder = global_server_args_dict[
-            "debug_tensor_dump_output_folder"
-        ]
+        self.debug_tensor_dump_output_folder = global_server_args_dict.get(
+            "debug_tensor_dump_output_folder", None
+        )
 
     def forward(
         self,
