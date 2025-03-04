@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -409,6 +410,10 @@ class ForwardBatch:
             batch_size=end_seq_index - start_seq_index,
             seq_lens_sum=output_dict['seq_lens'].sum().item(),
         ))
+
+        for field in dataclasses.fields(ForwardBatch):
+            assert getattr(self, field.name) is None or output_dict.get(field.name) is not None, \
+                f'Field {field.name} has value, but is not yet supported'
 
         return ForwardBatch(**output_dict)
 
