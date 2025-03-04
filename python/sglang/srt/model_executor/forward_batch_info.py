@@ -369,16 +369,20 @@ class ForwardBatch:
         num_tokens = self.input_ids.shape[0]
 
         if self.forward_mode.is_extend():
-            raw = TODO
+            split_token_index = 0
+            for extend_seq_len in self.extend_seq_lens_cpu:
+                split_token_index += extend_seq_len
+                if split_token_index >= num_tokens // 2:
+                    break
         elif self.forward_mode.is_decode():
-            raw = num_tokens // 2
+            split_token_index = num_tokens // 2
         else:
             raise NotImplementedError
 
-        if raw == 0 or raw == num_tokens:
+        if split_token_index == 0 or split_token_index == num_tokens:
             return None
 
-        return raw
+        return split_token_index
 
 
 def compute_position_triton(
