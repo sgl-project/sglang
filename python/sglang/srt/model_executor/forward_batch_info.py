@@ -382,6 +382,7 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
         output_global_num_tokens: List[int],
+        output_attn_backend: AttentionBackend,
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
@@ -420,7 +421,6 @@ class ForwardBatch:
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",
-            "attn_backend",
             "can_run_dp_cuda_graph",
             "spec_info",
             "spec_algorithm",
@@ -453,6 +453,7 @@ class ForwardBatch:
                 extend_num_tokens=extend_num_tokens,
                 global_num_tokens=output_global_num_tokens,
                 gathered_buffer=gathered_buffer,
+                attn_backend=output_attn_backend,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
                 # No longer used
