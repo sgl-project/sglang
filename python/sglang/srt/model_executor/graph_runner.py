@@ -258,6 +258,9 @@ class GraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_hip_attention = model_runner.server_args.enable_hip_attention
+        if self.enable_hip_attention:
+            self.hip_config = model_runner.server_args.hip_attention_config
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -479,22 +482,24 @@ class GraphRunner:
                         capture_range.set_description(
                             f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                         )
+                    
+                    for capture_config in self.capture_configs():
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(bs, forward)
+                            graph_handle = (bs, *capture_config)
+                            self.graphs[graph_handle] = graph
+                            self.output_buffers[graph_handle] = output_buffers
 
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward)
-                        self.graphs[bs] = graph
-                        self.output_buffers[bs] = output_buffers
-
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
+                        # Save gemlite cache after each capture
+                        save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
             log_message = (
@@ -508,6 +513,14 @@ class GraphRunner:
                 )
             )
             logger.info(log_message)
+    
+    def capture_configs(self):
+        if self.enable_hip_attention:
+            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+
+            return cuda_graph_capture_configs(self.hip_config)
+        else:
+            return [()]
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with self.device_module.graph(graph, pool=pool, stream=stream):
@@ -517,7 +530,7 @@ class GraphRunner:
     def _create_device_graph(self):
         pass
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, capture_config: tuple):
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -589,6 +602,10 @@ class GraphRunner:
             lora_ids = [None] * bs
         else:
             lora_ids = None
+        
+        hip_num_cached_stages = None
+        if self.enable_hip_attention:
+            (hip_num_cached_stages,) = capture_config
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -601,6 +618,8 @@ class GraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
+            hip_metadata_cache_pool=self.model_runner.hip_metadata_cache_pool,
+            hip_metadata_cached_stages=hip_num_cached_stages,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             encoder_lens=encoder_lens,
@@ -807,9 +826,13 @@ class GraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
+        graph_handle = (self.bs,)
+        if self.enable_hip_attention:
+            graph_handle = (self.bs, forward_batch.hip_metadata_cached_stages)
+        self.graphs[graph_handle].replay()
 
-        output = self.output_buffers[self.bs]
+        output = self.output_buffers[graph_handle]
+        
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],

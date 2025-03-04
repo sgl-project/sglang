@@ -54,6 +54,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from hip_attn.v1_2 import HiPMetadataCachePool
+
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
@@ -268,6 +270,10 @@ class ForwardBatch:
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # For HiP attention
+    hip_metadata_cache_pool: Optional[HiPMetadataCachePool] = None
+    hip_metadata_cached_stages: Optional[int] = None
+
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
@@ -439,6 +445,17 @@ class ForwardBatch:
 
         if model_runner.model_is_mrope:
             ret._compute_mrope_positions(model_runner, batch)
+
+        # Init HiP attention information
+        if model_runner.hip_metadata_cache_pool is not None:
+            ret.hip_metadata_cache_pool = model_runner.hip_metadata_cache_pool
+            if isinstance(batch.hip_metadata_cached_stages, int) and (
+                batch.hip_metadata_cached_stages < 0
+            ):
+                ret.hip_metadata_cache_pool.reset_decode_phase()
+                ret.hip_metadata_cached_stages = 0
+            else:
+                ret.hip_metadata_cached_stages = batch.hip_metadata_cached_stages
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -901,6 +918,18 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+    def on_model_start(self):
+        self.token_to_kv_pool.on_model_start(self)
+
+    def on_model_end(self):
+        self.token_to_kv_pool.on_model_end(self)
+
+    def on_layer_start(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_start(self, layer_id)
+
+    def on_layer_end(self, layer_id: int):
+        self.token_to_kv_pool.on_layer_end(self, layer_id)
 
 
 def compute_position(

@@ -266,6 +266,7 @@ def extend(reqs, model_runner):
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        hip_attention_config=model_runner.server_args.hip_attention_config,
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)

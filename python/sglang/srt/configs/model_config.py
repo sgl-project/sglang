@@ -59,6 +59,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        is_context_extended: Optional[bool] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
@@ -166,22 +167,22 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var(
+                if is_context_extended:
+                    pass
+                elif get_bool_env_var(
                     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
                     )
-                    self.context_len = context_length
                 else:
                     raise ValueError(
                         f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
                         f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
-            else:
-                self.context_len = context_length
+            self.context_len = context_length
         else:
             self.context_len = derived_context_len
 
@@ -301,6 +302,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            is_context_extended=server_args.enable_hip_attention,
             **kwargs,
         )
 

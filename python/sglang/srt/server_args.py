@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -21,7 +23,7 @@ import os
 import random
 import sys
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
@@ -42,6 +44,9 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     nullable_str,
 )
+
+if TYPE_CHECKING:
+    from hip_attn.v1_2 import HiPAttentionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +152,15 @@ class ServerArgs:
     # Model override args in JSON
     json_model_override_args: str = "{}"
     preferred_sampling_params: Optional[str] = None
+
+    # HiP Attention
+    enable_hip_attention: bool = False
+    hip_attention_config: Optional[HiPAttentionConfig] = None
+
+    # HiP Attention Offload
+    enable_hip_offload: bool = False
+    hip_max_mask_cache_token_size: int = 64 * 1024
+    hip_max_sa_cache_token_size: int = 8 * 1024
 
     # LoRA
     enable_lora: Optional[bool] = None
@@ -1303,6 +1317,44 @@ class ServerArgs:
             help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
+        # HiP Attention
+        parser.add_argument(
+            "--enable-hip-attention",
+            action="store_true",
+            help="Enable HiP attention. This flag is not compatible with other sparse attention flags (e.g., double sparsity).",
+        )
+        parser.add_argument(
+            "--hip-attention-config",
+            type=str,
+            default=ServerArgs.hip_attention_config,
+            help="Path to the HiP attention config file, or the json in string format.",
+        )
+
+        # HiP Attention Offload
+        parser.add_argument(
+            "--enable-hip-offload",
+            action="store_true",
+            help="Enable HiP KV cache offloading. This option should be set with --enable-hip-attention.",
+        )
+        parser.add_argument(
+            "--hip-max-mask-cache-token-size",
+            type=int,
+            default=128 * 1024,
+            help=(
+                "On-gpu cache size of HiP masking kernels. "
+                "This will be a major determining factor for mask-refreshing decoding step latency."
+            ),
+        )
+        parser.add_argument(
+            "--hip-max-sa-cache-token-size",
+            type=int,
+            default=16 * 1024,
+            help=(
+                "On-gpu cache size of sparse attention kernels. "
+                "This will be a major determining factor for mask-cached decoding step latency."
+            ),
+        )
+
         # LoRA
         parser.add_argument(
             "--enable-lora",
@@ -2021,6 +2073,14 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
+        if args.enable_hip_attention:
+            from hip_attn.v1_2 import HiPAttentionConfig
+
+            args.hip_attention_config = HiPAttentionConfig(
+                json_or_path=args.hip_attention_config
+            )
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
