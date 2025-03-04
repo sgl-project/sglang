@@ -26,7 +26,7 @@ IMAGES = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild/res
 
 
 MODELS = [
-    ("/home/base-data/largeModel/internalAccess/gme-Qwen2-VL-2B-Instruct/", 1e-4),
+    ("Alibaba-NLP/gme-Qwen2-VL-2B-Instruct", 1e-4),
 ]
 TORCH_DTYPES = [torch.float16]
 
