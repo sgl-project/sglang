@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -152,6 +153,13 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
+            global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
+            dp_local_start_pos=forward_batch.dp_local_start_pos,
+            dp_local_num_tokens=forward_batch.dp_local_num_tokens,
+            gathered_buffer=forward_batch.gathered_buffer,
+            forward_batch_gathered_buffer=forward_batch.gathered_buffer,
+            global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
+            global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
         )
 
     def compute_dp_attention_metadata(self, hidden_states: torch.Tensor):
@@ -203,8 +211,6 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
-
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         self.debug_tensor_dump_output_folder = global_server_args_dict.get(
             "debug_tensor_dump_output_folder", None
