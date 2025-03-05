@@ -30,7 +30,7 @@ def main():
     # Print the outputs.
     for prompt, output in zip(prompts, outputs):
         print("===============================")
-        print(f"Prompt: {prompt}\nGenerated token ids: {output['token_ids']}")
+        print(f"Prompt: {prompt}\nGenerated token ids: {output['output_ids']}")
 
 
 # The __main__ condition is necessary here because we use "spawn" to create subprocesses
