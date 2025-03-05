@@ -363,7 +363,7 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
-            global_num_tokens=global_num_tokens,
+            global_num_tokens_cpu=global_num_tokens,
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
