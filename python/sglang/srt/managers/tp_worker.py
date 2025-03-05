@@ -15,10 +15,13 @@
 
 import logging
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -159,7 +162,7 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ):
+    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:

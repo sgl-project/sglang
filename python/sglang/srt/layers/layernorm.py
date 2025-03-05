@@ -69,7 +69,7 @@ class RMSNorm(CustomOp):
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(orig_dtype) * self.weight
+        x = (x * self.weight).to(orig_dtype)
         if residual is None:
             return x
         else:

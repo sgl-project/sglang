@@ -39,7 +39,7 @@ Again, please go through the entire documentation to confirm your system is usin
 
 ## Installing SGLang
 
-For general installation instructions, see the official [SGLang Installation Docs](https://docs.sglang.ai/start/install.html). Below are the AMD-specific steps summarized for convenience.
+For general installation instructions, see the official [SGLang Installation Docs](../start/install.md). Below are the AMD-specific steps summarized for convenience.
 
 ### Install from Source
 

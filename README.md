@@ -16,6 +16,7 @@
 | [**Documentation**](https://docs.sglang.ai/)
 | [**Join Slack**](https://slack.sglang.ai/)
 | [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
+| [**Roadmap**](https://github.com/sgl-project/sglang/issues/4042)
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
 ## News
@@ -55,7 +56,7 @@ The core features include:
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
 
 ## Roadmap
-[Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
+[Development Roadmap (2025 H1)](https://github.com/sgl-project/sglang/issues/4042)
 
 ## Adoption and Sponsorship
 The project has been deployed to large-scale production, generating trillions of tokens every day.

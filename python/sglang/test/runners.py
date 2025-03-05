@@ -15,7 +15,7 @@
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +56,13 @@ def get_top_logprobs(logits, k):
     return logprobs
 
 
+def get_token_ids_logprobs(logits, token_ids):
+    logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
+    del logits
+    logprobs = logprobs[..., token_ids]
+    return logprobs
+
+
 def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
@@ -84,8 +91,13 @@ class ModelOutput:
     output_ids: List[int] = None
     top_input_logprobs: List[torch.Tensor] = None
     top_output_logprobs: List[torch.Tensor] = None
+    top_output_logprob_idx: List[List[int]] = None
     embed_logits: List[torch.Tensor] = None
     scores: List[float] = None
+    input_token_logprobs_lst: List[List[Tuple[float, int, None]]] = None
+    output_token_logprobs_lst: List[List[Tuple[float, int, None]]] = None
+    token_ids_input_logprobs: List[torch.Tensor] = None
+    token_ids_output_logprobs: List[torch.Tensor] = None
 
 
 class HFRunner:
@@ -157,7 +169,7 @@ class HFRunner:
 
         # Run forward
         while True:
-            prompts, max_new_tokens, lora_paths = in_queue.get()
+            prompts, max_new_tokens, lora_paths, token_ids_logprob = in_queue.get()
             if lora_paths is not None:
                 assert len(prompts) == len(lora_paths)
 
@@ -165,16 +177,16 @@ class HFRunner:
                 if self.model_type == "generation":
                     out_queue.put(
                         self.forward_generation_raw(
+                            base_model=self.base_model,
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
-                            base_model=self.base_model,
                             tokenizer=self.tokenizer,
                             lora_paths=lora_paths,
                             torch_dtype=torch_dtype,
                             output_str_only=self.output_str_only,
+                            token_ids_logprob=token_ids_logprob,
                         )
                     )
-
                 elif self.model_type == "embedding":
                     assert not self.output_str_only
                     logits = self.model.encode(prompts).tolist()
@@ -199,10 +211,11 @@ class HFRunner:
     def forward(
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
-        max_new_tokens=8,
-        lora_paths=None,
+        max_new_tokens: int = 8,
+        lora_paths: Optional[List[str]] = None,
+        token_ids_logprob: Optional[int] = None,
     ):
-        self.in_queue.put((prompts, max_new_tokens, lora_paths))
+        self.in_queue.put((prompts, max_new_tokens, lora_paths, token_ids_logprob))
         return self.out_queue.get()
 
     def terminate(self):
@@ -218,17 +231,24 @@ class HFRunner:
 
     @staticmethod
     def forward_generation_raw(
-        prompts: Union[List[str], List[torch.Tensor]],
-        max_new_tokens,
         base_model,
+        prompts: Union[List[str], List[torch.Tensor]],
+        max_new_tokens: int,
         tokenizer,
-        lora_paths,
         torch_dtype: torch.dtype,
-        output_str_only: bool,
+        lora_paths: Optional[List[str]] = None,
+        output_str_only: bool = False,
+        token_ids_logprob: Optional[int] = None,
     ) -> ModelOutput:
         output_strs = []
         top_input_logprobs = []
         top_output_logprobs = []
+        if token_ids_logprob is not None:
+            token_ids_input_logprobs = []
+            token_ids_output_logprobs = []
+        else:
+            token_ids_input_logprobs = token_ids_output_logprobs = None
+
         for i, p in enumerate(prompts):
             if isinstance(p, str):
                 input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
@@ -275,18 +295,33 @@ class HFRunner:
                         for logits in outputs.scores
                     ]
                 )
+                if token_ids_logprob is not None:
+                    token_ids_output_logprobs.append(
+                        [
+                            get_token_ids_logprobs(
+                                logits[0], token_ids_logprob
+                            ).tolist()
+                            for logits in outputs.scores
+                        ]
+                    )
                 del outputs
 
                 input_logits = model.forward(input_ids).logits[0]
                 top_input_logprobs.append(
                     get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
                 )
+                if token_ids_logprob is not None:
+                    token_ids_input_logprobs.append(
+                        get_token_ids_logprobs(input_logits, token_ids_logprob).tolist()
+                    )
                 del input_logits
 
         return ModelOutput(
             output_strs=output_strs,
             top_input_logprobs=top_input_logprobs,
             top_output_logprobs=top_output_logprobs,
+            token_ids_input_logprobs=token_ids_input_logprobs,
+            token_ids_output_logprobs=token_ids_output_logprobs,
         )
 
 
@@ -303,11 +338,31 @@ class SRTRunner:
         lora_backend: str = "triton",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
+        chunked_prefill_size: Optional[int] = None,
+        dp_size: int = 1,
+        tokenizer_path: Optional[str] = None,
+        enable_ep_moe: bool = False,
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
+        speculative_draft_model_path: Optional[str] = None,
+        speculative_algorithm: Optional[str] = None,
+        speculative_num_steps: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+        disable_overlap_schedule: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
+        enable_dp_attention = dp_size > 1
+
+        spec_kwargs = {}
+        if speculative_draft_model_path:
+            spec_kwargs["speculative_draft_model_path"] = speculative_draft_model_path
+            spec_kwargs["speculative_algorithm"] = speculative_algorithm
+            spec_kwargs["speculative_num_steps"] = speculative_num_steps
+            spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
+            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
+
         self.engine = Engine(
             model_path=model_path,
             tp_size=tp_size,
@@ -321,21 +376,41 @@ class SRTRunner:
             lora_backend=lora_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            chunked_prefill_size=chunked_prefill_size,
+            enable_dp_attention=enable_dp_attention,
+            dp_size=dp_size,
+            tokenizer_path=tokenizer_path,
+            enable_ep_moe=enable_ep_moe,
+            disable_overlap_schedule=disable_overlap_schedule,
+            cuda_graph_max_bs=4,
+            **spec_kwargs,
         )
-        self.tokenizer = get_tokenizer(model_path, trust_remote_code=trust_remote_code)
+
+        if tokenizer_path is None:
+            self.tokenizer = get_tokenizer(
+                model_path, trust_remote_code=trust_remote_code
+            )
+        else:
+            self.tokenizer = None
 
     def forward(
         self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
-        max_new_tokens=8,
-        lora_paths=None,
+        max_new_tokens: int = 8,
+        lora_paths: Optional[List[str]] = None,
+        logprob_start_len: int = 0,
+        top_k: Optional[int] = None,
+        token_ids_logprob: Optional[List[int]] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
+                engine=self.engine,
                 prompts=prompts,
                 max_new_tokens=max_new_tokens,
                 lora_paths=lora_paths,
-                engine=self.engine,
+                logprob_start_len=logprob_start_len,
+                top_k=top_k,
+                token_ids_logprob=token_ids_logprob,
             )
         else:
             response = self.engine.encode(prompts)
@@ -358,10 +433,10 @@ class SRTRunner:
         """
         if self.is_generation:
             return self.batch_forward_generation_raw(
+                engine=self.engine,
                 prompts=prompts,
                 max_new_tokens=max_new_tokens,
                 lora_paths=lora_paths,
-                engine=self.engine,
             )
         else:
             response = self.engine.encode(prompts)
@@ -381,24 +456,43 @@ class SRTRunner:
 
     @staticmethod
     def forward_generation_raw(
+        engine: Engine,
         prompts: Union[List[str], List[torch.Tensor]],
-        max_new_tokens,
-        lora_paths,
-        engine,
+        max_new_tokens: int = 8,
+        lora_paths: Optional[List[str]] = None,
+        logprob_start_len: int = 0,
+        top_k: Optional[int] = None,
+        token_ids_logprob: Optional[List[int]] = None,
     ):
         # the return value contains logprobs from prefill
         output_strs = []
+        output_ids = []
+        # Input logprobs. Note that the last item in input logprob is equivalent to
+        # the first item in the output logprob.
         top_input_logprobs = []
+        input_token_logprobs_lst = []
         top_output_logprobs = []
+        output_token_logprobs_lst = []
+        top_output_logprob_idx = []
+        if token_ids_logprob is not None:
+            token_ids_input_logprobs = []
+            token_ids_output_logprobs = []
+        else:
+            token_ids_input_logprobs = token_ids_output_logprobs = None
+
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+        if top_k:
+            sampling_params["top_k"] = top_k
+
         for i, prompt in enumerate(prompts):
             response = engine.generate(
                 prompt,
                 lora_path=lora_paths[i] if lora_paths else None,
                 sampling_params=sampling_params,
                 return_logprob=True,
-                logprob_start_len=0,
+                logprob_start_len=logprob_start_len,
                 top_logprobs_num=NUM_TOP_LOGPROBS,
+                token_ids_logprob=token_ids_logprob,
             )
             text = response["text"]
 
@@ -408,12 +502,36 @@ class SRTRunner:
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
+            # output_ids.append(response["output_ids"])
+
+            input_token_logprobs = response["meta_info"]["input_token_logprobs"]
+            output_token_logprobs = response["meta_info"]["output_token_logprobs"]
+            # print(i, input_token_logprobs)
+            # print(i, output_token_logprobs)
+            logprobs = response["meta_info"]["input_top_logprobs"]
+            if token_ids_logprob is not None:
+                input_token_ids_logprobs = response["meta_info"][
+                    "input_token_ids_logprobs"
+                ][1:]
+            else:
+                input_token_ids_logprobs = None
+
+            num_prompt_tokens = response["meta_info"]["prompt_tokens"]
+            assert len(input_token_logprobs) == num_prompt_tokens - logprob_start_len
+            assert len(logprobs) == num_prompt_tokens - logprob_start_len
+
+            # The first token logprob has no meaning in sglang.
+            input_token_logprobs = input_token_logprobs[1:]
+            logprobs = logprobs[1:]
+            assert len(input_token_logprobs) == len(logprobs)
+
+            input_token_logprobs_lst.append(
+                input_token_logprobs + [output_token_logprobs[0]]
+            )
+            output_token_logprobs_lst.append(output_token_logprobs)
 
             top_input_logprobs.append(
-                [
-                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["input_top_logprobs"][1:]
-                ]
+                [[tup[0] for tup in x[:NUM_TOP_LOGPROBS]] for x in logprobs]
                 + [
                     [
                         tup[0]
@@ -429,11 +547,41 @@ class SRTRunner:
                     for x in response["meta_info"]["output_top_logprobs"]
                 ]
             )
+            top_output_logprob_idx.append(
+                [
+                    [tup[1] for tup in x[:NUM_TOP_LOGPROBS]]
+                    for x in response["meta_info"]["output_top_logprobs"]
+                ]
+            )
+            if token_ids_logprob is not None:
+                token_ids_input_logprobs.append(
+                    [[tup[0] for tup in x] for x in input_token_ids_logprobs]
+                    + [
+                        [
+                            tup[0]
+                            for tup in response["meta_info"][
+                                "output_token_ids_logprobs"
+                            ][0]
+                        ]
+                    ]
+                )
+                token_ids_output_logprobs.append(
+                    [
+                        [tup[0] for tup in x]
+                        for x in response["meta_info"]["output_token_ids_logprobs"]
+                    ]
+                )
 
         return ModelOutput(
             output_strs=output_strs,
+            output_ids=output_ids,
             top_input_logprobs=top_input_logprobs,
             top_output_logprobs=top_output_logprobs,
+            input_token_logprobs_lst=input_token_logprobs_lst,
+            output_token_logprobs_lst=output_token_logprobs_lst,
+            top_output_logprob_idx=top_output_logprob_idx,
+            token_ids_input_logprobs=token_ids_input_logprobs,
+            token_ids_output_logprobs=token_ids_output_logprobs,
         )
 
     @staticmethod
