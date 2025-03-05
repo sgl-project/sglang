@@ -89,7 +89,7 @@ def parse_args():
         "--dataset-path",
         type=str,
         default="",
-        help="dataset path for ShareGPT file",
+        help="local dataset to sample tokens from",
     )
     parser.add_argument(
         "--log-file",
