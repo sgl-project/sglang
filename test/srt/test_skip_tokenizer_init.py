@@ -18,6 +18,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    DEFAULT_SMALL_VLM_MODEL_NAME,
+    DEFAULT_IMAGE_URL
 )
 
 
@@ -189,10 +191,10 @@ class TestSkipTokenizerInit(unittest.TestCase):
 class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        cls.image_url = DEFAULT_IMAGE_URL
         response = requests.get(cls.image_url)
         cls.image = Image.open(BytesIO(response.content))
-        cls.model = "Qwen/Qwen2-VL-2B"
+        cls.model = DEFAULT_SMALL_VLM_MODEL_NAME
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
         cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST
