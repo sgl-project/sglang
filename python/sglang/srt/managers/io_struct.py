@@ -414,6 +414,12 @@ class BatchTokenIDOut:
 class BatchMultimodalDecodeReq:
     # The request id
     rids: List[str]
+    finished_reasons: List[BaseFinishReason]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
 
 
 @dataclass
@@ -424,6 +430,8 @@ class BatchStrOut:
     finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
+    # The token ids
+    output_ids: Optional[List[int]]
 
     # Token counts
     prompt_tokens: List[int]
@@ -453,6 +461,15 @@ class BatchStrOut:
 class BatchMultimodalOut:
     # The request id
     rids: List[str]
+    # The finish reason
+    finished_reasons: List[dict]
+    # The outputs
+    outputs: List[List[Dict]]
+
+    # Token counts
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    cached_tokens: List[int]
 
 
 @dataclass

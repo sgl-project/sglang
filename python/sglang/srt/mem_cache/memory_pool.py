@@ -192,7 +192,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
-            f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB."
+            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
         )
 
     def _create_buffers(self):

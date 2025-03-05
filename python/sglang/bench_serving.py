@@ -39,6 +39,7 @@ from transformers import (
 )
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+ASSISTANT_SUFFIX = "Assistant:"
 
 global args
 
@@ -635,7 +636,11 @@ def sample_sharegpt_requests(
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
         if prompt_suffix:
-            prompt = prompt
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
 
         if apply_chat_template:
             prompt = tokenizer.apply_chat_template(
