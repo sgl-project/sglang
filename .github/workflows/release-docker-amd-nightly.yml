@@ -2,7 +2,7 @@ name: Release Docker Images Nightly (AMD)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 5 * * *'
+    - cron: '0 13 * * *'
 
 jobs:
   publish:
