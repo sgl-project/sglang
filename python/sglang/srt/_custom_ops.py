@@ -1,10 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
-import contextlib
-import functools
-import importlib
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import List, Tuple
 
 import torch
 import torch.library
@@ -13,8 +10,9 @@ from sglang.srt.utils import is_hip, is_hpu
 
 logger = logging.getLogger(__name__)
 use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
+
 if not is_hpu():
-    # Remove vllm dependency for custom allreduce on ROCm
+    # ROCm does not use vllm custom allreduce
     if use_vllm_custom_allreduce and not is_hip():
         try:
             import vllm._C
@@ -27,37 +25,8 @@ if not is_hpu():
             logger.warning("Failed to import from custom_ar with %r", e)
 
 
-def hint_on_error(fn):
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-
-        except NotImplementedError as e:
-            msg = (
-                "Error in calling custom op %s: %s\n"
-                "Not implemented or built, mostly likely because the current current device "
-                "does not support this kernel (less likely TORCH_CUDA_ARCH_LIST was set "
-                "incorrectly while building)"
-            )
-            logger.error(msg, fn.__name__, e)
-            raise NotImplementedError(msg % (fn.__name__, e)) from e
-        except AttributeError as e:
-            msg = (
-                "Error in calling custom op %s: %s\n"
-                "Possibly you have built or installed an obsolete version of vllm.\n"
-                "Please try a clean build and install of vllm,"
-                "or remove old built files such as vllm/*cpython*.so and build/ ."
-            )
-            logger.error(msg, fn.__name__, e)
-            raise e
-
-    return wrapper
-
-
 if use_vllm_custom_allreduce and not is_hip():
-    # custom ar
+    # vLLM custom allreduce
     def init_custom_ar(
         ipc_tensors: List[torch.Tensor],
         rank_data: torch.Tensor,
@@ -96,6 +65,7 @@ if use_vllm_custom_allreduce and not is_hip():
 
 else:
     if is_hip():
+        # ROCM custom allreduce
 
         def init_custom_ar(
             meta: torch.Tensor,
@@ -105,45 +75,45 @@ else:
             rank: int,
             full_nvlink: bool,
         ) -> int:
-            return sgl_kernel.ops.init_custom_ar(
+            return sgl_kernel.ops.allreduce.init_custom_ar(
                 meta, rank_data, handles, offsets, rank, full_nvlink
             )
 
         def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-            sgl_kernel.ops.all_reduce_reg(fa, inp, out)
+            sgl_kernel.ops.allreduce.all_reduce_reg(fa, inp, out)
 
         def all_reduce_unreg(
             fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
         ) -> None:
-            sgl_kernel.ops.all_reduce_unreg(fa, inp, reg_buffer, out)
+            sgl_kernel.ops.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
 
         def dispose(fa: int) -> None:
-            sgl_kernel.ops.dispose(fa)
+            sgl_kernel.ops.allreduce.dispose(fa)
 
         def meta_size() -> int:
-            return sgl_kernel.ops.meta_size()
+            return sgl_kernel.ops.allreduce.meta_size()
 
         def register_buffer(
             fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
         ) -> None:
-            return sgl_kernel.ops.register_buffer(fa, t, handles, offsets)
+            return sgl_kernel.ops.allreduce.register_buffer(fa, t, handles, offsets)
 
         def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
-            return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
+            return sgl_kernel.ops.allreduce.get_graph_buffer_ipc_meta(fa)
 
         def register_graph_buffers(
             fa: int, handles: List[str], offsets: List[List[int]]
         ) -> None:
-            sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
+            sgl_kernel.ops.allreduce.register_graph_buffers(fa, handles, offsets)
 
         def allocate_meta_buffer(size: int) -> torch.Tensor:
-            return sgl_kernel.ops.allocate_meta_buffer(size)
+            return sgl_kernel.ops.allreduce.allocate_meta_buffer(size)
 
         def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
-            return sgl_kernel.ops.get_meta_buffer_ipc_handle(inp)
+            return sgl_kernel.ops.allreduce.get_meta_buffer_ipc_handle(inp)
 
     else:
-        # custom ar
+        # TRTLLM custom allreduce
         def init_custom_ar(
             rank_id: int,
             world_size: int,
@@ -176,29 +146,3 @@ else:
             fa: int, handles: List[List[int]], offsets: List[List[int]]
         ) -> None:
             sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
-
-
-# temporary fix for https://github.com/vllm-project/vllm/issues/5456
-# TODO: remove this in v0.6.0
-names_and_values = globals()
-names_and_values_to_update = {}
-# prepare variables to avoid dict size change during iteration
-k, v, arg = None, None, None
-fn_type = type(lambda x: x)
-for k, v in names_and_values.items():
-    # find functions that are defined in this file and have torch.Tensor
-    # in their annotations. `arg == "torch.Tensor"` is used to handle
-    # the case when users use `import __annotations__` to turn type
-    # hints into strings.
-    if (
-        isinstance(v, fn_type)
-        and v.__code__.co_filename == __file__
-        and any(
-            arg is torch.Tensor or arg == "torch.Tensor"
-            for arg in v.__annotations__.values()
-        )
-    ):
-        names_and_values_to_update[k] = hint_on_error(v)
-
-names_and_values.update(names_and_values_to_update)
-del names_and_values_to_update, names_and_values, v, k, fn_type
