@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.utils import get_device_capability
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -51,7 +52,20 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 89  # Minimum hardware capability (e.g., Hopper GPUs).
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return 89
+
+        # Vendors can update
+        return "unknown"
+
+    @classmethod
+    def get_available(cls) -> bool:
+        major, minor = get_device_capability()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return major * 10 + minor > 80
+
+        # Vendors can update
+        return False
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
