@@ -198,6 +198,23 @@ sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
 sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B-A100.yaml --retry-until-up
 ```
 
+### Example: Serving with INT8 Quantization
+
+INT8 weights for DeepSeek R1 are available [here](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8). 
+
+The execution commands remain equivalent to the FP8/BF16 case. The configuration difference lies in the `config.json` within the checkpoint:
+
+```json
+"quantization_config": {
+    "activation_scheme": "dynamic",
+    "quant_method": "blockwise_int8",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+```
+
 #### Troubleshooting
 
 If you encounter the following error with fp16/bf16 checkpoint:
