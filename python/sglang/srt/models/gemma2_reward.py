@@ -22,6 +22,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
+from sglang.srt.utils import add_prefix
 
 
 class Gemma2ForSequenceClassification(nn.Module):
@@ -29,12 +30,15 @@ class Gemma2ForSequenceClassification(nn.Module):
         self,
         config: Gemma2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.num_labels = config.num_labels
-        self.model = Gemma2Model(config, quant_config=quant_config)
+        self.model = Gemma2Model(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 

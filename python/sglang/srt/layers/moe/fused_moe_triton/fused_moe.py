@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
 )
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_bool_env_var,
     get_device_name,
     is_cuda_available,
     is_hip,
@@ -973,7 +974,11 @@ def fused_experts_impl(
     no_combine: bool = False,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8 or not use_int8_w8a8 or block_shape is not None:
+    if (
+        not (use_fp8_w8a8 or use_int8_w8a8)
+        or block_shape is not None
+        or (is_hip_ and get_bool_env_var("CK_MOE"))
+    ):
         padded_size = 0
 
     # Check constraints.
