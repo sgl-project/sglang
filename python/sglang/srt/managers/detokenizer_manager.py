@@ -212,6 +212,7 @@ class DetokenizerManager:
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
+            output_ids=None,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,

@@ -24,7 +24,7 @@ class TestInputEmbeds(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--disable-radix"],
+            other_args=["--disable-radix", "--cuda-graph-max-bs", 4],
         )
         cls.texts = [
             "The capital of France is",
