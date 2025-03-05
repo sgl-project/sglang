@@ -39,7 +39,7 @@ class TestEAGLEEngine(unittest.TestCase):
         self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
         ref_engine.shutdown()
 
-    def test_eagle_accuracy(self):
+    def test_correctness(self):
         configs = [
             self.BASE_CONFIG,
             {**self.BASE_CONFIG, "disable_cuda_graph": True},
@@ -78,67 +78,6 @@ class TestEAGLEEngine(unittest.TestCase):
 
         tokens = tokenizer.encode(output, truncation=False)
         self.assertNotIn(tokenizer.eos_token_id, tokens)
-
-    def _test_batch_generation(self, engine):
-        prompts = [
-            "Hello, my name is",
-            "The president of the United States is",
-            "The capital of France is",
-            "The future of AI is",
-        ]
-        params = {"temperature": 0, "max_new_tokens": 30}
-
-        outputs = engine.generate(prompts, params)
-        for prompt, output in zip(prompts, outputs):
-            print(f"Prompt: {prompt}")
-            print(f"Generated: {output['text']}")
-            print("-" * 40)
-
-
-class TestEAGLEEngineTokenMap(unittest.TestCase):
-    BASE_CONFIG = {
-        "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "speculative_draft_model_path": "lmzheng/sglang-EAGLE-LLaMA3-Instruct-8B",
-        "speculative_algorithm": "EAGLE",
-        "speculative_num_steps": 5,
-        "speculative_eagle_topk": 8,
-        "speculative_num_draft_tokens": 64,
-        "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 4,
-        "dtype": "float16",
-    }
-
-    def setUp(self):
-        self.prompt = "Today is a sunny day and I like"
-        self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
-
-        ref_engine = sgl.Engine(model_path=self.BASE_CONFIG["model_path"])
-        self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
-        ref_engine.shutdown()
-
-    def test_token_map_accuracy(self):
-        configs = [
-            self.BASE_CONFIG,
-            {
-                **self.BASE_CONFIG,
-                "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
-            },
-        ]
-
-        for config in configs:
-            print("testing config: ", config)
-            with self.subTest(cuda_graph="enabled"):
-                engine = sgl.Engine(**config)
-                try:
-                    self._test_basic_generation(engine)
-                    self._test_batch_generation(engine)
-                finally:
-                    engine.shutdown()
-
-    def _test_basic_generation(self, engine):
-        output = engine.generate(self.prompt, self.sampling_params)["text"]
-        print(f"{output=}, {self.ref_output=}")
-        self.assertEqual(output, self.ref_output)
 
     def _test_batch_generation(self, engine):
         prompts = [
@@ -222,7 +161,7 @@ class TestEAGLEServer(unittest.TestCase):
                         "max_new_tokens": 1024,
                     },
                 }
-                # set timeout = 1s,mock disconnected
+                # set timeout = 1s, mock disconnected
                 requests.post(url, json=data, timeout=1)
             except Exception as e:
                 print(e)
@@ -273,17 +212,70 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
-                "8",
+                "4",
                 "--speculative-num-draft-tokens",
-                "64",
+                "8",
                 "--mem-fraction-static",
                 "0.7",
                 "--attention-backend",
                 "triton",
                 "--cuda-graph-max-bs",
-                "32",
+                "16",
             ],
         )
+
+
+class TestEAGLEEngineTokenMap(unittest.TestCase):
+    def setUp(self):
+        self.prompt = "Today is a sunny day and I like"
+        self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
+
+        ref_engine = sgl.Engine(
+            model_path="meta-llama/Meta-Llama-3-8B-Instruct", cuda_graph_max_bs=2
+        )
+        self.ref_output = ref_engine.generate(self.prompt, self.sampling_params)["text"]
+        ref_engine.shutdown()
+
+    def test_correctness(self):
+        config = {
+            "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
+            "speculative_draft_model_path": "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B",
+            "speculative_algorithm": "EAGLE",
+            "speculative_num_steps": 5,
+            "speculative_eagle_topk": 4,
+            "speculative_num_draft_tokens": 8,
+            "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
+            "mem_fraction_static": 0.7,
+            "cuda_graph_max_bs": 4,
+            "dtype": "bfloat16",
+        }
+
+        engine = sgl.Engine(**config)
+        try:
+            self._test_basic_generation(engine)
+            self._test_batch_generation(engine)
+        finally:
+            engine.shutdown()
+
+    def _test_basic_generation(self, engine):
+        output = engine.generate(self.prompt, self.sampling_params)["text"]
+        print(f"{output=}, {self.ref_output=}")
+        self.assertEqual(output, self.ref_output)
+
+    def _test_batch_generation(self, engine):
+        prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        params = {"temperature": 0, "max_new_tokens": 30}
+
+        outputs = engine.generate(prompts, params)
+        for prompt, output in zip(prompts, outputs):
+            print(f"Prompt: {prompt}")
+            print(f"Generated: {output['text']}")
+            print("-" * 40)
 
 
 if __name__ == "__main__":
