@@ -22,7 +22,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MHATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class HiCacheController:
     def __init__(
         self,
         mem_pool_device: MHATokenToKVPool,
-        mem_pool_host: MLATokenToKVPoolHost,
+        mem_pool_host: MHATokenToKVPoolHost,
         write_policy: str = "write_through_selective",
     ):
 
