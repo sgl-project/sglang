@@ -741,13 +741,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     return result
 
 
-def first_rank_print(*args, **kwargs):
-    if torch.cuda.current_device() == 0:
-        print(*args, **kwargs)
-    else:
-        pass
-
-
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
@@ -1175,6 +1168,11 @@ def set_gpu_proc_affinity(
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+@lru_cache(maxsize=2)
+def disable_request_logging() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
 @lru_cache(maxsize=8)
