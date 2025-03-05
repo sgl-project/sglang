@@ -73,6 +73,7 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         
         
+        
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -124,6 +125,8 @@ class AiterAttnBackend(AttentionBackend):
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
         self.kv_last_page_lens = torch.ones((max_bs, ), dtype=torch.int32).to(self.device)
+        
+        self.logits_soft_cap = 0.0
             
     
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
@@ -291,6 +294,7 @@ class AiterAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr 
@@ -343,7 +347,7 @@ class AiterAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        logits_soft_cap = layer.logit_cap
+        self.logits_soft_cap = layer.logit_cap
 
         if k is not None:
             assert v is not None
@@ -358,7 +362,7 @@ class AiterAttnBackend(AttentionBackend):
             causal=not layer.is_cross_attention,
             sm_scale=layer.scaling,
             window_left=layer.sliding_window_size,
-            logits_soft_cap=logits_soft_cap,
+            logits_soft_cap=self.logits_soft_cap,
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
         )
@@ -387,7 +391,7 @@ class AiterAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         
-        
+        self.logits_soft_cap = layer.logit_cap
         paged_attention_rocm(
             o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.workspace_buffer,
@@ -403,7 +407,7 @@ class AiterAttnBackend(AttentionBackend):
             None, 
             "auto", 
             "NHD", 
-            layer.logit_cap,
+            self.logits_soft_cap,
             self.k_scale,
             self.v_scale,
             None, 
@@ -522,6 +526,8 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
+        # adding logits_soft_cap arg in plan() stage
+        print("=====logits cap used: {}".format(self.attn_backend.logits_soft_cap))
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -534,6 +540,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             custom_mask=custom_mask,
             non_blocking=True,
+            logits_soft_cap=self.attn_backend.logits_soft_cap,
         )
 
 @triton.jit
