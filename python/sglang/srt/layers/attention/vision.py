@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.utils import add_prefix
 
 
 def rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
@@ -122,20 +123,20 @@ class VisionAttention(nn.Module):
                 head_size=self.head_size,
                 total_num_heads=num_heads,
                 quant_config=quant_config,
-                prefix=f"{prefix}.qkv_proj",
+                prefix=add_prefix("qkv_proj", prefix),
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
                 input_size=embed_dim,
                 output_size=3 * projection_size,
                 quant_config=quant_config,
-                prefix=f"{prefix}.qkv_proj",
+                prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
             input_size=embed_dim,
             output_size=embed_dim,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
+            prefix=add_prefix("out_proj", prefix),
         )
 
     def forward(
