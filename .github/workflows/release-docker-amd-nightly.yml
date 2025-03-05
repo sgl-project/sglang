@@ -22,9 +22,6 @@ jobs:
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
-      - name: "Restart docker"
-        run: sudo systemctl restart docker
-
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -59,3 +56,4 @@ jobs:
       - name: "Remove docker image"
         run: |
           sudo rm -rf /var/lib/docker
+          sudo systemctl restart docker
