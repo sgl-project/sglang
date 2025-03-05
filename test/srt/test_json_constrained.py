@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, backend: str, disable_overlap: bool):
+def setup_class(cls, backend: str):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
     cls.json_schema = json.dumps(
@@ -42,9 +42,6 @@ def setup_class(cls, backend: str, disable_overlap: bool):
         backend,
     ]
 
-    if disable_overlap:
-        other_args += ["--disable-overlap-schedule"]
-
     cls.process = popen_launch_server(
         cls.model,
         cls.base_url,
@@ -56,7 +53,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
 class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=False)
+        setup_class(cls, backend="outlines")
 
     @classmethod
     def tearDownClass(cls):
@@ -131,6 +128,18 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
 
         with ThreadPoolExecutor(len(json_schemas)) as executor:
             list(executor.map(self.run_decode, json_schemas))
+
+
+class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="xgrammar")
+
+
+class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="llguidance")
 
 
 if __name__ == "__main__":
