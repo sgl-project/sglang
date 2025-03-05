@@ -59,7 +59,6 @@ The core features include:
       :caption: References
 
       references/deepseek
-      references/deepseek_ablations
       references/general
       references/hardware
       references/advanced_deploy
