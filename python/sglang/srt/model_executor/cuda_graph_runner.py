@@ -238,6 +238,9 @@ class CudaGraphRunner:
                     ),
                     dtype=self.model_runner.dtype,
                 )
+                self.global_num_tokens_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
 
         # Capture
         try:
@@ -266,9 +269,9 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention:
-            min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
-                forward_batch.global_num_tokens
-            )
+            min_num_tokens, max_num_tokens = min(
+                forward_batch.global_num_tokens_cpu
+            ), max(forward_batch.global_num_tokens_cpu)
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
                 (min_num_tokens == max_num_tokens and max_num_tokens in self.graphs)
                 if self.disable_padding
@@ -360,7 +363,7 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
-            global_num_tokens=global_num_tokens,
+            global_num_tokens_cpu=global_num_tokens,
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -430,7 +433,7 @@ class CudaGraphRunner:
         # Pad
         if self.enable_dp_attention:
             index = bisect.bisect_left(
-                self.capture_bs, max(forward_batch.global_num_tokens)
+                self.capture_bs, max(forward_batch.global_num_tokens_cpu)
             )
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
