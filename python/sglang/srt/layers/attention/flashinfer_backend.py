@@ -19,10 +19,9 @@ import triton
 import triton.language as tl
 
 from sglang.global_config import global_config
-from sglang.srt.layers.attention import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available
@@ -434,10 +433,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self._to_dtype(
-                        forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                        q.dtype,
-                    ),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=layer.logit_cap,
@@ -479,9 +475,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self._to_dtype(
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id), q.dtype
-            ),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             k_scale=layer.k_scale,
@@ -489,12 +483,6 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-    def _to_dtype(self, kv_tuple, dtype):
-        if kv_tuple[0].dtype != dtype:
-            return tuple(t.to(dtype) for t in kv_tuple)
-        else:
-            return kv_tuple
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:

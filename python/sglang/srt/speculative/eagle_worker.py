@@ -52,22 +52,14 @@ class EAGLEWorker(TpModelWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
-        # lossy optimization by using hot tokens
+        # Lossy optimization by using hot tokens
         if server_args.speculative_token_map is not None:
-            if os.path.exists(server_args.speculative_token_map):
-                self.hot_token_id = torch.load(server_args.speculative_token_map)
-            else:
-                cache_dir = snapshot_download(
-                    os.path.dirname(server_args.speculative_token_map),
-                    ignore_patterns=["*.bin", "*.safetensors"],
-                )
-                file_path = os.path.join(
-                    cache_dir, os.path.basename(server_args.speculative_token_map)
-                )
-                self.hot_token_id = torch.load(file_path)
+            self.hot_token_id = load_token_map(server_args.speculative_token_map)
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
+        else:
+            self.hot_token_id = None
 
         # We share the allocator with a target worker. Draft/target worker
         # owns its own KV cache.
@@ -75,6 +67,7 @@ class EAGLEWorker(TpModelWorker):
             target_worker.get_memory_pool()
         )
 
+        # Init target worker
         super().__init__(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -99,27 +92,13 @@ class EAGLEWorker(TpModelWorker):
         self.gpu_id = self.model_runner.gpu_id
 
         # Share the embedding and lm_head
-        if not self.speculative_algorithm.is_nextn():
-            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-            if server_args.speculative_token_map is not None:
-                head = head.clone()
-                self.hot_token_id = torch.tensor(
-                    self.hot_token_id, dtype=torch.int32, device=head.device
-                )
-                head.data = head.data[self.hot_token_id]
-            else:
-                self.hot_token_id = None
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
-            self.draft_model_runner.server_args.disable_cuda_graph = (
-                backup_disable_cuda_graph
-            )
-        else:
-            if server_args.speculative_token_map is not None:
-                raise NotImplementedError(
-                    "NEXTN does not support speculative-token-map now"
-                )
-            self.hot_token_id = None
-            self.model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        if self.hot_token_id is not None:
+            head = head.clone()
+            self.hot_token_id = self.hot_token_id.to(head.device)
+            head.data = head.data[self.hot_token_id]
+        self.draft_model_runner.model.set_embed_and_head(embed, head)
+        self.draft_model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
 
         # Create multi-step attn backends and cuda graph runners
         if server_args.attention_backend == "flashinfer":
@@ -438,3 +417,13 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.warning("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+def load_token_map(token_map_path: str) -> List[int]:
+    if not os.path.exists(token_map_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(token_map_path),
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+    hot_token_id = torch.load(token_map_path)
+    return torch.tensor(hot_token_id, dtype=torch.int32)

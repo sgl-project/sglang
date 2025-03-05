@@ -35,6 +35,7 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
+DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
@@ -44,7 +45,7 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmzheng/sglang-EAGLE-llama2-chat-7B"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 
 
 def is_in_ci():
@@ -159,45 +160,6 @@ def call_generate_guidance(
     return rets if n > 1 else rets[0]
 
 
-async def call_generate_lmql(
-    prompt, temperature, max_tokens, stop=None, n=1, max_len=4096, model=None, **kwargs
-):
-    assert model is not None
-    import lmql
-
-    if stop != None:
-
-        @lmql.query(model=model)
-        async def program(question, max_tokens, stop):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and STOPS_AT(ANSWER, stop)
-            return ANSWER
-            '''
-
-    else:
-
-        @lmql.query(model=model)
-        async def program(question, max_tokens):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens
-            return ANSWER
-            '''
-
-    tasks = [
-        program(
-            question=prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stop=stop,
-            max_len=max_len,
-            **kwargs,
-        )
-        for _ in range(n)
-    ]
-    rets = await asyncio.gather(*tasks)
-    return rets if n > 1 else rets[0]
-
-
 def call_select_lightllm(context, choices, url=None):
     assert url is not None
 
@@ -247,23 +209,6 @@ def call_select_guidance(context, choices, model=None):
     return choices.index(out["answer"])
 
 
-async def call_select_lmql(context, choices, temperature=0, max_len=4096, model=None):
-    assert model is not None
-    import lmql
-
-    @lmql.query(model=model)
-    async def program(ctx, choices):
-        '''lmql
-        """{ctx}[ANSWER]""" where ANSWER in set(choices)
-        return ANSWER
-        '''
-
-    answer = await program(
-        ctx=context, choices=choices, temperature=temperature, max_len=max_len
-    )
-    return choices.index(answer)
-
-
 def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
@@ -278,7 +223,6 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "lightllm",
             "gserver",
             "guidance",
-            "lmql",
             "srt-raw",
             "llama.cpp",
         ],
@@ -295,7 +239,6 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "vllm": 21000,
             "outlines": 21000,
             "lightllm": 22000,
-            "lmql": 23000,
             "srt-raw": 30000,
             "gserver": 9988,
         }
@@ -343,11 +286,6 @@ def _get_call_generate(args: argparse.Namespace):
         call_generate = partial(call_generate_guidance, model=model)
         call_generate("Hello,", 1.0, 8, ".")
         return call_generate
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
-        return partial(call_generate_lmql, model=model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -365,12 +303,6 @@ def _get_call_select(args: argparse.Namespace):
 
         call_select("Hello,", ["world", "earth"])
         return call_select
-
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
-        return partial(call_select_lmql, model=model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -569,6 +501,7 @@ def get_benchmark_args(
     request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
+    seed: int = 0,
     pd_seperated: bool = False,
 ):
     return SimpleNamespace(
@@ -592,7 +525,7 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
-        seed=0,
+        seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
         apply_chat_template=False,
@@ -617,6 +550,7 @@ def run_bench_serving(
     disable_stream=False,
     disable_ignore_eos=False,
     need_warmup=False,
+    seed: int = 0,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -640,6 +574,7 @@ def run_bench_serving(
         request_rate=request_rate,
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
+        seed=seed,
     )
 
     try:
