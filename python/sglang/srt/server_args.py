@@ -280,11 +280,16 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
-            self.disable_radix_cache = True
-            self.chunked_prefill_size = -1
+            if self.max_running_requests is None:
+                self.max_running_requests = 32
             logger.info(
-                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
+                "Overlap scheduler are disabled because of using "
+                "eagle speculative decoding."
+                "Max running request set to 32 because of using eagle speculative decoding."
             )
+            # The token generated from the verify step is counted.
+            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
         if (
