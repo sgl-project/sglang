@@ -47,7 +47,7 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
-    # indies of unfinished requests during extend-after-decode
+    # indices of unfinished requests during extend-after-decode
     # e.g. [0, 2, 3, 4] if only the 1st request is finished
     keep_indices: List[int] = None
 

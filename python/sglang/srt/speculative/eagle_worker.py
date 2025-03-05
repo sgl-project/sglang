@@ -98,7 +98,9 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = self.hot_token_id.to(head.device)
             head.data = head.data[self.hot_token_id]
         self.draft_model_runner.model.set_embed_and_head(embed, head)
-        self.draft_model_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.draft_model_runner.server_args.disable_cuda_graph = (
+            backup_disable_cuda_graph
+        )
 
         # Create multi-step attn backends and cuda graph runners
         if server_args.attention_backend == "flashinfer":
@@ -417,6 +419,7 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.warning("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
