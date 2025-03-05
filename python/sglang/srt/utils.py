@@ -32,13 +32,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
 
 import numpy as np
 import psutil
@@ -311,7 +313,7 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     modules = torch.nn.ModuleList(
         [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
             for idx in range(num_hidden_layers)
         ]
     )
@@ -480,6 +482,10 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
+    # Remove sigchld handler to avoid spammy logs.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -499,17 +505,14 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
-        if parent_pid == os.getpid():
-            sys.exit(0)
-        else:
-            try:
-                itself.kill()
+        try:
+            itself.kill()
 
-                # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-                # so we send an additional signal to kill them.
-                itself.send_signal(signal.SIGQUIT)
-            except psutil.NoSuchProcess:
-                pass
+            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+            # so we send an additional signal to kill them.
+            itself.send_signal(signal.SIGQUIT)
+        except psutil.NoSuchProcess:
+            pass
 
 
 def monkey_patch_p2p_access_check():
@@ -736,13 +739,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
-
-
-def first_rank_print(*args, **kwargs):
-    if torch.cuda.current_device() == 0:
-        print(*args, **kwargs)
-    else:
-        pass
 
 
 def get_zmq_socket(
@@ -1174,6 +1170,11 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
+@lru_cache(maxsize=2)
+def disable_request_logging() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+
+
 @lru_cache(maxsize=8)
 def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
@@ -1215,7 +1216,11 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def dataclass_to_string_truncated(data, max_length=2048):
+def dataclass_to_string_truncated(
+    data, max_length=2048, skip_names: Optional[Set[str]] = None
+):
+    if skip_names is None:
+        skip_names = set()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1234,6 +1239,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
             + ", ".join(
                 f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
+                if k not in skip_names
             )
             + "}"
         )
@@ -1244,6 +1250,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
             + ", ".join(
                 f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
                 for f in fields
+                if f.name not in skip_names
             )
             + ")"
         )
@@ -1322,9 +1329,9 @@ def pyspy_dump_schedulers():
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
-        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
     except subprocess.CalledProcessError as e:
-        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
 
 
 def kill_itself_when_parent_died():
@@ -1448,8 +1455,25 @@ def launch_dummy_health_check_server(host, port):
     )
 
 
+def create_checksum(directory: str):
+    raise NotImplementedError()
+
+
 def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"

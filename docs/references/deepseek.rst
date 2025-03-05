@@ -1,6 +1,9 @@
-Multi-Node Deployment
+DeepSeek Models
 ==========================
+
 .. toctree::
    :maxdepth: 1
 
-   deepseek.md
+   deepseek_usage.md
+   deepseek_optimization.md
+   deepseek_ablations.md
