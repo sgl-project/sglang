@@ -326,6 +326,7 @@ class Scheduler:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool=self.token_to_kv_pool,
+                    tp_cache_group=self.tp_worker.get_tp_cache_group(),
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -334,11 +335,12 @@ class Scheduler:
                     disable=server_args.disable_radix_cache,
                 )
 
-        self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
+        self.policy = SchedulePolicy(
+            self.schedule_policy, self.tree_cache, self.enable_hierarchical_cache
+        )
 
         # Init running status
         self.waiting_queue: List[Req] = []
-        self.staging_reqs = {}
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -995,6 +997,11 @@ class Scheduler:
             self.batch_is_full = True
             return None
 
+        if self.enable_hierarchical_cache:
+            # check for completion of hierarchical cache activities to release memory
+            self.tree_cache.writing_check()
+            self.tree_cache.loading_check()
+
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
@@ -1038,30 +1045,20 @@ class Scheduler:
                 self.batch_is_full = True
                 break
 
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
 
-            if self.enable_hierarchical_cache and req.last_node is not None:
-                if req.last_node.evicted:
-                    # loading KV cache for the request
+            if self.enable_hierarchical_cache and req.last_node_global is not None:
+                if req.last_node_global.evicted:
+                    # todo: more diverse loading strategy
                     req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                        req.last_node,
+                        req.last_node_global,
                         req.prefix_indices,
                         adder.rem_total_tokens,
                     )
-                    if req.last_node.loading:
-                        # to prevent frequent cache invalidation
-                        if req.rid in self.staging_reqs:
-                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                        self.tree_cache.inc_lock_ref(req.last_node)
-                        self.staging_reqs[req.rid] = req.last_node
-                        continue
-                elif req.last_node.loading:
-                    if not self.tree_cache.loading_complete(req.last_node):
-                        continue
-
-                if req.rid in self.staging_reqs:
-                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                    del self.staging_reqs[req.rid]
+                    req.init_next_round_input()
 
             res = adder.add_one_req(req, self.chunked_req)
             if res != AddReqResult.CONTINUE:
@@ -1085,6 +1082,9 @@ class Scheduler:
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.ready_to_load()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None

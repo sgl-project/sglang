@@ -69,9 +69,15 @@ class CacheAgnosticPolicy(Enum):
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
-    def __init__(self, policy: str, tree_cache: BasePrefixCache):
+    def __init__(
+        self,
+        policy: str,
+        tree_cache: BasePrefixCache,
+        enable_hierarchical_cache: bool = False,
+    ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
+        self.enable_hierarchical_cache = enable_hierarchical_cache
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -145,9 +151,14 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
-            r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
-                rid=r.rid, key=prefix_ids
-            )
+            if self.enable_hierarchical_cache:
+                r.prefix_indices, r.last_node, r.last_node_global = (
+                    self.tree_cache.match_prefix(key=prefix_ids, include_evicted=True)
+                )
+            else:
+                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
+                    rid=r.rid, key=prefix_ids
+                )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
