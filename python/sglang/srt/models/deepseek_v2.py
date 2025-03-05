@@ -815,8 +815,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
-    all_lens = forward_batch.global_num_tokens
-    max_len = max(forward_batch.global_num_tokens)
+    if world_size == 1:
+        return input_tensor
+
+    all_lens = forward_batch.global_num_tokens_cpu
+    max_len = max(forward_batch.global_num_tokens_cpu)
 
     if world_size == 1:
         return input_tensor, 0, all_lens[0]

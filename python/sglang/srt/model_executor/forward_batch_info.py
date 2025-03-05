@@ -190,7 +190,16 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
-    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_cpu: Optional[List[int]] = None
+    global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Has to be None when cuda graph is captured.
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # for extend, local start pos and num tokens is different in logits processor
+    # this will be computed in get_dp_local_info
+    # this will be recomputed in LogitsMetadata.from_forward_batch
+    dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
+    dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
 
@@ -234,7 +243,6 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
-            global_num_tokens=batch.global_num_tokens,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
@@ -248,8 +256,9 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
-        if ret.global_num_tokens is not None:
-            max_len = max(ret.global_num_tokens)
+        if batch.global_num_tokens is not None:
+            ret.global_num_tokens_cpu = batch.global_num_tokens
+            max_len = max(ret.global_num_tokens_cpu)
             ret.gathered_buffer = torch.zeros(
                 (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,

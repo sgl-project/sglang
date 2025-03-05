@@ -1141,7 +1141,7 @@ async def print_exception_wrapper(func):
 
 
 class SignalHandler:
-    def __init__(self, tokenizer_manager):
+    def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
 
     def signal_handler(self, signum=None, frame=None):

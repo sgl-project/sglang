@@ -42,7 +42,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
-    BatchMultimodalDecodeReq,
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
@@ -104,7 +103,6 @@ from sglang.srt.utils import (
     crash_on_warnings,
     get_bool_env_var,
     get_zmq_socket,
-    kill_itself_when_parent_died,
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -1199,7 +1197,6 @@ class Scheduler:
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
-
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -1480,7 +1477,6 @@ class Scheduler:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
-
         self.stream_output(batch.reqs, batch.return_logprob)
 
         self.token_to_kv_pool.free_group_end()
@@ -1580,11 +1576,11 @@ class Scheduler:
             if req.top_logprobs_num > 0:
                 req.input_top_logprobs_val = [None]
                 req.input_top_logprobs_idx = [None]
-
+                assert len(req.temp_input_token_ids_logprobs_val) == len(
+                    req.temp_input_token_ids_logprobs_idx
+                )
                 for val, idx in zip(
-                    req.temp_input_top_logprobs_val,
-                    req.temp_input_top_logprobs_idx,
-                    strict=True,
+                    req.temp_input_top_logprobs_val, req.temp_input_top_logprobs_idx
                 ):
                     req.input_top_logprobs_val.extend(val)
                     req.input_top_logprobs_idx.extend(idx)
@@ -1779,7 +1775,6 @@ class Scheduler:
             if rids:
                 if self.model_config.is_multimodal_gen:
                     raise NotImplementedError()
-
                 self.send_to_detokenizer.send_pyobj(
                     BatchTokenIDOut(
                         rids,
