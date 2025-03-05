@@ -18,7 +18,7 @@ class TestEnableMetrics(unittest.TestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-metrics"],
+            other_args=["--enable-metrics", "--cuda-graph-max-bs", 2],
         )
 
         try:
