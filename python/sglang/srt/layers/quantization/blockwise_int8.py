@@ -71,7 +71,13 @@ class BlockInt8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return 80
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return 12
+
+        # Vendors can update
+        return 999
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:

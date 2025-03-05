@@ -108,16 +108,13 @@ def _get_quantization_config(
         quant_config = get_quant_config(model_config, load_config)
         major, minor = get_device_capability()
 
-        if major is not None and minor is not None:
-            assert 0 <= minor < 10
-            capability = major * 10 + minor
-            if capability < quant_config.get_min_capability():
-                raise ValueError(
-                    f"The quantization method {model_config.quantization} "
-                    "is not supported for the current GPU. "
-                    f"Minimum capability: {quant_config.get_min_capability()}. "
-                    f"Current capability: {capability}."
-                )
+        if not quant_config.get_available():
+            raise ValueError(
+                f"The quantization method {model_config.quantization} "
+                "is not supported for the current GPU. "
+                f"Minimum capability: {quant_config.get_min_capability()}. "
+                f"Current capability: {major, minor}."
+            )
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(

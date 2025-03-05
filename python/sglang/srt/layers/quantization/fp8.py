@@ -36,7 +36,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_kernel import (
+    native_per_token_group_quant_fp8,
+    native_w8a8_block_fp8_matmul,
+    per_token_group_quant_fp8,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_w8a8_block_fp8_linear,
@@ -46,6 +50,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_device_capability,
+    is_cuda,
     is_hip,
     permute_weight,
     print_warning_once,
@@ -55,6 +61,7 @@ from sglang.srt.utils import (
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe
@@ -108,7 +115,24 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 80
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return 80
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return 12
+
+        # Vendors can update
+        return 999
+
+    @classmethod
+    def get_available(cls) -> bool:
+        major, minor = get_device_capability()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return major * 10 + minor > 80
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return major >= 12
+
+        # Vendors can update
+        return False
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -850,6 +874,51 @@ class Fp8MoEMethod:
             )
             torch.cuda.empty_cache()
 
+    def torch_w8a8_block_fp8_moe(self, a, w1, w2, w1_s, w2_s, score, topk, block_shape):
+        from sglang.srt.layers.activation import SiluAndMul
+
+        """This function performs fused moe with block-wise quantization using native torch."""
+
+        B, D = a.shape
+        a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+        out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        topk_weight = topk_weight.view(-1)
+        topk_ids = topk_ids.view(-1)
+
+        _, block_k = block_shape[0], block_shape[1]
+        a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
+        # NOTE(HandH1998): Since "index_cuda" not implemented for 'Float8_e4m3fn', we need to cast `float8`` to `float32``.
+        a_q = a_q.to(torch.float32)
+        for i in range(w1.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                inter_out = native_w8a8_block_fp8_matmul(
+                    a_q[mask],
+                    w1[i],
+                    a_s[mask],
+                    w1_s[i],
+                    block_shape,
+                    output_dtype=a.dtype,
+                )
+                act_out = SiluAndMul().forward_native(inter_out)
+                act_out_q, act_out_s = native_per_token_group_quant_fp8(
+                    act_out, block_k
+                )
+                act_out = act_out.to(torch.float32)
+                out[mask] = native_w8a8_block_fp8_matmul(
+                    act_out_q,
+                    w2[i],
+                    act_out_s,
+                    w2_s[i],
+                    block_shape,
+                    output_dtype=a.dtype,
+                )
+        return (
+            out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+        ).sum(dim=1)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -923,7 +992,7 @@ class Fp8MoEMethod:
                     layer.w13_weight_scale1,
                     layer.w2_weight_scale1,
                 )
-        else:
+        elif is_cuda_:
             # Expert fusion with FP8 quantization
             return fused_experts(
                 x,
@@ -949,6 +1018,24 @@ class Fp8MoEMethod:
                 block_shape=self.quant_config.weight_block_size,
                 no_combine=no_combine,
             )
+
+        # for CPU and other accelerators, fallback to native path
+        return self.torch_w8a8_block_fp8_moe(
+            a=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_s=(
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            ),
+            w2_s=(
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            ),
+            score=router_logits,
+            topk=top_k,
+            block_shape=self.quant_config.weight_block_size,
+        )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
