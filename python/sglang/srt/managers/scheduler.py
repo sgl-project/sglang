@@ -62,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -1960,6 +1962,35 @@ class Scheduler:
             ret["step_time_dict"] = self.step_time_dict
         return GetInternalStateReqOutput(
             internal_state=ret,
+        )
+
+    def set_internal_state(self, recv_req: SetInternalStateReq):
+        server_args_dict = recv_req.server_args
+        args_allow_update = set(
+            [
+                "speculative_accept_threshold_single",
+                "speculative_accept_threshold_acc",
+            ]
+        )
+        if_success = True
+        for k, v in server_args_dict.items():
+            if k not in args_allow_update:
+                logging.warning(f"Updating {k} is not supported.")
+                if_success = False
+                break
+        if if_success:
+            if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
+                avg_spec_accept_length = (
+                    self.cum_spec_accept_length / self.cum_spec_accept_count
+                )
+                logger.info(f"{avg_spec_accept_length=}")
+            self.cum_spec_accept_length = self.cum_spec_accept_count = 0
+            for k, v in server_args_dict.items():
+                global_server_args_dict[k] = v
+            logger.info(f"Global server args updated! " f"{global_server_args_dict=}")
+        return SetInternalStateReqOutput(
+            updated=True,
+            server_args=global_server_args_dict,
         )
 
     def abort_request(self, recv_req: AbortReq):

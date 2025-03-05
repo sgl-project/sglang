@@ -601,6 +601,17 @@ class GetInternalStateReqOutput:
 
 
 @dataclass
+class SetInternalStateReq:
+    server_args: Dict[str, Any]
+
+
+@dataclass
+class SetInternalStateReqOutput:
+    updated: bool
+    server_args: Dict[str, Any]
+
+
+@dataclass
 class ProfileReqInput:
     # The output directory
     output_dir: Optional[str] = None
