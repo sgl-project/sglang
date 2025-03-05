@@ -238,6 +238,9 @@ class CudaGraphRunner:
                     ),
                     dtype=self.model_runner.dtype,
                 )
+                self.global_num_tokens_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
 
         # Capture
         try:
