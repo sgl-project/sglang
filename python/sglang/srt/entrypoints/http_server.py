@@ -56,7 +56,6 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
-    SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     VertexGenerateReqInput,
