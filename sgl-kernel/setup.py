@@ -23,7 +23,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-
 if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
@@ -76,6 +75,8 @@ nvcc_flags = [
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_100,code=sm_100",
+    "-gencode=arch=compute_120,code=sm_120",
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
@@ -119,10 +120,14 @@ sources = [
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
 enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
 enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
+enable_sm100a = os.getenv("SGL_KERNEL_ENABLE_SM100A", "0") == "1"
 cuda_version = _get_cuda_version()
 sm_version = _get_device_sm()
 
 if torch.cuda.is_available():
+    if cuda_version >= (12, 8) and sm_version >= 100:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1")
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if sm_version >= 90:
@@ -133,6 +138,9 @@ else:
     # compilation environment without GPU
     if enable_sm90a:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+    if enable_sm100a:
+        nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+        nvcc_flags.append("-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:
@@ -151,7 +159,11 @@ for flag in [
 
 cxx_flags = ["-O3"]
 libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
+machine_arch = os.uname().machine
+extra_link_args = [
+    "-Wl,-rpath,$ORIGIN/../../torch/lib",
+    "-L/usr/lib/%s-linux-gnu" % machine_arch,
+]
 
 ext_modules = [
     CUDAExtension(
