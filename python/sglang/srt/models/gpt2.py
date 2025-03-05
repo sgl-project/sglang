@@ -275,4 +275,4 @@ class GPT2LMHeadModel(nn.Module):
             weight_loader(param, loaded_weight)
 
 
-EntryClass = GPT2LMHeadModel
+EntryClass = (GPT2LMHeadModel, "GPT-2")

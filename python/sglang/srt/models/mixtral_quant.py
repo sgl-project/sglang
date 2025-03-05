@@ -380,4 +380,4 @@ class QuantMixtralForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = QuantMixtralForCausalLM
+EntryClass = (QuantMixtralForCausalLM, "Mixtral")

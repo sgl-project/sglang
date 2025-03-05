@@ -434,4 +434,4 @@ class DeepseekForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = DeepseekForCausalLM
+EntryClass = (DeepseekForCausalLM, "DeepSeek")
