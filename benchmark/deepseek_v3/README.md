@@ -184,6 +184,32 @@ AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for qua
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
 ```
 
+### Example: Serving with two A100\*8 nodes with INT8 Quantization
+
+INT8 weights for DeepSeek R1 are available [here](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8). This checkpoint is converted from BF16 with [script](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8/blob/main/inference/bf16_cast_block_int8.py).
+
+Assuming that head node IP is `HEAD_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
+```bash
+# head node
+python3 -m sglang.launch_server --model /path/to/DeepSeek-R1-INT8 --tp 16 --dist-init-addr HEAD_IP:5000 --nnodes 2 --node-rank 0 --trust-remote
+# another node
+python3 -m sglang.launch_server --model /path/to/DeepSeek-R1-INT8 --tp 16 --dist-init-addr HEAD_IP:5000 --nnodes 2 --node-rank 1 --trust-remote
+```
+
+> **Note that the launch command here does not enable `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+
+Then on the head node, supposing the ShareGPT data is located at `/path/to/ShareGPT_V3_unfiltered_cleaned_split.json`, you can run the following commands to benchmark the launched server:
+
+```bash
+# bench accuracy
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+
+# bench serving
+python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
+```
+
+> **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
+
 ### Example: Serving on any cloud or Kubernetes with SkyPilot
 
 SkyPilot helps find cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).
@@ -196,23 +222,6 @@ git clone https://github.com/skypilot-org/skypilot.git
 sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B.yaml --retry-until-up
 # Serve on 4 A100x8 nodes
 sky launch -c r1 llm/deepseek-r1/deepseek-r1-671B-A100.yaml --retry-until-up
-```
-
-### Example: Serving with INT8 Quantization
-
-INT8 weights for DeepSeek R1 are available [here](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8). 
-
-The execution commands remain equivalent to the FP8/BF16 case. The configuration difference lies in the `config.json` within the checkpoint:
-
-```json
-"quantization_config": {
-    "activation_scheme": "dynamic",
-    "quant_method": "blockwise_int8",
-    "weight_block_size": [
-      128,
-      128
-    ]
-  },
 ```
 
 #### Troubleshooting
