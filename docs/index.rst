@@ -37,6 +37,7 @@ The core features include:
    backend/speculative_decoding.ipynb
    backend/structured_outputs.ipynb
    backend/function_calling.ipynb
+   backend/separate_reasoning.ipynb
    backend/custom_chat_template.md
    backend/quantization.md
 
@@ -58,6 +59,7 @@ The core features include:
       :caption: References
 
       references/deepseek
+      references/deepseek_ablations
       references/general
       references/hardware
       references/advanced_deploy

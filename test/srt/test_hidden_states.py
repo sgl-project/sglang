@@ -4,20 +4,19 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestHiddenState(unittest.TestCase):
     def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
         sampling_params = {
             "temperature": 0,
             "max_new_tokens": 8,
-            "return_hidden_states": True,
         }
 
         engine = sgl.Engine(
@@ -25,7 +24,11 @@ class TestHiddenState(unittest.TestCase):
             random_seed=42,
             skip_tokenizer_init=True,
         )
-        outputs = engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        outputs = engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
+        )
         engine.shutdown()
 
         for output in outputs:
@@ -46,7 +49,7 @@ class TestHiddenState(unittest.TestCase):
             with torch.inference_mode():
                 hf_out = model(
                     torch.tensor(
-                        [input_id + output["token_ids"][:-1]], device=model.device
+                        [input_id + output["output_ids"][:-1]], device=model.device
                     ),
                     output_hidden_states=True,
                 )
@@ -77,20 +80,13 @@ class TestHiddenState(unittest.TestCase):
 
     def test_repeatedly_changes_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
-        sample_completion = {
+        sampling_params = {
             "temperature": 0,
             "max_new_tokens": 8,
-            "return_hidden_states": True,
-        }
-
-        sample_hidden_state = {
-            "temperature": 0,
-            "max_new_tokens": 8,
-            "return_hidden_states": False,
         }
 
         engine = sgl.Engine(
@@ -99,14 +95,20 @@ class TestHiddenState(unittest.TestCase):
             skip_tokenizer_init=True,
         )
         outputs_completion_first_round = engine.generate(
-            input_ids=input_ids, sampling_params=sample_completion
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
         )
         outputs_hidden_state = engine.generate(
-            input_ids=input_ids, sampling_params=sample_hidden_state
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=False,
         )
 
         outputs_completion_last_round = engine.generate(
-            input_ids=input_ids, sampling_params=sample_completion
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_hidden_states=True,
         )
         engine.shutdown()
 
