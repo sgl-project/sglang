@@ -1,9 +1,7 @@
-DeepSeek Models
+DeepSeek Optimization
 ==========================
-
 .. toctree::
    :maxdepth: 1
 
-   deepseek_usage.md
-   deepseek_optimization.md
+   deepseek.md
    deepseek_ablations.md

@@ -1,6 +1,6 @@
-# Best Practice Ablations
+# DeepSeek Optimization Ablations
 
-## Rule of Thumb Overview
+## Overview
 
 We sincerely thanks for the help from [M0gician](https://github.com/M0gician) for the massive experiments.
 
@@ -95,14 +95,14 @@ As of 2024-03-04, SGLang provides the following optimizations for DeepSeek V3/R1
 | ❌[6]  |       ➖       |      ➖     |      ➖      |        ➖       |    ✅   |    ➖   |       ✅      | N/A                            | N/A                                                | N/A                                           | N/A                 | 768                      |
 
 
-1. DeepSeek-R1 cannot give the correct output if quantization is used or has precision issues (fixed in [b110084](https://github.com/sgl-project/sglang/commit/b110084654a1986f0148901190e2f280c605476f))
-2. TPS@1 (Tokens Per Second for single request) is read directly from SGLang's logging.
-3. CUDA error at graph capture.
-4. CUDA out of memory.
-5. Requires setting `mem-fraction-static=0.7` to avoid OOM errors.
-6. TypeError: object of type 'NoneType' has no len().
-7. All statistics are collected from the test bench. Token count is calculated using the same tokenizer used in inference.
-8. Average Throughput(prefill+decode, token/s) = (total tokens)/(total time).
-9. Average Decoding Throughput = (sum of (output tokens/duration) for each successful request)/(number of successful requests).
-10. The maximum number of requests to run concurrently at a SGLang backend, controlled by `--max-running-requests`.
-11. Tested by [Lzhang-Hub](https://github.com/sgl-project/sglang/issues/3956#issuecomment-2700514223).
+- [^1]: DeepSeek-R1 cannot give the correct output if quantization is used or has precision issues (fixed in [b110084](https://github.com/sgl-project/sglang/commit/b110084654a1986f0148901190e2f280c605476f))
+- [^2]: TPS@1 (Tokens Per Second for single request) is read directly from SGLang's logging.
+- [^3]: CUDA error at graph capture.
+- [^4]: CUDA out of memory.
+- [^5]: Requires setting `mem-fraction-static=0.7` to avoid OOM errors.
+- [^6]: TypeError: object of type 'NoneType' has no len().
+- [^7]: All statistics are collected from the test bench. Token count is calculated using the same tokenizer used in inference.
+- [^8]: Average Throughput(prefill+decode, token/s) = (total tokens)/(total time).
+- [^9]: Average Decoding Throughput = (sum of (output tokens/duration) for each successful request)/(number of successful requests).
+- [^10]: The maximum number of requests to run concurrently at a SGLang backend, controlled by `--max-running-requests`.
+- [^11]: Tested by [Lzhang-Hub](https://github.com/sgl-project/sglang/issues/3956#issuecomment-2700514223).
