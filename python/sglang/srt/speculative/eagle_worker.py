@@ -46,6 +46,7 @@ class EAGLEWorker(TpModelWorker):
     ):
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
+        os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
         # Do not capture cuda graph in `super().__init__()`
         # We will capture it later
