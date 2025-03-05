@@ -13,7 +13,6 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
-import collections
 import datetime
 import gc
 import json
@@ -269,6 +268,7 @@ class ModelRunner:
         elif self.device == "cpu":
             backend = "gloo"
 
+        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -299,20 +299,24 @@ class ModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
+        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
 
+        logger.info(
+            f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
+        )
         return min_per_gpu_memory
 
     def load_model(self):
+        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
@@ -382,11 +386,13 @@ class ModelRunner:
         )
         self.dtype = self.model_config.dtype
 
+        after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={after_avail_memory:.2f} GB, "
+            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
         )
 
     def update_weights_from_disk(
@@ -785,12 +791,15 @@ class ModelRunner:
             return
 
         tic = time.time()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph begin. This can take up to several minutes. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
+            f"avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
     def apply_torch_tp(self):
@@ -806,8 +815,12 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch)
+    def forward_extend(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ):
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(
