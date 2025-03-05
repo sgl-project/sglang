@@ -818,8 +818,8 @@ def all_gather(
     if world_size == 1:
         return input_tensor
 
-    all_lens = forward_batch.global_num_tokens
-    max_len = max(forward_batch.global_num_tokens)
+    all_lens = forward_batch.global_num_tokens_cpu
+    max_len = max(forward_batch.global_num_tokens_cpu)
 
     padded_tensor = torch.nn.functional.pad(
         input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
@@ -1178,6 +1178,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if is_hip_:
                         self_attn.w_scale *= 2.0
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

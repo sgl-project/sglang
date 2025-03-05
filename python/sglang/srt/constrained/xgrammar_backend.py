@@ -15,7 +15,7 @@
 
 import json
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 from xgrammar import (
@@ -42,17 +42,22 @@ MAX_ROLLBACK_TOKENS = 200
 class XGrammarGrammar(BaseGrammarObject):
 
     def __init__(
-        self, matcher: GrammarMatcher, vocab_size: int, ctx: CompiledGrammar
+        self,
+        matcher: GrammarMatcher,
+        vocab_size: int,
+        ctx: CompiledGrammar,
+        override_stop_tokens: Optional[Union[List[int], int]],
     ) -> None:
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx
+        self.override_stop_tokens = override_stop_tokens
         self.finished = False
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
-    def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         s = self.matcher.find_jump_forward_string()
         if s:
             return [], s
@@ -96,8 +101,14 @@ class XGrammarGrammar(BaseGrammarObject):
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
-        matcher = GrammarMatcher(self.ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
-        return XGrammarGrammar(matcher, self.vocab_size, self.ctx)
+        matcher = GrammarMatcher(
+            self.ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            override_stop_tokens=self.override_stop_tokens,
+        )
+        return XGrammarGrammar(
+            matcher, self.vocab_size, self.ctx, self.override_stop_tokens
+        )
 
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
@@ -111,57 +122,61 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         tokenizer_info = TokenizerInfo.from_huggingface(
             tokenizer, vocab_size=vocab_size
         )
+        override_stop_tokens = None
+
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
+        self.override_stop_tokens = override_stop_tokens
 
-    def init_value_impl(self, key: Tuple[str, str]) -> XGrammarGrammar:
-
-        key_type, key_string = key
-        if key_type == "json":
-            try:
-                if key_string == "$$ANY$$":
-                    ctx = self.grammar_compiler.compile_builtin_json_grammar()
-                else:
-                    ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
-            except RuntimeError as e:
-                logging.warning(
-                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
-                )
-                return None
-        elif key_type == "ebnf":
-            try:
-                ctx = self.grammar_compiler.compile_grammar(key_string)
-            except RuntimeError as e:
-                logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
-                return None
-        elif key_type == "regex":
-            try:
-                ctx = self.grammar_compiler.compile_regex(key_string)
-            except RuntimeError as e:
-                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
-                return None
-        elif key_type == "structural_tag":
-            try:
-                structural_tag = json.loads(key_string)
-                tags = [
-                    StructuralTagItem(
-                        begin=structure["begin"],
-                        schema=json.dumps(structure["schema"]),
-                        end=structure["end"],
-                    )
-                    for structure in structural_tag["structures"]
-                ]
-                ctx = self.grammar_compiler.compile_structural_tag(
-                    tags, structural_tag["triggers"]
-                )
-            except RuntimeError as e:
-                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
-                return None
-        else:
-            raise ValueError(f"Invalid key_type: {key_type}")
-
+    def _from_context(self, ctx: CompiledGrammar) -> XGrammarGrammar:
         matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
-        return XGrammarGrammar(matcher, self.vocab_size, ctx)
+        return XGrammarGrammar(matcher, self.vocab_size, ctx, self.override_stop_tokens)
+
+    def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
+        try:
+            if key_string == "$$ANY$$":
+                ctx = self.grammar_compiler.compile_builtin_json_grammar()
+            else:
+                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+        except RuntimeError as e:
+            logging.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
+            return None
+        return self._from_context(ctx)
+
+    def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
+        try:
+            ctx = self.grammar_compiler.compile_grammar(key_string)
+        except RuntimeError as e:
+            logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
+            return None
+        return self._from_context(ctx)
+
+    def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
+        try:
+            ctx = self.grammar_compiler.compile_regex(key_string)
+        except RuntimeError as e:
+            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+            return None
+        return self._from_context(ctx)
+
+    def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
+        try:
+            structural_tag = json.loads(key_string)
+            tags = [
+                StructuralTagItem(
+                    begin=structure["begin"],
+                    schema=json.dumps(structure["schema"]),
+                    end=structure["end"],
+                )
+                for structure in structural_tag["structures"]
+            ]
+            ctx = self.grammar_compiler.compile_structural_tag(
+                tags, structural_tag["triggers"]
+            )
+        except RuntimeError as e:
+            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+            return None
+        return self._from_context(ctx)
 
     def reset(self):
         if self.grammar_compiler:
