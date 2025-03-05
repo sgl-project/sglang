@@ -111,6 +111,12 @@ def is_cuda_available():
     return is_cuda()
 
 
+def is_triton_available():
+    if not get_bool_env_var("TRITON_AVAILABLE", default="true"):
+        return False
+    return True
+
+
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
@@ -1062,6 +1068,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
+        assert 0 <= minor < 10
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
