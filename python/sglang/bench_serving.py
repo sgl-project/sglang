@@ -172,7 +172,7 @@ async def async_request_openai_completions(
             "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
-            "max_tokens": request_func_input.output_len,
+            "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
