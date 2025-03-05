@@ -21,7 +21,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 
