@@ -28,6 +28,7 @@ from sgl_kernel.ops.gemm import (
     fp8_scaled_mm,
     int8_scaled_mm,
     sgl_per_token_group_quant_fp8,
+    sgl_per_token_quant_fp8,
 )
 from sgl_kernel.ops.moe import moe_align_block_size
 from sgl_kernel.ops.sampling import (

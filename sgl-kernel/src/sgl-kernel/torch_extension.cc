@@ -168,6 +168,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  // per token quant fp8
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 }
 
 REGISTER_EXTENSION(_kernels)
