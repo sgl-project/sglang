@@ -1,0 +1,60 @@
+name: Release Docker Images Nightly (AMD)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * *'
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker
+    environment: 'prod'
+    strategy:
+      matrix:
+        rocm_version: ['6.3.0']
+        build_type: ['all', 'srt']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: "Set Date"
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: "Restart docker"
+        run: sudo systemctl restart docker
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and Push
+        run: |
+          if [ "${{ matrix.build_type }}" = "all" ]; then
+            tag_suffix=""
+          elif [ "${{ matrix.build_type }}" = "srt" ]; then
+            tag_suffix="-srt"
+          else
+            echo "Unsupported build type"
+            exit 1
+          fi
+
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t rocm/sgl-dev:${{ env.DATE }} --no-cache
+          docker push rocm/sgl-dev:${{ env.DATE }}
+
+      - name: "Remove docker image"
+        run: |
+          sudo rm -rf /var/lib/docker
