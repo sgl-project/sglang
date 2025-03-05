@@ -156,6 +156,7 @@ class TritonAttnBackend(AttentionBackend):
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
+                    None,
                     self.req_to_token,
                 )
             )
