@@ -294,9 +294,55 @@ void gemm_fp8_fp8_bf16_nt(torch::Tensor& lhs, torch::Tensor& lhs_scales,
     auto stream = at::cuda::getCurrentCUDAStream(lhs.get_device());
 
     // dispatch
-    if(n==128 && k==128){
-        gemm_fp8_fp8_bf16_nt_N_K<128, 128, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+    // constexpr int TP = 16;
+    // if (n == 36 && k == 7168)
+    //     // q_proj for q: (512+64)/tp, 7168
+    //     gemm_fp8_fp8_bf16_nt_N_K<36, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+    //         lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+    //     );
+    if (n == 1536 && k == 7168)
+        // q_a_proj
+        gemm_fp8_fp8_bf16_nt_N_K<1536, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
             lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
         );
-    }
+    else if(n == 1536 && k == 1536)
+        // q_b_proj when q_lora: 24576/tp, 1536
+        gemm_fp8_fp8_bf16_nt_N_K<1536, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 24576 && k == 7168)
+        // kv_a_proj_with_mqa for kv: (128 + 64) * 128, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<24576, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 2048 && k == 512)
+        // kv_b_proj for k: 128 * (128 + 128)/tp, 512
+        gemm_fp8_fp8_bf16_nt_N_K<2048, 512, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 1024)
+        // o_proj: 7168, 16384/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 1024, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 2304 && k == 7168)
+        // gate_up_proj for FFN: 18432 * 2/tp, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<2304, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 256 && k == 7168)
+        // gate_up_proj for MoE: 4096/tp, 7168
+        gemm_fp8_fp8_bf16_nt_N_K<256, 7168, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 1152)
+        // down_proj for FFN: 7168, 18432/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 1152, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
+    else if(n == 7168 && k == 256)
+        // down_proj for MoE: 7168, 2048/tp
+        gemm_fp8_fp8_bf16_nt_N_K<7168, 256, BLOCK_M, BLOCK_N, kNumStages, kNumTMAMulticast>(
+            lhs, lhs_scales, rhs, rhs_scales, out, m, stream, num_sms, smem_size
+        );
 }
