@@ -1,7 +1,6 @@
 """
 Usage:
 
-python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --port 30000
 python hidden_states_server.py
 
 Note that each time you change the `return_hidden_states` parameter,
@@ -11,8 +10,22 @@ So avoid getting hidden states and completions alternately.
 
 import requests
 
+from sglang.test.test_utils import is_in_ci
+from sglang.utils import print_highlight, terminate_process, wait_for_server
+
+if is_in_ci():
+    from docs.backend.patch import launch_server_cmd
+else:
+    from sglang.utils import launch_server_cmd
+
 
 def main():
+    # Launch the server
+    server_process, port = launch_server_cmd(
+        "python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct --host 0.0.0.0"
+    )
+    wait_for_server(f"http://localhost:{port}")
+
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -33,7 +46,7 @@ def main():
     }
 
     response = requests.post(
-        "http://127.0.0.1:30000/generate",
+        f"http://localhost:{port}/generate",
         json=json_data,
     )
 
@@ -48,6 +61,8 @@ def main():
             f"Hidden states: {output['meta_info']['hidden_states']}"
         )
         print()
+
+    terminate_process(server_process)
 
 
 if __name__ == "__main__":
