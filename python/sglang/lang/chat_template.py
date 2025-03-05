@@ -353,7 +353,6 @@ register_chat_template(
     )
 )
 
-
 register_chat_template(
     ChatTemplate(
         name="deepseek-v3",
@@ -428,12 +427,15 @@ def match_chat_ml(model_path: str):
     if "tinyllama" in model_path:
         return get_chat_template("chatml")
     # Now the suffix for qwen2 chat model is "instruct"
-    if (
-        "qwen" in model_path
-        and ("chat" in model_path or "instruct" in model_path)
-        and ("llava" not in model_path)
-    ):
-        return get_chat_template("qwen")
+    if "qwen" in model_path and "vl" in model_path:
+        return get_chat_template("qwen2-vl")
+    if "qwen" in model_path:
+        if "vl" in model_path:
+            return get_chat_template("qwen2-vl")
+        if ("chat" in model_path or "instruct" in model_path) and (
+            "llava" not in model_path
+        ):
+            return get_chat_template("qwen")
     if (
         "llava-v1.6-34b" in model_path
         or "llava-v1.6-yi-34b" in model_path
@@ -441,6 +443,12 @@ def match_chat_ml(model_path: str):
         or "llava-onevision-qwen2" in model_path
     ):
         return get_chat_template("chatml-llava")
+
+
+@register_chat_template_matching_function
+def match_chat_minicpm(model_path: str):
+    if "minicpm" in model_path:
+        return get_chat_template("minicpmv")
 
 
 @register_chat_template_matching_function
@@ -457,6 +465,13 @@ def match_gemma_it(model_path: str):
     model_path = model_path.lower()
     if "gemma" in model_path and "it" in model_path:
         return get_chat_template("gemma-it")
+
+
+@register_chat_template_matching_function
+def match_openbmb_minicpm(model_path: str):
+    model_path = model_path.lower()
+    if "minicpm" in model_path:
+        return get_chat_template("minicpmv")
 
 
 @register_chat_template_matching_function

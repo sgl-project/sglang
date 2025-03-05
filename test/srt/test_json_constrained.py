@@ -1,6 +1,7 @@
 """
 python3 -m unittest test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
 python3 -m unittest test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
+python3 -m unittest test_json_constrained.TestJSONConstrainedLLGuidanceBackend.test_json_generate
 """
 
 import json
@@ -19,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, backend: str, disable_overlap: bool):
+def setup_class(cls, backend: str):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
     cls.json_schema = json.dumps(
@@ -30,6 +31,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
                 "population": {"type": "integer"},
             },
             "required": ["name", "population"],
+            "additionalProperties": False,
         }
     )
 
@@ -39,9 +41,6 @@ def setup_class(cls, backend: str, disable_overlap: bool):
         "--grammar-backend",
         backend,
     ]
-
-    if disable_overlap:
-        other_args += ["--disable-overlap-schedule"]
 
     cls.process = popen_launch_server(
         cls.model,
@@ -54,8 +53,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
 class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=False)
-        cls.check_jump_forward = False
+        setup_class(cls, backend="outlines")
 
     @classmethod
     def tearDownClass(cls):
@@ -132,18 +130,16 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
             list(executor.map(self.run_decode, json_schemas))
 
 
-class TestJumpForwardOutlinesBackend(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=True)
-        cls.check_jump_forward = True
-
-
 class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="xgrammar", disable_overlap=False)
-        cls.check_jump_forward = False
+        setup_class(cls, backend="xgrammar")
+
+
+class TestJSONConstrainedLLGuidanceBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="llguidance")
 
 
 if __name__ == "__main__":

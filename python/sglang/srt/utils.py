@@ -32,13 +32,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
+from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
 
 import numpy as np
 import psutil
@@ -311,7 +313,7 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     modules = torch.nn.ModuleList(
         [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
             for idx in range(num_hidden_layers)
         ]
     )
@@ -480,6 +482,10 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
+    # Remove sigchld handler to avoid spammy logs.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -733,13 +739,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
-
-
-def first_rank_print(*args, **kwargs):
-    if torch.cuda.current_device() == 0:
-        print(*args, **kwargs)
-    else:
-        pass
 
 
 def get_zmq_socket(
@@ -1154,9 +1153,9 @@ def set_gpu_proc_affinity(
 
     if psutil.cpu_count() != psutil.cpu_count(logical=False):
         # HT on
-        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
+        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
     else:
         # HT off
         bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
@@ -1169,6 +1168,11 @@ def set_gpu_proc_affinity(
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+@lru_cache(maxsize=2)
+def disable_request_logging() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
 @lru_cache(maxsize=8)
@@ -1212,7 +1216,11 @@ def cuda_device_count_stateless() -> int:
     return _cuda_device_count_stateless(os.environ.get("CUDA_VISIBLE_DEVICES", None))
 
 
-def dataclass_to_string_truncated(data, max_length=2048):
+def dataclass_to_string_truncated(
+    data, max_length=2048, skip_names: Optional[Set[str]] = None
+):
+    if skip_names is None:
+        skip_names = set()
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -1231,6 +1239,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
             + ", ".join(
                 f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
                 for k, v in data.items()
+                if k not in skip_names
             )
             + "}"
         )
@@ -1241,6 +1250,7 @@ def dataclass_to_string_truncated(data, max_length=2048):
             + ", ".join(
                 f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
                 for f in fields
+                if f.name not in skip_names
             )
             + ")"
         )
@@ -1289,7 +1299,7 @@ def debug_timing(func):
             tic.record()
             result = func(*args, **kwargs)
             toc.record()
-            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
             elapsed = tic.elapsed_time(toc)
             indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
             num_tokens = len(indices) if indices is not None else 0
@@ -1319,9 +1329,9 @@ def pyspy_dump_schedulers():
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
-        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
+        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
     except subprocess.CalledProcessError as e:
-        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
+        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
 
 
 def kill_itself_when_parent_died():
@@ -1383,7 +1393,6 @@ def get_ip() -> str:
 
 
 def get_open_port() -> int:
-
     port = os.getenv("SGLANG_PORT")
     if port is not None:
         while True:
@@ -1446,8 +1455,25 @@ def launch_dummy_health_check_server(host, port):
     )
 
 
+def create_checksum(directory: str):
+    raise NotImplementedError()
+
+
 def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"

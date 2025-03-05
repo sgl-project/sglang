@@ -5,12 +5,15 @@ import importlib
 import json
 import logging
 import os
+import random
 import signal
+import socket
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
@@ -20,6 +23,8 @@ import numpy as np
 import requests
 from IPython.display import HTML, display
 from tqdm import tqdm
+
+from sglang.srt.utils import kill_process_tree
 
 logger = logging.getLogger(__name__)
 
@@ -306,20 +311,91 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+def is_in_ci():
+    from sglang.test.test_utils import is_in_ci
+
+    return is_in_ci()
+
+
+def print_highlight(html_content: str):
+    if is_in_ci():
+        html_content = str(html_content).replace("\n", "<br>")
+        display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+    else:
+        print(html_content)
+
+
+process_socket_map = weakref.WeakKeyDictionary()
+
+
+def reserve_port(host, start=30000, end=40000):
+    """
+    Reserve an available port by trying to bind a socket.
+    Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
+    """
+    candidates = list(range(start, end))
+    random.shuffle(candidates)
+
+    for port in candidates:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # Attempt to bind to the port on localhost
+            sock.bind((host, port))
+            return port, sock
+        except socket.error:
+            sock.close()  # Failed to bind, try next port
+            continue
+    raise RuntimeError("No free port available.")
+
+
+def release_port(lock_socket):
+    """
+    Release the reserved port by closing the lock socket.
+    """
+    try:
+        lock_socket.close()
+    except Exception as e:
+        print(f"Error closing socket: {e}")
+
+
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
-    Execute a shell command and return the process handle
-
-    Args:
-        command: Shell command as a string (can include \\ line continuations)
-    Returns:
-        subprocess.Popen: Process handle
+    Execute a shell command and return its process handle.
     """
-    # Replace \ newline with space and split
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-
     return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+
+
+def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
+    """
+    Launch the server using the given command.
+    If no port is specified, a free port is reserved.
+    """
+    if port is None:
+        port, lock_socket = reserve_port(host)
+    else:
+        lock_socket = None
+
+    full_command = f"{command} --port {port}"
+    process = execute_shell_command(full_command)
+
+    if lock_socket is not None:
+        process_socket_map[process] = lock_socket
+
+    return process, port
+
+
+def terminate_process(process):
+    """
+    Terminate the process and automatically release the reserved port.
+    """
+    kill_process_tree(process.pid)
+
+    lock_socket = process_socket_map.pop(process, None)
+    if lock_socket is not None:
+        release_port(lock_socket)
 
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -343,6 +419,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
@@ -351,17 +428,6 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
-
-
-def terminate_process(process):
-    from sglang.srt.utils import kill_process_tree
-
-    kill_process_tree(process.pid)
-
-
-def print_highlight(html_content: str):
-    html_content = str(html_content).replace("\n", "<br>")
-    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
 
 
 class TypeBasedDispatcher:
