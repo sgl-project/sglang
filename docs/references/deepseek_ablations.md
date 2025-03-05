@@ -1,4 +1,4 @@
-#   Ablations On Best Practices
+# Best Practice Ablations
 
 ## Rule of Thumb Overview
 
