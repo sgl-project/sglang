@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
-    BaseTokenToKVPool,
-    MLATokenToKVPoolHost,
+    MHATokenToKVPool,
+    MHATokenToKVPoolHost,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
@@ -21,9 +21,9 @@ class HiRadixCache(RadixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: BaseTokenToKVPool,
+        token_to_kv_pool: MHATokenToKVPool,
     ):
-        self.token_to_kv_pool_host = MLATokenToKVPoolHost(token_to_kv_pool)
+        self.token_to_kv_pool_host = MHATokenToKVPoolHost(token_to_kv_pool)
         self.cache_controller = HiCacheController(
             token_to_kv_pool, self.token_to_kv_pool_host
         )
