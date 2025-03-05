@@ -941,7 +941,7 @@ def fused_experts_impl(
     no_combine: bool = False,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8 or not use_int8_w8a8 or block_shape is not None:
+    if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None:
         padded_size = 0
 
     # Check constraints.
