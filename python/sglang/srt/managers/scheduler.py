@@ -484,7 +484,7 @@ class Scheduler:
         logger.error(
             f"{self.cur_batch.batch_size()=}, "
             f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool.available_size()=}, "
+            f"{self.token_to_kv_pool_allocator.available_size()=}, "
             f"{self.tree_cache.evictable_size()=}, "
         )
         # Wait for some time so that the parent process can print the error.
@@ -932,7 +932,7 @@ class Scheduler:
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool.available_size()
+                self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
             num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
