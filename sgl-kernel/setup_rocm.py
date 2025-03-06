@@ -46,6 +46,7 @@ sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/allreduce/custom_all_reduce.hip",
     "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/activation/amd/fused_mul_and_silu_kernel.cu",
 ]
 
 cxx_flags = ["-O3"]

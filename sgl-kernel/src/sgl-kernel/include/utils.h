@@ -18,6 +18,21 @@ limitations under the License.
 #include <cuda_runtime.h>
 #ifndef USE_ROCM
 #include <pytorch_extension_utils.h>
+#else
+
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
+#define _DISPATCH_CASE_F16(c_type, ...) \
+  case at::ScalarType::Half: {          \
+    using c_type = __half;              \
+    return __VA_ARGS__();               \
+  }
+
+#define _DISPATCH_CASE_BF16(c_type, ...) \
+  case at::ScalarType::BFloat16: {       \
+    using c_type = __hip_bfloat16;       \
+    return __VA_ARGS__();                \
+  }
+
 #endif
 #include <torch/extension.h>
 
@@ -65,7 +80,6 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
-#ifndef USE_ROCM
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -82,7 +96,6 @@ inline int getSMVersion() {
         return false;                                                                    \
     }                                                                                    \
   }()
-#endif
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -95,3 +108,15 @@ inline int getSMVersion() {
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
 #define CEILDIV(x, y) (((x) + (y)-1) / (y))
+
+#ifndef USE_ROCM
+#define WARP_SIZE 32
+#else
+#define WARP_SIZE warpSize  // 64
+#endif
+
+#if defined(__HIP_PLATFORM_AMD__)
+
+#include "hip_vec_dtypes.h"
+
+#endif
