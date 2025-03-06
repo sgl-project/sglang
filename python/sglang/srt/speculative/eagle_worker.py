@@ -450,7 +450,7 @@ class EAGLEWorker(TpModelWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
     def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
-        if self.use_nan_detection:
+        if self.enable_nan_detection:
             logits = logits_output.next_token_logits
             if torch.any(torch.isnan(logits)):
                 logger.warning("Detected errors during sampling! NaN in the logits.")
