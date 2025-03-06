@@ -101,6 +101,8 @@ def get_wave_kernel(
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
         kernel_hash=kernel_hash,
+        use_buffer_load_ops=True,
+        use_buffer_store_ops=True,
     )
 
     return (
@@ -134,7 +136,6 @@ def extend_attention_wave(
         head_size_kv=k_extend.shape[2],
         num_seqs=b_seq_len.shape[0],
         max_seq_len=max_seq_len,
-        block_size=64,
     )
 
     # Run the wave kernel.
