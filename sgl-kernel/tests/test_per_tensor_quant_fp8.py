@@ -1,12 +1,12 @@
 import itertools
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pytest
 import torch
 from sgl_kernel import sgl_per_tensor_quant_fp8
 from vllm import _custom_ops as ops
 
-from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
+from sglang.srt.utils import is_hip
 
 is_hip_ = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
