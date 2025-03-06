@@ -9,6 +9,7 @@
 /python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/openai_api @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/sampling @merrymercy @hnyls2002
+/python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
 /test/lang @merrymercy @Ying1123 @ByronHsu
 /test/srt @merrymercy @Ying1123 @zhyncs
 /sgl-router @ByronHsu @Ying1123
