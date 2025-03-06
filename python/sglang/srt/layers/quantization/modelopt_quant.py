@@ -63,7 +63,7 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_available(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 80
+            return major * 10 + minor > 89
 
         # Vendors can update
         return False
