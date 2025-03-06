@@ -15,7 +15,7 @@ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-In
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See [hyperparameter tuning](../references/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+- See [hyperparameter tuning](hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
@@ -24,7 +24,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports other [quantization strategies (INT8/FP8)](https://github.com/sgl-project/sglang/blob/v0.3.6/python/sglang/srt/server_args.py#L671) as well.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template.md).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](custom_chat_template.md).
 
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
@@ -101,7 +101,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `stream_interval`: Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming, and larger values lead to better throughput.
 * `random_seed`: Can be used to enforce more deterministic behavior.
-* `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
+* `watchdog_timeout`: Adjusts the watchdog thread's timeout before killing the server if batch generation takes too long.
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
 * `allow_auto_truncate`: Automatically truncate requests that exceed the maximum input length.
@@ -117,14 +117,14 @@ Please consult the documentation below to learn more about the parameters you ma
 
 ## Multi-node distributed serving
 
-* `dist_init_addr`: The TCP address used for initializing PyTorch’s distributed backend (e.g. `192.168.0.2:25000`).
+* `dist_init_addr`: The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`).
 * `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes).
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
 ## LoRA
 
-* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
+* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supported with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
 * `max_loras_per_batch`: Maximum number of LoRAs in a running batch including base model.
 * `lora_backend`: The backend of running GEMM kernels for Lora modules, can be one of `triton` or `flashinfer`. Defaults to be `triton`.
 
