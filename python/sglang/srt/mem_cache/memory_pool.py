@@ -20,9 +20,8 @@ Memory pool.
 
 SGLang has two levels of memory pool.
 ReqToTokenPool maps a a request to its token locations.
-TokenToKVPoolAllocator maps a token location to its KV cache data.
-KVCache actually holds the physical kv cache. Allocation indices are allocated
-by TokenToKVPoolAllocator
+TokenToKVPoolAllocator manages the indices to kv cache data.
+KVCache actually holds the physical kv cache.
 """
 
 import abc
@@ -118,14 +117,14 @@ class KVCache(abc.ABC):
 
 
 class TokenToKVPoolAllocator:
-    """A memory pool that maps a token location to its kv cache data."""
+    """An allocator managing the indices to kv cache data."""
 
     def __init__(
         self,
         size: int,
         dtype: torch.dtype,
         device: str,
-        pool: KVCache,
+        kvcache: KVCache,
     ):
         self.size = size
         self.dtype = dtype
@@ -136,13 +135,13 @@ class TokenToKVPoolAllocator:
         self.free_group = []
         self.clear()
 
-        self._pool = pool
+        self._kvcache = kvcache
 
     def available_size(self):
         return len(self.free_slots)
 
-    def get_memory_pool(self):
-        return self._pool
+    def get_kvcache(self):
+        return self._kvcache
 
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):

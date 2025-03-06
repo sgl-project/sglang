@@ -750,7 +750,7 @@ class ModelRunner:
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
                 device=self.device,
-                pool=self.token_to_kv_pool,
+                kvcache=self.token_to_kv_pool,
             )
         else:
             assert self.is_draft_worker
