@@ -396,15 +396,9 @@ class CudaGraphRunner:
 
             run_once()
 
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
-
         global global_graph_memory_pool
         with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
 
         global_graph_memory_pool = graph.pool()
         return graph, out
@@ -427,7 +421,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size

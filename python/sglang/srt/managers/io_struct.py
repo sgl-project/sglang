@@ -482,6 +482,7 @@ class BatchEmbeddingOut:
     embeddings: List[List[float]]
     # Token counts
     prompt_tokens: List[int]
+    cached_tokens: List[int]
 
 
 @dataclass
