@@ -118,5 +118,13 @@ inline int getSMVersion() {
 #if defined(__HIP_PLATFORM_AMD__)
 
 #include "hip_vec_dtypes.h"
+#include "hip_math_def.h"
+
+#else
+
+template <typename srcDtype>
+__device__ __forceinline__ float castToFloat(srcDtype val) {
+  return static_cast<srcDtype>(val);
+}
 
 #endif

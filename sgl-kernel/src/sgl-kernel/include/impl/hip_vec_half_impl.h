@@ -27,6 +27,7 @@ struct vec_t<half, 1> {
     return reinterpret_cast<half*>(&data);
   }
   FLASHINFER_INLINE void load(const half* ptr);
+  FLASHINFER_INLINE void store(half* ptr) const;
   template <typename T>
   FLASHINFER_INLINE void cast_from(const vec_t<T, 1>& src) {
     cast_from_impl(*this, src);
@@ -35,11 +36,17 @@ struct vec_t<half, 1> {
   FLASHINFER_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
+  template <typename T>
+  FLASHINFER_INLINE void cast_store(T* ptr) const {
+    cast_store_impl(ptr, *this);
+  }
 };
 
 FLASHINFER_INLINE void vec_t<half, 1>::load(const half* ptr) {
   data = *ptr;
 }
+
+FLASHINFER_INLINE void vec_t<half, 1>::store(half* ptr) const { *ptr = data; }
 
 // half x 2
 template <>
@@ -56,6 +63,7 @@ struct vec_t<half, 2> {
     return reinterpret_cast<half*>(&data);
   }
   FLASHINFER_INLINE void load(const half* ptr);
+  FLASHINFER_INLINE void store(half* ptr) const;
   template <typename T>
   FLASHINFER_INLINE void cast_from(const vec_t<T, 2>& src) {
     cast_from_impl(*this, src);
@@ -64,11 +72,17 @@ struct vec_t<half, 2> {
   FLASHINFER_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
+  template <typename T>
+  FLASHINFER_INLINE void cast_store(T* ptr) const {
+    cast_store_impl(ptr, *this);
+  }
 };
 
 FLASHINFER_INLINE void vec_t<half, 2>::load(const half* ptr) {
   data = *((half2*)ptr);
 }
+
+FLASHINFER_INLINE void vec_t<half, 2>::store(half* ptr) const { *((half2*)ptr) = data; }
 
 // half x 4
 
@@ -86,6 +100,7 @@ struct vec_t<half, 4> {
     return reinterpret_cast<half*>(&data);
   }
   FLASHINFER_INLINE void load(const half* ptr);
+  FLASHINFER_INLINE void store(half* ptr) const;
   template <typename T>
   FLASHINFER_INLINE void cast_from(const vec_t<T, 4>& src) {
     cast_from_impl(*this, src);
@@ -94,11 +109,17 @@ struct vec_t<half, 4> {
   FLASHINFER_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
+  template <typename T>
+  FLASHINFER_INLINE void cast_store(T* ptr) const {
+    cast_store_impl(ptr, *this);
+  }
 };
 
 FLASHINFER_INLINE void vec_t<half, 4>::load(const half* ptr) {
   data = *((uint2*)ptr);
 }
+
+FLASHINFER_INLINE void vec_t<half, 4>::store(half* ptr) const { *((uint2*)ptr) = data; }
 
 // half x 8 or more
 
@@ -121,6 +142,12 @@ struct vec_t<half, vec_size> {
       data[i] = ((uint4*)ptr)[i];
     }
   }
+  FLASHINFER_INLINE void store(half* ptr) const {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      ((uint4*)ptr)[i] = data[i];
+    }
+  }
   template <typename T>
   FLASHINFER_INLINE void cast_from(const vec_t<T, vec_size>& src) {
     cast_from_impl(*this, src);
@@ -128,6 +155,10 @@ struct vec_t<half, vec_size> {
   template <typename T>
   FLASHINFER_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
+  }
+  template <typename T>
+  FLASHINFER_INLINE void cast_store(T* ptr) const {
+    cast_store_impl(ptr, *this);
   }
 };
 
