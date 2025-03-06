@@ -92,6 +92,31 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
+class KVCache(abc.ABC):
+
+    @abc.abstractmethod
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        raise NotImplementedError()
+
+
 class TokenToKVPoolAllocator:
     """A memory pool that maps a token location to its kv cache data."""
 
@@ -100,6 +125,7 @@ class TokenToKVPoolAllocator:
         size: int,
         dtype: torch.dtype,
         device: str,
+        pool: KVCache,
     ):
         self.size = size
         self.dtype = dtype
@@ -110,8 +136,13 @@ class TokenToKVPoolAllocator:
         self.free_group = []
         self.clear()
 
+        self._pool = pool
+
     def available_size(self):
         return len(self.free_slots)
+
+    def get_memory_pool(self):
+        return self._pool
 
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
@@ -145,31 +176,6 @@ class TokenToKVPoolAllocator:
         self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
         self.is_in_free_group = False
         self.free_group = []
-
-
-class KVCache(abc.ABC):
-
-    @abc.abstractmethod
-    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-    ) -> None:
-        raise NotImplementedError()
 
 
 class MHATokenToKVPool(KVCache):

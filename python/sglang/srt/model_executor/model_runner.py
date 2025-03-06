@@ -710,15 +710,6 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        if self.token_to_kv_pool_allocator is None:
-            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
-                device=self.device,
-            )
-        else:
-            assert self.is_draft_worker
-
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
@@ -753,6 +744,17 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+
+        if self.token_to_kv_pool_allocator is None:
+            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                pool=self.token_to_kv_pool,
+            )
+        else:
+            assert self.is_draft_worker
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
