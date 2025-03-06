@@ -95,7 +95,11 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = castToFloat(input_vec[j]);
       float q_val = fminf(fmaxf(val / y_s, fp8_min), fp8_max);
+#ifndef USE_ROCM
       group_output[i * vec_size + j] = FP8_TYPE(q_val);
+#else
+      group_output[i * vec_size + j] = FP8_TYPE(castToFP8Storage(q_val), FP8_TYPE::from_bits());
+#endif
     }
   }
 }
