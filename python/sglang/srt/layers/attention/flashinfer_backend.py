@@ -904,6 +904,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.head_dim,
             1,
             q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
             custom_mask=custom_mask,
             non_blocking=True,
         )
