@@ -82,6 +82,7 @@ class ServerArgs:
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
+    gpu_id_step: int = 1
 
     # Logging
     log_level: str = "info"
@@ -127,6 +128,7 @@ class ServerArgs:
     speculative_num_steps: int = 5
     speculative_eagle_topk: int = 8
     speculative_num_draft_tokens: int = 64
+    speculative_token_map: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -166,6 +168,7 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
+    flashinfer_mla_disable_ragged: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -552,6 +555,12 @@ class ServerArgs:
             default=ServerArgs.base_gpu_id,
             help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
         )
+        parser.add_argument(
+            "--gpu-id-step",
+            type=int,
+            default=ServerArgs.gpu_id_step,
+            help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        )
 
         # Logging
         parser.add_argument(
@@ -706,6 +715,11 @@ class ServerArgs:
             action="store_true",
             help="Enable FlashInfer MLA optimization",
         )
+        parser.add_argument(
+            "--flashinfer-mla-disable-ragged",
+            action="store_true",
+            help="Not using ragged prefill wrapper when running flashinfer mla",
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -737,6 +751,12 @@ class ServerArgs:
             type=int,
             help="The number of token sampled from draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-token-map",
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
         )
 
         # Double Sparsity
@@ -957,6 +977,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
