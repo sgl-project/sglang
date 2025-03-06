@@ -30,8 +30,26 @@ If you see out of memory (OOM) errors, you can try to tune the following paramet
 - If OOM happens during decoding, try to decrease `--max-running-requests`.
 - You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
 
-### Try Advanced Options
+### Enabling cache for torch.compile
+
 - To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currently.
+- By default, `torch.compile` will automatically cache the FX graph and Triton in `/tmp/torchinductor_root`, which might be cleared according to the [system policy](https://serverfault.com/questions/377348/when-does-tmp-get-cleared).
+- You can export the environment variable `TORCHINDUCTOR_CACHE_DIR` to save compilation cache in your desired directory to avoid unwanted deletion. You can also share the cache with other machines to reduce the compilation time.
+
+
+SGLang uses `max-autotune-no-cudagraphs` mode of torch.compile. The auto-tuning can be slow.
+If you want to deploy a model on many different machines, you can ship the torch.compile cache to these machines and skip the compilation steps.
+
+This is based on [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html)
+
+*Examples*：
+
+1. Generate the cache by setting `TORCHINDUCTOR_CACHE_DIR` and running the model once.
+```
+TORCHINDUCTOR_CACHE_DIR=/root/inductor_root_cache python3 -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --enable-torch-compile
+```
+2. Copy the cache folder to other machines and launch the server with `TORCHINDUCTOR_CACHE_DIR`.
+
 
 ### Tune `--schedule-policy`
 If the workload has many shared prefixes, use the default `--schedule-policy lpm`. `lpm` stands for longest prefix match.
