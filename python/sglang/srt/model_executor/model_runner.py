@@ -13,7 +13,6 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
-import collections
 import datetime
 import gc
 import json
@@ -56,6 +55,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
+    TokenToKVPoolAllocator,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -99,6 +99,8 @@ class ModelRunner:
         nccl_port: int,
         server_args: ServerArgs,
         is_draft_worker: bool = False,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -116,6 +118,8 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
         # Model-specific adjustment
         if (
@@ -258,19 +262,18 @@ class ModelRunner:
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-
         torch.get_device_module(self.device).set_device(self.gpu_id)
+
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            # TODO(liangan1): Just use gloo to bypass the initilization fail
-            # Need to use xccl for xpu backend in the future
-            backend = "gloo"
+            backend = "xccl"
         elif self.device == "hpu":
             backend = "hccl"
         elif self.device == "cpu":
             backend = "gloo"
 
+        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -301,20 +304,24 @@ class ModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
+        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
                 )
 
+        logger.info(
+            f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
+        )
         return min_per_gpu_memory
 
     def load_model(self):
+        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
@@ -384,11 +391,13 @@ class ModelRunner:
         )
         self.dtype = self.model_config.dtype
 
+        after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={after_avail_memory:.2f} GB, "
+            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
         )
 
     def update_weights_from_disk(
@@ -656,12 +665,25 @@ class ModelRunner:
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                max_num_reqs = self.server_args.max_num_reqs
             else:
+                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
+                # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
-                    + max_num_reqs * self.server_args.speculative_num_steps
+                    # draft
+                    + max_num_reqs
+                    * self.server_args.speculative_num_steps
+                    * self.server_args.speculative_eagle_topk
+                    # verify
+                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    # buffer
                     + 100
                 )
+                # Target worker and draft worker shares the same indices for the
+                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
+                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
@@ -677,12 +699,25 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        self.req_to_token_pool = ReqToTokenPool(
-            size=max_num_reqs + 1,
-            max_context_len=self.model_config.context_len + 4,
-            device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
-        )
+        if self.req_to_token_pool is None:
+            self.req_to_token_pool = ReqToTokenPool(
+                size=max_num_reqs + 1,
+                max_context_len=self.model_config.context_len + 4,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+            )
+        else:
+            # Draft worker shares req_to_token_pool with the target worker.
+            assert self.is_draft_worker
+
+        if self.token_to_kv_pool_allocator is None:
+            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+            )
+        else:
+            assert self.is_draft_worker
 
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -787,12 +822,15 @@ class ModelRunner:
             return
 
         tic = time.time()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph begin. This can take up to several minutes. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
+            f"avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
     def apply_torch_tp(self):
@@ -808,8 +846,12 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward_extend(self, forward_batch: ForwardBatch):
-        self.attn_backend.init_forward_metadata(forward_batch)
+    def forward_extend(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ):
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         if self.is_generation:
             if forward_batch.input_embeds is None:
                 return self.model.forward(

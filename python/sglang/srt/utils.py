@@ -314,7 +314,7 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     modules = torch.nn.ModuleList(
         [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
             for idx in range(num_hidden_layers)
         ]
     )
@@ -740,13 +740,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
-
-
-def first_rank_print(*args, **kwargs):
-    if torch.cuda.current_device() == 0:
-        print(*args, **kwargs)
-    else:
-        pass
 
 
 def get_zmq_socket(
@@ -1238,6 +1231,11 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
+@lru_cache(maxsize=2)
+def disable_request_logging() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+
+
 @lru_cache(maxsize=8)
 def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
@@ -1527,3 +1525,16 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"
