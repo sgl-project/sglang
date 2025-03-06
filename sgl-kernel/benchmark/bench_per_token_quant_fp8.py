@@ -71,7 +71,7 @@ configs = list(itertools.product(batch_size_range, seq_len_range))
         line_names=["VLLM", "SGL Kernel"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
-        plot_name="per-tensor-quant-fp8-performance",
+        plot_name="per-token-dynamic-quant-fp8-performance",
         args={},
     )
 )
@@ -96,4 +96,3 @@ def benchmark_dynamic_quantization(batch_size, seq_len, provider):
 if __name__ == "__main__":
     calculate_diff(batch_size=4, seq_len=4096)
     benchmark_dynamic_quantization.run(print_data=True)
-    # benchmark_static_quantization.run(print_data=True)
