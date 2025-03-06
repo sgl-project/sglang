@@ -17,8 +17,8 @@ limitations under the License.
 
 #if USE_ROCM
 
-#include <hip/hip_common.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 
@@ -35,8 +35,7 @@ template <typename srcDtype, typename dstDtype, size_t vec_size>
 FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src);
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr,
-                                       const vec_t<srcDtype, vec_size>& src);
+FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src);
 
 template <typename float_t, size_t vec_size>
 struct vec_t {
@@ -55,11 +54,11 @@ struct vec_t {
   FLASHINFER_INLINE void cast_store(T* ptr) const;
 };
 
-} // namespace flashinfer
+}  // namespace flashinfer
 
 // **** impl *****
 
-namespace flashinfer  {
+namespace flashinfer {
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
 FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src_ptr) {
@@ -73,8 +72,7 @@ FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcD
 }
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr,
-                                       const vec_t<srcDtype, vec_size>& src) {
+FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src) {
   if constexpr (std::is_same<srcDtype, dstDtype>::value) {
     src.store(dst_ptr);
   } else {
@@ -96,9 +94,9 @@ FLASHINFER_INLINE void vec_t<float_t, vec_size>::cast_store(T* ptr) const {
   cast_store_impl(ptr, *this);
 }
 
-} // namespace flashinfer
+}  // namespace flashinfer
 
 #include "impl/hip_vec_bf16_impl.h"
-#include "impl/hip_vec_half_impl.h"
 #include "impl/hip_vec_fp32_impl.h"
+#include "impl/hip_vec_half_impl.h"
 #endif

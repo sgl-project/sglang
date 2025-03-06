@@ -52,7 +52,9 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::load(const nv_bfloat16* ptr) {
   data = *ptr;
 }
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::store(nv_bfloat16* ptr) const { *ptr = data; }
+FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::store(nv_bfloat16* ptr) const {
+  *ptr = data;
+}
 
 // nv_bfloat16 x 2
 template <>
