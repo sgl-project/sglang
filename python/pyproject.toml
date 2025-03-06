@@ -38,7 +38,8 @@ runtime_common = [
     "xgrammar==0.1.14",
     "ninja",
     "transformers==4.48.3",
-    "llguidance>=0.6.15"
+    "llguidance>=0.6.15",
+    "datasets"
 ]
 
 srt = [
