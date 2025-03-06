@@ -117,8 +117,8 @@ inline int getSMVersion() {
 
 #if defined(__HIP_PLATFORM_AMD__)
 
-#include "hip_vec_dtypes.h"
 #include "hip_math_def.h"
+#include "hip_vec_dtypes.h"
 
 #else
 

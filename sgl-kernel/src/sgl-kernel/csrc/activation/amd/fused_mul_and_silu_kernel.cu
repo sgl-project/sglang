@@ -25,12 +25,11 @@ template <typename T>
 __device__ __forceinline__ T silu(const T& x) {
   // x * sigmoid(x)
   float f32_val = castToFloat(x);
-  return castFrom<T>( f32_val / (1.0f + expf(-f32_val)) );
+  return castFrom<T>(f32_val / (1.0f + expf(-f32_val)));
 }
 
-} // activation
-} // flashinfer
-
+}  // namespace activation
+}  // namespace flashinfer
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
@@ -44,8 +43,8 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
 
-    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::silu><<<grid, block, 0, stream>>>(
-        static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::silu>
+        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;
   });

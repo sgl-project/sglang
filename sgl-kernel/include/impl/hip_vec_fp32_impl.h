@@ -41,7 +41,9 @@ FLASHINFER_INLINE void vec_t<float, 1>::load(const float* ptr) {
   data = *ptr;
 }
 
-FLASHINFER_INLINE void vec_t<float, 1>::store(float* ptr) const { *ptr = data; }
+FLASHINFER_INLINE void vec_t<float, 1>::store(float* ptr) const {
+  *ptr = data;
+}
 
 // float x 2
 
@@ -78,7 +80,9 @@ FLASHINFER_INLINE void vec_t<float, 2>::load(const float* ptr) {
   data = *((float2*)ptr);
 }
 
-FLASHINFER_INLINE void vec_t<float, 2>::store(float* ptr) const { *((float2*)ptr) = data; }
+FLASHINFER_INLINE void vec_t<float, 2>::store(float* ptr) const {
+  *((float2*)ptr) = data;
+}
 
 // float x 4 or more
 template <size_t vec_size>
