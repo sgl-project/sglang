@@ -274,10 +274,8 @@ class Scheduler:
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
-            self.prefill_only_one_req = True
         else:
             self.draft_worker = None
-            self.prefill_only_one_req = False
 
         # Get token and memory info from the model worker
         (
@@ -1076,8 +1074,6 @@ class Scheduler:
                         )
                     else:
                         self.batch_is_full = True
-                break
-            if self.prefill_only_one_req:
                 break
 
         # Update waiting queue
