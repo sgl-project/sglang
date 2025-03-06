@@ -1276,7 +1276,7 @@ class RemoteModelLoader(BaseModelLoader):
                         ".safetensors",
                     ):
                         file_path = os.path.join(root, file_name)
-                        with open(file_path) as file:
+                        with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
                             f_key = f"{model_name}/files/{file_name}"
                             client.setstr(f_key, file_content)
