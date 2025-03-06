@@ -1,0 +1,350 @@
+name: PR Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/pyproject.toml"
+      - "python/sglang/**"
+      - "test/**"
+      - "docs/**"
+      - "scripts/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/pyproject.toml"
+      - "python/sglang/**"
+      - "test/**"
+      - "docs/**"
+      - "scripts/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "FlashInfer version"
+        required: true
+        type: choice
+        default: 'release'
+        options:
+          - 'release'
+          - 'nightly'
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+            scripts:
+              - 'scripts/**'
+            sglang:
+              - 'python/sglang/**'
+            test:
+              - 'test/**'
+            pyproject:
+              - 'python/pyproject.toml'
+      - name: Set run_tests output
+        id: set_run_tests
+        run: |
+          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ] || [ "${{ steps.filter.outputs.pyproject }}" == "true" ]; then
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+  unit-test-frontend:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          cd test/lang
+          python3 run_suite.py --suite per-commit
+
+  unit-test-backend-1-gpu:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 1-gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-48, 48-100]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          RANGE=${{ matrix.range }}
+          range_begin=${RANGE%-*}
+          range_end=${RANGE#*-}
+          cd test/srt
+          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+
+  unit-test-backend-2-gpu:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Test data parallelism (DP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_data_parallelism.py
+
+      - name: Test data parallelism attention (DP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_dp_attention.py
+
+      - name: Test update weights from distributed
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_update_weights_from_distributed.py
+
+      - name: Test VerlEngine
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_verl_engine.py
+
+      - name: Test expert parallelism (EP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_moe_ep.py
+
+      - name: Test torch compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_mla_tp.py
+
+  performance-test-1-gpu-part-1:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark single latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1
+
+      - name: Benchmark online latency
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default
+
+      - name: Benchmark offline throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default
+
+      - name: Benchmark offline throughput (Non-streaming, small batch size)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
+
+      - name: Benchmark online latency (EAGLE)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
+
+  performance-test-1-gpu-part-2:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark offline throughput (w/o RadixAttention)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache
+
+      - name: Benchmark offline throughput (w/ Triton)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
+
+      - name: Benchmark offline throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+
+  performance-test-2-gpu:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Benchmark single latency (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
+      - name: Benchmark single latency + torch.compile (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_torch_compile_tp2_bs1
+
+      - name: Benchmark offline throughput (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_default
+
+      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
+
+  accuracy-test-1-gpu:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_eval_accuracy_large.py
+
+  accuracy-test-2-gpu:
+    needs: filter
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false &&
+        needs.filter.outputs.run_tests == 'true'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        env:
+          FLASHINFER_REPO: ${{ inputs.version == 'nightly' && 'https://flashinfer.ai/whl/nightly/cu124/torch2.5/flashinfer-python' || 'https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python' }}
+        run: |
+          bash scripts/ci_install_dependency.sh
+          git clone https://github.com/merrymercy/human-eval.git
+          cd human-eval
+          pip install -e .
+
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 test_moe_eval_accuracy_large.py
+
+  finish:
+    if: always()
+    needs: [
+      unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      accuracy-test-1-gpu, accuracy-test-2-gpu
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."

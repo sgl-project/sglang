@@ -1,0 +1,3 @@
+# Must include:
+include Cargo.toml        # Rust project configuration
+recursive-include src *.rs  # Rust source files

@@ -1,0 +1,103 @@
+name: PR Test (sgl-kernel)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "sgl-kernel/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "sgl-kernel/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-sgl-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check clang-format
+        uses: DoozyX/clang-format-lint-action@v0.18.1
+        with:
+          source: sgl-kernel
+          extensions: h,c,cpp,hpp,cu,cuh,cc
+          clangFormatVersion: 16
+          style: file
+
+  build-wheels:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: sgl-kernel-build-node
+    strategy:
+      matrix:
+        python-version: ['3.9']
+        cuda-version: ['12.4']
+
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
+          path: sgl-kernel/dist/*
+
+  unit-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    needs: build-wheels
+    runs-on: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - name: Install
+        run: |
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
+          pip3 uninstall sgl-kernel -y || true
+          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
+          pip3 list | grep sgl-kernel
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd sgl-kernel
+          find tests -name "test_*.py" | xargs -n 1 python3
+
+      - name: Uninstall dependencies
+        run: |
+          pip3 uninstall sgl-kernel -y
+
+  finish:
+    needs: [unit-test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
