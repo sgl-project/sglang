@@ -486,6 +486,7 @@ class CudaGraphRunner:
                 hidden_states[:raw_num_token] if hidden_states is not None else None
             ),
         )
+        print("Memory allocated after replay: ", torch.cuda.memory_allocated())
         return logits_output
 
     def get_spec_info(self, num_tokens: int):
