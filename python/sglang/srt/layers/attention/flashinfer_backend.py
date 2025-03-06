@@ -1198,24 +1198,28 @@ def fast_decode_plan(
 
     indptr_host = indptr.cpu()
 
-    self._plan_info = self._cached_module.plan(
-        self._float_workspace_buffer,
-        self._int_workspace_buffer,
-        self._pin_memory_int_workspace_buffer,
-        indptr_host,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        page_size,
-        self.is_cuda_graph_enabled,
-        window_left,
-        logits_soft_cap,
-        head_dim,
-        head_dim,
-        self.empty_q_data,
-        self.empty_kv_cache,
-        torch.cuda.current_stream().cuda_stream,
-    )
+    if self.use_tensor_cores:
+        raise NotImplementedError()
+    else:
+        self._plan_info = self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            indptr_host,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            window_left,
+            logits_soft_cap,
+            head_dim,
+            head_dim,
+            self.empty_q_data,
+            self.empty_kv_cache,
+            torch.cuda.current_stream().cuda_stream,
+        )
+
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left
     self._logits_soft_cap = logits_soft_cap
