@@ -14,6 +14,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
+    
+try:    
+    from aiter import paged_attention_rocm
+except ImportError:
+    print("aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device.")
+    
+from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
@@ -24,14 +31,6 @@ class AiterDecodeAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
-        # Lazy import
-        from aiter import (
-            paged_attention_rocm,
-        )
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd,
-        )
-
         super().__init__()
 
         self.decode_attention_fwd = paged_attention_rocm

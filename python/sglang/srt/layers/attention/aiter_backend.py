@@ -24,14 +24,16 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
-
-
-
+    
+# flashinfer AMD fork
 from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper, 
 )
-    
-from aiter import paged_attention_rocm # aiter decode
+
+try:    
+    from aiter import paged_attention_rocm
+except ImportError:
+    print("aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device.")
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -527,7 +529,6 @@ class FlashInferIndicesUpdaterPrefill:
 
         # cached part
         # adding logits_soft_cap arg in plan() stage
-        print("=====logits cap used: {}".format(self.attn_backend.logits_soft_cap))
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
