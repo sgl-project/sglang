@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import bisect
-import time
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -162,19 +161,10 @@ class EAGLEDraftCudaGraphRunner:
 
             run_once()
 
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
-
         with torch.cuda.graph(
             graph, pool=get_global_graph_memory_pool(), stream=stream
         ):
             out = run_once()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
