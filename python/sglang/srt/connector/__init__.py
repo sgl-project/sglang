@@ -9,6 +9,7 @@ from sglang.srt.connector.base_connector import (
     BaseKVConnector,
 )
 from sglang.srt.connector.redis import RedisConnector
+from sglang.srt.connector.s3 import S3Connector
 from sglang.srt.utils import parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,8 @@ def create_remote_connector(url, device="cpu") -> BaseConnector:
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)
+    elif connector_type == "s3":
+        return S3Connector(url)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
@@ -41,6 +44,7 @@ __all__ = [
     "BaseFileConnector",
     "BaseKVConnector",
     "RedisConnector",
+    "S3Connector",
     "ConnectorType",
     "create_remote_connector",
     "get_connector_type",
