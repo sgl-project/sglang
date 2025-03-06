@@ -147,6 +147,7 @@ nvcc_flags_fp8 = [
 
 sources = [
     "src/sgl-kernel/csrc/cpu/activation.cpp",
+    "src/sgl-kernel/csrc/cpu/decode.cpp",
     "src/sgl-kernel/csrc/cpu/norm.cpp",
     "src/sgl-kernel/csrc/cpu/topk.cpp",
     "src/sgl-kernel/csrc/cpu/interface.cpp",
