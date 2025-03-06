@@ -464,12 +464,7 @@ class Scheduler:
         self.cum_spec_accept_count = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
-            if self.server_args.disaggregation_mode == "prefill":
-                engine_type = "prefill"
-            elif self.server_args.disaggregation_mode == "decode":
-                engine_type = "decode"
-            else:
-                engine_type = "unified"
+            engine_type = "unified"
             self.metrics_collector = SchedulerMetricsCollector(
                 labels={
                     "model_name": self.server_args.served_model_name,
