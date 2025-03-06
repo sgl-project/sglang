@@ -26,11 +26,16 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
 is_hip_ = is_hip()
+
+if is_hip_:
+    from aiter.fused_moe_bf16_asm import asm_moe
+    from aiter.ops.shuffle import shuffle_weight
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -179,7 +184,7 @@ class EPMoE(torch.nn.Module):
                 device="cuda",
                 dtype=torch.int,
             )
-            self.expert_mask[self.start_expert_is : self.end_expert_id + 1] = 1
+            self.expert_mask[self.start_expert_id : self.end_expert_id + 1] = 1
             self.expert_mask[self.num_experts : -1] = 1
             self.num_experts_per_partition += self.num_shared_experts
 
@@ -196,6 +201,21 @@ class EPMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
+
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            # Matrix multiply.
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+            )
+            return final_hidden_states
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
@@ -401,11 +421,7 @@ class EPMoE(torch.nn.Module):
                     if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
                     else "experts.w2_"
                 ),
-                (
-                    f"shared_experts.{expert_id}.{weight_name}."
-                    if num_shared_experts >= 2
-                    else f"shared_experts.{weight_name}."
-                ),
+                f"shared_experts.{expert_id}.{weight_name}." if num_shared_experts >= 2 else f"shared_experts.{weight_name}.",
                 -num_shared_experts + expert_id,
                 shard_id,
             )
@@ -427,7 +443,7 @@ class EPMoE(torch.nn.Module):
     ) -> None:
         if expert_id >= 0 and (expert_id < self.start_expert_id or expert_id > self.end_expert_id):
             return
-        if expert_id < 0:
+        if expert_id >= 0:
             expert_id = expert_id - self.start_expert_id
 
         if shard_id not in ("w1", "w2", "w3"):
@@ -780,6 +796,41 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     torch.max(layer.w13_weight_scale, dim=1).values,
                     requires_grad=False,
                 )
+        
+        if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip_:
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
+
+                if get_bool_env_var("CK_MOE"):
+                    # Pre-shuffle weights
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
             return
 
     def apply(
@@ -794,4 +845,54 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=layer.correction_bias,
+            )
+
+            # TODO these can be removed when "select_experts" is inplaced op
+            token = x.shape[0]
+            layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
+            layer.ns_topk_ids[:token] = topk_ids
+            topk_ids = layer.total_topk_ids[:token]
+            topk_weights = layer.total_topk_weights[:token]
+
+            if self.block_quant:
+                return asm_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                    None,
+                    None,
+                    False,
+                    None,
+                    block_shape=tuple(self.quant_config.weight_block_size),
+                    expert_mask=layer.expert_mask,
+                )
+            else:
+                return asm_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    layer.w13_weight_scale1,
+                    layer.w2_weight_scale1,
+                    None,
+                    None,
+                    False,
+                )
+        else:
+            raise NotImplementedError
