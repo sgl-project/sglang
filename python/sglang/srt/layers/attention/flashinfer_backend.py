@@ -35,7 +35,7 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import PosEncodingMode
+    from flashinfer.decode import _get_range_buf
 
 
 class WrapperDispatch(Enum):
@@ -1150,6 +1150,9 @@ def fast_decode_plan(
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
 
+    if self.use_tensor_cores:
+        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
             raise ValueError(
@@ -1170,6 +1173,7 @@ def fast_decode_plan(
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
         self._paged_kv_last_page_len_buf = last_page_len
+        self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=non_blocking)
 
     # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
     if not q_data_type:
@@ -1192,14 +1196,13 @@ def fast_decode_plan(
         )
         self.last_page_len = torch.ones(32768, dtype=torch.int32)
 
-    empty_q_data = self.empty_q_data
-    empty_kv_cache = self.empty_kv_cache
-    stream = torch.cuda.current_stream()
-    self._cached_module.plan(
+    indptr_host = indptr.cpu()
+
+    self._plan_info = self._cached_module.plan(
         self._float_workspace_buffer,
         self._int_workspace_buffer,
         self._pin_memory_int_workspace_buffer,
-        indptr.to("cpu"),
+        indptr_host,
         batch_size,
         num_qo_heads,
         num_kv_heads,
@@ -1209,9 +1212,9 @@ def fast_decode_plan(
         logits_soft_cap,
         head_dim,
         head_dim,
-        empty_q_data,
-        empty_kv_cache,
-        stream.cuda_stream,
+        self.empty_q_data,
+        self.empty_kv_cache,
+        torch.cuda.current_stream().cuda_stream,
     )
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left
