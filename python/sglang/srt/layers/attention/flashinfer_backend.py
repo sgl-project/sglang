@@ -299,9 +299,6 @@ class FlashInferAttnBackend(AttentionBackend):
                         ],
                     )
                 )
-                decode_wrappers[-1].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[-1]
-                )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
@@ -313,6 +310,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
+            for i in range(self.num_wrappers):
+                decode_wrappers[i].begin_forward = partial(
+                    fast_decode_plan, decode_wrappers[-1]
+                )
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -1051,10 +1052,6 @@ class FlashInferMultiStepDraftBackend:
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
             )
-            decode_wrapper = self.attn_backends[i].decode_cuda_graph_metadata[
-                forward_batch.batch_size
-            ][0]
-            decode_wrapper.begin_forward = partial(fast_decode_plan, decode_wrapper)
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
