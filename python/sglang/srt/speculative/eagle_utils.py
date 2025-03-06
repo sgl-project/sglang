@@ -62,6 +62,7 @@ class EagleDraftInput:
             batch.input_ids[pt : pt + extend_len] = torch.concat(
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
+            pt += extend_len
 
     def prepare_extend_after_decode(self, batch: ScheduleBatch, speculative_num_steps):
         assert self.verified_id.numel() == batch.out_cache_loc.shape[0]
