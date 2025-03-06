@@ -477,7 +477,7 @@ class FlashInferAttnBackend(AttentionBackend):
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
-            logits_soft_cap=logits_soft_cap,
+            logits_soft_cap=layer.logit_cap,
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
         )
