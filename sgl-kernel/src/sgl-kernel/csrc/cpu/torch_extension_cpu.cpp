@@ -19,6 +19,9 @@ limitations under the License.
 
 #include "shm.h"
 
+// silu_and_mul
+void silu_and_mul_cpu(at::Tensor& out, at::Tensor& input);
+
 // rmsnorm
 void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps);
 
@@ -32,6 +35,9 @@ void initialize(int size, int rank);
 void shm_allreduce(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, py::object op);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // activation
+  m.def("silu_and_mul_cpu", &silu_and_mul_cpu, "SiLU and mul for CPU");
+
   // norm
   m.def("rmsnorm_cpu", &rmsnorm_cpu, "Root mean square normalization for CPU");
   m.def("fused_add_rmsnorm_cpu", &fused_add_rmsnorm_cpu, "Fused add root mean square normalization for CPU");
