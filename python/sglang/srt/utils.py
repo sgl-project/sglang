@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import builtins
 import ctypes
 import dataclasses
 import io
@@ -75,6 +76,14 @@ HIP_FP8_E4M3_FNUZ_MAX = 224
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
+
+
+if is_hip():
+    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
+else:
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 
 
 def is_cuda():
