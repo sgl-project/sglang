@@ -118,7 +118,7 @@ class Fp8Config(QuantizationConfig):
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return 80
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return 12
+            return 0
 
         # Vendors can update
         return 999
@@ -129,7 +129,7 @@ class Fp8Config(QuantizationConfig):
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 80
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return major >= 12
+            return True
 
         # Vendors can update
         return False
