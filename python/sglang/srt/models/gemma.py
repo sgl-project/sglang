@@ -37,6 +37,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 
 
 class GemmaMLP(nn.Module):
@@ -45,6 +46,7 @@ class GemmaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -52,12 +54,14 @@ class GemmaMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = GeluAndMul("none")
 
@@ -79,6 +83,7 @@ class GemmaAttention(nn.Module):
         max_position_embeddings: int = 8192,
         rope_theta: float = 10000,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -109,12 +114,14 @@ class GemmaAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -130,6 +137,7 @@ class GemmaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -152,6 +160,7 @@ class GemmaDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -164,11 +173,13 @@ class GemmaDecoderLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = GemmaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -205,6 +216,7 @@ class GemmaModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -215,7 +227,12 @@ class GemmaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                GemmaDecoderLayer(config, i, quant_config=quant_config)
+                GemmaDecoderLayer(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -277,11 +294,14 @@ class GemmaForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GemmaModel(config, quant_config=quant_config)
+        self.model = GemmaModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
