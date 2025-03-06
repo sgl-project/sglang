@@ -542,7 +542,6 @@ class CudaGraphRunner:
                 else None
             ),
         )
-        print("Memory allocated after replay: ", torch.cuda.memory_allocated())
         return logits_output
 
     def get_spec_info(self, num_tokens: int):
