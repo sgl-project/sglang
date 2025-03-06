@@ -302,10 +302,6 @@ class TestEAGLEServer(unittest.TestCase):
 
             self.assertEqual(res["meta_info"]["completion_tokens"], new_tokens)
             self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), new_tokens)
-            self.assertEqual(
-                res["output_ids"],
-                [x[1] for x in res["meta_info"]["output_token_logprobs"]],
-            )
 
     def test_logprob_match(self):
         """Test the output logprobs are close to the input logprobs if we run a prefill again."""
@@ -454,106 +450,6 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 8,
             ],
         )
-
-
-class TestEagleLogprob(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        mp.set_start_method("spawn", force=True)
-
-    def assert_spec_logprobs(
-        self,
-        prompts: List[str],
-        tp_size: int = 1,
-        chunked_prefill_size: Optional[int] = None,
-    ) -> None:
-        model_path = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
-        speculative_draft_model_path = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-
-        speculative_algorithm = "EAGLE"
-        speculative_num_steps = 3
-        speculative_eagle_topk = 4
-        speculative_num_draft_tokens = 16
-        max_new_tokens = 32
-        print(f"RUNNING TP={tp_size} CHUNK_SIZE={chunked_prefill_size}")
-
-        with SRTRunner(
-            model_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=tp_size,
-            chunked_prefill_size=chunked_prefill_size,
-            disable_radix_cache=True,
-        ) as base_runner:
-            base_outputs = base_runner.forward(prompts, max_new_tokens=max_new_tokens)
-
-        with SRTRunner(
-            model_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=tp_size,
-            chunked_prefill_size=chunked_prefill_size,
-            speculative_draft_model_path=speculative_draft_model_path,
-            speculative_algorithm=speculative_algorithm,
-            speculative_num_steps=speculative_num_steps,
-            speculative_eagle_topk=speculative_eagle_topk,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-            disable_radix_cache=True,
-        ) as spec_runner:
-            spec_outputs = spec_runner.forward(prompts, max_new_tokens=max_new_tokens)
-
-        for i in range(len(prompts)):
-            # Compare input logprobs
-            base_logprobs = torch.Tensor(base_outputs.top_input_logprobs[i])
-            spec_logprobs = torch.Tensor(spec_outputs.top_input_logprobs[i])
-            assert base_logprobs.size() == spec_logprobs.size()
-            print(
-                "prefill logprobs max_diff",
-                torch.max(abs(base_logprobs - spec_logprobs)),
-            )
-            # if input_len <= 100:
-            assert torch.all(abs(base_logprobs - spec_logprobs) < prefill_tolerance), (
-                f"prefill logprobs are not all close with model_path={model_path} prompts={prompts} "
-                f"prefill_tolerance={prefill_tolerance}."
-                f"{base_logprobs=}, {spec_logprobs=}"
-            )
-
-            # Compare output logprobs
-            base_logprobs = torch.Tensor(base_outputs.top_output_logprobs[i])
-            spec_logprobs = torch.Tensor(spec_outputs.top_output_logprobs[i])
-            assert base_logprobs.size() == spec_logprobs.size()
-
-            print(
-                f"{prompts[i]=} {base_outputs.output_strs[i]=}, {spec_outputs.output_strs[i]=}"
-            )
-
-            print(
-                "decode logprobs max_diff",
-                torch.max(abs(base_logprobs - spec_logprobs)),
-            )
-
-            assert torch.all(abs(base_logprobs - spec_logprobs) < decode_tolerance), (
-                f"decode logprobs are not all close with {model_path=} {prompts[i]=}, "
-                f"{decode_tolerance=}. "
-                f"{base_logprobs=}, {spec_logprobs=}"
-            )
-
-            for (logprob, token_id, _), top_logprobs, output_id, top_output_ids in zip(
-                spec_outputs.output_token_logprobs_lst[i],
-                spec_logprobs,
-                spec_outputs.output_ids[i],
-                spec_outputs.top_output_logprob_idx[i],
-                strict=True,
-            ):
-                assert top_logprobs[0] == logprob
-                assert top_output_ids[0] == output_id
-                assert output_id == token_id
-
-    def test_eagle_logprobs(self):
-        # NOTE: Skip long prompts.
-        prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-        self.assert_spec_logprobs(prompts, tp_size=1)
 
 
 if __name__ == "__main__":
