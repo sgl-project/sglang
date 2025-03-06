@@ -347,6 +347,7 @@ class ServerArgs:
                 "safetensors",
                 "npcache",
                 "dummy",
+                "sharded_state",
                 "gguf",
                 "bitsandbytes",
                 "layered",
@@ -1085,6 +1086,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The ipc filename for rpc call between Engine and Scheduler
+    rpc_ipc_name: str
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
@@ -1103,6 +1107,7 @@ class PortArgs:
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
+                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1128,6 +1133,7 @@ class PortArgs:
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
+                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
 
 

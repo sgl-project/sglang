@@ -1009,6 +1009,22 @@ class ModelRunner:
             return False
         return rope_scaling.get("type", None) == "mrope"
 
+    def save_remote_model(self, url: str):
+        from sglang.srt.model_loader.loader import RemoteModelLoader
+
+        logger.info(f"Saving model to {url}")
+        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
+
+    def save_sharded_model(
+        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
+    ):
+        from sglang.srt.model_loader.loader import ShardedStateLoader
+
+        logger.info(
+            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
+        )
+        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
