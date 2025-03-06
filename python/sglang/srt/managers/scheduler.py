@@ -438,6 +438,18 @@ class Scheduler:
                     disable=server_args.disable_radix_cache,
                 )
 
+        self.decode_mem_cache_buf_multiplier = (
+            1
+            if self.spec_algorithm.is_none()
+            else (
+                server_args.speculative_num_draft_tokens
+                + (
+                    server_args.speculative_eagle_topk
+                    * server_args.speculative_num_steps
+                )
+            )
+        )
+
     def init_metrics(self):
         # The largest prefill length of a single request
         self._largest_prefill_len: int = 0
