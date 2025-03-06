@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FlushCacheReq,
+    PrefillOnlyInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -261,6 +262,14 @@ class TokenizerManager:
                 ),
             ]
         )
+
+    async def pass_through_prefill_request(
+        self,
+        obj: PrefillOnlyInput,
+        request: Optional[fastapi.Request] = None,
+    ):  
+        print("!!!!! pass through req to scheduler")
+        self.send_to_scheduler.send_pyobj(obj)
 
     async def generate_request(
         self,

@@ -14,7 +14,7 @@ class KVCacheReceiver:
         self.connections = {}  # Maps (remote_ip, remote_port) to active socket
         self.connection_lock = Lock()
 
-    def pull_kv_cache(self, remote_ip, remote_port, kv_cache_size):
+    def pull_kv_cache(self, remote_ip, remote_port, kv_cache_size) -> bytes:
         future = self.kv_receiver_executor.submit(
             self._pull_kv, remote_ip, remote_port, kv_cache_size
         )

@@ -34,6 +34,24 @@ class SessionParams:
 
 
 @dataclass
+class PrefillOnlyInput:
+    # The input prompt. It can be a single prompt or a batch of prompts.
+    input_text: Optional[Union[List[str], str]] = None
+    # The token ids for text; one can specify either text or input_ids
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    #
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+    # Session info for continual prompting
+    session_params: Optional[Union[List[Dict], Dict]] = None
+    # Origin decode instance info
+    decode_instance_ip_port: Optional[List[str]] = None
+    # target prefill instance info
+    prefill_instance_ip_port: Optional[List[str]] = None
+
+
+@dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
@@ -335,6 +353,13 @@ class TokenizedEmbeddingReqInput:
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
 
+
+# @dataclass
+# class PassThroughPrefillInput:
+#     # The request id
+#     rid: str
+#     # The input token ids
+#     input_ids: List[int]
 
 @dataclass
 class BatchTokenIDOut:

@@ -1015,6 +1015,10 @@ class PortArgs:
     scheduler_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
+    # The ipc filename for scheduler to send out req to frontend (zmq)
+    scheduler_out_bound_ipc_name: str
+    # The ipc filename for scheduler to receive from frontend (zmq)
+    scheduler_in_bound_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
     nccl_port: int
@@ -1036,6 +1040,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_out_bound_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                scheduler_in_bound_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
             )
         else:
@@ -1061,6 +1067,8 @@ class PortArgs:
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
+                scheduler_out_bound_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                scheduler_in_bound_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
                 nccl_port=port,
             )
 

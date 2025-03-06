@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FunctionCallReqInput,
+    PrefillOnlyInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -115,6 +116,15 @@ def set_global_state(global_state: _GlobalState):
 @app.get("/health")
 async def health() -> Response:
     """Check the health of the http server."""
+    return Response(status_code=200)
+
+
+@app.post("/process_prefill_only")
+async def process_prefill_only(obj: PrefillOnlyInput, request: Request) -> Response:
+    """For Prefill Decode Disaggregation, process prefill request send from decode instance"""
+    print("!!!!!!! recv request from decode !!!!!!!!")
+    print(obj)
+    await _global_state.tokenizer_manager.pass_through_prefill_request(obj, request)
     return Response(status_code=200)
 
 

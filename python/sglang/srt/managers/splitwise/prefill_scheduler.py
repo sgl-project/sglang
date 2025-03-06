@@ -63,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    PrefillOnlyInput,
+    SamplingParams,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -411,6 +413,7 @@ class PrefillScheduler:
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (PrefillOnlyInput, self.handle_generate_request),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 # (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (FlushCacheReq, self.flush_cache_wrapped),
@@ -531,110 +534,134 @@ class PrefillScheduler:
         else:
             recv_reqs = None
 
-        if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
-                work_reqs = [
-                    req
-                    for req in recv_reqs
-                    if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-                control_reqs = [
-                    req
-                    for req in recv_reqs
-                    if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-            else:
-                work_reqs = None
-                control_reqs = None
+        # if self.server_args.enable_dp_attention:
+        #     if self.attn_tp_rank == 0:
+        #         work_reqs = [
+        #             req
+        #             for req in recv_reqs
+        #             if isinstance(
+        #                 req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        #             )
+        #         ]
+        #         control_reqs = [
+        #             req
+        #             for req in recv_reqs
+        #             if not isinstance(
+        #                 req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        #             )
+        #         ]
+        #     else:
+        #         work_reqs = None
+        #         control_reqs = None
 
-            if self.attn_tp_size != 1:
-                attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_rank,
-                    self.attn_tp_cpu_group,
-                    src=attn_tp_rank_0,
-                )
-            if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs, self.tp_rank, self.tp_cpu_group
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        #     if self.attn_tp_size != 1:
+        #         attn_tp_rank_0 = self.dp_rank * self.attn_tp_size
+        #         work_reqs = broadcast_pyobj(
+        #             work_reqs,
+        #             self.attn_tp_rank,
+        #             self.attn_tp_cpu_group,
+        #             src=attn_tp_rank_0,
+        #         )
+        #     if self.tp_size != 1:
+        #         control_reqs = broadcast_pyobj(
+        #             control_reqs, self.tp_rank, self.tp_cpu_group
+        #         )
+        #     recv_reqs = work_reqs + control_reqs
+        # elif self.tp_size != 1:
+        #     recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+
+        # assume for now no dp attention and etc
+        recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
+            print("!!!!!!!! receive new req !!!!!!!!!!")
+            print(recv_req)
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
-        recv_req: TokenizedGenerateReqInput,
+        recv_req: Union[TokenizedGenerateReqInput, PrefillOnlyInput],
     ):
+        # for now not sure about what self.sessions is doing, just create a new request for the purpose of testing
+        sample_param = recv_req.sampling_params if isinstance(recv_req.sampling_params, SamplingParams) else SamplingParams(**recv_req.sampling_params)
+        
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            sample_param,
+            # return_logprob=False,
+            # top_logprobs_num=recv_req.top_logprobs_num,
+            stream=False,
+            lora_path=None,
+            input_embeds=None,
+            custom_logit_processor=None,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+        )
+        req.tokenizer = self.tokenizer
+
         # Create a new request
-        if (
-            recv_req.session_params is None
-            or recv_req.session_params.id is None
-            or recv_req.session_params.id not in self.sessions
-        ):
+        # if (
+        #     recv_req.session_params is None
+        #     or recv_req.session_params.id is None
+        #     or recv_req.session_params.id not in self.sessions
+        # ):
 
-            if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+        #     # if recv_req.input_embeds is not None:
+        #     #     # Generate fake input_ids based on the length of input_embeds
+        #     #     seq_length = len(recv_req.input_embeds)
+        #     #     fake_input_ids = [1] * seq_length
+        #     #     recv_req.input_ids = fake_input_ids
 
-            # Handle custom logit processor passed to the request
-            custom_logit_processor = recv_req.custom_logit_processor
-            if (
-                not self.server_args.enable_custom_logit_processor
-                and custom_logit_processor is not None
-            ):
-                logger.warning(
-                    "The SGLang server is not configured to enable custom logit processor."
-                    "The custom logit processor passed in will be ignored."
-                    "Please set --enable-custom-logits-processor to enable this feature."
-                )
-                custom_logit_processor = None
+        #     # Handle custom logit processor passed to the request
+        #     custom_logit_processor = recv_req.custom_logit_processor
+        #     if (
+        #         not self.server_args.enable_custom_logit_processor
+        #         and custom_logit_processor is not None
+        #     ):
+        #         logger.warning(
+        #             "The SGLang server is not configured to enable custom logit processor."
+        #             "The custom logit processor passed in will be ignored."
+        #             "Please set --enable-custom-logits-processor to enable this feature."
+        #         )
+        #         custom_logit_processor = None
 
-            req = Req(
-                recv_req.rid,
-                recv_req.input_text,
-                recv_req.input_ids,
-                recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
-                stream=recv_req.stream,
-                lora_path=recv_req.lora_path,
-                input_embeds=recv_req.input_embeds,
-                custom_logit_processor=custom_logit_processor,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-            )
-            req.tokenizer = self.tokenizer
+        #     req = Req(
+        #         recv_req.rid,
+        #         recv_req.input_text,
+        #         recv_req.input_ids,
+        #         recv_req.sampling_params,
+        #         return_logprob=recv_req.return_logprob,
+        #         top_logprobs_num=recv_req.top_logprobs_num,
+        #         stream=recv_req.stream,
+        #         lora_path=recv_req.lora_path,
+        #         input_embeds=recv_req.input_embeds,
+        #         custom_logit_processor=custom_logit_processor,
+        #         eos_token_ids=self.model_config.hf_eos_token_id,
+        #     )
+        #     req.tokenizer = self.tokenizer
 
-            if (
-                recv_req.session_params is not None
-                and recv_req.session_params.id is not None
-            ):
-                req.finished_reason = FINISH_ABORT(
-                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
-                )
-                self.waiting_queue.append(req)
-                return
-        else:
-            # Create a new request from a previous session
-            session = self.sessions[recv_req.session_params.id]
-            req = session.create_req(recv_req, self.tokenizer)
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                self.waiting_queue.append(req)
-                return
+        #     if (
+        #         recv_req.session_params is not None
+        #         and recv_req.session_params.id is not None
+        #     ):
+        #         req.finished_reason = FINISH_ABORT(
+        #             f"Invalid request: session id {recv_req.session_params.id} does not exist"
+        #         )
+        #         self.waiting_queue.append(req)
+        #         return
+        # else:
+        #     # Create a new request from a previous session
+        #     session = self.sessions[recv_req.session_params.id]
+        #     req = session.create_req(recv_req, self.tokenizer)
+        #     if isinstance(req.finished_reason, FINISH_ABORT):
+        #         self.waiting_queue.append(req)
+        #         return
 
         # Handle multimodal inputs
         # if recv_req.image_inputs is not None:
@@ -671,20 +698,20 @@ class PrefillScheduler:
             return
 
         # Copy more attributes
-        if recv_req.logprob_start_len == -1:
-            # By default, only return the logprobs for output tokens
-            req.logprob_start_len = len(req.origin_input_ids) - 1
-        else:
-            req.logprob_start_len = recv_req.logprob_start_len
+        # if recv_req.logprob_start_len == -1:
+        #     # By default, only return the logprobs for output tokens
+        #     req.logprob_start_len = len(req.origin_input_ids) - 1
+        # else:
+        #     req.logprob_start_len = recv_req.logprob_start_len
 
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
-        )
+        # req.sampling_params.max_new_tokens = min(
+        #     (
+        #         req.sampling_params.max_new_tokens
+        #         if req.sampling_params.max_new_tokens is not None
+        #         else 1 << 30
+        #     ),
+        #     self.max_req_len - len(req.origin_input_ids) - 1,
+        # )
 
         # Init grammar cache for this request
         # add_to_grammar_queue = False
@@ -709,6 +736,7 @@ class PrefillScheduler:
         # if add_to_grammar_queue:
         #     self.grammar_queue.append(req)
         # else:
+        print("!!!!!!!! put req into waiting_queue !!!!!!!!!!")
         self.waiting_queue.append(req)
 
     # def handle_embedding_request(
@@ -822,6 +850,7 @@ class PrefillScheduler:
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
+        # print("!!!!!!!! new batch: ", new_batch)
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
@@ -912,6 +941,7 @@ class PrefillScheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            print("!!!!!!!! add one req")
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
