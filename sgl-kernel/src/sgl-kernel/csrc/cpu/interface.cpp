@@ -83,9 +83,3 @@ void shm_allreduce(
 
   return;
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("initialize", &initialize, "shm initialize");
-  m.def(
-      "shm_allreduce", &shm_allreduce, "low latency all_reduce implementation");
-}

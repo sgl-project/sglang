@@ -40,12 +40,20 @@ operator_namespace = "sgl_kernel"
 include_dirs = []
 
 sources = [
+    "src/sgl-kernel/csrc/cpu/norm.cpp",
     "src/sgl-kernel/csrc/cpu/interface.cpp",
     "src/sgl-kernel/csrc/cpu/shm.cpp",
+    "src/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp",
 ]
 
-cxx_flags = ["-O3"]
-extra_compile_args = {"cxx": cxx_flags}
+extra_compile_args = {
+    "cxx": [
+        "-O3",
+        "-Wno-unknown-pragmas",
+        "-march=native",
+        "-fopenmp",
+    ]
+}
 libraries = ["c10", "torch", "torch_python"]
 cmdclass = {
     "build_ext": BuildExtension.with_options(use_ninja=True),
