@@ -33,6 +33,12 @@ void grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
     at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk,
     bool renormalize, int64_t num_expert_group, int64_t topk_group);
 
+// attention
+void decode_attention_cpu(at::Tensor& query, at::Tensor& output,
+    at::Tensor& k_cache, at::Tensor& v_cahce, at::Tensor& attn_logits,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices,
+    at::Tensor& seq_lens, double scaling, double logit_cap);
+
 // shared memory init
 void initialize(int size, int rank);
 
@@ -49,6 +55,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // topk
   m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
+
+  // decode
+  m.def("decode_attention_cpu", &decode_attention_cpu, "Attention decoding for CPU");
 
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");
