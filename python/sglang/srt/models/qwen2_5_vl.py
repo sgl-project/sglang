@@ -678,6 +678,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     )
                     image_embeds_offset += num_image_tokens
 
+        new_input_ids = input_ids
         input_ids = None
         hidden_states = self.model(
             input_ids=input_ids,
@@ -688,7 +689,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                new_input_ids, hidden_states, self.lm_head, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
