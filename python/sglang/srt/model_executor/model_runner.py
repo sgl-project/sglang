@@ -202,10 +202,6 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
-        # Init streams
-        if self.server_args.speculative_algorithm == "EAGLE":
-            self.plan_stream_for_flashinfer = torch.cuda.Stream()
-
     def model_specific_adjustment(self):
         server_args = self.server_args
 
@@ -783,6 +779,10 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
+            # Init streams
+            if self.server_args.speculative_algorithm == "EAGLE":
+                self.plan_stream_for_flashinfer = torch.cuda.Stream()
+
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
