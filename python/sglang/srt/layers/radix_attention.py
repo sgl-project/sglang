@@ -38,6 +38,7 @@ class RadixAttention(nn.Module):
         is_cross_attention: bool = False,
         orig_context_len: Optional[int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads

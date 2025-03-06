@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 class TestFlashinferMLA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-test"
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -59,7 +59,7 @@ class TestFlashinferMLA(unittest.TestCase):
 class TestFlashinferMLANoRagged(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-test"
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:

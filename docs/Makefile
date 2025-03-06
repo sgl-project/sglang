@@ -1,11 +1,16 @@
 # Minimal Makefile for Sphinx documentation
 SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
+SPHINXAUTOBUILD ?= sphinx-autobuild
 SOURCEDIR     = .
 BUILDDIR      = _build
+PORT          ?= 8003
 
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@echo ""
+	@echo "Additional targets:"
+	@echo "  serve       to build and serve documentation with auto-build and live reload"
 
 # Compile Notebook files and record execution time
 compile:
@@ -32,8 +37,15 @@ compile:
 	echo "Total execution time: $${TOTAL_ELAPSED}s" >> logs/timing.log; \
 	echo "All Notebook execution timings:" && cat logs/timing.log
 
+# Serve documentation with auto-build and live reload
+serve:
+	@echo "Starting auto-build server at http://localhost:$(PORT)"
+	@$(SPHINXAUTOBUILD) "$(SOURCEDIR)" "$(BUILDDIR)/html" \
+		--port $(PORT) \
+		--watch $(SOURCEDIR) \
+		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"
 
-.PHONY: help Makefile compile clean
+.PHONY: help Makefile compile clean serve
 
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)

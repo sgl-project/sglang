@@ -121,6 +121,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.cached_tokens_total = Counter(
+            name="sglang:cached_tokens_total",
+            documentation="Number of cached prompt tokens.",
+            labelnames=labels.keys(),
+        )
+
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
@@ -245,10 +251,12 @@ class TokenizerMetricsCollector:
         self,
         prompt_tokens: int,
         generation_tokens: int,
+        cached_tokens: int,
         e2e_latency: float,
     ):
         self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.cached_tokens_total.labels(**self.labels).inc(cached_tokens)
         self.num_requests_total.labels(**self.labels).inc(1)
         self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
         if generation_tokens >= 1:

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
-
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -21,11 +20,13 @@ class ChunkCacheEntry:
 
 class ChunkCache(BasePrefixCache):
     def __init__(
-        self, req_to_token_pool: ReqToTokenPool, token_to_kv_pool: BaseTokenToKVPool
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
     ):
         self.disable = True
         self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.entries: Dict[str, ChunkCacheEntry] = {}
 
         self.reset()
@@ -51,7 +52,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :token_id_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool.free(kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices)
 
         if req.rid in self.entries:
             del self.entries[req.rid]
@@ -91,3 +92,6 @@ class ChunkCache(BasePrefixCache):
 
     def protected_size(self):
         return 0
+
+    def pretty_print(self):
+        return ""

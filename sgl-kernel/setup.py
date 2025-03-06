@@ -85,6 +85,7 @@ nvcc_flags = [
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
     "--ptxas-options=-v",
+    "--expt-relaxed-constexpr",
     "-Xcompiler=-Wconversion",
     "-Xcompiler=-fno-strict-aliasing",
 ]

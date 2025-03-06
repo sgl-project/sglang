@@ -3,14 +3,8 @@
 from typing import List
 
 import torch
-
-from sglang.srt.utils import is_cuda_available
-
-if is_cuda_available():
-    from sgl_kernel import build_tree_kernel as sgl_build_tree_kernel
-    from sgl_kernel import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
+from sgl_kernel import build_tree_kernel as sgl_build_tree_kernel
+from sgl_kernel import build_tree_kernel_efficient as sgl_build_tree_kernel_efficient
 
 
 def build_tree_kernel_efficient_preprocess(
@@ -32,7 +26,12 @@ def build_tree_kernel_efficient_preprocess(
 
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
-    parent_list = torch.cat(parents_list[:-1], dim=1)
+
+    if len(parents_list) > 1:
+        parent_list = torch.cat(parents_list[:-1], dim=1)
+    else:
+        batch_size = parents_list[0].shape[0]
+        parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
     return parent_list, top_scores_index, draft_tokens
 
