@@ -1,4 +1,5 @@
 # SGLang Documentation
+
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. Most documentation files are located under the `docs/` folder. We prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline.
 
 ## Docs Workflow
@@ -20,9 +21,16 @@ Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. I
 # 1) Compile all Jupyter notebooks
 make compile
 
-# 2) Compile and Preview documentation locally
+# 2) Compile and Preview documentation locally with auto-build
+# This will automatically rebuild docs when files change
 # Open your browser at the displayed port to view the docs
 bash serve.sh
+
+# 2a) Alternative ways to serve documentation
+# Directly use make serve
+make serve
+# With custom port
+PORT=8080 make serve
 
 # 3) Clean notebook outputs
 # nbstripout removes notebook outputs so your PR stays clean
@@ -90,7 +98,7 @@ For demonstrations in the docs, **prefer smaller models** to reduce memory consu
 
 ### **Prompt Alignment Example**
 
-When designing prompts, ensure they align with SGLang’s structured formatting. For example:
+When designing prompts, ensure they align with SGLang's structured formatting. For example:
 
 ```python
 prompt = """You are an AI assistant. Answer concisely and accurately.
