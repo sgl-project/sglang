@@ -39,8 +39,6 @@ class W8A8Int8Config(QuantizationConfig):
     def get_min_capability(cls) -> int:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return 75
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return 12
 
         # Vendors can update
         return 999
@@ -50,8 +48,6 @@ class W8A8Int8Config(QuantizationConfig):
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 75
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return major >= 12
 
         # Vendors can update
         return False

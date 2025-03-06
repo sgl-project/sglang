@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -73,11 +73,18 @@ class BlockInt8Config(QuantizationConfig):
     def get_min_capability(cls) -> int:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return 80
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return 12
 
         # Vendors can update
         return 999
+
+    @classmethod
+    def get_available(cls) -> bool:
+        major, minor = get_device_capability()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return major * 10 + minor > 80
+
+        # Vendors can update
+        return False
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
