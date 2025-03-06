@@ -46,7 +46,9 @@ FLASHINFER_INLINE void vec_t<half, 1>::load(const half* ptr) {
   data = *ptr;
 }
 
-FLASHINFER_INLINE void vec_t<half, 1>::store(half* ptr) const { *ptr = data; }
+FLASHINFER_INLINE void vec_t<half, 1>::store(half* ptr) const {
+  *ptr = data;
+}
 
 // half x 2
 template <>
@@ -82,7 +84,9 @@ FLASHINFER_INLINE void vec_t<half, 2>::load(const half* ptr) {
   data = *((half2*)ptr);
 }
 
-FLASHINFER_INLINE void vec_t<half, 2>::store(half* ptr) const { *((half2*)ptr) = data; }
+FLASHINFER_INLINE void vec_t<half, 2>::store(half* ptr) const {
+  *((half2*)ptr) = data;
+}
 
 // half x 4
 
@@ -119,7 +123,9 @@ FLASHINFER_INLINE void vec_t<half, 4>::load(const half* ptr) {
   data = *((uint2*)ptr);
 }
 
-FLASHINFER_INLINE void vec_t<half, 4>::store(half* ptr) const { *((uint2*)ptr) = data; }
+FLASHINFER_INLINE void vec_t<half, 4>::store(half* ptr) const {
+  *((uint2*)ptr) = data;
+}
 
 // half x 8 or more
 

@@ -20,7 +20,8 @@ limitations under the License.
 #define kBitsToLoad 128
 #define kBytesToLoad (kBitsToLoad / 8)
 
-// Adapted from [flashinfer::activation::act_and_mul_kernel](https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44)
+// Adapted from
+// [flashinfer::activation::act_and_mul_kernel](https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44)
 
 namespace flashinfer {
 namespace activation {
@@ -49,11 +50,10 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
   // process the remaining elements
 #pragma unroll 1
   for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
-    T x = input[offset + remaining_offset + idx],
-      y = input[offset + remaining_offset + d + idx];
+    T x = input[offset + remaining_offset + idx], y = input[offset + remaining_offset + d + idx];
     out[token_idx * d + remaining_offset + idx] = Activation(x) * y;
   }
 }
 
-} // activation
-} // flashinfer
+}  // namespace activation
+}  // namespace flashinfer
