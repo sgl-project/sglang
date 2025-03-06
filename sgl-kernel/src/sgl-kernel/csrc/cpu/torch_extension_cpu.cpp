@@ -28,6 +28,11 @@ void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, doub
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
+// topk
+void grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
+    at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk,
+    bool renormalize, int64_t num_expert_group, int64_t topk_group);
+
 // shared memory init
 void initialize(int size, int rank);
 
@@ -41,6 +46,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // norm
   m.def("rmsnorm_cpu", &rmsnorm_cpu, "Root mean square normalization for CPU");
   m.def("fused_add_rmsnorm_cpu", &fused_add_rmsnorm_cpu, "Fused add root mean square normalization for CPU");
+
+  // topk
+  m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
 
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");
