@@ -1068,6 +1068,7 @@ class TokenizerManager:
             self.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
+                recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
             )
 
