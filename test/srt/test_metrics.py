@@ -59,6 +59,7 @@ class TestEnableMetrics(unittest.TestCase):
                 "sglang:spec_accept_length",
                 "sglang:prompt_tokens_total",
                 "sglang:generation_tokens_total",
+                "sglang:cached_tokens_total",
                 "sglang:num_requests_total",
                 "sglang:time_to_first_token_seconds",
                 "sglang:time_per_output_token_seconds",
