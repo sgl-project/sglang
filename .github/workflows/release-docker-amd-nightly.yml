@@ -57,8 +57,8 @@ jobs:
             exit 1
           fi
 
-          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t rocm/sgl-dev:${{ env.DATE }} --no-cache
-          docker push rocm/sgl-dev:${{ env.DATE }}
+          docker build . -f docker/Dockerfile.rocm --build-arg BUILD_TYPE=${{ matrix.build_type }} -t rocm/sgl-dev:${{ env.DATE }}${tag_suffix} --no-cache
+          docker push rocm/sgl-dev:${{ env.DATE }}${tag_suffix}
 
       - name: "Remove docker image"
         run: |
