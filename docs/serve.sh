@@ -1,3 +1,3 @@
+# Clean and serve documentation with auto-build
 make clean
-make html
-python3 -m http.server --d _build/html 8003
+make serve
