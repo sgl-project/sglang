@@ -427,7 +427,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
