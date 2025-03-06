@@ -57,7 +57,7 @@ class ModelOptFp8Config(QuantizationConfig):
             return 89
 
         # Vendors can update
-        return "unknown"
+        return 999
 
     @classmethod
     def get_available(cls) -> bool:
