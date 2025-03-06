@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-100]
+        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-48, 48-100]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
