@@ -18,6 +18,21 @@ limitations under the License.
 #include <cuda_runtime.h>
 #ifndef USE_ROCM
 #include <pytorch_extension_utils.h>
+#else
+
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
+#define _DISPATCH_CASE_F16(c_type, ...) \
+  case at::ScalarType::Half: {          \
+    using c_type = __half;              \
+    return __VA_ARGS__();               \
+  }
+
+#define _DISPATCH_CASE_BF16(c_type, ...) \
+  case at::ScalarType::BFloat16: {       \
+    using c_type = __hip_bfloat16;       \
+    return __VA_ARGS__();                \
+  }
+
 #endif
 #include <torch/extension.h>
 
@@ -65,16 +80,6 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
-// SGLANG_SHFL_XOR_* adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/csrc/cuda_compat.h#L19-L28
-#ifndef USE_ROCM
-#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
-#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
-#else
-#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor((var), (lane_mask))
-#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor((var), (lane_mask), (width))
-#endif
-
-#ifndef USE_ROCM
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(pytorch_dtype, c_type, ...)           \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -91,7 +96,6 @@ inline int getSMVersion() {
         return false;                                                                    \
     }                                                                                    \
   }()
-#endif
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -103,70 +107,24 @@ inline int getSMVersion() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define CEILDIV(x, y) (((x) + (y)-1) / (y))
+
+#ifndef USE_ROCM
 #define WARP_SIZE 32
-
-#ifndef USE_ROCM
-#include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
-#include <c10/util/Float8_e4m3fnuz.h>
-
-using FP8_TYPE = c10::Float8_e4m3fnuz;
-constexpr auto FP8_E4M3_MAX = 224.0f;
+#define WARP_SIZE warpSize  // 64
 #endif
 
-#ifndef USE_ROCM
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
-  float old;
-  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
-                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-  return old;
+#if defined(__HIP_PLATFORM_AMD__)
+
+#include "hip_vec_dtypes.h"
+#include "hip_math_def.h"
+
+#else
+
+template <typename srcDtype>
+__device__ __forceinline__ float castToFloat(srcDtype val) {
+  return static_cast<srcDtype>(val);
 }
 
-__device__ __forceinline__ float warpReduceMax(float max_value) {
-  max_value = fmaxf(max_value, SGLANG_SHFL_XOR_SYNC(0xffffffff, max_value, 16));
-  max_value = fmaxf(max_value, SGLANG_SHFL_XOR_SYNC(0xffffffff, max_value, 8));
-  max_value = fmaxf(max_value, SGLANG_SHFL_XOR_SYNC(0xffffffff, max_value, 4));
-  max_value = fmaxf(max_value, SGLANG_SHFL_XOR_SYNC(0xffffffff, max_value, 2));
-  max_value = fmaxf(max_value, SGLANG_SHFL_XOR_SYNC(0xffffffff, max_value, 1));
-  return max_value;
-}
-
-__device__ __forceinline__ float blockReduceMax(float max_value) {
-  static __shared__ float warpLevelMaxs[WARP_SIZE];
-  const int laneId = threadIdx.x % WARP_SIZE;
-  const int warpId = threadIdx.x / WARP_SIZE;
-
-  max_value = warpReduceMax(max_value);
-
-  if (laneId == 0) warpLevelMaxs[warpId] = max_value;
-  __syncthreads();
-
-  max_value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
-  if (warpId == 0) max_value = warpReduceMax(max_value);
-
-  return max_value;
-}
 #endif
-
-// Pads to a multiple of `alignment` rows.
-inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment = 4, bool is_column_major = false) {
-  int64_t rows = tensor.size(0);
-  int64_t cols = tensor.size(1);
-  int64_t pad_rows = (alignment - (rows % alignment)) % alignment;  // Compute padding size
-
-  if (pad_rows == 0) {
-    return tensor;  // Already aligned
-  }
-
-  torch::Tensor padding = torch::zeros({pad_rows, cols}, tensor.options());
-  torch::Tensor tensor_padded = torch::cat({tensor, padding}, 0);  // Pad along rows
-
-  // Ensure column-major layout
-  if (is_column_major) {
-    return tensor_padded.t().contiguous().t();
-  }
-  return tensor_padded;
-}

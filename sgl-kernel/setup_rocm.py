@@ -40,9 +40,12 @@ include_dirs = [
 ]
 
 sources = [
+    "csrc/torch_extension_rocm.cc",
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/moe/moe_align_kernel.cu",
-    "csrc/torch_extension_rocm.cc",
+    "csrc/activation/amd/fused_mul_and_silu_kernel.cu",
+    "csrc/activation/amd/fused_mul_and_gelu_tanh_kernel.cu",
+    "csrc/activation/amd/fused_mul_and_gelu_kernel.cu",
 ]
 
 cxx_flags = ["-O3"]
