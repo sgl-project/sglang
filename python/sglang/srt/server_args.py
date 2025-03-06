@@ -278,7 +278,6 @@ class ServerArgs:
 
         if self.speculative_algorithm == "EAGLE":
             self.disable_overlap_schedule = True
-            self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
             if self.max_running_requests is None:
                 self.max_running_requests = 32

@@ -170,6 +170,7 @@ class Scheduler:
             if not self.spec_algorithm.is_none()
             else 1
         )
+        self.prefill_only_one_req = server_args.prefill_only_one_req
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -274,10 +275,8 @@ class Scheduler:
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
-            self.prefill_only_one_req = True
         else:
             self.draft_worker = None
-            self.prefill_only_one_req = False
 
         # Get token and memory info from the model worker
         (
