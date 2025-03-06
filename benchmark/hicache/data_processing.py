@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
-import requests
-from nextqa.video import NExTQALoader, VideoPrompt
+from nextqa import NExTQALoader
+
+# from nextqa.video import , VideoPrompt
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 

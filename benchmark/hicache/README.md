@@ -22,7 +22,7 @@ python bench_multiturn.py --model-path Qwen/Qwen2.5-14B-Instruct
 Note: The performance gain of hierarchical caching depends on the ratio of reusable tokens to GPU memory capacity. The more tokens to be reused, the larger the model, and the more constrained the GPU memory size, the greater the benefit one can expect from hierarchical caching.
 
 
-# Usage for Real World Dataset Benchmarks
+# Benchmark with more datasets 
 ## Download Dataset
 ```bash
 ./download.sh {sharegpt|ultragpt|loogle|nextqa|all}
@@ -80,14 +80,12 @@ python3 -m sglang.launch_server --model-path lmms-lab/LLaVA-NeXT-Video-7B  --tp 
 --json-model-override-args "{\"architectures\": [\"LlavaVidForCausalLM\"], \"model_type\":\"llava\", \"mm_spatial_pool_stride\":2}"
 
 Client:
-python3 bench_serving.py --model lmms-lab/LLaVA-NeXT-Video-7B --backend sglang-oai  --dataset-path \
+python3 bench_serving.py --model lmms-lab/LLaVA-NeXT-Video-7B --backend sglang  --dataset-path \
 NExTVideo  --dataset-name nextqa --request-rate 10 --num-prompts 1 --disable-shuffle --port 8001 \ --enable-multiturn --max-frames 16 --tokenizer llava-hf/llava-1.5-7b-hf --fixed-output-len 2048
 ```
 Note: for the server args, `tokenizer-path`, overriding architecture are necessary.
 
 ## Supported Backend
-- sglang
-- sglang-native
-- sglang-oai
+- sglang (oai)
 - vllm (oai)
 - lmdeploy (oai)

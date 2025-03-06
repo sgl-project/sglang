@@ -16,7 +16,6 @@ import asyncio
 import json
 import os
 import random
-import resource
 import sys
 import time
 import traceback
@@ -31,20 +30,9 @@ import numpy as np
 import requests
 from data_processing import MsgContent, SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
+from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import (
-    check_chat_template,
-    get_tokenizer,
-    parse_request_rate_range,
-    remove_prefix,
-    set_ulimit,
-)
+from sglang.bench_serving import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -211,142 +199,6 @@ async def async_request_openai_completions(
     return output
 
 
-async def async_request_sglang_generate(
-    request_func_input: RequestFuncInput,
-    queue: asyncio.Queue,
-    tokenizer: PreTrainedTokenizerBase,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        payload = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
-            "stream": not args.disable_stream,
-            "stream_options": {"include_usage": True},
-            "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "logprob_start_len": -1,
-            **request_func_input.extra_request_body,
-        }
-        headers = {}
-
-        output = RequestFuncOutput()
-
-        prompt_idx = request_func_input.finished_prompts
-        messages = request_func_input.prev_messages
-        prompt, input_len, max_tokens = request_func_input.prompts[prompt_idx]
-        prompt_len = sum(
-            prompt[1] + prompt[2]  # input_len + output_len
-            for prompt in request_func_input.prompts[:prompt_idx]
-        )
-        prompt_len += input_len
-
-        # TODO: Make use of the new session field of the GenerateReqInput
-        # Now we simply concatenate all the prompts and responses in the
-        # text field
-
-        # NOTE: We specialize for the case of nextqa
-        if isinstance(prompt, List):
-            messages.append(prompt[1]["text"])
-            payload["image_data"] = prompt[0]["image_url"]["url"]
-        elif isinstance(prompt, str):
-            messages.append(prompt)
-
-        payload["text"] = " ".join(messages)
-        payload["sampling_params"]["max_new_tokens"] = max_tokens
-
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    actual_prompt_len = prompt_len - 1
-                    actual_output_len = 0
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-                        # print(chunk_bytes)
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            timestamp = time.perf_counter()
-                            if (
-                                data["meta_info"] is not None
-                                and data["meta_info"]["prompt_tokens"] is not None
-                            ):
-                                actual_prompt_len = int(
-                                    data["meta_info"]["prompt_tokens"]
-                                )
-                            if (
-                                data["meta_info"] is not None
-                                and data["meta_info"]["completion_tokens"] is not None
-                            ):
-                                actual_output_len = int(
-                                    data["meta_info"]["completion_tokens"]
-                                )
-                            if data["text"]:
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft.append(ttft)
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                generated_text = data["text"]
-                            most_recent_timestamp = timestamp
-
-                    output.prompt_len.append(actual_prompt_len)  # truncate <s>
-                    output.output_len.append(actual_output_len)
-                    output.generated_text.append(generated_text)
-                    output.success = True
-                    output.latency.append(latency)
-
-                    # Prepare for the new request
-                    request_func_input.prompts[prompt_idx] = (
-                        prompt,
-                        input_len,
-                        actual_output_len,  # changes from max_tokens to output_len
-                    )
-                    prompt_idx += 1
-                    messages.append(generated_text)
-
-                    # Move the new request to the end of the queue
-                    if prompt_idx < len(request_func_input.prompts):
-                        request_func_input.finished_prompts = prompt_idx
-                        request_func_input.prev_messages = messages
-                        await queue.put(request_func_input)
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
@@ -366,9 +218,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
 
 ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_sglang_generate,
-    "sglang-native": async_request_sglang_generate,
-    "sglang-oai": async_request_openai_completions,
+    "sglang": async_request_openai_completions,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
 }
@@ -853,8 +703,6 @@ def run_benchmark(args_: argparse.Namespace):
     if args.port is None:
         args.port = {
             "sglang": 30000,
-            "sglang-native": 30000,
-            "sglang-oai": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
         }.get(args.backend, 30000)
@@ -865,13 +713,7 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend in ["sglang", "sglang-native"]:
-        api_url = (
-            f"{args.base_url}/generate"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/generate"
-        )
-    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
+    if args.backend in ["sglang", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
@@ -928,46 +770,23 @@ def run_benchmark(args_: argparse.Namespace):
 
     input_requests = get_dataset(args, tokenizer)
 
-    if not args.multi:
-        return asyncio.run(
-            benchmark(
-                backend=backend,
-                api_url=api_url,
-                base_url=base_url,
-                model_id=model_id,
-                tokenizer=tokenizer,
-                input_requests=input_requests,
-                request_rate=args.request_rate,
-                max_concurrency=args.max_concurrency,
-                disable_tqdm=args.disable_tqdm,
-                lora_name=args.lora_name,
-                extra_request_body=extra_request_body,
-                profile=args.profile,
-                enable_shared_prefix=args.enable_shared_prefix,
-            )
+    return asyncio.run(
+        benchmark(
+            backend=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            request_rate=args.request_rate,
+            max_concurrency=args.max_concurrency,
+            disable_tqdm=args.disable_tqdm,
+            lora_name=args.lora_name,
+            extra_request_body=extra_request_body,
+            profile=args.profile,
+            enable_shared_prefix=args.enable_shared_prefix,
         )
-    else:
-        # Benchmark multiple rps. TODO: use a fixed duration to compute num_prompts
-        request_rates = parse_request_rate_range(args.request_rate_range)
-
-        for rate in request_rates:
-            asyncio.run(
-                benchmark(
-                    backend=backend,
-                    api_url=api_url,
-                    base_url=base_url,
-                    model_id=model_id,
-                    tokenizer=tokenizer,
-                    input_requests=input_requests,
-                    request_rate=rate,
-                    max_concurrency=args.max_concurrency,
-                    disable_tqdm=args.disable_tqdm,
-                    lora_name=args.lora_name,
-                    extra_request_body=extra_request_body,
-                    profile=args.profile,
-                    enable_shared_prefix=args.enable_shared_prefix,
-                )
-            )
+    )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,8 @@
-import base64
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
-from typing import List, Tuple
+from typing import List
 
 import av
-import numpy as np
 from datasets import load_dataset
 
 
