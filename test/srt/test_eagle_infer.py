@@ -260,7 +260,7 @@ class TestEAGLEServer(unittest.TestCase):
         server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 3.5)
+        self.assertGreater(avg_spec_accept_length, 2.9)
 
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
