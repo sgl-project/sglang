@@ -396,15 +396,9 @@ class CudaGraphRunner:
 
             run_once()
 
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
-
         global global_graph_memory_pool
         with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
 
         global_graph_memory_pool = graph.pool()
         return graph, out
