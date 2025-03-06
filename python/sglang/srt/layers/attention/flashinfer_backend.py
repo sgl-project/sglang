@@ -35,7 +35,7 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _get_range_buf
+    from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
 class WrapperDispatch(Enum):
@@ -1199,7 +1199,26 @@ def fast_decode_plan(
     indptr_host = indptr.cpu()
 
     if self.use_tensor_cores:
-        raise NotImplementedError()
+        kv_lens_arr_host = get_seq_lens(indptr_host, self.last_page_len, page_size)
+
+        self._plan_info = self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_host,
+            indptr_host,
+            kv_lens_arr_host,
+            batch_size,  # total_num_rows
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim,
+            head_dim,
+            False,  # causal
+            torch.cuda.current_stream().cuda_stream,
+        )
     else:
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
