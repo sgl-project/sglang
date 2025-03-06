@@ -312,7 +312,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.forward_metadata = DecodeMetadata(decode_wrappers)
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[-1]
+                    fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
@@ -1121,6 +1121,11 @@ def should_use_tensor_core(
         return False
 
 
+# Use as a fast path to override the indptr in flashinfer's plan function
+# This is used to remove some host-to-device copy overhead.
+global_override_indptr_cpu = None
+
+
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -1196,11 +1201,15 @@ def fast_decode_plan(
         )
         self.last_page_len = torch.ones(32768, dtype=torch.int32)
 
-    indptr_host = indptr.cpu()
+    indptr_host = (
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
+    )
 
     if self.use_tensor_cores:
         kv_lens_arr_host = get_seq_lens(
-            indptr_host, self.last_page_len[: len(indptr_host) - 1], page_size
+            indptr_host, self.last_page_len[:batch_size], page_size
         )
 
         self._plan_info = self._cached_module.plan(
