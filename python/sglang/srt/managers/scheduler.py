@@ -373,6 +373,7 @@ class Scheduler:
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
+                (SetInternalStateReq, self.set_internal_state),
             ]
         )
 
@@ -1160,6 +1161,7 @@ class Scheduler:
         ):
             self.stop_profile()
 
+        # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
@@ -1180,6 +1182,7 @@ class Scheduler:
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
+
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -1213,7 +1216,6 @@ class Scheduler:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            assert isinstance(result, GenerationBatchResult)
             self.process_batch_result_decode(batch, result)
             if batch.is_empty():
                 self.running_batch = None
@@ -1465,6 +1467,7 @@ class Scheduler:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
         self.stream_output(batch.reqs, batch.return_logprob)
 
         self.token_to_kv_pool_allocator.free_group_end()
@@ -1568,7 +1571,9 @@ class Scheduler:
                     req.temp_input_token_ids_logprobs_idx
                 )
                 for val, idx in zip(
-                    req.temp_input_top_logprobs_val, req.temp_input_top_logprobs_idx
+                    req.temp_input_top_logprobs_val,
+                    req.temp_input_top_logprobs_idx,
+                    strict=True,
                 ):
                     req.input_top_logprobs_val.extend(val)
                     req.input_top_logprobs_idx.extend(idx)
@@ -1932,7 +1937,6 @@ class Scheduler:
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
-            self.tree_cache_metrics = {"total": 0, "hit": 0}
             if self.grammar_backend:
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
@@ -2023,6 +2027,9 @@ class Scheduler:
                     logger.debug(f"Abort running request. {req.rid=}")
                     req.to_abort = True
                     break
+
+    def _pause_engine(self) -> Tuple[List[Req], int]:
+        raise NotImplementedError()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
