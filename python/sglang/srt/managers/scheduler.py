@@ -330,7 +330,7 @@ class Scheduler:
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool_allocator,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     disable=server_args.disable_radix_cache,
                 )
 
