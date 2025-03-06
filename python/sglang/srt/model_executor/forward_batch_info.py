@@ -156,6 +156,9 @@ class ForwardBatch:
     # Position information
     positions: torch.Tensor = None
 
+    # For decode
+    decode_seq_lens_cpu: Optional[torch.Tensor] = None
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
@@ -280,6 +283,8 @@ class ForwardBatch:
         if ret.forward_mode.is_decode():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+            if ret.decode_seq_lens_cpu is None:
+                ret.decode_seq_lens_cpu = batch.decode_seq_lens
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -287,11 +292,7 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if (
-                model_runner.server_args.attention_backend != "torch_native"
-                # TODO: Fix triton kernel illegal memory access for EAGLE
-                and model_runner.server_args.speculative_algorithm != "EAGLE"
-            ):
+            if model_runner.server_args.attention_backend != "torch_native":
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -381,6 +382,8 @@ def compute_position_triton(
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
+    has_prefix = extend_prefix_lens.shape[0] == batch_size
+
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
     )
@@ -394,6 +397,7 @@ def compute_position_triton(
         extend_start_loc,
         extend_prefix_lens,
         extend_seq_lens,
+        has_prefix,
     )
 
     return positions, extend_start_loc
@@ -405,11 +409,12 @@ def compute_position_kernel(
     extend_start_loc,
     extend_prefix_lens,
     extend_seq_lens,
+    has_prefix: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(0).to(tl.int64)
 
-    prefix_len = tl.load(extend_prefix_lens + pid)
+    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
     # TODO: optimize this?

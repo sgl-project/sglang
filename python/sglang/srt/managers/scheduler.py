@@ -159,17 +159,6 @@ class Scheduler:
         )
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.decode_mem_cache_buf_multiplier = (
-            (
-                self.server_args.speculative_num_draft_tokens
-                + (
-                    self.server_args.speculative_eagle_topk
-                    * self.server_args.speculative_num_steps
-                )
-            )
-            if not self.spec_algorithm.is_none()
-            else 1
-        )
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -208,42 +197,12 @@ class Scheduler:
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
-        self.is_generation = self.model_config.is_generation
-
-        if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
-                self.tokenizer = self.processor.tokenizer
-            else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
+        self.init_tokenizer()
 
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-
         if self.model_config.is_multimodal:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for multimodal models.")
@@ -274,10 +233,8 @@ class Scheduler:
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
             )
-            self.prefill_only_one_req = True
         else:
             self.draft_worker = None
-            self.prefill_only_one_req = False
 
         # Get token and memory info from the model worker
         (
@@ -309,30 +266,7 @@ class Scheduler:
         )
 
         # Init memory pool and cache
-        self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
-
-        if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
-        ):
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-            )
-        else:
-            if self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                )
-            else:
-                self.tree_cache = RadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    disable=server_args.disable_radix_cache,
-                )
-
-        self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
+        self.init_memory_pool_and_cache()
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -346,25 +280,13 @@ class Scheduler:
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.spec_num_total_accepted_tokens = 0
-        self.spec_num_total_forward_ct = 0
-        self.cum_spec_accept_length = 0
-        self.cum_spec_accept_count = 0
         self.last_decode_stats_tic = time.time()
         self.return_health_check_ct = 0
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
 
-        # For metrics only.
-        # The largest prefill length of a single request
-        self._largest_prefill_len: int = 0
-        # The largest context length (prefill + generation) of a single request
-        self._largest_prefill_decode_len: int = 0
-        self.last_gen_throughput: float = 0.0
-        self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
-
-        # Session info
+        # Init session info
         self.sessions: Dict[str, Session] = {}
 
         # Init chunked prefill
@@ -385,11 +307,11 @@ class Scheduler:
         else:
             self.grammar_backend = None
 
-        # Init new token estimation
+        # Init schedule policy and new token estimation
+        self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
-
         self.init_new_token_ratio = min(
             global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
@@ -428,14 +350,7 @@ class Scheduler:
         self.profiler_target_forward_ct: Optional[int] = None
 
         # Init metrics stats
-        self.stats = SchedulerStats()
-        if self.enable_metrics:
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    # TODO: Add lora name/path in the future,
-                },
-            )
+        self.init_metrics()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -462,36 +377,100 @@ class Scheduler:
             ]
         )
 
-    def watchdog_thread(self):
-        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
-        self.watchdog_last_forward_ct = 0
-        self.watchdog_last_time = time.time()
+    def init_tokenizer(self):
+        server_args = self.server_args
 
-        while True:
-            current = time.time()
-            if self.cur_batch is not None:
-                if self.watchdog_last_forward_ct == self.forward_ct:
-                    if current > self.watchdog_last_time + self.watchdog_timeout:
-                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
-                        break
-                else:
-                    self.watchdog_last_forward_ct = self.forward_ct
-                    self.watchdog_last_time = current
-            time.sleep(self.watchdog_timeout // 2)
-
-        # Print batch size and memory pool info to check whether there are de-sync issues.
-        logger.error(
-            f"{self.cur_batch.batch_size()=}, "
-            f"{self.cur_batch.reqs=}, "
-            f"{self.token_to_kv_pool.available_size()=}, "
-            f"{self.tree_cache.evictable_size()=}, "
+        self.model_config = ModelConfig(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
-        # Wait for some time so that the parent process can print the error.
-        pyspy_dump_schedulers()
-        print(file=sys.stderr, flush=True)
-        print(file=sys.stdout, flush=True)
-        time.sleep(5)
-        self.parent_process.send_signal(signal.SIGQUIT)
+        self.is_generation = self.model_config.is_generation
+
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                self.tokenizer = self.processor.tokenizer
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+
+    def init_memory_pool_and_cache(self):
+        server_args = self.server_args
+
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self.tp_worker.get_memory_pool()
+        )
+
+        if (
+            server_args.chunked_prefill_size is not None
+            and server_args.disable_radix_cache
+        ):
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+        else:
+            if self.enable_hierarchical_cache:
+                self.tree_cache = HiRadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                )
+            else:
+                self.tree_cache = RadixCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    disable=server_args.disable_radix_cache,
+                )
+
+        self.decode_mem_cache_buf_multiplier = (
+            1
+            if self.spec_algorithm.is_none()
+            else (
+                server_args.speculative_num_draft_tokens
+                + (
+                    server_args.speculative_eagle_topk
+                    * server_args.speculative_num_steps
+                )
+            )
+        )
+
+    def init_metrics(self):
+        # The largest prefill length of a single request
+        self._largest_prefill_len: int = 0
+        # The largest context length (prefill + generation) of a single request
+        self._largest_prefill_decode_len: int = 0
+        self.last_gen_throughput: float = 0.0
+        self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        self.spec_num_total_accepted_tokens = 0
+        self.spec_num_total_forward_ct = 0
+        self.cum_spec_accept_length = 0
+        self.cum_spec_accept_count = 0
+        self.stats = SchedulerStats()
+        if self.enable_metrics:
+            engine_type = "unified"
+            self.metrics_collector = SchedulerMetricsCollector(
+                labels={
+                    "model_name": self.server_args.served_model_name,
+                    "engine_type": engine_type,
+                },
+            )
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -809,7 +788,8 @@ class Scheduler:
         running_bs: int,
     ):
         num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
         )
         self._largest_prefill_len = max(
             self._largest_prefill_len, adder.log_input_tokens
@@ -844,7 +824,8 @@ class Scheduler:
         self.num_generated_tokens = 0
         num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
         num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
         )
 
         if RECORD_STEP_TIME:
@@ -894,7 +875,8 @@ class Scheduler:
 
     def check_memory(self):
         available_size = (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
         )
         protected_size = self.tree_cache.protected_size()
         memory_leak = available_size != (
@@ -928,7 +910,7 @@ class Scheduler:
         ):
             # During idle time, also collect metrics every 30 seconds.
             num_used = self.max_total_num_tokens - (
-                self.token_to_kv_pool.available_size()
+                self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
             num_running_reqs = len(self.running_batch.reqs) if self.running_batch else 0
@@ -999,7 +981,7 @@ class Scheduler:
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
-            self.token_to_kv_pool,
+            self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
@@ -1073,8 +1055,6 @@ class Scheduler:
                     else:
                         self.batch_is_full = True
                 break
-            if self.prefill_only_one_req:
-                break
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -1099,7 +1079,7 @@ class Scheduler:
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
-            self.token_to_kv_pool,
+            self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
@@ -1143,8 +1123,6 @@ class Scheduler:
 
             retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
             self.new_token_ratio = new_token_ratio
-            if self.draft_worker:
-                self.draft_worker.finish_request(retracted_reqs)
 
             logger.info(
                 "Decode out of memory happened. "
@@ -1178,17 +1156,19 @@ class Scheduler:
         ):
             self.stop_profile()
 
+        # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+                bid = model_worker_batch.bid
             else:
                 (
                     logits_output,
                     next_token_ids,
-                    model_worker_batch,
+                    bid,
                     num_accepted_tokens,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 self.spec_num_total_accepted_tokens += (
@@ -1197,6 +1177,7 @@ class Scheduler:
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
             batch.output_ids = next_token_ids
+
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
@@ -1214,7 +1195,7 @@ class Scheduler:
                 next_token_ids=next_token_ids,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                bid=model_worker_batch.bid,
+                bid=bid,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
@@ -1302,7 +1283,7 @@ class Scheduler:
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
                 if req.is_chunked <= 0:
@@ -1420,23 +1401,27 @@ class Scheduler:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
+            assert batch.spec_algorithm.is_none()
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
-        else:
+        elif batch.spec_algorithm.is_none():
+            # spec decoding handles output logprobs inside verify process.
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
-        self.token_to_kv_pool.free_group_begin()
+        self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition
+        # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
+        # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
 
             if self.enable_overlap and req.finished():
                 # Free the one delayed token
-                self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
+                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
                 continue
 
             if batch.spec_algorithm.is_none():
@@ -1477,9 +1462,10 @@ class Scheduler:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
         self.stream_output(batch.reqs, batch.return_logprob)
 
-        self.token_to_kv_pool.free_group_end()
+        self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (
@@ -1580,7 +1566,9 @@ class Scheduler:
                     req.temp_input_token_ids_logprobs_idx
                 )
                 for val, idx in zip(
-                    req.temp_input_top_logprobs_val, req.temp_input_top_logprobs_idx
+                    req.temp_input_top_logprobs_val,
+                    req.temp_input_top_logprobs_idx,
+                    strict=True,
                 ):
                     req.input_top_logprobs_val.extend(val)
                     req.input_top_logprobs_idx.extend(idx)
@@ -1718,9 +1706,6 @@ class Scheduler:
                         and not self.model_config.is_multimodal_gen
                     )
                 ):
-                    if self.draft_worker and req.finished():
-                        self.draft_worker.finish_request(req)
-
                     rids.append(req.rid)
                     finished_reasons.append(
                         req.finished_reason.to_json() if req.finished_reason else None
@@ -1808,14 +1793,18 @@ class Scheduler:
         else:  # embedding or reward model
             embeddings = []
             prompt_tokens = []
+            cached_tokens = []
             for req in reqs:
                 if req.finished():
                     rids.append(req.rid)
                     finished_reasons.append(req.finished_reason.to_json())
                     embeddings.append(req.embedding)
                     prompt_tokens.append(len(req.origin_input_ids))
+                    cached_tokens.append(req.cached_tokens)
             self.send_to_detokenizer.send_pyobj(
-                BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
+                BatchEmbeddingOut(
+                    rids, finished_reasons, embeddings, prompt_tokens, cached_tokens
+                )
             )
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
@@ -1860,7 +1849,7 @@ class Scheduler:
         idle_batch = ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,
-            self.token_to_kv_pool,
+            self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
@@ -1901,6 +1890,37 @@ class Scheduler:
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
+    def watchdog_thread(self):
+        """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
+        self.watchdog_last_forward_ct = 0
+        self.watchdog_last_time = time.time()
+
+        while True:
+            current = time.time()
+            if self.cur_batch is not None:
+                if self.watchdog_last_forward_ct == self.forward_ct:
+                    if current > self.watchdog_last_time + self.watchdog_timeout:
+                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+                        break
+                else:
+                    self.watchdog_last_forward_ct = self.forward_ct
+                    self.watchdog_last_time = current
+            time.sleep(self.watchdog_timeout // 2)
+
+        # Print batch size and memory pool info to check whether there are de-sync issues.
+        logger.error(
+            f"{self.cur_batch.batch_size()=}, "
+            f"{self.cur_batch.reqs=}, "
+            f"{self.token_to_kv_pool_allocator.available_size()=}, "
+            f"{self.tree_cache.evictable_size()=}, "
+        )
+        # Wait for some time so that the parent process can print the error.
+        pyspy_dump_schedulers()
+        print(file=sys.stderr, flush=True)
+        print(file=sys.stdout, flush=True)
+        time.sleep(5)
+        self.parent_process.send_signal(signal.SIGQUIT)
+
     def flush_cache_wrapped(self, recv_req: FlushCacheReq):
         self.flush_cache()
 
@@ -1912,15 +1932,14 @@ class Scheduler:
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
-            self.tree_cache_metrics = {"total": 0, "hit": 0}
             if self.grammar_backend:
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
-            self.token_to_kv_pool.clear()
+            self.token_to_kv_pool_allocator.clear()
 
             if not self.spec_algorithm.is_none():
                 self.draft_worker.model_runner.req_to_token_pool.clear()
-                self.draft_worker.model_runner.token_to_kv_pool.clear()
+                self.draft_worker.model_runner.token_to_kv_pool_allocator.clear()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
@@ -2003,6 +2022,9 @@ class Scheduler:
                     logger.debug(f"Abort running request. {req.rid=}")
                     req.to_abort = True
                     break
+
+    def _pause_engine(self) -> Tuple[List[Req], int]:
+        raise NotImplementedError()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
