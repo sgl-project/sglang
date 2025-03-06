@@ -29,8 +29,12 @@ def main():
     outputs = llm.generate(input_ids=token_ids_list, sampling_params=sampling_params)
     # Print the outputs.
     for prompt, output in zip(prompts, outputs):
+        decode_output = tokenizer.decode(output["output_ids"])
         print("===============================")
-        print(f"Prompt: {prompt}\nGenerated token ids: {output['output_ids']}")
+        print(
+            f"Prompt: {prompt}\nGenerated token ids: {output['output_ids']}\nGenerated text: {decode_output}"
+        )
+        print()
 
 
 # The __main__ condition is necessary here because we use "spawn" to create subprocesses
