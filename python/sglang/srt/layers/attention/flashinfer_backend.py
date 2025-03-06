@@ -299,7 +299,9 @@ class FlashInferAttnBackend(AttentionBackend):
                         ],
                     )
                 )
-
+                decode_wrappers[-1].begin_forward = partial(
+                    fast_decode_plan, decode_wrappers[-1]
+                )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
@@ -635,9 +637,15 @@ class FlashInferIndicesUpdaterDecode:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
-            )
+
+            if wrapper.is_cuda_graph_enabled:
+                # Directly write to the cuda graph input buffer
+                kv_indices = wrapper._paged_kv_indices_buf
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                )
+
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
