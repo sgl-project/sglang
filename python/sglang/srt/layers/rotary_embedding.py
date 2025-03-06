@@ -1168,7 +1168,8 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
-                device**extra_kwargs,
+                device,
+                **extra_kwargs,
             )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
