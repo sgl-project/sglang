@@ -60,6 +60,7 @@ class VerlEngine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -76,6 +77,7 @@ class VerlEngine:
                 return_logprob=return_logprob,
                 logprob_start_len=logprob_start_len,
                 top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
                 lora_path=lora_path,
                 custom_logit_processor=custom_logit_processor,
             )
