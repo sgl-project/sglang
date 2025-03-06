@@ -15,7 +15,7 @@ python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-In
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
 ```
-- See [hyperparameter tuning](../references/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+- See [hyperparameter tuning](hyperparameter_tuning.md) on tuning hyperparameters for better performance.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 ```
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
@@ -24,7 +24,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports other [quantization strategies (INT8/FP8)](https://github.com/sgl-project/sglang/blob/v0.3.6/python/sglang/srt/server_args.py#L671) as well.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
-- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template.md).
+- If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](custom_chat_template.md).
 
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 ```
@@ -52,7 +52,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template).
 * `is_embedding`: Set to true to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
-* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/token_in_token_out/).
+* `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/).
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
 
@@ -101,7 +101,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `stream_interval`: Interval (in tokens) for streaming responses. Smaller values lead to smoother streaming, and larger values lead to better throughput.
 * `random_seed`: Can be used to enforce more deterministic behavior.
-* `watchdog_timeout`: Adjusts the watchdog thread’s timeout before killing the server if batch generation takes too long.
+* `watchdog_timeout`: Adjusts the watchdog thread's timeout before killing the server if batch generation takes too long.
 * `download_dir`: Use to override the default Hugging Face cache directory for model weights.
 * `base_gpu_id`: Use to adjust first GPU used to distribute the model across available GPUs.
 * `allow_auto_truncate`: Automatically truncate requests that exceed the maximum input length.
@@ -117,14 +117,14 @@ Please consult the documentation below to learn more about the parameters you ma
 
 ## Multi-node distributed serving
 
-* `dist_init_addr`: The TCP address used for initializing PyTorch’s distributed backend (e.g. `192.168.0.2:25000`).
+* `dist_init_addr`: The TCP address used for initializing PyTorch's distributed backend (e.g. `192.168.0.2:25000`).
 * `nnodes`: Total number of nodes in the cluster. Refer to how to run the [Llama 405B model](https://docs.sglang.ai/references/llama_405B.html#run-405b-fp16-on-two-nodes).
 * `node_rank`: Rank (ID) of this node among the `nnodes` in the distributed setup.
 
 
 ## LoRA
 
-* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supportet with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
+* `lora_paths`: You may provide a list of adapters to your model as a list. Each batch element will get model response with the corresponding lora adapter applied. Currently `cuda_graph` and `radix_attention` are not supported with this option so you need to disable them manually. We are still working on through these [issues](https://github.com/sgl-project/sglang/issues/2929).
 * `max_loras_per_batch`: Maximum number of LoRAs in a running batch including base model.
 * `lora_backend`: The backend of running GEMM kernels for Lora modules, can be one of `triton` or `flashinfer`. Defaults to be `triton`.
 
@@ -184,5 +184,5 @@ Please consult the documentation below to learn more about the parameters you ma
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
 * `torchao_config`: Experimental feature that optimizes the model with [torchao](https://github.com/pytorch/ao). Possible choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row.
 * `triton_attention_num_kv_splits`: Use to adjust the number of KV splits in triton kernels. Default is 8.
-* `enable_flashinfer_mla`: The backend for flashinfer MLA wrapper that accelerates deepseek models.
+* `enable_flashinfer_mla`: Use the attention backend with flashinfer MLA wrapper for deepseek models. When providing this argument, `attention_backend` argument is overridden.
 * `flashinfer_mla_disable_ragged`: Disable usage of ragged prefill wrapper for flashinfer mla attention backend. Should be used when `enable_flashinfer_mla` is turned on.

@@ -156,6 +156,7 @@ class TritonAttnBackend(AttentionBackend):
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
+                    None,
                     self.req_to_token,
                 )
             )
@@ -311,6 +312,7 @@ class TritonAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
@@ -586,6 +588,7 @@ class TritonMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
+                seq_lens_cpu=None,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)

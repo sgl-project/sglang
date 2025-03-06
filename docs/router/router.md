@@ -107,7 +107,7 @@ Note:
 
 ## Routing Strategies
 
-#### Cache-Aware Load-Balancing Router
+### Cache-Aware Load-Balancing Router
 
 The native router combines two strategies to optimize both cache utilization and request distribution:
 

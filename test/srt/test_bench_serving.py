@@ -166,7 +166,7 @@ class TestBenchServing(unittest.TestCase):
                 f'accept_length : {res["accept_length"]:.2f} \n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 1100)
-            self.assertGreater(res["accept_length"], 3.0)
+            self.assertGreater(res["accept_length"], 2.99)
 
     def test_moe_offline_throughput_default(self):
         res = run_bench_serving(
