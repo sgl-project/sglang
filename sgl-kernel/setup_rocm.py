@@ -46,7 +46,7 @@ sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/allreduce/custom_all_reduce.hip",
     "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
-    "src/sgl-kernel/csrc/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_token_group_quant_fp8.cu",
 ]
 
 cxx_flags = ["-O3"]
