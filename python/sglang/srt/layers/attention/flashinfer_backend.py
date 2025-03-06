@@ -1199,7 +1199,9 @@ def fast_decode_plan(
     indptr_host = indptr.cpu()
 
     if self.use_tensor_cores:
-        kv_lens_arr_host = get_seq_lens(indptr_host, self.last_page_len, page_size)
+        kv_lens_arr_host = get_seq_lens(
+            indptr_host, self.last_page_len[: len(indptr_host) - 1], page_size
+        )
 
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
