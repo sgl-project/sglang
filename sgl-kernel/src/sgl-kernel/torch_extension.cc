@@ -90,6 +90,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
       " float eps, float fp8_min, float fp8_max) -> ()");
   m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
 
+  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
+
   m.def(
       "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
       " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
