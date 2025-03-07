@@ -427,8 +427,8 @@ void decode_attention_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_cache,
-    const scalar_t* __restrict__ v_cache,
+    const scalar_t* __restrict__ k_buffer,
+    const scalar_t* __restrict__ v_buffer,
     const index_t* __restrict__ req_to_token,
     const index_t* __restrict__ req_pool_indices,
     const index_t* __restrict__ seq_lens,
@@ -437,6 +437,10 @@ void decode_attention_kernel_impl(
     int head_size,
     int head_size_v,
     int num_kv_splits,
+    int k_strideN,
+    int k_strideH,
+    int v_strideN,
+    int v_strideH,
     float scaling,
     float logit_cap,
     int max_num_reqs,
@@ -445,18 +449,14 @@ void decode_attention_kernel_impl(
 
   using Vec = at::vec::Vectorized<float>;
 
-  // block length for k_cache and v_cache
+  // block length for k_buffer and v_buffer
   constexpr int BLOCK_N = 256;
 
   // strides
-  const int stride_q0 = num_heads * head_size;
-  const int stride_q1 = head_size;
-  const int stride_k0 = num_heads * head_size;
-  const int stride_k1 = head_size;
-  const int stride_v0 = num_heads * head_size_v;
-  const int stride_v1 = head_size_v;
-  const int stride_l1 = num_kv_splits * (head_size_v + 1);
-  const int stride_l2 = head_size_v + 1;
+  const int q_strideM = num_heads * head_size;
+  const int q_strideH = head_size;
+  const int l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int l_stride2 = head_size_v + 1;
 
   const bool has_logit_cap = logit_cap > 0;
   float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
@@ -472,7 +472,7 @@ void decode_attention_kernel_impl(
 
     for (int i = begin; i < end; ++i) {
       // get query
-      const scalar_t* __restrict__ q_ptr = query + bs * stride_q0 + head_id * stride_q1;
+      const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + head_id * q_strideH;
 
       // get key/value
       int seq_len_kv = seq_lens[bs];
@@ -498,7 +498,7 @@ void decode_attention_kernel_impl(
         // calculate s_i <- scale * Q @ K
         index_gemm_kernel_nt<scalar_t, index_t>(
             /* A   */ q_ptr,
-            /* B   */ k_cache + head_id * stride_k1,
+            /* B   */ k_buffer + head_id * k_strideH,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ scaling,
@@ -506,7 +506,7 @@ void decode_attention_kernel_impl(
             /* N   */ n_size,
             /* K   */ head_size,
             /* lda */ 1,
-            /* ldb */ stride_k0,
+            /* ldb */ k_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
 
@@ -548,7 +548,7 @@ void decode_attention_kernel_impl(
         // caculate V' <- s_delta @ V + V' * m_delta
         index_gemm_kernel_nn(
             /* A   */ s_delta,
-            /* B   */ v_cache + head_id * stride_v1,
+            /* B   */ v_buffer + head_id * v_strideH,
             /* C   */ v_prime,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ &m_delta,
@@ -556,7 +556,7 @@ void decode_attention_kernel_impl(
             /* N   */ head_size_v,
             /* K   */ n_size,
             /* lda */ 1,
-            /* ldb */ stride_v0,
+            /* ldb */ v_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
       } // loop with KV blocks
@@ -586,15 +586,15 @@ void decode_attention_kernel_impl(
     //   e_logic = std::exp(0) = 1
     //   acc = acc * m_delta + tv * e_logic = tv
     for (int i = begin; i < end; ++i) {
-      float* __restrict__ acc = attn_logits + i * stride_l1;
+      float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
       float m_prime = -std::numeric_limits<scalar_t>::infinity();
 
       // update acc with from each kv_split
       for (int kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
-        float* __restrict__ tv = acc + kv_id * stride_l2;
-        const float tlogic = (acc + kv_id * stride_l2)[head_size_v];
+        float* __restrict__ tv = acc + kv_id * l_stride2;
+        const float tlogic = (acc + kv_id * l_stride2)[head_size_v];
 
         float m_i = std::max(tlogic, m_prime);
         float m_delta = std::exp(m_prime - m_i);
@@ -619,8 +619,8 @@ void decode_attention_grouped_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_cache,
-    const scalar_t* __restrict__ v_cache,
+    const scalar_t* __restrict__ k_buffer,
+    const scalar_t* __restrict__ v_buffer,
     const index_t* __restrict__ req_to_token,
     const index_t* __restrict__ req_pool_indices,
     const index_t* __restrict__ seq_lens,
@@ -630,6 +630,10 @@ void decode_attention_grouped_kernel_impl(
     int head_size,
     int head_size_v,
     int num_kv_splits,
+    int k_strideN,
+    int k_strideH,
+    int v_strideN,
+    int v_strideH,
     float scaling,
     float logit_cap,
     int max_num_reqs,
@@ -638,21 +642,17 @@ void decode_attention_grouped_kernel_impl(
 
   using Vec = at::vec::Vectorized<float>;
 
-  // block length for k_cache and v_cache
+  // block length for k_buffer and v_buffer
   constexpr int BLOCK_N = 256;
   // block length for heads
   constexpr int BLOCK_H = 16;
 
   // strides
-  const int stride_q0 = num_heads * head_size;
-  const int stride_q1 = head_size;
-  const int stride_k0 = num_heads_kv * head_size;
-  const int stride_k1 = head_size;
-  const int stride_v0 = num_heads_kv * head_size_v;
-  const int stride_v1 = head_size_v;
-  const int stride_l0 = num_heads * num_kv_splits * (head_size_v + 1);
-  const int stride_l1 = num_kv_splits * (head_size_v + 1);
-  const int stride_l2 = head_size_v + 1;
+  const int q_strideM = num_heads * head_size;
+  const int q_strideH = head_size;
+  const int l_stride0 = num_heads * num_kv_splits * (head_size_v + 1);
+  const int l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int l_stride2 = head_size_v + 1;
 
   const bool has_logit_cap = logit_cap > 0;
   float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
@@ -681,7 +681,7 @@ void decode_attention_grouped_kernel_impl(
       const int h_size = h_end - h_start;
 
       // get query
-      const scalar_t* __restrict__ q_ptr = query + bs * stride_q0 + h_start * stride_q1;
+      const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
 
       // kv head id and valid block head size
       int head_kv_id = head_id / num_groups_per_block;
@@ -698,9 +698,9 @@ void decode_attention_grouped_kernel_impl(
       fill_stub(m_prime, -std::numeric_limits<float>::infinity(), BLOCK_H);
 
       // get v_prime, and init to zero
-      float* __restrict__ v_prime = attn_logits + bs * stride_l0 + h_start * stride_l1 + kv_id * stride_l2;
+      float* __restrict__ v_prime = attn_logits + bs * l_stride0 + h_start * l_stride1 + kv_id * l_stride2;
       for (int h = 0; h < h_size; ++h) {
-        fill_stub(v_prime + h * stride_l1, 0.f, head_size_v);
+        fill_stub(v_prime + h * l_stride1, 0.f, head_size_v);
       }
 
       // loop over K and V sequence with BLOCK_N
@@ -710,15 +710,15 @@ void decode_attention_grouped_kernel_impl(
         // calculate Q @ K
         index_gemm_kernel_nt<scalar_t, index_t>(
             /* A   */ q_ptr,
-            /* B   */ k_cache + head_kv_id * stride_k1,
+            /* B   */ k_buffer + head_kv_id * k_strideH,
             /* C   */ s_i,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ scaling,
             /* M   */ h_size,
             /* N   */ n_size,
             /* K   */ head_size,
-            /* lda */ stride_q1,
-            /* ldb */ stride_k0,
+            /* lda */ q_strideH,
+            /* ldb */ k_strideN,
             /* ldc */ BLOCK_N,
             /* mtt */ max_total_num_tokens);
 
@@ -762,7 +762,7 @@ void decode_attention_grouped_kernel_impl(
         // caculate V' <- s_delta @ V + V' * m_delta
         index_gemm_kernel_nn(
             /* A   */ s_delta,
-            /* B   */ v_cache + head_kv_id * stride_v1,
+            /* B   */ v_buffer + head_kv_id * v_strideH,
             /* C   */ v_prime,
             /* ind */ req_to_token + req_pool_id * max_context_len + n,
             /* scl */ m_delta,
@@ -770,8 +770,8 @@ void decode_attention_grouped_kernel_impl(
             /* N   */ head_size_v,
             /* K   */ n_size,
             /* lda */ BLOCK_N,
-            /* ldb */ stride_v0,
-            /* ldc */ stride_l1,
+            /* ldb */ v_strideN,
+            /* ldc */ l_stride1,
             /* mtt */ max_total_num_tokens);
       } // loop with KV blocks
 
@@ -781,10 +781,10 @@ void decode_attention_grouped_kernel_impl(
           float s = 1 / s_prime[h];
           at::vec::map<float>(
               [s](Vec out) { return out * Vec(s); },
-              v_prime + h * stride_l1,
-              v_prime + h * stride_l1,
+              v_prime + h * l_stride1,
+              v_prime + h * l_stride1,
               head_size_v);
-          (v_prime + h * stride_l1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
+          (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
       }
 
@@ -797,15 +797,15 @@ void decode_attention_grouped_kernel_impl(
   at::parallel_for(0, batches * num_heads, 0, [&] (int begin, int end) {
     // NB: same as above
     for (int i = begin; i < end; ++i) {
-      float* __restrict__ acc = attn_logits + i * stride_l1;
+      float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
       float m_prime = -std::numeric_limits<scalar_t>::infinity();
 
       // update acc with from each kv_split
       for (int kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
-        float* __restrict__ tv = acc + kv_id * stride_l2;
-        const float tlogic = (acc + kv_id * stride_l2)[head_size_v];
+        float* __restrict__ tv = acc + kv_id * l_stride2;
+        const float tlogic = (acc + kv_id * l_stride2)[head_size_v];
 
         float m_i = std::max(tlogic, m_prime);
         float m_delta = std::exp(m_prime - m_i);
@@ -827,43 +827,43 @@ void decode_attention_grouped_kernel_impl(
 
 } // anonymous namespace
 
-// query: [num_tokens, num_heads, head_size]
-// output: [num_tokens, num_heads, head_size]
-// k_cache: [max_total_num_tokens, num_heads, head_size]
-// v_cache: [max_total_num_tokens, num_heads, head_size_v]
-// attn_logits: [num_seqs, num_heads, num_kv_splits, head_size_v + 1]
-// req_to_token: [max_num_reqs, max_context_len]
+// query:            [num_tokens, num_heads, head_size]
+// output:           [num_tokens, num_heads, head_size]
+// k_buffer:         [max_total_num_tokens, num_heads, head_size]
+// v_buffer:         [max_total_num_tokens, num_heads, head_size_v]
+// attn_logits:      [num_seqs, num_heads, num_kv_splits, head_size_v + 1]
+// req_to_token:     [max_num_reqs, max_context_len]
 // req_pool_indices: [num_seqs]
-// seq_lens: [num_seqs]
+// seq_lens:         [num_seqs]
 //
 void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& output,
-    at::Tensor& k_cache,
-    at::Tensor& v_cache,
+    at::Tensor& k_buffer,
+    at::Tensor& v_buffer,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
-    double scaling,
+    double sm_scale,
     double logit_cap) {
 
   CHECK_INPUT(query);
-  CHECK_INPUT(k_cache);
-  CHECK_INPUT(v_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
   CHECK_DIM(3, query);
-  CHECK_DIM(3, k_cache);
-  CHECK_DIM(3, v_cache);
+  CHECK_DIM(3, k_buffer);
+  CHECK_DIM(3, v_buffer);
 
   int num_seqs = seq_lens.size(0);
   int max_num_reqs = req_to_token.size(0);
   int max_context_len = req_to_token.size(1);
-  int max_total_num_tokens = k_cache.size(0);
+  int max_total_num_tokens = k_buffer.size(0);
 
   int num_heads = query.size(1);
-  int num_heads_kv = k_cache.size(1);
+  int num_heads_kv = k_buffer.size(1);
   int head_size = query.size(2);
-  int head_size_v = v_cache.size(2);
+  int head_size_v = v_buffer.size(2);
 
   int num_kv_splits = attn_logits.size(2);
 
@@ -871,6 +871,12 @@ void decode_attention_cpu(
   CHECK_EQ(attn_logits.size(1), num_heads);
   CHECK_EQ(attn_logits.size(3), head_size_v + 1);
   CHECK_EQ(attn_logits.scalar_type(), at::kFloat);
+
+  // strides for k_buffer and v_buffer
+  int k_strideN = k_buffer.stride(0);
+  int k_strideH = k_buffer.stride(1);
+  int v_strideN = v_buffer.stride(0);
+  int v_strideH = v_buffer.stride(1);
 
   // make sure all the indices have the same data type
   const auto index_dtype = seq_lens.scalar_type();
@@ -885,8 +891,8 @@ void decode_attention_cpu(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(),
+            k_buffer.data_ptr<scalar_t>(),
+            v_buffer.data_ptr<scalar_t>(),
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<index_t>(),
             seq_lens.data_ptr<index_t>(),
@@ -895,7 +901,11 @@ void decode_attention_cpu(
             head_size,
             head_size_v,
             num_kv_splits,
-            scaling,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            sm_scale,
             logit_cap,
             max_num_reqs,
             max_context_len,
@@ -906,8 +916,8 @@ void decode_attention_cpu(
             output.data_ptr<scalar_t>(),
             attn_logits.data_ptr<float>(),
             query.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(),
+            k_buffer.data_ptr<scalar_t>(),
+            v_buffer.data_ptr<scalar_t>(),
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<index_t>(),
             seq_lens.data_ptr<index_t>(),
@@ -917,7 +927,11 @@ void decode_attention_cpu(
             head_size,
             head_size_v,
             num_kv_splits,
-            scaling,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            sm_scale,
             logit_cap,
             max_num_reqs,
             max_context_len,
