@@ -26,4 +26,4 @@ pip install "transformers @ git+https://github.com/huggingface/transformers.git@
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # reinstall sgl-kernel
-pip install sgl-kernel --force-reinstall --no-deps
+pip install sgl-kernel==0.0.3.post6 --force-reinstall --no-deps
