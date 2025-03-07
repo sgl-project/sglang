@@ -4,13 +4,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestHiddenState(unittest.TestCase):
     def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
@@ -80,7 +80,7 @@ class TestHiddenState(unittest.TestCase):
 
     def test_repeatedly_changes_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 

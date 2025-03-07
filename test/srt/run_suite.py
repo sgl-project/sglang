@@ -12,6 +12,8 @@ suites = {
         "models/test_generation_models.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
+        "test_gptqmodel_dynamic.py",
+        "models/test_gme_qwen_models.py",
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_custom_allreduce.py",
@@ -59,6 +61,8 @@ suites = {
         "test_w8a8_quantization.py",
         "test_fp8_kernel.py",
         "test_block_int8.py",
+        "test_int8_kernel.py",
+        "test_reasoning_content.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
