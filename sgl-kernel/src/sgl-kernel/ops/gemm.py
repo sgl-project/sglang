@@ -91,6 +91,15 @@ def sgl_per_token_group_quant_fp8(
     )
 
 
+def sgl_per_tensor_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    is_static: bool,
+) -> None:
+    torch.ops.sgl_kernels.sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
+
+
 def cublas_grouped_gemm(
     inputs: List[torch.Tensor],
     weights: List[torch.Tensor],
