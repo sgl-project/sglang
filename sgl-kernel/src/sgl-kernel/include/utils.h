@@ -109,6 +109,7 @@ using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;
 #endif
 
+#ifndef USE_ROCM
 __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
   float old;
   old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
@@ -124,3 +125,4 @@ __device__ __forceinline__ float warpReduceMax(float max_value) {
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 1));
   return max_value;
 }
+#endif
