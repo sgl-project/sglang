@@ -21,7 +21,6 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-from sglang.srt.utils import is_hip
 
 import torch
 import torch.distributed as dist
@@ -41,11 +40,6 @@ from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-if is_hip():
-    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-    from sglang.srt.layers.attention.aiter_decode_backend import AiterDecodeAttnBackend
-    
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -84,6 +78,12 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 from sglang.utils import get_exception_traceback
+
+is_hip_ = is_hip()
+
+if is_hip_:
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.aiter_decode_backend import AiterDecodeAttnBackend
 
 logger = logging.getLogger(__name__)
 
@@ -128,34 +128,115 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
         # Model-specific adjustment
+        self.model_specific_adjustment()
+
+        if server_args.show_time_cost:
+            enable_show_time_cost()
+
+        if server_args.disable_outlines_disk_cache:
+            from outlines.caching import disable_cache
+
+            disable_cache()
+
+        # Global vars
+        global_server_args_dict.update(
+            {
+                "attention_backend": server_args.attention_backend,
+                "sampling_backend": server_args.sampling_backend,
+                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+                "disable_mla": server_args.disable_mla,
+                "torchao_config": server_args.torchao_config,
+                "enable_nan_detection": server_args.enable_nan_detection,
+                "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_ep_moe": server_args.enable_ep_moe,
+                "device": server_args.device,
+                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
+                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
+                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+                "disable_radix_cache": server_args.disable_radix_cache,
+                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
+                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
+                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
+            }
+        )
+
+        # CPU offload
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+
+        # Get memory before model loading
+        min_per_gpu_memory = self.init_torch_distributed()
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
+        )
+
+        # Load the model
+        self.sampler = Sampler()
+        self.load_model()
+
+        # Apply torchao quantization
+        torchao_applied = getattr(self.model, "torchao_applied", False)
+        # In layered loading, torchao may have been applied
+        if not torchao_applied:
+            apply_torchao_config_to_model(
+                self.model, global_server_args_dict["torchao_config"]
+            )
+
+        # Apply torch TP if the model supports it
+        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+        if self.tp_size > 1 and supports_torch_tp:
+            self.apply_torch_tp()
+            self.torch_tp_applied = True
+        else:
+            self.torch_tp_applied = False
+
+        # Init lora
+        if server_args.lora_paths is not None:
+            self.init_lora_manager()
+
+        # Init memory pool and attention backends
+        self.init_memory_pool(
+            min_per_gpu_memory,
+            server_args.max_running_requests,
+            server_args.max_total_tokens,
+        )
+        if self.device == "cuda":
+            self.init_cublas()
+            self.init_attention_backend()
+            self.init_cuda_graphs()
+        else:
+            self.cuda_graph_runner = None
+            self.init_attention_backend()
+
+    def model_specific_adjustment(self):
+        server_args = self.server_args
+
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and not self.server_args.disable_mla
+            and not server_args.disable_mla
         ):
             # TODO: add MLA optimization on CPU
-            if self.server_args.device != "cpu":
+            if server_args.device != "cpu":
                 if server_args.enable_flashinfer_mla:
                     logger.info(
                         "MLA optimization is turned on. Use flashinfer mla backend."
                     )
-                    self.server_args.attention_backend = "flashinfer_mla"
+                    server_args.attention_backend = "flashinfer_mla"
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
-                    self.server_args.attention_backend = "triton"
+                    server_args.attention_backend = "triton"
 
-        if self.server_args.enable_double_sparsity:
+        if server_args.enable_double_sparsity:
             logger.info(
                 "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
             )
-            self.server_args.attention_backend = "triton"
-            self.server_args.disable_cuda_graph = True
-            if self.server_args.ds_heavy_channel_type is None:
+            server_args.attention_backend = "triton"
+            server_args.disable_cuda_graph = True
+            if server_args.ds_heavy_channel_type is None:
                 raise ValueError(
                     "Please specify the heavy channel type for double sparsity optimization."
                 )
-            self.init_double_sparsity_channel_config(
-                self.server_args.ds_heavy_channel_type
-            )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.95
@@ -180,96 +261,10 @@ class ModelRunner:
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
 
-        # Global vars
-        if server_args.show_time_cost:
-            enable_show_time_cost()
-        if server_args.disable_outlines_disk_cache:
-            from outlines.caching import disable_cache
-
-            disable_cache()
-
-        global_server_args_dict.update(
-            {
-                "attention_backend": server_args.attention_backend,
-                "sampling_backend": server_args.sampling_backend,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "disable_mla": server_args.disable_mla,
-                "torchao_config": server_args.torchao_config,
-                "enable_nan_detection": server_args.enable_nan_detection,
-                "enable_dp_attention": server_args.enable_dp_attention,
-                "enable_ep_moe": server_args.enable_ep_moe,
-                "device": server_args.device,
-                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
-                "disable_radix_cache": server_args.disable_radix_cache,
-                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
-                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
-            }
-        )
-
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
-
-        # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        # Load the model
-        self.sampler = Sampler()
-        self.load_model()
-
-        # Handle the case where some of models don't finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
-
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        # In layered loading, torchao may have been applied
-        if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
-            )
-
-        # Apply torch TP if the model supports it
-        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
-            self.apply_torch_tp()
-            self.torch_tp_applied = True
-        else:
-            self.torch_tp_applied = False
-
-        # Init memory pool and attention backends
-        if server_args.lora_paths is not None:
-            self.init_lora_manager()
-        self.init_memory_pool(
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-        )
-        if self.device == "cuda":
-            self.init_cublas()
-            self.init_attention_backend()
-            self.init_cuda_graphs()
-        else:
-            self.cuda_graph_runner = None
-            self.init_attention_backend()
-
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-        torch.get_device_module(self.device).set_device(self.gpu_id)
 
+        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
@@ -405,6 +400,18 @@ class ModelRunner:
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
         )
+
+        # Handle the case where some ranks do not finish loading.
+        try:
+            dist.monitored_barrier(
+                group=get_tp_group().cpu_group,
+                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                wait_all_ranks=True,
+            )
+        except RuntimeError:
+            raise ValueError(
+                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+            ) from None
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str
@@ -640,7 +647,7 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if is_hip():  # Using natively supported format
+            if is_hip_:  # Using natively supported format
                 self.kv_cache_dtype = torch.float8_e5m2fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
@@ -716,15 +723,6 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
-        if self.token_to_kv_pool_allocator is None:
-            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
-                device=self.device,
-            )
-        else:
-            assert self.is_draft_worker
-
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
@@ -759,6 +757,17 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+
+        if self.token_to_kv_pool_allocator is None:
+            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                kvcache=self.token_to_kv_pool,
+            )
+        else:
+            assert self.is_draft_worker
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -775,8 +784,12 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if not is_hip():
+        if is_cuda():
             if self.server_args.attention_backend == "flashinfer":
+                # Init streams
+                if self.server_args.speculative_algorithm == "EAGLE":
+                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
+
                 self.attn_backend = FlashInferAttnBackend(self)
             elif self.server_args.attention_backend == "triton":
                 assert self.sliding_window_size is None, (
@@ -799,7 +812,7 @@ class ModelRunner:
                 raise ValueError(
                     f"Invalid attention backend: {self.server_args.attention_backend}"
                 )
-        else:
+        elif is_hip_:
             # AMD hip supported attention backends
             if self.server_args.attention_backend == "aiter":
                 self.attn_backend = AiterAttnBackend(self)
@@ -820,6 +833,10 @@ class ModelRunner:
                     self.attn_backend = TritonAttnBackend(self)
             elif self.server_args.attention_backend == "torch_native":
                 self.attn_backend = TorchNativeAttnBackend(self)
+            else:
+                raise ValueError(
+                    f"Invalid attention backend: {self.server_args.attention_backend}"
+                )
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"
@@ -906,18 +923,24 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+    def forward(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         ):
-            return self.cuda_graph_runner.replay(forward_batch)
+            return self.cuda_graph_runner.replay(
+                forward_batch, skip_attn_backend_init=skip_attn_backend_init
+            )
 
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(forward_batch)
+            return self.forward_extend(
+                forward_batch, skip_attn_backend_init=skip_attn_backend_init
+            )
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:

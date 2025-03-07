@@ -83,11 +83,7 @@ setup(
             py_limited_api=True,
         ),
     ],
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
     install_requires=["torch"],
 )
