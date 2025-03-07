@@ -488,11 +488,16 @@ class SRTRunner:
                 token_ids_logprob=token_ids_logprob,
             )
         else:
-            response = self.engine.encode(prompts)
             if self.model_type == "embedding":
-                logits = [x["embedding"] for x in response]
+                response = self.engine.encode(prompt=prompts, image_data=image_data)
+                if isinstance(response, list):
+                    logits = [x["embedding"] for x in response]
+                else:
+                    logits = [response["embedding"]]
                 return ModelOutput(embed_logits=logits)
+            # reward model
             else:
+                response = self.engine.encode(prompts)
                 scores = [x["embedding"][0] for x in response]
                 return ModelOutput(scores=scores)
 
