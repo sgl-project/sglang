@@ -28,11 +28,12 @@ If you see `decode out of memory happened` occasionally but not frequently, it i
 
 ### Tune `--dp-size` and `--tp-size`
 
-Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [sglang router](../backend/sglang_router.md) for a better data parallelism rather than using `dp_size` parameter.
+Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [sglang router](../router/router.md) for a better data parallelism rather than using `dp_size` parameter.
 
 ## Avoid out-of-memory by Tuning `--chunked-prefill-size`, `--mem-fraction-static`, `--max-running-requests`
 
 If you see out of memory (OOM) errors, you can try to tune the following parameters.
+
 - If OOM happens during prefill, try to decrease `--chunked-prefill-size` to `4096` or `2048`.
 - If OOM happens during decoding, try to decrease `--max-running-requests`.
 - You can also try to decrease `--mem-fraction-static`, which reduces the memory usage of the KV cache memory pool and helps both prefill and decoding.
@@ -48,16 +49,15 @@ If you want to deploy a model on many different machines, you can ship the `torc
 
 1. Generate the cache by setting `TORCHINDUCTOR_CACHE_DIR` and running the model once.
 
-```bash
-TORCHINDUCTOR_CACHE_DIR=/root/inductor_root_cache python3 -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --enable-torch-compile
-```
+   ```bash
+   TORCHINDUCTOR_CACHE_DIR=/root/inductor_root_cache python3 -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --enable-torch-compile
+   ```
 
 2. Copy the cache folder to other machines and launch the server with `TORCHINDUCTOR_CACHE_DIR`.
 
-
 ## Tune `--schedule-policy`
 
-If the workload has many shared prefixes, use the default `--schedule-policy lpm`. `lpm` stands for longest prefix match.
+If the workload has many shared prefixes, use the default `--schedule-policy lpm`. Where `lpm` stands for longest prefix match.
 
 When you have no shared prefixes at all or you always send the requests with the shared prefixes together,
-you can try `--schedule-policy fcfs`. `fcfs` stands for first come first serve. `fcfs` has a lower scheduling overhead.
+you can try `--schedule-policy fcfs`. Where `fcfs` stands for first come first serve. This policy has a lower scheduling overhead.
