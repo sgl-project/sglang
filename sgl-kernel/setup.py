@@ -106,6 +106,7 @@ sources = [
     "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_token_quant_fp8.cu",
     "src/sgl-kernel/csrc/gemm/per_tensor_quant_fp8.cu",
     "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/speculative/eagle_utils.cu",
