@@ -29,7 +29,7 @@ fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 if _is_cuda:
-    from sgl_kernel import sgl_per_token_group_quant_fp8
+    from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,25 @@ def sglang_per_token_group_quant_fp8(
     )
 
     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+
+    return x_q, x_s
+
+
+def sglang_per_token_quant_fp8(
+    x: torch.Tensor,
+    dtype: torch.dtype = fp8_type_,
+):
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_s = torch.empty(
+        x.shape[0],
+        1,
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 

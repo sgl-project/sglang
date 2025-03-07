@@ -28,6 +28,8 @@ _is_cuda = torch.cuda.is_available() and torch.version.cuda
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm
 
+    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+
     if use_vllm_cutlass_w8a8_fp8_kernel:
         from vllm import _custom_ops as ops
     else:
@@ -208,9 +210,12 @@ def apply_fp8_linear(
         )
     else:
         # default use per-token quantization if dynamic
-        qinput, x_scale = per_token_group_quant_fp8(
-            input_2d, group_size=input_2d.shape[1]
-        )
+        if _is_cuda:
+            qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+        else:
+            qinput, x_scale = per_token_group_quant_fp8(
+                input_2d, group_size=input_2d.shape[1]
+            )
 
     if cutlass_fp8_supported:
         if use_vllm_cutlass_w8a8_fp8_kernel:
