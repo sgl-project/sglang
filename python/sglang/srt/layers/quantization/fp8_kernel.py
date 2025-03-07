@@ -18,10 +18,10 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+import deep_gemm
 import torch
 import triton
 import triton.language as tl
-import deep_gemm
 
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
@@ -35,6 +35,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
+
 
 @triton.jit
 def _per_token_group_quant_fp8(

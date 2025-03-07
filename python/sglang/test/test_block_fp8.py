@@ -1,6 +1,6 @@
 import itertools
-import unittest
 import os
+import unittest
 
 import torch
 
@@ -214,7 +214,11 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
     if not _enable_jit_deepgemm:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]
-        NKs = [(N, K) for N in [128, 512, 1024, 4096, 7748, 13824] for K in [256, 4096, 5120, 3884, 13824]]
+        NKs = [
+            (N, K)
+            for N in [128, 512, 1024, 4096, 7748, 13824]
+            for K in [256, 4096, 5120, 3884, 13824]
+        ]
         # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
         BLOCK_SIZE = [[128, 128]]
         SEEDS = [0]
@@ -223,16 +227,16 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
         OUT_DTYPES = [torch.bfloat16]
         M = [64, 128, 512, 1024, 4096]
         NKs = [
-                (1536, 7168),
-                (3072, 1536),
-                (24576, 7168),
-                (4096, 512),
-                (7168, 2048),
-                (4608, 7168),
-                (512, 7168),
-                (7168, 2304),
-                (7168, 512),
-            ]
+            (1536, 7168),
+            (3072, 1536),
+            (24576, 7168),
+            (4096, 512),
+            (7168, 2048),
+            (4608, 7168),
+            (512, 7168),
+            (7168, 2304),
+            (7168, 512),
+        ]
         BLOCK_SIZE = [[128, 128]]
         SEEDS = [0]
 
@@ -268,7 +272,7 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
                 A_fp8, B_fp8, As, Bs, block_size, out_dtype
             )
             out = w8a8_block_fp8_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-        
+
         self.assertTrue(
             torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
             / torch.mean(torch.abs(ref_out.to(torch.float32)))
