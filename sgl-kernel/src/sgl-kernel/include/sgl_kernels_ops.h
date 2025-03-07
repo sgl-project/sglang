@@ -161,4 +161,4 @@ void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, 
                                 torch::Tensor new_kv);
 
 // sgl_per_token_quant_fp8
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
+void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
