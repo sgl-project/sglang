@@ -13,6 +13,7 @@ suites = {
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "test_gptqmodel_dynamic.py",
+        "models/test_gme_qwen_models.py",
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_custom_allreduce.py",
