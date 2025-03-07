@@ -44,6 +44,6 @@ curl -X POST http://localhost:8000/generate_stream  -H "Content-Type: applicatio
 
 This will send both non-streaming and streaming requests to the server.
 
-### [Token-In-Token-Out for RLHF](./token_in_token_out)
+### [Token-In-Token-Out for RLHF](../token_in_token_out)
 
 In this example, we launch an SGLang engine, feed tokens as input and generate tokens as output.
