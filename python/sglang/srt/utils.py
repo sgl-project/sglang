@@ -1269,7 +1269,8 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
         x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
     else:
-        return x_
+        # return x_
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
 
     x_ = x_.permute(0, 1, 3, 4, 2, 5)
     x_ = x_.contiguous()
