@@ -160,3 +160,6 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
 void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
                                 const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
                                 torch::Tensor new_kv);
+
+// sgl_per_token_quant_fp8
+void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
