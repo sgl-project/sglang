@@ -105,7 +105,6 @@ C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max
 #else
 #include <c10/util/Float8_e4m3fnuz.h>
 
-#include "amd/quant_utils.cuh"
 using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;
 #endif
