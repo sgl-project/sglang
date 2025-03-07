@@ -122,11 +122,15 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
 
-  int const hidden_size = input.size(-1);
-  int const num_tokens = input.numel() / hidden_size;
+  const auto input_sizes = input.sizes();
+  const int64_t num_tokens = input_sizes[0];
+  const int64_t hidden_dim = input_sizes[1];
 
-  dim3 grid(num_tokens);
-  dim3 block(std::min(hidden_size, 1024));
+  const int block_size = 128;
+  const int num_blocks = num_tokens;
+
+  dim3 grid(num_blocks);
+  dim3 block(block_size);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
