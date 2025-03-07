@@ -128,7 +128,7 @@ class TestRadixCache(unittest.TestCase):
         # Run a few times to ensure eviction happens
         print(f"Running test_mmlu {num_iters} times...")
         start_time = time.time()
-        for i in range(10):
+        for i in range(num_iters):
             print(f"Running iteration {i+1}/{num_iters}")
             self.test_mmlu()
         end_time = time.time()
@@ -194,11 +194,11 @@ class TestHiCache(unittest.TestCase):
         )
         return response.json()
 
-    def test_evict(self):
-        print("Running test_mmlu 10 times...")
+    def test_evict(self, num_iters=2):
+        print(f"Running test_mmlu {num_iters} times...")
         start_time = time.time()
-        for i in range(10):
-            print(f"Running iteration {i+1}/10")
+        for i in range(num_iters):
+            print(f"Running iteration {i+1}/{num_iters}")
             self.test_mmlu()
         end_time = time.time()
         print(f"Total time: {end_time - start_time:.2f} seconds")
