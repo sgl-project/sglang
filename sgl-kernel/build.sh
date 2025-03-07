@@ -16,6 +16,7 @@ docker run --rm \
     bash -c "
     ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.} && \
     ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools>=75.0 wheel numpy && \
+    ${PYTHON_ROOT_PATH}/bin/python -c "import setuptools; import sys; print('Setuptools path:', setuptools.__file__); print('Python path priority:', sys.path)" && \
     export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
     export CUDA_VERSION=${CUDA_VERSION} && \
     export SGL_KERNEL_ENABLE_BF16=1 && \
