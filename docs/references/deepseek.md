@@ -1,15 +1,69 @@
-# DeepSeek Model Usage and Optimizations
+# DeepSeek Usage
 
 SGLang provides several optimizations specifically designed for the DeepSeek model to boost its inference speed. This document outlines current optimizations for DeepSeek. Additionally, the SGLang team is actively developing enhancements for [DeepSeek V3](https://github.com/sgl-project/sglang/issues/2591).
 
 ## Launch DeepSeek V3 with SGLang
 
-SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3).
+SGLang is recognized as one of the top engines for [DeepSeek model inference](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3). To run DeepSeek V3/R1 models, the requirements are as follows:
+
+| Weight Type | Configuration |
+|------------|-------------------|
+| **Full precision FP8**<br>*(recommended)* | 8 x H200 |
+| | 8 x MI300X |
+| | 2 x 8 x H100/800/20 |
+| **Full precision BF16** | 2 x 8 x H200 |
+| | 2 x 8 x MI300X |
+| | 4 x 8 x H100/800/20 |
+| | 4 x 8 x A100/A800 |
+| **Quantized weights (AWQ)** | 8 x H100/800/20 |
+| | 8 x A100/A800 |
+| **Quantized weights (int8)** | 16 x A100/800 |
+
+<style>
+.md-typeset__table {
+  width: 100%;
+}
+
+.md-typeset__table table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  border: 2px solid var(--md-typeset-table-color);
+  table-layout: fixed;
+}
+
+.md-typeset__table th {
+  border: 1px solid var(--md-typeset-table-color);
+  border-bottom: 2px solid var(--md-typeset-table-color);
+  background-color: var(--md-default-bg-color--lighter);
+  padding: 12px;
+}
+
+.md-typeset__table td {
+  border: 1px solid var(--md-typeset-table-color);
+  padding: 12px;
+}
+
+.md-typeset__table tr:nth-child(2n) {
+  background-color: var(--md-default-bg-color--lightest);
+}
+</style>
+
+Detailed commands for reference:
+
+- [8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended)
+- [8 x MI300X](https://docs.sglang.ai/references/amd.html#running-deepseek-v3)
+- [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes)
+- [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
+- [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
+- [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 
 ### Download Weights
 
-If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3]([https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only)) offical guide to download the weights.
+If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
 
+### Caching `torch.compile`
+
+The DeepSeek series have huge model weights, it takes some time to compile the model with `torch.compile` for the first time if you have added the flag `--enable-torch-compile`. You can refer [here](https://docs.sglang.ai/backend/hyperparameter_tuning.html#try-advanced-options) to optimize the caching of compilation results, so that the cache can be used to speed up the next startup.
 ### Launch with One node of 8 H200
 
 Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended). **Note that Deepseek V3 is already in FP8. So we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.** Also, `--enable-dp-attention` can be useful to improve for Deepseek V3/R1's throughput. Please refer to [Data Parallelism Attention](https://docs.sglang.ai/references/deepseek.html#multi-head-latent-attention-mla-throughput-optimizations) for detail.
@@ -30,7 +84,7 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - **Weight Absorption**: By applying the associative law of matrix multiplication to reorder computation steps, this method balances computation and memory access and improves efficiency in the decoding phase.
 
-- **Triton Decoding Kernel Optimization**: In the MLA decoding kernel, there is only one KV head. This optimization reduces memory access to the KV cache by processing multiple query heads within one block, accelerating the decoding process.
+- **Flashinfer MLA Wrapper**: By providing `--enable-flashinfer-mla` argument, the server will use MLA kernels customized by Flashinfer. More details can be referred to [this document](https://docs.flashinfer.ai/api/mla.html). Under long input scenarios, flashinfer mla can improve performance significantly. Optimized triton kernels will be used when flashinfer mla is turned off.
 
 - **FP8 Quantization**: W8A8 FP8 and KV Cache FP8 quantization enables efficient FP8 inference. Additionally, we have implemented Batched Matrix Multiplication (BMM) operator to facilitate FP8 inference in MLA with weight absorption.
 
@@ -78,20 +132,12 @@ Overall, with these optimizations, we have achieved up to a 7x acceleration in o
 
 **Usage**: turn on by default for DeepSeek V3 models.
 
-### Cublas Grouped Gemm
+### Reasoning Content for DeepSeek R1
 
-**Description**: [Grouped Gemm API](https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmgroupedbatchedex) provided by Cublas 12.5 is attached to SGLang for acceleration of
-settings where a group of matrix multiplication with different shapes needs to be executed. Typical examples are expert parallel in MoE layers, and lora modules in multi-serving Lora layers.
+See [Separate Reasoning](https://docs.sglang.ai/backend/separate_reasoning.html).
 
-**Usage**: SGLang currently only supports Pytorch 2.5, which is installed with Cuda 12.4 packages together. Users need to work on a Cuda environment >= 12.5 and forcely upgrade the Cublas package in the following way:
+## FAQ
 
-1. Make sure the system Cuda version is >= 12.5 with `nvcc -V`
-2. Install sglang under instruction of [official document ](https://docs.sglang.ai/start/install.html)
-3. Reinstall cublas 12.5 through `pip install nvidia-cublas-cu12==12.5.3.2` so that the cublas package is upgraded
-4. Compile the new sgl-kernel library with `cd sgl-kernel && make build`
+1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
 
-Then the cublas grouped gemm kernel can be imported with
-```python
-from sgl_kernel import cublas_grouped_gemm
-```
-Currently Cublas only support grouped gemm kernel for fp16/bf16/fp32 tensors, so fp8 tensors cannot be applied.
+    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.

@@ -1,1 +1,3 @@
-python3 -m http.server --d _build/html
+# Clean and serve documentation with auto-build
+make clean
+make serve

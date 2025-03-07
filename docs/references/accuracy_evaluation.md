@@ -52,7 +52,7 @@ These adjustments should return the desired accuracy.
 ## Extending Evaluation Capabilities
 
 1. **Contribute New Benchmarks**
-   * Follow our [contribution guidelines](https://docs.sglang.ai/references/contribution_guide.html) to add new test scripts
+   * Follow our [contribution guidelines](../references/contribution_guide.md) to add new test scripts
 2. **Request Implementations**
    * Feel free to open an issue describing your evaluation needs
 3. **Use Alternative Tools**
