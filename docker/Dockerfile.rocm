@@ -65,6 +65,8 @@ RUN git clone ${FLASH_REPO} \
     && cd flashinfer \
     && git checkout ${FLASH_COMMIT} \
     && git submodule update --init --recursive \
+    && git checkout flashinfer/jit/aot_config.py \
+    && pip install --no-build-isolation --verbose --editable . \
     && PYTORCH_ROCM_ARCH="native gfx942" FLASHINFER_ENABLE_AOT=1 FLASHINFER_ENABLE_SM90=0 pip install --no-build-isolation --verbose --editable .
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
