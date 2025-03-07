@@ -37,7 +37,7 @@ runtime_common = [
     "uvloop",
     "xgrammar==0.1.14",
     "ninja",
-    "transformers==4.49.0",
+    "transformers @ git+https://github.com/huggingface/transformers.git@84f0186",
     "llguidance>=0.6.15",
     "datasets"
 ]

@@ -20,7 +20,7 @@ pip install flashinfer_python==0.2.2.post1 --find-links ${FLASHINFER_REPO} --for
 
 pip install torch_memory_saver --force-reinstall
 
-pip install transformers==4.49.0 sentence_transformers accelerate peft pandas datasets
+pip install "transformers @ git+https://github.com/huggingface/transformers.git@84f0186" sentence_transformers accelerate peft pandas datasets
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
