@@ -22,6 +22,7 @@ from sgl_kernel.ops.activation import (
 from sgl_kernel.ops.allreduce import *
 from sgl_kernel.ops.attention import lightning_attention_decode
 from sgl_kernel.ops.gemm import (
+    awq_dequantize,
     bmm_fp8,
     cublas_grouped_gemm,
     fp8_blockwise_scaled_mm,

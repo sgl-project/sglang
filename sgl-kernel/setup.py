@@ -101,6 +101,7 @@ sources = [
     "src/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu",
     "src/sgl-kernel/csrc/allreduce/trt_reduce_kernel.cu",
     "src/sgl-kernel/csrc/attention/lightning_attention_decode_kernel.cu",
+    "src/sgl-kernel/csrc/gemm/awq_kernel.cu",
     "src/sgl-kernel/csrc/gemm/cublas_grouped_gemm.cu",
     "src/sgl-kernel/csrc/gemm/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
