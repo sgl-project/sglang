@@ -39,6 +39,13 @@ void decode_attention_cpu(at::Tensor& query, at::Tensor& output,
     at::Tensor& req_to_token, at::Tensor& req_pool_indices,
     at::Tensor& seq_lens, double scaling, double logit_cap);
 
+// weight prepack
+at::Tensor convert_weight_packed(at::Tensor& weight);
+
+// fused moe
+at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
+    at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool is_vnni);
+
 // shared memory init
 void initialize(int size, int rank);
 
@@ -58,6 +65,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // decode
   m.def("decode_attention_cpu", &decode_attention_cpu, "Attention decoding for CPU");
+
+  // weight prepack
+  m.def("convert_weight_packed", &convert_weight_packed, "prepack weight to vnni format for intel AMX");
+
+  // moe
+  m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");
 
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");
