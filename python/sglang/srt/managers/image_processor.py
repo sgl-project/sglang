@@ -457,24 +457,28 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
     ):
         pass #TODO(Xiao)
 
-    async def _process_images(self, images, input_text) -> dict:
+    async def _process_single_image(self, image_data: Union[bytes, str]):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.executor,
-                PaliGemmaImageProcessor._process_images_task,
-                images,
-                input_text,
+                PaliGemmaImageProcessor._process_single_image_task
+                image_data,
             )
         else:
-            return self._process_images_task(images, input_text)
+            return self._process_single_image_task(image_data)
 
-
-    async def _process_single_image(self, image_data: Union[bytes, str]):
-        pass #TODO(Xiao)
-
-    async def _process_single_image(self, image_data: Union[bytes, str]):
+    async def process_images_async(
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        *args,
+        **kwargs,
+    ):
         pass  #TODO(Xiao)
+
+
         
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
