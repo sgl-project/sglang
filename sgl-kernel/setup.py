@@ -16,6 +16,9 @@
 import os
 import sys
 from pathlib import Path
+import shutil
+from setuptools.command.bdist_wheel import bdist_wheel
+from setuptools.command.build_py import build_py
 
 import torch
 from setuptools import find_packages, setup
@@ -52,6 +55,8 @@ operator_namespace = "sgl_kernel"
 cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
+turbomind = root / "3rdparty" / "turbomind"
+deepgemm = root / "3rdparty" / "deepgemm"
 include_dirs = [
     root / "include",
     root / "csrc",
@@ -62,6 +67,57 @@ include_dirs = [
     flashinfer.resolve() / "csrc",
     "cublas",
 ]
+
+deepgemm_third_party_include_dirs = (
+    'third-party/cutlass/include/cute',
+    'third-party/cutlass/include/cutlass',
+)
+class PostDevelopCommand(bdist_wheel):
+    def run(self):
+        bdist_wheel.run(self)
+        self.make_jit_include_symlinks()
+
+    @staticmethod
+    def make_jit_include_symlinks():
+        current_dir = str(deepgemm.resolve())
+        # Make symbolic links of third-party include directories
+        for d in deepgemm_third_party_include_dirs:
+            dirname = d.split('/')[-1]
+            src_dir = f'{current_dir}/{d}'
+            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}'
+            assert os.path.exists(src_dir)
+            if os.path.exists(dst_dir):
+                assert os.path.islink(dst_dir)
+                os.unlink(dst_dir)
+            os.symlink(src_dir, dst_dir, target_is_directory=True)
+
+class CustomBuildPy(build_py):
+    def run(self):
+        # First, prepare the include directories
+        self.prepare_includes()
+
+        # Then run the regular build
+        build_py.run(self)
+
+    def prepare_includes(self):
+        # Create temporary build directory instead of modifying package directory
+        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        os.makedirs(build_include_dir, exist_ok=True)
+
+        current_dir = str(deepgemm.resolve())
+
+        # Copy third-party includes to the build directory
+        for d in deepgemm_third_party_include_dirs:
+            dirname = d.split('/')[-1]
+            src_dir = os.path.join(current_dir, d)
+            dst_dir = os.path.join(build_include_dir, dirname)
+
+            # Remove existing directory if it exists
+            if os.path.exists(dst_dir):
+                shutil.rmtree(dst_dir)
+
+            # Copy the directory
+            shutil.copytree(src_dir, dst_dir)
 
 nvcc_flags = [
     "-DNDEBUG",
@@ -174,6 +230,12 @@ setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    cmdclass={
+        "build_ext": BuildExtension.with_options(
+            use_ninja=True
+        ),
+        "bdist_wheel": PostDevelopCommand,
+        "build_py": CustomBuildPy,
+    },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

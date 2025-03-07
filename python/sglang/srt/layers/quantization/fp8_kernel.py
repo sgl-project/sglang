@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+import deep_gemm
 
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
@@ -33,6 +34,7 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
 @triton.jit
 def _per_token_group_quant_fp8(
@@ -728,28 +730,37 @@ def w8a8_block_fp8_matmul(
         else _w8a8_block_fp8_matmul
     )
 
-    kernel[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        **config,
-    )
+    if _enable_jit_deepgemm:
+        deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+    else:
+        kernel = (
+            _w8a8_block_fp8_matmul_unrolledx4
+            if (is_hip_ == True and num_workgroups <= get_device_core_count())
+            else _w8a8_block_fp8_matmul
+        )
+
+        kernel[grid](
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            **config,
+        )
 
     return C
