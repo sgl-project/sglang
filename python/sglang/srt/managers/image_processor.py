@@ -457,6 +457,18 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
     ):
         pass #TODO(Xiao)
 
+    async def _process_images(self, images, input_text) -> dict:
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                PaliGemmaImageProcessor._process_images_task,
+                images,
+                input_text,
+            )
+        else:
+            return self._process_images_task(images, input_text)
+
 
     async def _process_single_image(self, image_data: Union[bytes, str]):
         pass #TODO(Xiao)
