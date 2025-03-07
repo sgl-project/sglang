@@ -29,7 +29,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
-    ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
@@ -54,7 +53,6 @@ from sglang.srt.utils import (
 )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
-WEIGHT_SCALE_SUPPORTED = ["tensor", "channel", "block"]
 
 is_hip_ = is_hip()
 
@@ -70,7 +68,6 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
-        weight_scale_type: str = "tensor",
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -80,13 +77,9 @@ class Fp8Config(QuantizationConfig):
             )
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
-        if weight_scale_type not in WEIGHT_SCALE_SUPPORTED:
-            raise ValueError(f"Unsupported weight scale type {weight_scale_type}")
         self.activation_scheme = activation_scheme
-        self.weight_scale_type = weight_scale_type
         self.ignored_layers = ignored_layers or []
         if weight_block_size is not None:
-            self.weight_scale_type = "block"
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
                     f"The block-wise quantization only supports fp8-serialized checkpoint for now."
@@ -124,16 +117,11 @@ class Fp8Config(QuantizationConfig):
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        # Default weight scale type is per-tensor
-        weight_scale_type = cls.get_from_keys_or(
-            config, ["weight_scale_type"], "tensor"
-        )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
-            weight_scale_type=weight_scale_type,
         )
 
     def get_quant_method(
@@ -272,21 +260,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
-                if self.quant_config.weight_scale_type == "tensor":
-                    scale = PerTensorScaleParameter(
-                        data=torch.empty(
-                            len(output_partition_sizes), dtype=torch.float32
-                        ),
-                        weight_loader=weight_loader,
-                    )
-                else:
-                    scale = ChannelQuantScaleParameter(
-                        data=torch.empty(
-                            output_size_per_partition, 1, dtype=torch.float32
-                        ),
-                        output_dim=0,
-                        weight_loader=weight_loader,
-                    )
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale", scale)
 
@@ -296,6 +273,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                     weight_loader=weight_loader,
                 )
+
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("input_scale", scale)
             else:
@@ -353,35 +331,32 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.input_scale = torch.nn.Parameter(
                     layer.input_scale.data, requires_grad=False
                 )
-            weight = layer.weight
-            weight_scale = layer.weight_scale
 
-            # Dequant -> Quant with max scale so we can run per tensor.
-            if self.quant_config.weight_scale_type == "tensor":
-                if self.cutlass_fp8_supported or self.use_marlin:
-                    weight_scale = convert_to_channelwise(
-                        layer.weight_scale, layer.logical_widths
-                    )
-                else:
-                    # If ROCm, normalize the weights and scales to e4m3fnuz
-                    if is_hip():
-                        weight, weight_scale, input_scale = (
-                            normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
-                                input_scale=layer.input_scale,
-                            )
-                        )
-                        if input_scale is not None:
-                            layer.input_scale = Parameter(
-                                input_scale, requires_grad=False
-                            )
-
-                    weight_scale, weight = requantize_with_max_scale(
+            # cutlass sgl-kernel and marlin only support per-channel scale
+            if self.cutlass_fp8_supported or self.use_marlin:
+                weight = layer.weight
+                weight_scale = convert_to_channelwise(
+                    layer.weight_scale, layer.logical_widths
+                )
+            else:
+                # Dequant -> Quant with max scale so we can run per tensor.
+                weight = layer.weight
+                weight_scale = layer.weight_scale
+                # If ROCm, normalize the weights and scales to e4m3fnuz
+                if is_hip():
+                    weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                         weight=weight,
                         weight_scale=weight_scale,
-                        logical_widths=layer.logical_widths,
+                        input_scale=layer.input_scale,
                     )
+                    if input_scale is not None:
+                        layer.input_scale = Parameter(input_scale, requires_grad=False)
+
+                weight_scale, weight = requantize_with_max_scale(
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    logical_widths=layer.logical_widths,
+                )
 
             # Update layer with new values.
             layer.weight = Parameter(weight.t(), requires_grad=False)
