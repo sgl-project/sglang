@@ -43,7 +43,6 @@ def test_per_token_quant_compare_implementations(
 
     vllm_out, vllm_scale = vllm_per_token_quant_fp8(x)
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
-    print(sglang_out)
 
     torch.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(
