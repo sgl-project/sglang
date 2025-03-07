@@ -135,8 +135,6 @@ class TokenToKVPoolAllocator:
         self.free_group = []
         self.clear()
 
-        self.layer_transfer_counter = None
-
         self._kvcache = kvcache
 
     def available_size(self):
@@ -207,6 +205,8 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
         self.layer_num = layer_num
         self._create_buffers()
+
+        self.layer_transfer_counter = None
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -491,7 +491,7 @@ class MHATokenToKVPoolHost:
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 2.0,
+        host_to_device_ratio: float = 3.0,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
