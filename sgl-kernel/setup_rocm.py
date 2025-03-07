@@ -38,6 +38,7 @@ def _get_version():
 operator_namespace = "sgl_kernels"
 include_dirs = [
     root / "src" / "sgl-kernel" / "include",
+    root / "src" / "sgl-kernel" / "include" / "impl",
     root / "src" / "sgl-kernel" / "csrc",
 ]
 
@@ -45,6 +46,9 @@ sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
     "src/sgl-kernel/csrc/allreduce/custom_all_reduce.hip",
     "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/activation/amd/fused_mul_and_silu_kernel.cu",
+    "src/sgl-kernel/csrc/activation/amd/fused_mul_and_gelu_tanh_kernel.cu",
+    "src/sgl-kernel/csrc/activation/amd/fused_mul_and_gelu_kernel.cu",
 ]
 
 cxx_flags = ["-O3"]
