@@ -430,8 +430,8 @@ void decode_attention_kernel_impl(
     const scalar_t* __restrict__ k_buffer,
     const scalar_t* __restrict__ v_buffer,
     const index_t* __restrict__ req_to_token,
-    const index_t* __restrict__ req_pool_indices,
-    const index_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
     int batches,
     int num_heads,
     int head_size,
@@ -546,7 +546,7 @@ void decode_attention_kernel_impl(
         m_prime = m_i;
 
         // caculate V' <- s_delta @ V + V' * m_delta
-        index_gemm_kernel_nn(
+        index_gemm_kernel_nn<scalar_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_id * v_strideH,
             /* C   */ v_prime,
@@ -622,8 +622,8 @@ void decode_attention_grouped_kernel_impl(
     const scalar_t* __restrict__ k_buffer,
     const scalar_t* __restrict__ v_buffer,
     const index_t* __restrict__ req_to_token,
-    const index_t* __restrict__ req_pool_indices,
-    const index_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ seq_lens,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -760,7 +760,7 @@ void decode_attention_grouped_kernel_impl(
         }
 
         // caculate V' <- s_delta @ V + V' * m_delta
-        index_gemm_kernel_nn(
+        index_gemm_kernel_nn<scalar_t, index_t>(
             /* A   */ s_delta,
             /* B   */ v_buffer + head_kv_id * v_strideH,
             /* C   */ v_prime,
@@ -832,9 +832,9 @@ void decode_attention_grouped_kernel_impl(
 // k_buffer:         [max_total_num_tokens, num_heads, head_size]
 // v_buffer:         [max_total_num_tokens, num_heads, head_size_v]
 // attn_logits:      [num_seqs, num_heads, num_kv_splits, head_size_v + 1]
-// req_to_token:     [max_num_reqs, max_context_len]
-// req_pool_indices: [num_seqs]
-// seq_lens:         [num_seqs]
+// req_to_token:     [max_num_reqs, max_context_len] int32 or int64
+// req_pool_indices: [num_seqs] int64
+// seq_lens:         [num_seqs] int64
 //
 void decode_attention_cpu(
     at::Tensor& query,
@@ -878,10 +878,17 @@ void decode_attention_cpu(
   int v_strideN = v_buffer.stride(0);
   int v_strideH = v_buffer.stride(1);
 
-  // make sure all the indices have the same data type
-  const auto index_dtype = seq_lens.scalar_type();
-  CHECK_EQ(req_to_token.scalar_type(), index_dtype);
-  CHECK_EQ(req_pool_indices.scalar_type(), index_dtype);
+  // check index data types
+  const auto index_dtype = req_to_token.scalar_type();
+  TORCH_CHECK(index_dtype == at::kInt || index_dtype == at::kLong,
+      "decode: expect req_to_token to be int32 or int64, got ",
+      index_dtype);
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong,
+      "decode: expect req_lens to be int64, got ",
+      seq_lens.scalar_type());
+  TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong,
+      "decode: expect req_pool_indices to be int64, got ",
+      req_pool_indices.scalar_type());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
@@ -894,8 +901,8 @@ void decode_attention_cpu(
             k_buffer.data_ptr<scalar_t>(),
             v_buffer.data_ptr<scalar_t>(),
             req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<index_t>(),
-            seq_lens.data_ptr<index_t>(),
+            req_pool_indices.data_ptr<int64_t>(),
+            seq_lens.data_ptr<int64_t>(),
             num_seqs,
             num_heads,
             head_size,
@@ -919,8 +926,8 @@ void decode_attention_cpu(
             k_buffer.data_ptr<scalar_t>(),
             v_buffer.data_ptr<scalar_t>(),
             req_to_token.data_ptr<index_t>(),
-            req_pool_indices.data_ptr<index_t>(),
-            seq_lens.data_ptr<index_t>(),
+            req_pool_indices.data_ptr<int64_t>(),
+            seq_lens.data_ptr<int64_t>(),
             num_seqs,
             num_heads,
             num_heads_kv,
