@@ -16,9 +16,11 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
-
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="testx"
+
+ARG FLASH_REPO="https://github.com/HaiShaw/flashinfer.git"
+ARG FLASH_COMMIT="testx"
 
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -58,6 +60,12 @@ RUN git clone ${AITER_REPO} \
     && git checkout ${AITER_COMMIT} \
     && git submodule update --init --recursive \
     && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
+
+RUN git clone ${FLASH_REPO} \
+    && cd flashinfer \
+    && git checkout ${FLASH_COMMIT} \
+    && git submodule update --init --recursive \
+    && PYTORCH_ROCM_ARCH="native gfx942" FLASHINFER_ENABLE_AOT=1 FLASHINFER_ENABLE_SM90=0 pip install --no-build-isolation --verbose --editable .
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
