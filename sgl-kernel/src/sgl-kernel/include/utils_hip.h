@@ -41,10 +41,10 @@ struct cuda_error : public std::runtime_error {
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
-    hipError_t e = cmd;                                                \
-    if (e != hipSuccess) {                                             \
+    hipError_t e = cmd;                                                 \
+    if (e != hipSuccess) {                                              \
       std::stringstream _message;                                       \
-      auto s = hipGetErrorString(e);                                   \
+      auto s = hipGetErrorString(e);                                    \
       _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
       throw cuda_error(_message.str());                                 \
     }                                                                   \
