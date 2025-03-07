@@ -272,28 +272,27 @@ class HiRadixCache(RadixCache):
 
         return last_node, prefix_indices
 
-    def _match_prefix_helper(
-        self, node: TreeNode, key: List, value, last_node: TreeNode
-    ):
+    def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
-        if len(key) == 0:
-            return
-
-        if key[0] in node.children.keys():
+        value = []
+        while len(key) > 0 and key[0] in node.children.keys():
             child = node.children[key[0]]
+            child.last_access_time = time.time()
             prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
-                last_node[0] = new_node
+                node = new_node
+                break
             else:
                 self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
-                last_node[0] = child
-                self._match_prefix_helper(child, key[prefix_len:], value, last_node)
+                node = child
+                key = key[prefix_len:]
+        return value, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # child node split into new_node -> child
