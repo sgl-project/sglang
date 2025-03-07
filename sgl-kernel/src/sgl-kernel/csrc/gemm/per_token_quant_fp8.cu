@@ -23,13 +23,6 @@ using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;
 #endif
 
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
-  float old;
-  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
-                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-  return old;
-}
-
 __device__ __forceinline__ float warpReduceMax(float max_value) {
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 16));
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 8));
@@ -41,8 +34,8 @@ __device__ __forceinline__ float warpReduceMax(float max_value) {
 
 template <typename T>
 __global__ void per_token_quant_fp8_kernel(const T* __restrict__ input, FP8_TYPE* __restrict__ output_q,
-                                                   float* __restrict__ output_s, const int64_t hidden_dim,
-                                                   const int64_t num_tokens) {
+                                           float* __restrict__ output_s, const int64_t hidden_dim,
+                                           const int64_t num_tokens) {
   const int token_idx = blockIdx.x;
 
   if (token_idx >= num_tokens) return;
@@ -129,15 +122,11 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
 
-  const auto input_sizes = input.sizes();
-  const int64_t num_tokens = input_sizes[0];
-  const int64_t hidden_dim = input_sizes[1];
+  int const hidden_size = input.size(-1);
+  int const num_tokens = input.numel() / hidden_size;
 
-  const int block_size = 128;
-  const int num_blocks = num_tokens;
-
-  dim3 grid(num_blocks);
-  dim3 block(block_size);
+  dim3 grid(num_tokens);
+  dim3 block(std::min(hidden_size, 1024));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

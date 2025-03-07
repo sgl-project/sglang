@@ -52,7 +52,7 @@ def calculate_diff(batch_size: int, seq_len: int):
 
 
 batch_size_range = [16, 32, 64, 128]
-seq_len_range = [64, 128, 256, 512, 1024, 2048]
+seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
 
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
