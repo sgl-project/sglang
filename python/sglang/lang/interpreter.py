@@ -763,6 +763,10 @@ class StreamExecutor:
             "dtype",
             "regex",
             "json_schema",
+            "boosted_tokens",
+            "max_boost_fraction",
+            "ramp_tokens",
+            "boost_type",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:

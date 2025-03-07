@@ -48,6 +48,10 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_frequency_penalties)
+        print('in frequency penalty:')
+        print('logits after: ', logits[0,:20])
+        print('max logit: ', logits.max())
+        print('min logit: ', logits.min())
 
     def _filter(self, keep_indices: torch.Tensor):
         self.frequency_penalties = self.frequency_penalties[keep_indices]

@@ -124,10 +124,6 @@ class SamplingParams:
                 f"min_new_tokens must be in (0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
             )
-        if not 0.0 <= self.max_boost_fraction <= 1.0:
-            raise ValueError(
-                f"max_boost_fraction must be in [0, 1], got {self.max_boost_fraction}."
-            )
         if self.ramp_tokens < 0:
             raise ValueError(
                 f"ramp_tokens must be non-negative, got {self.ramp_tokens}."
@@ -171,3 +167,8 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+        # Process boosted tokens
+        for i, boosted in enumerate(self.boosted_tokens):
+            if isinstance(boosted, str) and tokenizer is not None:
+                self.boosted_tokens[i] = tokenizer.encode(boosted, add_special_tokens=False)[0]

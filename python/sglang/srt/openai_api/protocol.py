@@ -158,6 +158,10 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 16
     n: int = 1
     presence_penalty: float = 0.0
+    boosted_tokens: Optional[List[int]] = None
+    max_boost_fraction: float = 0.0
+    ramp_tokens: int = 0
+    boost_type: str = "linear"
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -336,7 +340,10 @@ class ChatCompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-
+    boosted_tokens: Optional[List[int]] = None
+    max_boost_fraction: float = 0.0
+    ramp_tokens: int = 0
+    boost_type: str = "linear"
 
 class FunctionResponse(BaseModel):
     """Function response."""

@@ -35,6 +35,15 @@ class BatchedMultiBoostTokensPenalizer(_BatchedPenalizer):
     
     def _is_required(self) -> bool:
         # The penalizer is needed if any request has a non-empty boosted_tokens list and proper boost parameters.
+        print('is_required: ', any(
+            bool(getattr(req.sampling_params, "boosted_tokens", []))
+            and getattr(req.sampling_params, "max_boost_fraction", 0.0) > 0.0
+            and getattr(req.sampling_params, "ramp_tokens", 0) > 0
+            for req in self.orchestrator.reqs()
+        ))  
+        # print the sampling_params for each request
+        for req in self.orchestrator.reqs():
+            print('sampling_params: ', f"boosted_tokens: {req.sampling_params.boosted_tokens}, max_boost_fraction: {req.sampling_params.max_boost_fraction}, ramp_tokens: {req.sampling_params.ramp_tokens}")
         return any(
             bool(getattr(req.sampling_params, "boosted_tokens", []))
             and getattr(req.sampling_params, "max_boost_fraction", 0.0) > 0.0
@@ -47,99 +56,84 @@ class BatchedMultiBoostTokensPenalizer(_BatchedPenalizer):
         Prepare a boolean mask for boosted tokens, the maximum boost fractions, and ramp thresholds.
         Also, initialize a counter to track the number of tokens generated so far.
         """
-        num_reqs = len(self.orchestrator.reqs())
-        vocab_size = self.orchestrator.vocab_size
+        self.boost_mask = torch.zeros(
+            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
+            dtype=torch.float32,
+            device=self.orchestrator.device,
+        )
+        for i,req in enumerate(self.orchestrator.reqs()):
+            for token in req.sampling_params.boosted_tokens:
+                self.boost_mask[i, token] = 1
         
-        boost_mask = torch.zeros((num_reqs, vocab_size), dtype=torch.bool, device=self.orchestrator.device)
-        max_boost_fraction = torch.zeros((num_reqs, 1), dtype=torch.float32, device=self.orchestrator.device)
-        ramp_tokens = torch.zeros((num_reqs, 1), dtype=torch.float32, device=self.orchestrator.device)
-        
-        # Store the boost type for each request
-        boost_types = []
-        
-        for i, req in enumerate(self.orchestrator.reqs()):
-            tokens = getattr(req.sampling_params, "boosted_tokens", []) or []
-            mbf = getattr(req.sampling_params, "max_boost_fraction", 0.0)
-            ramp = getattr(req.sampling_params, "ramp_tokens", 0)
-            boost_type = getattr(req.sampling_params, "boost_type", "linear").lower()
-            
-            max_boost_fraction[i, 0] = mbf
-            ramp_tokens[i, 0] = float(ramp)
-            boost_types.append(boost_type)
-            
-            for token in tokens:
-                if 0 <= token < vocab_size:
-                    boost_mask[i, token] = True
-        
-        self.boost_mask = boost_mask                    # shape: (batch_size, vocab_size)
-        self.max_boost_fraction = max_boost_fraction    # shape: (batch_size, 1)
-        self.ramp_tokens = ramp_tokens                  # shape: (batch_size, 1)
-        self.boost_types = boost_types                  # list of boost types for each request
-        # Track the number of tokens generated so far per request.
-        self.len_output_tokens = torch.zeros((num_reqs, 1), dtype=torch.float32, device=self.orchestrator.device)
-    
+        self.ramp_scale = torch.tensor([req.sampling_params.ramp_tokens for req in self.orchestrator.reqs()], device=self.orchestrator.device)
+        self.boost_factor = torch.tensor([req.sampling_params.max_boost_fraction for req in self.orchestrator.reqs()], device=self.orchestrator.device)
+        self.len_output_tokens = torch.zeros(
+            size=(len(self.orchestrator.reqs()),),
+            dtype=torch.int32,
+            device=self.orchestrator.device,
+        )
+
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         # Increment the token counter for each new token generated.
         self.len_output_tokens += 1
     
     def _apply(self, logits: torch.Tensor):
         """
-        Apply the boosting function based on the boost_type for each request:
-        
-          - For "linear":
-              effective_boost = max_boost_fraction * clamp(len_output_tokens / ramp_tokens, max=1)
-          - For "heaviside":
-              effective_boost = max_boost_fraction if len_output_tokens >= ramp_tokens, else 0.
-          - For "tanh":
-              effective_boost = max_boost_fraction * tanh(len_output_tokens / ramp_tokens)
-        
-        Then, compute a new probability distribution:
-        
-              new_prob = (1 - effective_boost) * softmax(logits) + effective_boost * uniform_boost
-        
-        Finally, convert back to logits.
+        Apply the boosting function based on the boost_type for each request.
         """
-        p = torch.softmax(logits, dim=-1)  # original probability distribution
+        print('logits shape: ', logits.shape)
+        print('max logit: ', logits[0].max())
+        print('min logit: ', logits[0].min())
+        print('logit before: ', logits[0,:20])
+
+        
         
         # Compute the ratio of generated tokens to ramp_tokens (avoid division by zero).
-        ratio = self.len_output_tokens / torch.clamp(self.ramp_tokens, min=1e-5)
+        ratio = self.len_output_tokens / self.ramp_scale # element-wise division, shape: (B)
+
+        print('ratio shape: ', ratio.shape)
         
-        # Initialize effective_boost as zeros (default)
-        effective_boost = torch.zeros_like(self.max_boost_fraction)
+        # Initialize effective_boost as zeros
+        effective_boost = torch.zeros_like(logits) # shape: (B, V)
         
-        # Apply different boost functions based on each request's boost_type
-        for i, boost_type in enumerate(self.boost_types):
-            if boost_type == "linear":
-                effective_boost[i] = self.max_boost_fraction[i] * torch.clamp(ratio[i], max=1.0)
-            elif boost_type == "heaviside":
-                effective_boost[i] = self.max_boost_fraction[i] * (self.len_output_tokens[i] >= self.ramp_tokens[i]).float()
-            elif boost_type == "tanh":
-                effective_boost[i] = self.max_boost_fraction[i] * torch.tanh(ratio[i])
-            else:
-                # Default to linear for unknown boost types
-                effective_boost[i] = self.max_boost_fraction[i] * torch.clamp(ratio[i], max=1.0)
+        # Compute all boost types in parallel
+        for i,req in enumerate(self.orchestrator.reqs()):
+            for token in req.sampling_params.boosted_tokens:
+                if req.sampling_params.boost_type == 'linear':
+                    effective_boost[i, token] = self.boost_factor[i] * torch.clamp(ratio[i], max=1.0)
+                elif req.sampling_params.boost_type == 'heaviside':
+                    effective_boost[i, token] = self.boost_factor[i] * (self.len_output_tokens[i] >= self.ramp_scale[i]).float()
+                elif req.sampling_params.boost_type == 'tanh':
+                    effective_boost[i, token] = self.boost_factor[i] * torch.tanh(ratio[i])
+                else:
+                    effective_boost[i, token] = torch.zeros_like(ratio[i])
         
-        # Build a uniform boost distribution over the boosted tokens.
-        count_boost = self.boost_mask.sum(dim=1, keepdim=True).float()  # number of boosted tokens per request.
-        uniform_boost = torch.zeros_like(p)
-        nonzero_mask = (count_boost > 0)
-        if nonzero_mask.any():
-            uniform_boost[nonzero_mask] = self.boost_mask[nonzero_mask].float() / count_boost[nonzero_mask]
         
-        new_p = (1 - effective_boost) * p + effective_boost * uniform_boost
-        new_logits = torch.log(new_p + 1e-10)
-        logits.copy_(new_logits)
+
+        # Combine results using masks
+        print('effective_boost shape: ', effective_boost.shape)
+        print('effective_boost: ', effective_boost)
+        # use formula Adjusted logits = logits + effective_boost 
+        # where effective_boost is the boost for each token
+        # namely boost is 0 if the token is not boosted
+        print('boost_mask shape: ', self.boost_mask.shape)
+        print('boost_mask: ', self.boost_mask)
+        logits.add_(effective_boost)
+        print('max logit: ', logits[0].max())
+        print('min logit: ', logits[0].min())
+        print('logit after: ', logits[0,:20])
+
     
     def _filter(self, keep_indices: torch.Tensor):
         self.boost_mask = self.boost_mask[keep_indices]
-        self.max_boost_fraction = self.max_boost_fraction[keep_indices]
-        self.ramp_tokens = self.ramp_tokens[keep_indices]
+        self.ramp_scale = self.ramp_scale[keep_indices]
+        self.boost_factor = self.boost_factor[keep_indices]
         self.len_output_tokens = self.len_output_tokens[keep_indices]
-        self.boost_types = [self.boost_types[i] for i in keep_indices.cpu().tolist()]
-    
+
     def _merge(self, their: "BatchedMultiBoostTokensPenalizer"):
+        print(f"{self.boost_mask.shape=}, {their.boost_mask.shape=}")
         self.boost_mask = torch.cat([self.boost_mask, their.boost_mask], dim=0)
-        self.max_boost_fraction = torch.cat([self.max_boost_fraction, their.max_boost_fraction], dim=0)
-        self.ramp_tokens = torch.cat([self.ramp_tokens, their.ramp_tokens], dim=0)
+        self.ramp_scale = torch.cat([self.ramp_scale, their.ramp_scale], dim=0)
+        self.boost_factor = torch.cat([self.boost_factor, their.boost_factor], dim=0)
         self.len_output_tokens = torch.cat([self.len_output_tokens, their.len_output_tokens], dim=0)
-        self.boost_types.extend(their.boost_types) 
+        

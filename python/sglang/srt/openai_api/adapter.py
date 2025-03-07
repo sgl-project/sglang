@@ -533,6 +533,10 @@ def v1_generate_request(
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
                 "skip_special_tokens": request.skip_special_tokens,
+                "boosted_tokens": request.boosted_tokens,
+                "max_boost_fraction": request.max_boost_fraction,
+                "ramp_tokens": request.ramp_tokens,
+                "boost_type": request.boost_type,
             }
         )
         return_logprobs.append(request.logprobs is not None)
@@ -986,6 +990,10 @@ def v1_chat_generate_request(
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
+            "boosted_tokens": request.boosted_tokens,
+            "max_boost_fraction": request.max_boost_fraction,
+            "ramp_tokens": request.ramp_tokens,
+            "boost_type": request.boost_type,
         }
 
         if request.response_format and request.response_format.type == "json_schema":
@@ -1203,8 +1211,10 @@ def v1_chat_generate_response(
 
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    print('request_json: ', request_json)
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    print('adapted_request: ', adapted_request)
 
     if adapted_request.stream:
         parser_dict = {}

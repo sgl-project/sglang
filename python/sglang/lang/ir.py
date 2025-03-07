@@ -36,6 +36,11 @@ class SglSamplingParams:
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
     regex: Optional[str] = None
+    # for token boosting
+    boosted_tokens: Optional[List[int]] = None
+    max_boost_fraction: float = 0.0
+    ramp_tokens: int = 0
+    boost_type: str = "linear"
 
     def clone(self):
         return SglSamplingParams(
@@ -55,6 +60,12 @@ class SglSamplingParams:
             self.top_logprobs_num,
             self.return_text_in_logprobs,
             self.json_schema,
+            self.dtype,
+            self.regex,
+            self.boosted_tokens,
+            self.max_boost_fraction,
+            self.ramp_tokens,
+            self.boost_type,
         )
 
     def to_openai_kwargs(self):
@@ -128,6 +139,10 @@ class SglSamplingParams:
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
+            "boosted_tokens": self.boosted_tokens,
+            "max_boost_fraction": self.max_boost_fraction,
+            "ramp_tokens": self.ramp_tokens,
+            "boost_type": self.boost_type,
         }
 
 
@@ -170,6 +185,10 @@ class SglFunction:
         stream: bool = False,
         backend=None,
         use_thread: bool = True,
+        boosted_tokens: Optional[List[int]] = None,
+        max_boost_fraction: float = 0.0,
+        ramp_tokens: int = 0,
+        boost_type: str = "linear",
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
@@ -195,6 +214,10 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            boosted_tokens=boosted_tokens,
+            max_boost_fraction=max_boost_fraction,
+            ramp_tokens=ramp_tokens,
+            boost_type=boost_type,
         )
         backend = backend or global_config.default_backend
         return run_program(
@@ -456,6 +479,10 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        boosted_tokens: Optional[List[int]] = None,
+        max_boost_fraction: Optional[float] = None,
+        ramp_tokens: Optional[int] = None,
+        boost_type: Optional[str] = None,
     ):
         """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
@@ -479,6 +506,10 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
             json_schema=json_schema,
+            boosted_tokens=boosted_tokens,
+            max_boost_fraction=max_boost_fraction,
+            ramp_tokens=ramp_tokens,
+            boost_type=boost_type,
         )
 
     def __repr__(self):
