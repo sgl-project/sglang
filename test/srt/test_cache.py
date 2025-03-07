@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
+# No need to test ChunkCache, as it's tested in test_chunked_prefill.py
 class TestDisableRadixCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -123,11 +123,12 @@ class TestRadixCache(unittest.TestCase):
         )
         return response.json()
 
-    def test_evict(self):
-        print("Running test_mmlu 10 times...")
+    def test_evict(self, num_iters=2):
+        # Run a few times to ensure eviction happens
+        print(f"Running test_mmlu {num_iters} times...")
         start_time = time.time()
         for i in range(10):
-            print(f"Running iteration {i+1}/10")
+            print(f"Running iteration {i+1}/{num_iters}")
             self.test_mmlu()
         end_time = time.time()
         print(f"Total time: {end_time - start_time:.2f} seconds")
@@ -211,7 +212,7 @@ class TestHiCache(unittest.TestCase):
         tok = time.time()
         print(f"{res=}")
         throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
+        print(f"Decode Throughput: {throughput} tokens/s")
         self.assertGreaterEqual(throughput, 80)
 
 
