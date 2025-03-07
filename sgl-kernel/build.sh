@@ -15,7 +15,7 @@ docker run --rm \
     pytorch/manylinux-builder:cuda${CUDA_VERSION} \
     bash -c "
     ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.} && \
-    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja && \
+    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools>=75.0 wheel numpy && \
     export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
     export CUDA_VERSION=${CUDA_VERSION} && \
     export SGL_KERNEL_ENABLE_BF16=1 && \
@@ -24,5 +24,6 @@ docker run --rm \
     mkdir -p /usr/lib/x86_64-linux-gnu/ && \
     ln -s /usr/local/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so && \
     cd /sgl-kernel && \
+    ${PYTHON_ROOT_PATH}/bin/pip list && \
     ${PYTHON_ROOT_PATH}/bin/python setup.py bdist_wheel
     "

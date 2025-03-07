@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 
 import torch
+from setuptools.command.bdist_wheel import bdist_wheel
+from setuptools.command.build_py import build_py
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
