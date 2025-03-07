@@ -1,36 +1,10 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/util/Float8_e4m3fn.h>
 
 #include <cmath>
 #include <cub/block/block_reduce.cuh>
 #include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
-
-#define WARP_SIZE 32
-
-#ifndef USE_ROCM
-#include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-#else
-#include <c10/util/Float8_e4m3fnuz.h>
-
-#include "amd/quant_utils.cuh"
-using FP8_TYPE = c10::Float8_e4m3fnuz;
-// Using the default max value from pytorch (240.0) will cause accuracy
-// issue when running dynamic quantization. Here use 224.0f for rocm.
-constexpr auto FP8_E4M3_MAX = 224.0f;
-#endif
-
-__device__ __forceinline__ float warpReduceMax(float max_value) {
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 16));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 8));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 4));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 2));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 1));
-  return max_value;
-}
 
 template <typename T>
 __global__ void per_token_quant_fp8_kernel(const T* __restrict__ input, FP8_TYPE* __restrict__ output_q,

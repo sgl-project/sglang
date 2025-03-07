@@ -7,38 +7,6 @@
 
 #include "utils.h"
 
-#define WARP_SIZE 32
-
-#ifndef USE_ROCM
-#include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-#else
-#include <c10/util/Float8_e4m3fnuz.h>
-
-#include "amd/quant_utils.cuh"
-using FP8_TYPE = c10::Float8_e4m3fnuz;
-// Using the default max value from pytorch (240.0) will cause accuracy
-// issue when running dynamic quantization. Here use 224.0f for rocm.
-constexpr auto FP8_E4M3_MAX = 224.0f;
-#endif
-
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
-  float old;
-  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
-                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-  return old;
-}
-
-__device__ __forceinline__ float warpReduceMax(float max_value) {
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 16));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 8));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 4));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 2));
-  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 1));
-  return max_value;
-}
-
 template <typename T>
 __global__ void per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s,
                                          const int64_t num_elements) {
