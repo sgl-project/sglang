@@ -7,9 +7,9 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
     MHATokenToKVPoolHost,
     ReqToTokenPool,
+    TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
 
@@ -21,11 +21,13 @@ class HiRadixCache(RadixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: MHATokenToKVPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
     ):
-        self.token_to_kv_pool_host = MHATokenToKVPoolHost(token_to_kv_pool)
+        self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            token_to_kv_pool_allocator.get_kvcache()
+        )
         self.cache_controller = HiCacheController(
-            token_to_kv_pool, self.token_to_kv_pool_host
+            token_to_kv_pool_allocator, self.token_to_kv_pool_host
         )
 
         # record the nodes with ongoing write through
@@ -35,7 +37,7 @@ class HiRadixCache(RadixCache):
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
-        super().__init__(req_to_token_pool, token_to_kv_pool, disable=False)
+        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, disable=False)
 
     def reset(self):
         TreeNode.counter = 0
@@ -160,7 +162,7 @@ class HiRadixCache(RadixCache):
 
     def _evict_write_through_selective(self, node: TreeNode):
         # evict a node not initiated write to host
-        self.cache_controller.mem_pool_device.free(node.value)
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
         return num_evicted
