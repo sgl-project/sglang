@@ -14,15 +14,18 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInfo
-    
-try:    
+
+try:
     from aiter import paged_attention_rocm
 except ImportError:
-    print("aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device.")
-    
+    print(
+        "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+    )
+
 from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
 
 _AITER_PARTITION_SIZE_ROCM = 256
+
 
 class AiterDecodeAttnBackend(AttentionBackend):
     def __init__(
@@ -64,41 +67,48 @@ class AiterDecodeAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        
+
         self.head_dim = model_runner.model_config.head_dim
-                
+
         # triton prefill initialization
         self.num_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        
+
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
-        
+
         self.num_v_head = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-2]
-        
+
         self.forward_metadata = None
 
         self.max_context_len = model_runner.model_config.context_len
 
         self.device = model_runner.device
-        
+
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        
+
         self.q_dtype = model_runner.model_config.dtype
-        
-        
+
         # aiter decode initialization
         self.max_num_partitions = (
-                self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-            ) // _AITER_PARTITION_SIZE_ROCM
-        
+            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+        ) // _AITER_PARTITION_SIZE_ROCM
+
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
-        
-        self.workspace_buffer = torch.empty((max_bs * self.num_head * self.max_num_partitions * self.head_dim) * nbyes_per_qo_elem
-                            + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4, dtype=torch.uint8, device=self.device)
-        
+
+        self.workspace_buffer = torch.empty(
+            (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
+            * nbyes_per_qo_elem
+            + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
-        self.kv_last_page_lens = torch.ones((max_bs, ), dtype=torch.int32).to(self.device)
-                
+        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
+            self.device
+        )
+        self.kv_last_page_lens = torch.ones((max_bs,), dtype=torch.int32).to(
+            self.device
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables"""
@@ -126,8 +136,8 @@ class AiterDecodeAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
-            
-            attn_logits = None # accomodate forward_metadata format
+
+            attn_logits = None  # accomodate forward_metadata format
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
@@ -186,7 +196,7 @@ class AiterDecodeAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            
+
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
@@ -214,12 +224,11 @@ class AiterDecodeAttnBackend(AttentionBackend):
             custom_mask,
             mask_indptr,
         )
-    
 
     def init_cuda_graph_state(
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
     ):
-        
+
         self.cuda_graph_attn_logits = torch.zeros(
             (max_bs, self.num_head, self.num_kv_splits, self.v_head_dim + 1),
             dtype=torch.float32,
@@ -457,31 +466,35 @@ class AiterDecodeAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-        
-        
+
         self.decode_attention_fwd(
-            o.view(-1, layer.tp_q_head_num, layer.qk_head_dim), # (bs, head_num_q, head_dim_q)
+            o.view(
+                -1, layer.tp_q_head_num, layer.qk_head_dim
+            ),  # (bs, head_num_q, head_dim_q)
             self.workspace_buffer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-            self.scale, 
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, 1, layer.tp_k_head_num, layer.qk_head_dim
+            ),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, 1, layer.tp_v_head_num, layer.v_head_dim
+            ),
+            self.scale,
             kv_indptr,
-            kv_indices, 
-            self.kv_last_page_lens, 
-            1, 
-            self.max_num_partitions, 
-            None, 
-            "auto", 
-            "NHD", 
+            kv_indices,
+            self.kv_last_page_lens,
+            1,
+            self.max_num_partitions,
+            None,
+            "auto",
+            "NHD",
             layer.logit_cap,
             self.k_scale,
             self.v_scale,
-            None, 
-            _AITER_PARTITION_SIZE_ROCM 
+            None,
+            _AITER_PARTITION_SIZE_ROCM,
         )
-        
-        
+
         return o
 
 
