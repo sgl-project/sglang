@@ -444,6 +444,26 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             "slice_end_id": slice_end_id,
         }
 
+class PaliGemmaImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _image_processor):
+        self.hf_config = hf_config
+        self._image_processor = _image_processor
+    
+
+    @staticmethod
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+        pass #TODO(Xiao)
+
+
+    async def _process_single_image(self, image_data: Union[bytes, str]):
+        pass #TODO(Xiao)
+
+    async def _process_single_image(self, image_data: Union[bytes, str]):
+        pass  #TODO(Xiao)
+        
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _image_processor):
@@ -641,6 +661,9 @@ def get_image_processor(
 
     elif "MiniCPMV" in hf_config.architectures:
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
+    
+    elif "PalieGemma" in hf_config.architectures:
+        return PaliGemmaImageProcessor(hf_config, server_args, processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 

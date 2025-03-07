@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""PaliGemma – Google's Cutting-Edge Open Vision Language Model. """
+"""PaliGemma - Google's Cutting-Edge Open Vision Language Model. """
 
 import math
 import re
@@ -53,7 +53,7 @@ class PaliGemmaForConditionalGeneration(nn.module):
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        pass 
+        pass #TODO(Xiao)
     
     @torch.no_grad()
     def forward(
@@ -76,7 +76,7 @@ class PaliGemmaForConditionalGeneration(nn.module):
         self.vision_tower = SiglipVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
             ).cuda()
-        pass 
+        pass #TODO(Xiao)
 
 EntryClass = PaliGemmaForConditionalGeneration
     
