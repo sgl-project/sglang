@@ -71,7 +71,6 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-    prefill_only_one_req: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -277,14 +276,17 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm == "EAGLE":
+            if self.max_running_requests is None:
+                self.max_running_requests = 32
             self.disable_overlap_schedule = True
-            self.prefill_only_one_req = True
             self.disable_cuda_graph_padding = True
-            self.disable_radix_cache = True
-            self.chunked_prefill_size = -1
             logger.info(
-                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
+                "Overlap scheduler are disabled because of using "
+                "eagle speculative decoding."
             )
+            # The token generated from the verify step is counted.
+            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
         if (
@@ -503,12 +505,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
-        )
-        parser.add_argument(
-            "--prefill-only-one-req",
-            type=bool,
-            help="If true, we only prefill one request at one prefill batch",
-            default=ServerArgs.prefill_only_one_req,
         )
 
         # Other runtime options

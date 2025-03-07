@@ -86,6 +86,12 @@ def parse_args():
         help="model path compatible with Hugging Face Transformers",
     )
     parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="",
+        help="local dataset to sample tokens from",
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         default="performance_metrics.jsonl",
@@ -231,7 +237,7 @@ class WorkloadGenerator:
             num_prompts=args.num_clients * args.num_rounds,
             range_ratio=1.0,
             tokenizer=self.tokenizer,
-            dataset_path="",
+            dataset_path=args.dataset_path,
         )
         self.candidate_inputs = [i[0] for i in self.candidate_inputs]
 

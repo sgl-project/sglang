@@ -4,4 +4,4 @@ Multi-Node Deployment
    :maxdepth: 1
 
    multi_node.md
-   k8s.md
+   deploy_on_k8s.md

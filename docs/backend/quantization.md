@@ -2,15 +2,25 @@
 
 SGLang supports various quantization methods, including offline quantization and online dynamic quantization.
 
-Offline quantization loads pre-quantized model weights directly during inference. This is useful for methods requiring pre-computed stats such as AWQ, which collects activation stats from the pre-training set.
+Offline quantization loads pre-quantized model weights directly during inference. This is required for quantization methods
+such as GPTQ and AWQ that collects and pre-compute various stats from the original weights using the calibration dataset.
 
-Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime. Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors on-the-fly to convert high-precision weights into a lower-precision format.
+Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime.
+Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors
+on-the-fly to convert high-precision weights into a lower-precision format.
 
-**Note that, for better performance, usability and convenience, offline quantization is recommended over online quantization.** And if you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time. For popular pre-quantized models, please visit [neuralmagic collection](https://huggingface.co/collections/neuralmagic) for some popular quantized LLMs on huggingface.
+**Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
+
+If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
+For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2) or [NeuralMagic](https://huggingface.co/collections/neuralmagic)  collections on HF for some
+popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
+to guard against abnormal quantization loss regressions.
 
 ## Offline Quantization
 
-To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
+To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline,
+there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the
+downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
 
 ```bash
 python3 -m sglang.launch_server \
@@ -18,9 +28,38 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-To do offline quantization for your model, firstly you need to install [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:
+### Examples of Offline Model Quantization
+
+#### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
 ```bash
+# install
+pip install gptqmodel --no-build-isolation -v
+```
+
+```py
+from datasets import load_dataset
+from gptqmodel import GPTQModel, QuantizeConfig
+
+model_id = "meta-llama/Llama-3.2-1B-Instruct"
+quant_path = "Llama-3.2-1B-Instruct-gptqmodel-4bit"
+
+calibration_dataset = load_dataset(
+    "allenai/c4", data_files="en/c4-train.00001-of-01024.json.gz",
+    split="train"
+  ).select(range(1024))["text"]
+
+quant_config = QuantizeConfig(bits=4, group_size=128) # quantization config
+model = GPTQModel.load(model_id, quant_config) # load model
+
+model.quantize(calibration_dataset, batch_size=2) # quantize
+model.save(quant_path) # save model
+```
+
+#### Using [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
+
+```bash
+# install
 pip install llmcompressor
 ```
 
@@ -99,8 +138,7 @@ python3 -m sglang.launch_server \
 
 ## Reference
 
-- [quantization document of vllm](https://docs.vllm.ai/en/latest/quantization/fp8.html)
-
-- [torchao](https://github.com/pytorch/ao)
-
-- [llm-compressor](https://github.com/vllm-project/llm-compressor/)
+- [GPTQModel](https://github.com/ModelCloud/GPTQModel)
+- [LLM Compressor](https://github.com/vllm-project/llm-compressor/)
+- [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
+- [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)

@@ -15,6 +15,7 @@ distributed setup.
 
 import gc
 import os
+import random
 import time
 import unittest
 
@@ -529,8 +530,9 @@ class TestUpdateWeightsFromDistributed(unittest.TestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
+            mode = random.choice(["Engine", "Server"])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode),
             ]
         else:
             test_suits = [

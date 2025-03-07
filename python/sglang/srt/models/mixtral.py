@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 
 
 class MixtralMoE(nn.Module):
@@ -78,7 +79,7 @@ class MixtralMoE(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
-            prefix=f"{prefix}.gate",
+            prefix=add_prefix("gate", prefix),
         )
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
@@ -90,7 +91,7 @@ class MixtralMoE(nn.Module):
             renormalize=True,
             quant_config=quant_config,
             tp_size=tp_size,
-            prefix=f"{prefix}.experts",
+            prefix=add_prefix("experts", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -146,14 +147,14 @@ class MixtralAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -168,6 +169,7 @@ class MixtralAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -204,7 +206,7 @@ class MixtralDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = MixtralMoE(
             num_experts=config.num_local_experts,
@@ -212,7 +214,7 @@ class MixtralDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.block_sparse_moe",
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -258,11 +260,15 @@ class MixtralModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
                 MixtralDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -296,12 +302,17 @@ class MixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = MixtralModel(config, quant_config=quant_config, prefix="model")
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.model = MixtralModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     def forward(

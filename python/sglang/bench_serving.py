@@ -220,7 +220,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = data.get("usage", {}).get(
+                                output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
