@@ -118,3 +118,11 @@ def cublas_grouped_gemm(
         cublas_handle,
         get_cuda_stream(),
     )
+
+
+def sgl_per_token_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernels.sgl_per_token_quant_fp8(input, output_q, output_s)
