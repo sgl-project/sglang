@@ -957,7 +957,11 @@ class Scheduler:
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.batch_is_full = False
 
+            last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch()
+            if self.last_batch.batch_size() < last_bs:
+                self.batch_is_full = False
+
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = self.last_batch
