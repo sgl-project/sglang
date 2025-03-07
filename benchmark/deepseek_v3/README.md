@@ -187,8 +187,10 @@ python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 
 There are block-wise and per-channel quantization methods, and the quantization parameters have already been uploaded to Huggingface. One example is as follows:
-[meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
-[meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+- [meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
 ```bash
 #master
 python3 -m sglang.launch_server \
