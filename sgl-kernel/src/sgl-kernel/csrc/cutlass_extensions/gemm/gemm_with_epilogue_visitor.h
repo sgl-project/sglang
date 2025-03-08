@@ -32,10 +32,11 @@ namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Mma_,                ///! Threadblock-scoped matrix multiply-accumulate
-          typename Epilogue_,           ///! Epilogue
-          typename ThreadblockSwizzle_  ///! Threadblock swizzling function
-          >
+template <
+    typename Mma_,                ///! Threadblock-scoped matrix multiply-accumulate
+    typename Epilogue_,           ///! Epilogue
+    typename ThreadblockSwizzle_  ///! Threadblock swizzling function
+    >
 struct GemmWithEpilogueVisitor {
  public:
   using Mma = Mma_;
@@ -119,9 +120,15 @@ struct GemmWithEpilogueVisitor {
     Arguments() : mode(GemmUniversalMode::kGemm), batch_count(1) {}
 
     /// constructs an arguments structure
-    Arguments(GemmCoord problem_size_, TensorRefA ref_A_, TensorRefB ref_B_, TensorRefAlphaCol ref_alpha_col_,
-              TensorRefAlphaRow ref_alpha_row_, TensorRefC ref_C_, TensorRefC ref_D_,
-              typename EpilogueVisitor::Arguments epilogue_visitor_)
+    Arguments(
+        GemmCoord problem_size_,
+        TensorRefA ref_A_,
+        TensorRefB ref_B_,
+        TensorRefAlphaCol ref_alpha_col_,
+        TensorRefAlphaRow ref_alpha_row_,
+        TensorRefC ref_C_,
+        TensorRefC ref_D_,
+        typename EpilogueVisitor::Arguments epilogue_visitor_)
         : mode(GemmUniversalMode::kGemm),
           problem_size(problem_size_),
           batch_count(1),
@@ -269,8 +276,9 @@ struct GemmWithEpilogueVisitor {
       isAMisaligned = problem_size.k() % kAlignmentA;
     } else if (platform::is_same<LayoutA, layout::ColumnMajor>::value) {
       isAMisaligned = problem_size.m() % kAlignmentA;
-    } else if (platform::is_same<LayoutA, layout::ColumnMajorInterleaved<32>>::value ||
-               platform::is_same<LayoutA, layout::ColumnMajorInterleaved<64>>::value) {
+    } else if (
+        platform::is_same<LayoutA, layout::ColumnMajorInterleaved<32>>::value ||
+        platform::is_same<LayoutA, layout::ColumnMajorInterleaved<64>>::value) {
       isAMisaligned = problem_size.k() % kAlignmentA;
     }
 
@@ -278,8 +286,9 @@ struct GemmWithEpilogueVisitor {
       isBMisaligned = problem_size.n() % kAlignmentB;
     } else if (platform::is_same<LayoutB, layout::ColumnMajor>::value) {
       isBMisaligned = problem_size.k() % kAlignmentB;
-    } else if (platform::is_same<LayoutB, layout::RowMajorInterleaved<32>>::value ||
-               platform::is_same<LayoutB, layout::RowMajorInterleaved<64>>::value) {
+    } else if (
+        platform::is_same<LayoutB, layout::RowMajorInterleaved<32>>::value ||
+        platform::is_same<LayoutB, layout::RowMajorInterleaved<64>>::value) {
       isBMisaligned = problem_size.k() % kAlignmentB;
     }
 
@@ -287,8 +296,9 @@ struct GemmWithEpilogueVisitor {
       isCMisaligned = problem_size.n() % kAlignmentC;
     } else if (platform::is_same<LayoutC, layout::ColumnMajor>::value) {
       isCMisaligned = problem_size.m() % kAlignmentC;
-    } else if (platform::is_same<LayoutC, layout::ColumnMajorInterleaved<32>>::value ||
-               platform::is_same<LayoutC, layout::ColumnMajorInterleaved<64>>::value) {
+    } else if (
+        platform::is_same<LayoutC, layout::ColumnMajorInterleaved<32>>::value ||
+        platform::is_same<LayoutC, layout::ColumnMajorInterleaved<64>>::value) {
       isCMisaligned = problem_size.n() % kAlignmentC;
     }
 
@@ -373,11 +383,11 @@ struct GemmWithEpilogueVisitor {
     int thread_idx = threadIdx.x;
 
     // Construct iterators to A and B operands
-    typename Mma::IteratorA iterator_A(params.params_A, ptr_A, {params.problem_size.m(), problem_size_k}, thread_idx,
-                                       tb_offset_A);
+    typename Mma::IteratorA iterator_A(
+        params.params_A, ptr_A, {params.problem_size.m(), problem_size_k}, thread_idx, tb_offset_A);
 
-    typename Mma::IteratorB iterator_B(params.params_B, ptr_B, {problem_size_k, params.problem_size.n()}, thread_idx,
-                                       tb_offset_B);
+    typename Mma::IteratorB iterator_B(
+        params.params_B, ptr_B, {problem_size_k, params.problem_size.n()}, thread_idx, tb_offset_B);
 
     // Broadcast the warp_id computed by lane 0 to ensure dependent code
     // is compiled as warp-uniform.
@@ -409,8 +419,8 @@ struct GemmWithEpilogueVisitor {
     threadblock_tile_offset = threadblock_swizzle.get_tile_offset(params.swizzle_log_tile);
 
     // assume identity swizzle
-    MatrixCoord threadblock_offset(threadblock_tile_offset.m() * Mma::Shape::kM,
-                                   threadblock_tile_offset.n() * Mma::Shape::kN);
+    MatrixCoord threadblock_offset(
+        threadblock_tile_offset.m() * Mma::Shape::kM, threadblock_tile_offset.n() * Mma::Shape::kN);
 
     int block_idx = threadblock_tile_offset.m() + threadblock_tile_offset.n() * params.grid_tiled_shape.m();
 
@@ -423,11 +433,25 @@ struct GemmWithEpilogueVisitor {
       with_bias = false;
     }
 
-    EpilogueVisitor epilogue_visitor(params.epilogue_visitor, shared_storage.epilogue.visitor, params.problem_size.mn(),
-                                     thread_idx, warp_idx, lane_idx, params.params_alpha_col, params.params_C,
-                                     params.params_D, with_bias, true, true, params.ptr_alpha_row, params.ptr_alpha_col,
-                                     params.ptr_C, params.ptr_D, threadblock_offset,
-                                     blockIdx.y * params.problem_size.m());
+    EpilogueVisitor epilogue_visitor(
+        params.epilogue_visitor,
+        shared_storage.epilogue.visitor,
+        params.problem_size.mn(),
+        thread_idx,
+        warp_idx,
+        lane_idx,
+        params.params_alpha_col,
+        params.params_C,
+        params.params_D,
+        with_bias,
+        true,
+        true,
+        params.ptr_alpha_row,
+        params.ptr_alpha_col,
+        params.ptr_C,
+        params.ptr_D,
+        threadblock_offset,
+        blockIdx.y * params.problem_size.m());
 
     if (params.mode == GemmUniversalMode::kGemm) {
       // Indicate which position in a serial reduction the output operator is currently updating
