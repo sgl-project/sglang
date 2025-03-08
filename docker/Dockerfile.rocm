@@ -1,5 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.4.3.post4 -t v0.4.3.post4-rocm630 -f Dockerfile.rocm .
+#   docker/podman build --build-arg SGL_BRANCH=v0.4.3.post4 -t v0.4.3.post4-rocm630 -f Dockerfile.rocm .
+# For developers :
+#   docker/podman build -t v0.4.3.post4-rocm630-test -f Dockerfile.rocm .
 
 # default base image
 ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
@@ -53,7 +55,7 @@ RUN git clone ${TRITON_REPO} -b main \
     && cd python \
     && python3 setup.py install
 
-RUN git clone ${AITER_REPO} \
+RUN git clone ${AITER_REPO} -b main \
     && cd aiter \
     && git checkout ${AITER_COMMIT} \
     && git submodule update --init --recursive \
