@@ -7,9 +7,12 @@
 #include "utils.h"
 
 template <typename T>
-__global__ void per_token_quant_fp8_kernel(const T* __restrict__ input, FP8_TYPE* __restrict__ output_q,
-                                           float* __restrict__ output_s, const int64_t hidden_dim,
-                                           const int64_t num_tokens) {
+__global__ void per_token_quant_fp8_kernel(
+    const T* __restrict__ input,
+    FP8_TYPE* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int64_t hidden_dim,
+    const int64_t num_tokens) {
   const int token_idx = blockIdx.x;
 
   if (token_idx >= num_tokens) return;
@@ -110,8 +113,11 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     per_token_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<scalar_t*>(input.data_ptr()), static_cast<FP8_TYPE*>(output_q.data_ptr()),
-        static_cast<float*>(output_s.data_ptr()), hidden_dim, num_tokens);
+        static_cast<scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        hidden_dim,
+        num_tokens);
     return true;
   });
 }

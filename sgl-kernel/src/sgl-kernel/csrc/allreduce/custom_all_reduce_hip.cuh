@@ -153,19 +153,20 @@ DINLINE O downcast(array_t<float, O::size> val) {
 // prior memory accesses. Note: volatile writes will not be reordered against
 // other volatile writes.
 template <int ngpus>
-DINLINE void start_sync(const RankSignals& sg,
+DINLINE void start_sync(
+    const RankSignals& sg,
 #ifndef USE_ROCM
-                        volatile
+    volatile
 #endif
-                        Signal* self_sg,
-                        int rank) {
+    Signal* self_sg,
+    int rank) {
 #ifdef USE_ROCM
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED,
-                            __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(
+        &sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) <
            flag)
@@ -193,12 +194,13 @@ DINLINE void start_sync(const RankSignals& sg,
 // barrier in the all reduce kernel. If it's the final synchronization barrier,
 // we don't need to make any visibility guarantees for prior memory accesses.
 template <int ngpus, bool final_sync = false>
-DINLINE void end_sync(const RankSignals& sg,
+DINLINE void end_sync(
+    const RankSignals& sg,
 #ifndef USE_ROCM
-                      volatile
+    volatile
 #endif
-                      Signal* self_sg,
-                      int rank) {
+    Signal* self_sg,
+    int rank) {
 #ifdef USE_ROCM
   __syncthreads();
   // eliminate the case that prior writes are not visible after signals become
@@ -209,11 +211,16 @@ DINLINE void end_sync(const RankSignals& sg,
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank], flag,
-                            final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    __scoped_atomic_store_n(
+        &sg.signals[threadIdx.x]->end[blockIdx.x][rank],
+        flag,
+        final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+        __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
-    while (__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                  final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < flag)
+    while (__scoped_atomic_load_n(
+               &self_sg->end[blockIdx.x][threadIdx.x],
+               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+               __MEMORY_SCOPE_DEVICE) < flag)
       ;
   }
   __syncthreads();
@@ -251,12 +258,16 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _dp, RankSignals sg,
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
+    RankData* _dp,
+    RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+    volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result, int rank, int size) {
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
@@ -280,12 +291,16 @@ DINLINE P* get_tmp_buf(volatile Signal* sg) {
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _dp, RankSignals sg,
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
+    RankData* _dp,
+    RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+    volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result, int rank, int size) {
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -357,8 +372,14 @@ class CustomAllreduce {
    * note: this class does not own any device memory. Any required buffers
    * are passed in from the constructor
    */
-  CustomAllreduce(Signal* meta, void* rank_data, size_t rank_data_sz, const hipIpcMemHandle_t* handles,
-                  const std::vector<int64_t>& offsets, int rank, bool full_nvlink = true)
+  CustomAllreduce(
+      Signal* meta,
+      void* rank_data,
+      size_t rank_data_sz,
+      const hipIpcMemHandle_t* handles,
+      const std::vector<int64_t>& offsets,
+      int rank,
+      bool full_nvlink = true)
       : rank_(rank),
         world_size_(offsets.size()),
         full_nvlink_(full_nvlink),
@@ -382,8 +403,8 @@ class CustomAllreduce {
     auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
     if (new_handle) {
       char* ipc_ptr;
-      CUDACHECK(hipIpcOpenMemHandle((void**)&ipc_ptr, *((const hipIpcMemHandle_t*)ipc_handle),
-                                    hipIpcMemLazyEnablePeerAccess));
+      CUDACHECK(hipIpcOpenMemHandle(
+          (void**)&ipc_ptr, *((const hipIpcMemHandle_t*)ipc_handle), hipIpcMemLazyEnablePeerAccess));
       it->second = ipc_ptr;
     }
     return it->second;
@@ -399,13 +420,14 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      if (hipPointerGetAttribute(&base_ptr,
+      if (hipPointerGetAttribute(
+              &base_ptr,
 #ifdef USE_ROCM
-                                 HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+              HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
-                                 CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+              CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
-                                 (hipDeviceptr_t)ptr) != hipSuccess)
+              (hipDeviceptr_t)ptr) != hipSuccess)
         throw std::runtime_error("failed to get pointer attr");
       CUDACHECK(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
@@ -415,8 +437,8 @@ class CustomAllreduce {
 
   void check_rank_data_capacity(size_t num = 1) {
     if (d_rank_data_base_ + num > d_rank_data_end_)
-      throw std::runtime_error("Rank data buffer is overflowed by " +
-                               std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
+      throw std::runtime_error(
+          "Rank data buffer is overflowed by " + std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
   }
 
   void register_buffer(const std::vector<std::string>& handles, const std::vector<int64_t>& offsets, void* self) {
@@ -443,8 +465,8 @@ class CustomAllreduce {
   // rank 1 may get the same input address for the second allreduce, but rank 2
   // got a different address. IPC handles have internal reference counting
   // mechanism so overhead should be small.
-  void register_graph_buffers(const std::vector<std::string>& handles,
-                              const std::vector<std::vector<int64_t>>& offsets) {
+  void
+  register_graph_buffers(const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets) {
     auto num_buffers = graph_unreg_buffers_.size();
     check_rank_data_capacity(num_buffers);
     std::vector<RankData> rank_data(num_buffers);
@@ -474,11 +496,17 @@ class CustomAllreduce {
    * will cause contention on NVLink bus.
    */
   template <typename T>
-  void allreduce(hipStream_t stream, T* input, T* output, int size,
+  void allreduce(
+      hipStream_t stream,
+      T* input,
+      T* output,
+      int size,
 #ifndef USE_ROCM
-                 int threads = 512, int block_limit = 36){
+      int threads = 512,
+      int block_limit = 36){
 #else
-                 int threads = 512, int block_limit = 16) {
+      int threads = 512,
+      int block_limit = 16) {
 #endif
       auto d = packed_t<T>::P::size;
   if (size % d != 0)
@@ -487,8 +515,8 @@ class CustomAllreduce {
         "of " +
         std::to_string(d));
   if (block_limit > kMaxBlocks)
-    throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " +
-                             std::to_string(block_limit));
+    throw std::runtime_error(
+        "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
 
   RankData* ptrs;
   hipStreamCaptureStatus status;
@@ -499,17 +527,17 @@ class CustomAllreduce {
   } else {
     auto it = buffers_.find(input);
     if (it == buffers_.end())
-      throw std::runtime_error("buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) +
-                               " is not registered!");
+      throw std::runtime_error(
+          "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
     ptrs = it->second;
   }
 
   size /= d;
   auto bytes = size * sizeof(typename packed_t<T>::P);
   int blocks = ::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name)                                                                                            \
-  hipLaunchKernelGGL((name<T, ngpus>), dim3(blocks), dim3(threads), 0, stream, ptrs, sg_, self_sg_, output, rank_, \
-                     size);
+#define KL(ngpus, name) \
+  hipLaunchKernelGGL(   \
+      (name<T, ngpus>), dim3(blocks), dim3(threads), 0, stream, ptrs, sg_, self_sg_, output, rank_, size);
 #define REDUCE_CASE(ngpus)                                                                        \
   case ngpus: {                                                                                   \
     if (world_size_ == 2) {                                                                       \

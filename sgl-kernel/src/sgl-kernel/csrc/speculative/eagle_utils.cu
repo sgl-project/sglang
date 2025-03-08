@@ -23,10 +23,18 @@
 // tree_mask [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] =
 // [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token] positions [bs * draft_token] retrive_index [b,
 // draft_token] retrive_next_token [b, draft_token] retrive_next_sibling [b, draft_token]
-__global__ void build_tree_efficient(int64_t* parent_list, int64_t* selected_index, int32_t* verified_seq_len,
-                                     bool* tree_mask, int64_t* positions, int64_t* retrive_index,
-                                     int64_t* retrive_next_token, int64_t* retrive_next_sibling, int topk, int depth,
-                                     int draft_token_num) {
+__global__ void build_tree_efficient(
+    int64_t* parent_list,
+    int64_t* selected_index,
+    int32_t* verified_seq_len,
+    bool* tree_mask,
+    int64_t* positions,
+    int64_t* retrive_index,
+    int64_t* retrive_next_token,
+    int64_t* retrive_next_sibling,
+    int topk,
+    int depth,
+    int draft_token_num) {
   int bid = blockIdx.x;
   int tid = threadIdx.x;
 
@@ -99,10 +107,18 @@ __global__ void build_tree_efficient(int64_t* parent_list, int64_t* selected_ind
   }
 }
 
-void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
-                                 at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index,
-                                 at::Tensor retrive_next_token, at::Tensor retrive_next_sibling, int64_t topk,
-                                 int64_t depth, int64_t draft_token_num) {
+void build_tree_kernel_efficient(
+    at::Tensor parent_list,
+    at::Tensor selected_index,
+    at::Tensor verified_seq_len,
+    at::Tensor tree_mask,
+    at::Tensor positions,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    int64_t topk,
+    int64_t depth,
+    int64_t draft_token_num) {
   // TODO (ying) check shape
   // TODO (ying) check type
   int bs = parent_list.size(0);
@@ -111,11 +127,17 @@ void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_ind
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   build_tree_efficient<<<grid, block, 0, stream>>>(
-      static_cast<int64_t*>(parent_list.data_ptr()), static_cast<int64_t*>(selected_index.data_ptr()),
-      static_cast<int32_t*>(verified_seq_len.data_ptr()), static_cast<bool*>(tree_mask.data_ptr()),
-      static_cast<int64_t*>(positions.data_ptr()), static_cast<int64_t*>(retrive_index.data_ptr()),
-      static_cast<int64_t*>(retrive_next_token.data_ptr()), static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
-      int32_t(topk), int32_t(depth), int32_t(draft_token_num));
+      static_cast<int64_t*>(parent_list.data_ptr()),
+      static_cast<int64_t*>(selected_index.data_ptr()),
+      static_cast<int32_t*>(verified_seq_len.data_ptr()),
+      static_cast<bool*>(tree_mask.data_ptr()),
+      static_cast<int64_t*>(positions.data_ptr()),
+      static_cast<int64_t*>(retrive_index.data_ptr()),
+      static_cast<int64_t*>(retrive_next_token.data_ptr()),
+      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      int32_t(topk),
+      int32_t(depth),
+      int32_t(draft_token_num));
 }
 
 // parent_list [bs, topk * (depth - 1) + 1)]
@@ -124,8 +146,16 @@ void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_ind
 // tree_mask [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] =
 // [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token] positions [bs * draft_token] retrive_index [b,
 // draft_token, depth + 2]
-__global__ void build_tree(int64_t* parent_list, int64_t* selected_index, int32_t* verified_seq_len, bool* tree_mask,
-                           int64_t* positions, int64_t* retrive_index, int topk, int depth, int draft_token_num) {
+__global__ void build_tree(
+    int64_t* parent_list,
+    int64_t* selected_index,
+    int32_t* verified_seq_len,
+    bool* tree_mask,
+    int64_t* positions,
+    int64_t* retrive_index,
+    int topk,
+    int depth,
+    int draft_token_num) {
   int bid = blockIdx.x;
   int tid = threadIdx.x;
 
@@ -191,9 +221,16 @@ __global__ void build_tree(int64_t* parent_list, int64_t* selected_index, int32_
   }
 }
 
-void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
-                       at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index, int64_t topk,
-                       int64_t depth, int64_t draft_token_num) {
+void build_tree_kernel(
+    at::Tensor parent_list,
+    at::Tensor selected_index,
+    at::Tensor verified_seq_len,
+    at::Tensor tree_mask,
+    at::Tensor positions,
+    at::Tensor retrive_index,
+    int64_t topk,
+    int64_t depth,
+    int64_t draft_token_num) {
   // TODO (ying) check shape
   // TODO (ying) check type
   int bs = parent_list.size(0);
@@ -202,8 +239,13 @@ void build_tree_kernel(at::Tensor parent_list, at::Tensor selected_index, at::Te
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   build_tree<<<grid, block, 0, stream>>>(
-      static_cast<int64_t*>(parent_list.data_ptr()), static_cast<int64_t*>(selected_index.data_ptr()),
-      static_cast<int32_t*>(verified_seq_len.data_ptr()), static_cast<bool*>(tree_mask.data_ptr()),
-      static_cast<int64_t*>(positions.data_ptr()), static_cast<int64_t*>(retrive_index.data_ptr()), int32_t(topk),
-      int32_t(depth), int32_t(draft_token_num));
+      static_cast<int64_t*>(parent_list.data_ptr()),
+      static_cast<int64_t*>(selected_index.data_ptr()),
+      static_cast<int32_t*>(verified_seq_len.data_ptr()),
+      static_cast<bool*>(tree_mask.data_ptr()),
+      static_cast<int64_t*>(positions.data_ptr()),
+      static_cast<int64_t*>(retrive_index.data_ptr()),
+      int32_t(topk),
+      int32_t(depth),
+      int32_t(draft_token_num));
 }
