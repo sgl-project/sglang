@@ -30,19 +30,7 @@ __global__ void per_token_quant_fp8_kernel(
     max_value = fmaxf(max_value, fabsf(val));
   }
 
-  max_value = warpReduceMax(max_value);
-
-  static __shared__ float warpLevelMaxs[WARP_SIZE];
-  const int laneId = threadIdx.x % WARP_SIZE;
-  const int warpId = threadIdx.x / WARP_SIZE;
-
-  if (laneId == 0) warpLevelMaxs[warpId] = max_value;
-  __syncthreads();
-
-  if (warpId == 0) {
-    max_value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
-    max_value = warpReduceMax(max_value);
-  }
+  max_value = blockReduceMax(max_value);
 
   __shared__ float block_max;
   if (tid == 0) {
