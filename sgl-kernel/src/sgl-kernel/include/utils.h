@@ -117,10 +117,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 }
 
 __device__ __forceinline__ float warpReduceMax(float max_value) {
-#pragma unroll
-  for (int offset = (WARP_SIZE >> 1); offset > 0; offset >>= 1) {
-    max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
-  }
+  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 16));
+  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 8));
+  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 4));
+  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 2));
+  max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 1));
   return max_value;
 }
 
