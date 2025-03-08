@@ -5,7 +5,7 @@ import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.custom_op import CustomOp, scaled_fp8_quant
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -718,10 +718,10 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 
             for expert in range(layer.num_experts_per_partition):
                 w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                 )
                 w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
                 )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
