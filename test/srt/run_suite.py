@@ -24,6 +24,7 @@ suites = {
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_mla.py",
+        "test_mla_deepseek_v3.py",
         "test_mla_flashinfer.py",
         "test_mla_fp8.py",
         "test_json_constrained.py",
