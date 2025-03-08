@@ -81,7 +81,7 @@ class ModelConfig:
         if context_length is not None:
             if context_length > derived_context_len:
                 if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="False"
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
