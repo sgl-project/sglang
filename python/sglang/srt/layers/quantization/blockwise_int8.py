@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+import sys
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -75,10 +76,10 @@ class BlockInt8Config(QuantizationConfig):
             return 80
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 80

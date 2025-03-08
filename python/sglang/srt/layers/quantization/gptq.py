@@ -1,3 +1,4 @@
+import sys
 import logging
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Union
@@ -95,10 +96,10 @@ class GPTQConfig(QuantizationConfig):
             return 60
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 60
@@ -227,10 +228,10 @@ class GPTQMarlinConfig(QuantizationConfig):
             return 80
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 80
@@ -402,10 +403,10 @@ class MarlinConfig(QuantizationConfig):
             return 80
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 80

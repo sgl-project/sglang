@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
+import sys
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -121,10 +122,10 @@ class Fp8Config(QuantizationConfig):
             return 0
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 80
@@ -873,17 +874,16 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
-
-    def torch_w8a8_block_fp8_moe(self, a, w1, w2, w1_s, w2_s, score, topk, block_shape):
+    
+    def torch_w8a8_block_fp8_moe(self, a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape):
         from sglang.srt.layers.activation import SiluAndMul
 
         """This function performs fused moe with block-wise quantization using native torch."""
 
         B, D = a.shape
+        topk = topk_ids.shape[-1]
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
         out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-        score = torch.softmax(score, dim=-1, dtype=torch.float32)
-        topk_weight, topk_ids = torch.topk(score, topk)
         topk_weight = topk_weight.view(-1)
         topk_ids = topk_ids.view(-1)
 

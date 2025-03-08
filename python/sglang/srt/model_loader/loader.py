@@ -121,7 +121,7 @@ def _get_quantization_config(
                         f"Current capability: {capability}."
                     )
         else:
-            if not quant_config.get_available():
+            if not quant_config.get_availability():
                 raise ValueError(
                     f"The quantization method {model_config.quantization} "
                     "is not supported for the current GPU. "
