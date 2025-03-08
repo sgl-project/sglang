@@ -626,10 +626,11 @@ class FusedMoE(torch.nn.Module):
             "inplace": self.inplace,
             "no_combine": self.no_combine,
         }
-        kwargs = inspect.signature(self.quant_method.apply).parameters
+        kwargs = {}
+        params = inspect.signature(self.quant_method.apply).parameters
         for k in optional_kwargs:
-            if k not in kwargs:
-                optional_kwargs.pop(k)
+            if k in params:
+                kwargs[k] = optional_kwargs[k]
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -639,7 +640,7 @@ class FusedMoE(torch.nn.Module):
             top_k=self.top_k,
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
-            **optional_kwargs,
+            **kwargs,
         )
 
         if self.reduce_results and self.tp_size > 1:
