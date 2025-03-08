@@ -108,7 +108,7 @@ class TestEAGLEEngine(unittest.TestCase):
     def _test_eos_token(self, engine):
         prompt = "[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\nToday is a sunny day and I like [/INST]"
         params = {
-            "temperature": 0,
+            "temperature": 0.1,
             "max_new_tokens": 1024,
             "skip_special_tokens": False,
         }
