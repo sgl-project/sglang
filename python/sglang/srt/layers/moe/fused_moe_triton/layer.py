@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import inspect
 from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -307,9 +308,7 @@ class FusedMoE(torch.nn.Module):
         self.no_combine = no_combine
 
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod()
-            )
+            self.quant_method: Optional[QuantizeMethodBase] = FusedMoEMethodBase()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
@@ -616,6 +615,22 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
+        # Filter kwargs not specified in FusedMoEMethodBase
+        # e.g. GPTQMarlinMoEMethod doesn't have correction_bias
+        optional_kwargs = {
+            "topk_group": self.topk_group,
+            "num_expert_group": self.num_expert_group,
+            "custom_routing_function": self.custom_routing_function,
+            "correction_bias": self.correction_bias,
+            "activation": self.activation,
+            "inplace": self.inplace,
+            "no_combine": self.no_combine,
+        }
+        kwargs = inspect.signature(self.quant_method.apply).parameters
+        for k in optional_kwargs:
+            if k not in kwargs:
+                optional_kwargs.pop(k)
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -624,13 +639,7 @@ class FusedMoE(torch.nn.Module):
             top_k=self.top_k,
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            correction_bias=self.correction_bias,
-            activation=self.activation,
-            inplace=self.inplace,
-            no_combine=self.no_combine,
+            **optional_kwargs,
         )
 
         if self.reduce_results and self.tp_size > 1:
