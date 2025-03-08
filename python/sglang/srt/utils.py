@@ -73,11 +73,6 @@ show_time_cost = False
 time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
-HIP_FP8_E4M3_FNUZ_MIN_SUB_NORM = 0.0009765625
-
-OCP_FP8_E4M3_FN_MIN_SUB_NORM = 0.001953125
-
-OCP_MXFP8_E8M0_GROUP_QUANT_GRANULARITY = 32
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -87,10 +82,8 @@ def is_hip() -> bool:
 
 if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
-    FP8_E4M3_MIN_SUB_NORM = HIP_FP8_E4M3_FNUZ_MIN_SUB_NORM
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-    FP8_E4M3_MIN_SUB_NORM = OCP_FP8_E4M3_FN_MIN_SUB_NORM
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
