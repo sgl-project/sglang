@@ -82,8 +82,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SessionParams,
-    SetInternalStateReq,
-    SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -257,9 +255,6 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -308,10 +303,6 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
-                ),
-                (
-                    SetInternalStateReqOutput,
-                    self.set_internal_state_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -381,13 +372,12 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
+        image_inputs: Dict = await self.image_processor.process_images_async(
+            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+        )
+        if image_inputs and "input_ids" in image_inputs:
+            input_ids = image_inputs["input_ids"]
         if self.is_generation:
-            # TODO: also support getting embeddings for multimodal models
-            image_inputs: Dict = await self.image_processor.process_images_async(
-                obj.image_data, input_text or input_ids, obj, self.max_req_input_len
-            )
-            if image_inputs and "input_ids" in image_inputs:
-                input_ids = image_inputs["input_ids"]
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
             top_logprobs_num = obj.top_logprobs_num
@@ -447,6 +437,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
+                image_inputs,
                 sampling_params,
             )
 
@@ -774,14 +765,6 @@ class TokenizerManager:
         )
         return res[0].internal_state
 
-    async def set_internal_state(
-        self, obj: SetInternalStateReq
-    ) -> SetInternalStateReqOutput:
-        res: List[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
-        return res[0]
-
     def get_log_request_metadata(self):
         max_length = None
         skip_names = None
@@ -1085,6 +1068,7 @@ class TokenizerManager:
             self.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
+                recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
             )
 
@@ -1141,7 +1125,7 @@ async def print_exception_wrapper(func):
 
 
 class SignalHandler:
-    def __init__(self, tokenizer_manager):
+    def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
 
     def signal_handler(self, signum=None, frame=None):

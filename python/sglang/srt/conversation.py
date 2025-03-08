@@ -45,6 +45,7 @@ class SeparatorStyle(IntEnum):
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
     DeepSeekVL2 = auto()
+    QWEN2_VL_EMBED = auto()
 
 
 @dataclasses.dataclass
@@ -111,6 +112,15 @@ class Conversation:
                     ret += role + "\n" + message + self.sep
                 else:
                     ret += role + "\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.QWEN2_VL_EMBED:
+            ret = "" if system_prompt == "" else system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+            ret += self.stop_str
             return ret
         elif self.sep_style == SeparatorStyle.NO_COLON_SINGLE:
             ret = system_prompt
@@ -380,6 +390,46 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
+def generate_embedding_convs(
+    texts: List[str], images: List[str], template_name: str
+) -> List[Conversation]:
+    conv_template = chat_templates[template_name].copy()
+    convs = []
+    for text, image in zip(texts, images):
+        conv = Conversation(
+            name=conv_template.name,
+            system_template=conv_template.system_template,
+            system_message=conv_template.system_message,
+            roles=conv_template.roles,
+            messages=list(conv_template.messages),  # prevent in-place modification
+            offset=conv_template.offset,
+            sep_style=SeparatorStyle(conv_template.sep_style),
+            sep=conv_template.sep,
+            sep2=conv_template.sep2,
+            stop_str=conv_template.stop_str,
+            image_data=[],
+            modalities=[],
+            image_token=conv_template.image_token,
+        )
+        real_content = ""
+
+        if image is not None:
+            image_token = (
+                conv.image_token + "\n"
+                if conv.name != "gme-qwen2-vl"
+                else conv.image_token
+            )
+            real_content += image_token
+        if text is not None:
+            real_content += text
+        conv.append_message(conv.roles[0], real_content)
+        # Add a blank message for the assistant.
+        conv.append_message(conv.roles[1], None)
+        convs.append(conv)
+
+    return convs
+
+
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
@@ -569,6 +619,7 @@ register_conv_template(
     )
 )
 
+
 register_conv_template(
     Conversation(
         name="deepseek-vl2",
@@ -584,6 +635,19 @@ register_conv_template(
         sep2="<｜end▁of▁sentence｜>",
         stop_token_ids=[100001],
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
+
+# Reference: https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct#usage
+register_conv_template(
+    Conversation(
+        name="gme-qwen2-vl",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.QWEN2_VL_EMBED,
+        stop_str="<|endoftext|>",
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+
     )
 )
 

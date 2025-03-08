@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -86,6 +85,7 @@ nvcc_flags = [
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
     "--ptxas-options=-v",
+    "--expt-relaxed-constexpr",
     "-Xcompiler=-Wconversion",
     "-Xcompiler=-fno-strict-aliasing",
 ]
@@ -106,6 +106,8 @@ sources = [
     "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/int8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_token_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_tensor_quant_fp8.cu",
     "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
     "src/sgl-kernel/csrc/speculative/eagle_utils.cu",
     "src/sgl-kernel/csrc/speculative/speculative_sampling.cu",
@@ -175,10 +177,6 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

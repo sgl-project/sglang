@@ -159,8 +159,9 @@ class GemmUniversalBaseCompat {
     get_grid_shape_(grid_tiled_shape, gemm_k_size, args);
     dim3 result = threadblock_swizzle.get_grid_shape(grid_tiled_shape);
 
-    CUTLASS_TRACE_HOST("  grid_tiled_shape: " << grid_tiled_shape << "\n"
-                                              << "  result = {" << result << "}");
+    CUTLASS_TRACE_HOST(
+        "  grid_tiled_shape: " << grid_tiled_shape << "\n"
+                               << "  result = {" << result << "}");
 
     return result;
   }
@@ -175,8 +176,8 @@ class GemmUniversalBaseCompat {
     CUTLASS_TRACE_HOST("  smem_size: " << smem_size << " bytes");
 
     if (smem_size <= (48 << 10)) {
-      cudaError_t result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, Kernel<GemmKernel>,
-                                                                         GemmKernel::kThreadCount, smem_size);
+      cudaError_t result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &max_active_blocks, Kernel<GemmKernel>, GemmKernel::kThreadCount, smem_size);
 
       if (result == cudaSuccess) {
         CUTLASS_TRACE_HOST("  max_active_blocks: " << max_active_blocks);
@@ -184,12 +185,12 @@ class GemmUniversalBaseCompat {
       }
     } else {
       // Query assuming zero shared memory then compute occupancy limit based on SMEM
-      cudaError_t result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, Kernel<GemmKernel>,
-                                                                         GemmKernel::kThreadCount, 0);
+      cudaError_t result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &max_active_blocks, Kernel<GemmKernel>, GemmKernel::kThreadCount, 0);
 
       if (result != cudaSuccess) {
-        CUTLASS_TRACE_HOST("  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error "
-                           << cudaGetErrorString(result));
+        CUTLASS_TRACE_HOST(
+            "  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error " << cudaGetErrorString(result));
 
         return -1;
       }
@@ -226,8 +227,9 @@ class GemmUniversalBaseCompat {
 
   /// Initializes GEMM state from arguments.
   Status initialize(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
-    CUTLASS_TRACE_HOST("GemmUniversalBaseCompat::initialize() - workspace "
-                       << workspace << ", stream: " << (stream ? "non-null" : "null"));
+    CUTLASS_TRACE_HOST(
+        "GemmUniversalBaseCompat::initialize() - workspace " << workspace
+                                                             << ", stream: " << (stream ? "non-null" : "null"));
 
     size_t workspace_bytes = get_workspace_size(args);
 

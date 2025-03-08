@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
@@ -58,7 +59,7 @@ class TestMLA(unittest.TestCase):
 class TestDeepseekV3(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-test"
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -93,7 +94,7 @@ class TestDeepseekV3(unittest.TestCase):
 class TestDeepseekV3MTP(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-test"
+        cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -106,9 +107,9 @@ class TestDeepseekV3MTP(unittest.TestCase):
                     "--torch-compile-max-bs",
                     "1",
                     "--speculative-algorithm",
-                    "NEXTN",
+                    "EAGLE",
                     "--speculative-draft",
-                    "sgl-project/sglang-ci-dsv3-test-NextN",
+                    "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
@@ -129,6 +130,8 @@ class TestDeepseekV3MTP(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -142,6 +145,11 @@ class TestDeepseekV3MTP(unittest.TestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 2.5)
 
 
 if __name__ == "__main__":

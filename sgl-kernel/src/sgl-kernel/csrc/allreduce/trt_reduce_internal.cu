@@ -118,8 +118,13 @@ inline __device__ int4 add128b(T& a, T& b) {
   return c.packed;
 }
 
-__inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const flag, size_t const local_rank,
-                                             size_t const world_size, int const tidx, int const bidx) {
+__inline__ __device__ void multi_gpu_barrier(
+    uint32_t** signals,
+    uint32_t const flag,
+    size_t const local_rank,
+    size_t const world_size,
+    int const tidx,
+    int const bidx) {
   // After this function, at least one block in each GPU has reached the barrier
   if (tidx < world_size) {
     // we can think of signals having the shape [world_size, world_size]
@@ -143,8 +148,14 @@ __inline__ __device__ void multi_gpu_barrier(uint32_t** signals, uint32_t const 
 }
 
 template <bool start, bool need_fence = false>
-__inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag, size_t const local_rank,
-                                         size_t const world_size, int const tidx, int const bidx, int const grid_size) {
+__inline__ __device__ void block_barrier(
+    uint32_t** signals,
+    uint32_t const flag,
+    size_t const local_rank,
+    size_t const world_size,
+    int const tidx,
+    int const bidx,
+    int const grid_size) {
   if constexpr (!start) {
     __syncthreads();
   }
@@ -227,8 +238,8 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
     }
   }
   // wait for equivalent blocks of other GPUs to have copied data to their shareable buffer
-  block_barrier<true>(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx,
-                      grid_size);
+  block_barrier<true>(
+      params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
 
   // Each block accumulates the values from the different GPUs on the same node.
   for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
@@ -341,8 +352,8 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
       }
     }
   }
-  block_barrier<true>(params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx,
-                      grid_size);
+  block_barrier<true>(
+      params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
 
   // Each block accumulates the values from the different GPUs on the same node.
   for (size_t local_offset = chunk_start; local_offset < chunk_end; local_offset += blockDim.x * PACKED_ELTS) {
@@ -372,8 +383,8 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
     }
   }
 
-  block_barrier<false, true>(params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx,
-                             bidx, grid_size);
+  block_barrier<false, true>(
+      params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
 
   // Gather all needed elts from other intra-node ranks
   for (size_t local_offset = chunk_start; local_offset < chunk_end; local_offset += blockDim.x * PACKED_ELTS) {
@@ -459,8 +470,12 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT>
-void dispatchARKernels(AllReduceStrategyType algo, AllReduceParams& param, int blocks_per_grid, int threads_per_block,
-                       cudaStream_t stream) {
+void dispatchARKernels(
+    AllReduceStrategyType algo,
+    AllReduceParams& param,
+    int blocks_per_grid,
+    int threads_per_block,
+    cudaStream_t stream) {
   switch (algo) {
     case AllReduceStrategyType::ONESHOT: {
       oneShotAllReduceKernel<T, RANKS_PER_NODE, COPY_INPUT><<<blocks_per_grid, threads_per_block, 0, stream>>>(param);
@@ -505,8 +520,8 @@ void invokeOneOrTwoShotAllReduceKernel(AllReduceParams& param, AllReduceStrategy
   CHECK_CUDA_SUCCESS(cudaGetLastError());
 }
 
-void trtCustomAllReduce(AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat,
-                        cudaStream_t stream) {
+void trtCustomAllReduce(
+    AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat, cudaStream_t stream) {
   if (params.elts_total == 0) {
     return;
   }
