@@ -18,7 +18,7 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
+TORCH_LIBRARY(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
@@ -63,4 +63,4 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 }
 
-REGISTER_EXTENSION(_kernels)
+REGISTER_EXTENSION(common_ops)

@@ -26,8 +26,6 @@ limitations under the License.
 #define _STRINGIFY(A) #A
 #define STRINGIFY(A) _STRINGIFY(A)
 
-#define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
-
 #define REGISTER_EXTENSION(NAME)                                                                      \
   PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
     static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \

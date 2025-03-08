@@ -18,31 +18,7 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
-  /*
-   * From csrc/activation
-   */
-  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
-
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
-
-  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
-
-  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
-  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
-
-  m.def("silu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
-  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
-
-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
-  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
-
-  m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
-  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
-
+TORCH_LIBRARY(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
@@ -68,6 +44,30 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
   /*
+   * From csrc/elementwise
+   */
+   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
+   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
+
+   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
+
+   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int cuda_stream) -> ()");
+   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
+
+   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, int cuda_stream) -> ()");
+   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
+
+   m.def("silu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+
+   m.def("gelu_tanh_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+   m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
+
+   m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
+   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
+
+   /*
    * From csrc/gemm
    */
   m.def(
@@ -176,4 +176,4 @@ TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 }
 
-REGISTER_EXTENSION(_kernels)
+REGISTER_EXTENSION(common_ops)
