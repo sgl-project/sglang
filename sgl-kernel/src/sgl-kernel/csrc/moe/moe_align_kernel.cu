@@ -25,9 +25,11 @@ limitations under the License.
 #define WARP_SIZE 32
 
 template <typename scalar_t>
-__global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__ topk_ids,
-                                                    int32_t* __restrict__ sorted_token_ids,
-                                                    int32_t* __restrict__ cumsum_buffer, size_t numel) {
+__global__ void count_and_sort_expert_tokens_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ cumsum_buffer,
+    size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
@@ -39,19 +41,24 @@ __global__ void count_and_sort_expert_tokens_kernel(const scalar_t* __restrict__
 }
 
 template <typename scalar_t>
-__global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_ids,
-                                            int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
-                                            int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
-                                            int32_t block_size, size_t numel, int32_t* __restrict__ cumsum) {
-  __shared__ int32_t shared_counts[WARP_SIZE][8];
+__global__ void moe_align_block_size_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t experts_per_warp,
+    int32_t block_size,
+    size_t numel,
+    int32_t* __restrict__ cumsum) {
+  extern __shared__ int32_t shared_counts[];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
-  const int experts_per_warp = 8;
   const int my_expert_start = warp_id * experts_per_warp;
 
   for (int i = 0; i < experts_per_warp; ++i) {
     if (my_expert_start + i < num_experts) {
-      shared_counts[warp_id][i] = 0;
+      shared_counts[warp_id * experts_per_warp + i] = 0;
     }
   }
 
@@ -64,7 +71,7 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
     int expert_id = topk_ids[i];
     int warp_idx = expert_id / experts_per_warp;
     int expert_offset = expert_id % experts_per_warp;
-    atomicAdd(&shared_counts[warp_idx][expert_offset], 1);
+    atomicAdd(&shared_counts[warp_idx * experts_per_warp + expert_offset], 1);
   }
 
   __syncthreads();
@@ -75,7 +82,7 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
       int expert_count = 0;
       int warp_idx = (i - 1) / experts_per_warp;
       int expert_offset = (i - 1) % experts_per_warp;
-      expert_count = shared_counts[warp_idx][expert_offset];
+      expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
 
       cumsum[i] = cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
     }
@@ -91,17 +98,31 @@ __global__ void moe_align_block_size_kernel(const scalar_t* __restrict__ topk_id
   }
 }
 
-void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
-                          torch::Tensor sorted_token_ids, torch::Tensor experts_ids, torch::Tensor num_tokens_post_pad,
-                          torch::Tensor token_cnts_buffer, torch::Tensor cumsum_buffer) {
+void moe_align_block_size(
+    torch::Tensor topk_ids,
+    int64_t num_experts,
+    int64_t block_size,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor experts_ids,
+    torch::Tensor num_tokens_post_pad,
+    torch::Tensor token_cnts_buffer,
+    torch::Tensor cumsum_buffer) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(num_experts == 256, "moe_align_block_size kernel only support deepseek v3 now.");
-
+  TORCH_CHECK(num_experts % WARP_SIZE == 0);
+  int experts_per_warp = num_experts / WARP_SIZE;
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto align_kernel = moe_align_block_size_kernel<scalar_t>;
-    align_kernel<<<1, 1024, 0, stream>>>(topk_ids.data_ptr<scalar_t>(), sorted_token_ids.data_ptr<int32_t>(),
-                                         experts_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-                                         num_experts, block_size, topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+    size_t shared_mem_size = 32 * experts_per_warp * sizeof(int32_t);
+    align_kernel<<<1, 1024, shared_mem_size, stream>>>(
+        topk_ids.data_ptr<scalar_t>(),
+        sorted_token_ids.data_ptr<int32_t>(),
+        experts_ids.data_ptr<int32_t>(),
+        num_tokens_post_pad.data_ptr<int32_t>(),
+        num_experts,
+        experts_per_warp,
+        block_size,
+        topk_ids.numel(),
+        cumsum_buffer.data_ptr<int32_t>());
 
     const int block_threads = 256;
     const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
@@ -109,8 +130,10 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
     const int actual_blocks = std::min(num_blocks, max_blocks);
 
     auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
-    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                                                             sorted_token_ids.data_ptr<int32_t>(),
-                                                             cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
+    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
+        topk_ids.data_ptr<scalar_t>(),
+        sorted_token_ids.data_ptr<int32_t>(),
+        cumsum_buffer.data_ptr<int32_t>(),
+        topk_ids.numel());
   });
 }

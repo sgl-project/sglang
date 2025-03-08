@@ -106,6 +106,8 @@ class Engine:
         tokenizer_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args
         )
+
+        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
