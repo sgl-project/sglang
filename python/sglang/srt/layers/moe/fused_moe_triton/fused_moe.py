@@ -12,8 +12,8 @@ import torch
 import triton
 import triton.language as tl
 from vllm import _custom_ops as ops
-from sglang.srt.custom_op import scaled_fp8_quant
 
+from sglang.srt.custom_op import scaled_fp8_quant
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.int8_kernel import (

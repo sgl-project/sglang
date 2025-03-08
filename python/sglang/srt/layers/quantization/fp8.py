@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
 
+from sglang.srt.custom_op import scaled_fp8_quant
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     LinearBase,
