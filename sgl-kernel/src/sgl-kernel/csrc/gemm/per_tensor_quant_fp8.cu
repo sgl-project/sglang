@@ -37,18 +37,7 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
     max_value = fmaxf(max_value, fabsf(val));
   }
 
-  static __shared__ float warpLevelMaxs[WARP_SIZE];
-  const int laneId = threadIdx.x % WARP_SIZE;
-  const int warpId = threadIdx.x / WARP_SIZE;
-
-  max_value = warpReduceMax(max_value);
-
-  if (laneId == 0) warpLevelMaxs[warpId] = max_value;
-  __syncthreads();
-
-  max_value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
-
-  if (warpId == 0) max_value = warpReduceMax(max_value);
+  max_value = blockReduceMax(max_value);
 
   if (tid == 0) {
     atomicMaxFloat(output_s, max_value / FP8_E4M3_MAX);
