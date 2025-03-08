@@ -70,7 +70,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
-#if 0
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
@@ -101,7 +100,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
       " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
   m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
-#endif
 
   /*
    * From csrc/moe
