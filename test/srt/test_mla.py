@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
@@ -129,6 +130,8 @@ class TestDeepseekV3MTP(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        requests.get(self.base_url + "/flush_cache")
+
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -142,6 +145,11 @@ class TestDeepseekV3MTP(unittest.TestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+        server_info = requests.get(self.base_url + "/get_server_info")
+        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 2.5)
 
 
 if __name__ == "__main__":
