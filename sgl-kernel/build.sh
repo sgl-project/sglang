@@ -27,5 +27,5 @@ docker run --rm \
     cd /sgl-kernel && \
     ${PYTHON_ROOT_PATH}/bin/python -c 'import setuptools; import importlib.util; print(\"setuptools version:\", setuptools.__version__); import wheel; print(\"wheel version:\", wheel.__version__); print(\"wheel modules:\", dir(wheel))' && \
     ls -la ${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages/wheel/ && \
-    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m pip wheel . --no-deps
+    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python setup.py bdist_wheel
     "

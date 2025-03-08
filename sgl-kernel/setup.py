@@ -20,9 +20,9 @@ from pathlib import Path
 
 import torch
 from setuptools import find_packages, setup
-from wheel.bdist_wheel import bdist_wheel
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from wheel.bdist_wheel import bdist_wheel
 
 root = Path(__file__).parent.resolve()
 
