@@ -308,7 +308,9 @@ class FusedMoE(torch.nn.Module):
         self.no_combine = no_combine
 
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = FusedMoEMethodBase()
+            self.quant_method: Optional[QuantizeMethodBase] = (
+                UnquantizedFusedMoEMethod()
+            )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
