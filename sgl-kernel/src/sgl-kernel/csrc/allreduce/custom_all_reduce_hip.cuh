@@ -169,7 +169,8 @@ DINLINE void start_sync(
         &sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) <
-           flag);
+           flag)
+      ;
   }
   __syncthreads();
   // use one thread to update flag
@@ -182,7 +183,8 @@ DINLINE void start_sync(
     // Latency = 1 p2p write
     sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
     // wait until we got true from all ranks
-    while (!self_sg->start[blockIdx.x][threadIdx.x]);
+    while (!self_sg->start[blockIdx.x][threadIdx.x])
+      ;
   }
   __syncthreads();
 #endif
@@ -218,7 +220,8 @@ DINLINE void end_sync(
     while (__scoped_atomic_load_n(
                &self_sg->end[blockIdx.x][threadIdx.x],
                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-               __MEMORY_SCOPE_DEVICE) < flag);
+               __MEMORY_SCOPE_DEVICE) < flag)
+      ;
   }
   __syncthreads();
   // use one thread to update flag
@@ -237,7 +240,8 @@ DINLINE void end_sync(
     // Latency = 1 p2p write
     sg.signals[threadIdx.x]->end[blockIdx.x][rank] = 1;
     // wait until we got true from all ranks
-    while (!self_sg->end[blockIdx.x][threadIdx.x]);
+    while (!self_sg->end[blockIdx.x][threadIdx.x])
+      ;
   }
   if constexpr (!final_sync) __syncthreads();
 #endif
