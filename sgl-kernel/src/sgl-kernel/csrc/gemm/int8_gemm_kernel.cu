@@ -35,11 +35,20 @@ limitations under the License.
 
 using namespace cute;
 
-template <typename ElementOutput, typename ArchTag, typename ThreadblockShape, typename WarpShape,
-          typename InstructionShape, int NumStages>
-void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                            const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                            const c10::optional<torch::Tensor>& bias) {
+template <
+    typename ElementOutput,
+    typename ArchTag,
+    typename ThreadblockShape,
+    typename WarpShape,
+    typename InstructionShape,
+    int NumStages>
+void cutlass_int8_scaled_mm(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   using ElementAccumulator = int32_t;
   using ElementCompute = float;
   using ElementInputA = int8_t;
@@ -48,30 +57,51 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
 
-  using DefaultGemmConf = cutlass::gemm::device::DefaultGemmConfiguration<OperatorClass, ArchTag, ElementInputA,
-                                                                          ElementInputB, ElementOutput, ElementCompute>;
+  using DefaultGemmConf = cutlass::gemm::device::
+      DefaultGemmConfiguration<OperatorClass, ArchTag, ElementInputA, ElementInputB, ElementOutput, ElementCompute>;
   using EpilogueOutputOp = typename DefaultGemmConf::EpilogueOutputOp;
 
   using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemm<
-      ElementInputA, cutlass::layout::RowMajor, DefaultGemmConf::kAlignmentA, ElementInputB,
-      cutlass::layout::ColumnMajor, DefaultGemmConf::kAlignmentB, ElementOutput, cutlass::layout::RowMajor,
-      ElementAccumulator, OperatorClass, ArchTag, ThreadblockShape, WarpShape, InstructionShape, EpilogueOutputOp,
-      ThreadblockSwizzle, NumStages, true, typename DefaultGemmConf::Operator>::GemmKernel;
+      ElementInputA,
+      cutlass::layout::RowMajor,
+      DefaultGemmConf::kAlignmentA,
+      ElementInputB,
+      cutlass::layout::ColumnMajor,
+      DefaultGemmConf::kAlignmentB,
+      ElementOutput,
+      cutlass::layout::RowMajor,
+      ElementAccumulator,
+      OperatorClass,
+      ArchTag,
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      EpilogueOutputOp,
+      ThreadblockSwizzle,
+      NumStages,
+      true,
+      typename DefaultGemmConf::Operator>::GemmKernel;
 
   using AlphaColTileIterator = cutlass::epilogue::threadblock::PredicatedTileIterator<
       cutlass::epilogue::threadblock::OutputTileOptimalThreadMap<
           typename GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::Shape,
           typename GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::Count,
           GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::kThreads,
-          GemmKernel_::Epilogue::OutputTileIterator::kElementsPerAccess, cutlass::sizeof_bits<ElementOutput>::value>,
+          GemmKernel_::Epilogue::OutputTileIterator::kElementsPerAccess,
+          cutlass::sizeof_bits<ElementOutput>::value>,
       ElementCompute>;
 
   using EpilogueVisitor = typename cutlass::epilogue::threadblock::EpilogueVisitorPerRowPerCol<
-      ThreadblockShape, GemmKernel_::kThreadCount, AlphaColTileIterator,
-      typename GemmKernel_::Epilogue::OutputTileIterator, ElementAccumulator, ElementCompute, EpilogueOutputOp>;
+      ThreadblockShape,
+      GemmKernel_::kThreadCount,
+      AlphaColTileIterator,
+      typename GemmKernel_::Epilogue::OutputTileIterator,
+      ElementAccumulator,
+      ElementCompute,
+      EpilogueOutputOp>;
 
-  using Epilogue = typename cutlass::epilogue::threadblock::EpilogueWithVisitorFromExistingEpilogue<
-      EpilogueVisitor, typename GemmKernel_::Epilogue>::Epilogue;
+  using Epilogue = typename cutlass::epilogue::threadblock::
+      EpilogueWithVisitorFromExistingEpilogue<EpilogueVisitor, typename GemmKernel_::Epilogue>::Epilogue;
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmKernel_::Mma, Epilogue, ThreadblockSwizzle>;
@@ -104,98 +134,164 @@ void cutlass_int8_scaled_mm(torch::Tensor& out, const torch::Tensor& mat_a, cons
   typename EpilogueOutputOp::Params linearScalingParams;
   typename EpilogueVisitor::Arguments visitor_args{linearScalingParams};
 
-  typename Gemm::Arguments args{{m, n, k},    {a_ptr, lda},    {b_ptr, ldb}, {b_s_ptr, 0},
-                                {a_s_ptr, 0}, {bias_ptr, ldc}, {o_ptr, ldd}, visitor_args};
+  typename Gemm::Arguments args{
+      {m, n, k}, {a_ptr, lda}, {b_ptr, ldb}, {b_s_ptr, 0}, {a_s_ptr, 0}, {bias_ptr, ldc}, {o_ptr, ldd}, visitor_args};
 
-  auto workspace = torch::empty(gemm_op.get_workspace_size(args),
-                                torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
+  auto workspace = torch::empty(
+      gemm_op.get_workspace_size(args), torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
 
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess,
-              "gemm cannot implement, error: ", cutlassGetStatusString(can_implement));
+  TORCH_CHECK(
+      can_implement == cutlass::Status::kSuccess,
+      "gemm cannot implement, error: ",
+      cutlassGetStatusString(can_implement));
 
   auto status = gemm_op(args, workspace.data_ptr(), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm executioin failed, error: ", cutlassGetStatusString(status));
 }
 
 template <typename ElementOutput, typename ArchTag, typename InstructionShape>
-void sm75_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                         const c10::optional<torch::Tensor>& bias) {
+void sm75_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   if (m <= 32) {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 128, 64>,
-                           cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<32, 128, 64>,
+        cutlass::gemm::GemmShape<32, 64, 64>,
+        InstructionShape,
+        2>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else if (m <= 64) {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 128, 128>,
-                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<64, 128, 128>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        InstructionShape,
+        2>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else if (m <= 256) {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 128>,
-                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<128, 128, 128>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        InstructionShape,
+        2>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 2>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        InstructionShape,
+        2>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
 }
 
 template <typename ElementOutput, typename ArchTag, typename InstructionShape>
-void sm80_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                         const c10::optional<torch::Tensor>& bias) {
+void sm80_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   int n = mat_b.size(1);
   if (m <= 16) {
     if (n <= 4096) {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<16, 64, 128>,
-                             cutlass::gemm::GemmShape<16, 64, 64>, InstructionShape, 6>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<16, 64, 128>,
+          cutlass::gemm::GemmShape<16, 64, 64>,
+          InstructionShape,
+          6>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<16, 64, 128>,
-                             cutlass::gemm::GemmShape<16, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<16, 64, 128>,
+          cutlass::gemm::GemmShape<16, 64, 64>,
+          InstructionShape,
+          5>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (m <= 32) {
     if (n <= 4096) {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 64, 128>,
-                             cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 6>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<32, 64, 128>,
+          cutlass::gemm::GemmShape<32, 64, 64>,
+          InstructionShape,
+          6>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<32, 64, 128>,
-                             cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<32, 64, 128>,
+          cutlass::gemm::GemmShape<32, 64, 64>,
+          InstructionShape,
+          5>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (m <= 64) {
     if (n <= 4096) {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 64, 128>,
-                             cutlass::gemm::GemmShape<32, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<64, 64, 128>,
+          cutlass::gemm::GemmShape<32, 64, 64>,
+          InstructionShape,
+          5>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 128, 128>,
-                             cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                        scales_b, bias);
+      cutlass_int8_scaled_mm<
+          ElementOutput,
+          ArchTag,
+          cutlass::gemm::GemmShape<64, 128, 128>,
+          cutlass::gemm::GemmShape<64, 64, 64>,
+          InstructionShape,
+          5>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (m <= 128 && n < 8192) {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<64, 128, 128>,
-                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<64, 128, 128>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        InstructionShape,
+        5>(out, mat_a, mat_b, scales_a, scales_b, bias);
   } else {
-    cutlass_int8_scaled_mm<ElementOutput, ArchTag, cutlass::gemm::GemmShape<128, 128, 64>,
-                           cutlass::gemm::GemmShape<64, 64, 64>, InstructionShape, 5>(out, mat_a, mat_b, scales_a,
-                                                                                      scales_b, bias);
+    cutlass_int8_scaled_mm<
+        ElementOutput,
+        ArchTag,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        InstructionShape,
+        5>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
 }
 
-template <typename ElementOutput, typename TileShape, typename ClusterShape, typename MainloopScheduleType,
-          bool WithBias>
-void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                                 const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                                 const c10::optional<torch::Tensor>& bias) {
+template <
+    typename ElementOutput,
+    typename TileShape,
+    typename ClusterShape,
+    typename MainloopScheduleType,
+    bool WithBias>
+void cutlass_int8_scaled_mm_sm90(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   using ArchTag = cutlass::arch::Sm90;
 
   using ElementAccumulator = int32_t;
@@ -213,50 +309,75 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
   using TileSchedulerType = cutlass::gemm::PersistentScheduler;
 
-  using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementCompute, ElementCompute,
-                                                             Stride<Int<1>, Int<0>, Int<0>>>;
+  using XScale = cutlass::epilogue::fusion::
+      Sm90ColBroadcast<0, TileShape, ElementCompute, ElementCompute, Stride<Int<1>, Int<0>, Int<0>>>;
 
-  using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementCompute, ElementCompute,
-                                                             Stride<Int<0>, Int<1>, Int<0>>>;
+  using WScale = cutlass::epilogue::fusion::
+      Sm90RowBroadcast<0, TileShape, ElementCompute, ElementCompute, Stride<Int<0>, Int<1>, Int<0>>>;
 
-  using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementOutput, ElementOutput,
-                                                           Stride<Int<0>, Int<1>, Int<0>>>;
+  using Bias = cutlass::epilogue::fusion::
+      Sm90RowBroadcast<0, TileShape, ElementOutput, ElementOutput, Stride<Int<0>, Int<1>, Int<0>>>;
 
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   // Scale
-  using Compute0 = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute,
-                                                          cutlass::FloatRoundStyle::round_to_nearest>;
+  using Compute0 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
 
   using EVTCompute0 = cutlass::epilogue::fusion::Sm90EVT<Compute0, WScale, Accum>;
 
-  using Compute1 = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiplies, ElementOutput, ElementCompute,
-                                                          cutlass::FloatRoundStyle::round_to_nearest>;
+  using Compute1 = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
 
   using EVTCompute1 = cutlass::epilogue::fusion::Sm90EVT<Compute1, XScale, EVTCompute0>;
 
   // With bias
-  using ComputeWithBias = cutlass::epilogue::fusion::Sm90Compute<cutlass::multiply_add, ElementOutput, ElementCompute,
-                                                                 cutlass::FloatRoundStyle::round_to_nearest>;
+  using ComputeWithBias = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiply_add, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
   using EVTComputeWithBias = cutlass::epilogue::fusion::Sm90EVT<ComputeWithBias, XScale, EVTCompute0, Bias>;
 
   using EpilogueEVT = typename cutlass::platform::conditional<WithBias, EVTComputeWithBias, EVTCompute1>::type;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementCompute, ElementOutput, cutlass::layout::RowMajor, AlignmentC, ElementOutput,
-      cutlass::layout::RowMajor, AlignmentOutput, EpilogueScheduleType, EpilogueEVT>::CollectiveOp;
+      ArchTag,
+      OperatorClass,
+      TileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementCompute,
+      ElementOutput,
+      cutlass::layout::RowMajor,
+      AlignmentC,
+      ElementOutput,
+      cutlass::layout::RowMajor,
+      AlignmentOutput,
+      EpilogueScheduleType,
+      EpilogueEVT>::CollectiveOp;
 
   using Stages = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
       sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, ElementInputA, cutlass::layout::RowMajor, AlignmentA, ElementInputB,
-      cutlass::layout::ColumnMajor, AlignmentB, ElementAccumulator, TileShape, ClusterShape, Stages,
+      ArchTag,
+      OperatorClass,
+      ElementInputA,
+      cutlass::layout::RowMajor,
+      AlignmentA,
+      ElementInputB,
+      cutlass::layout::ColumnMajor,
+      AlignmentB,
+      ElementAccumulator,
+      TileShape,
+      ClusterShape,
+      Stages,
       MainloopScheduleType>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,  // Indicates ProblemShape
-                                                          CollectiveMainloop, CollectiveEpilogue, TileSchedulerType>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,  // Indicates ProblemShape
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      TileSchedulerType>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -283,14 +404,15 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
   StrideC stride_c;
   StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
 
-  typename Gemm::Arguments args = {cutlass::gemm::GemmUniversalMode::kGemm,
-                                   {m, n, k, 1},
-                                   {a_ptr, stride_a, b_ptr, stride_b},
-                                   {{},  // epilogue.thread
-                                    nullptr,
-                                    stride_c,
-                                    o_ptr,
-                                    stride_d}};
+  typename Gemm::Arguments args = {
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1},
+      {a_ptr, stride_a, b_ptr, stride_b},
+      {{},  // epilogue.thread
+       nullptr,
+       stride_c,
+       o_ptr,
+       stride_d}};
 
   if constexpr (WithBias) {
     ElementOutput* bias_ptr = static_cast<ElementOutput*>(bias->data_ptr());
@@ -308,23 +430,29 @@ void cutlass_int8_scaled_mm_sm90(torch::Tensor& out, const torch::Tensor& mat_a,
     };
   }
 
-  auto workspace = torch::empty(gemm_op.get_workspace_size(args),
-                                torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
+  auto workspace = torch::empty(
+      gemm_op.get_workspace_size(args), torch::TensorOptions().dtype(torch::kUInt8).device(mat_a.device()));
 
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 
   auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess,
-              "gemm cannot implement, error: ", cutlassGetStatusString(can_implement));
+  TORCH_CHECK(
+      can_implement == cutlass::Status::kSuccess,
+      "gemm cannot implement, error: ",
+      cutlassGetStatusString(can_implement));
 
   auto status = gemm_op(args, workspace.data_ptr(), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "gemm executioin failed, error: ", cutlassGetStatusString(status));
 }
 
 template <typename ElementOutput, typename TileShape, typename ClusterShape, typename MainloopScheduleType>
-void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                        const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                        const c10::optional<torch::Tensor>& bias) {
+void sm90_dispatch_bias(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   if (bias) {
     cutlass_int8_scaled_mm_sm90<ElementOutput, TileShape, ClusterShape, MainloopScheduleType, true>(
         out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -335,45 +463,73 @@ void sm90_dispatch_bias(torch::Tensor& out, const torch::Tensor& mat_a, const to
 }
 
 template <typename ElementOutput>
-void sm90_dispatch_shape(torch::Tensor& out, const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                         const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                         const c10::optional<torch::Tensor>& bias) {
+void sm90_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
   int m = mat_a.size(0);
   int n = mat_b.size(1);
   if (m <= 32) {
     if (n < 8192) {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_1, _8, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _64, _128>,
+          Shape<_1, _8, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _128, _128>, Shape<_1, _8, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _128, _128>,
+          Shape<_1, _8, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (m <= 64) {
     if (n < 8192) {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_1, _4, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _64, _128>,
+          Shape<_1, _4, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _256>, Shape<_1, _1, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _64, _256>,
+          Shape<_1, _1, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else if (m <= 128) {
     if (n <= 4096) {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _64, _128>, Shape<_2, _1, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _64, _128>,
+          Shape<_2, _1, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
-      return sm90_dispatch_bias<ElementOutput, Shape<_64, _128, _128>, Shape<_2, _1, _1>,
-                                cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
+      return sm90_dispatch_bias<
+          ElementOutput,
+          Shape<_64, _128, _128>,
+          Shape<_2, _1, _1>,
+          cutlass::gemm::KernelTmaWarpSpecialized>(out, mat_a, mat_b, scales_a, scales_b, bias);
     }
   } else {
-    return sm90_dispatch_bias<ElementOutput, Shape<_128, _128, _128>, Shape<_2, _1, _1>,
-                              cutlass::gemm::KernelTmaWarpSpecializedPingpong>(out, mat_a, mat_b, scales_a, scales_b,
-                                                                               bias);
+    return sm90_dispatch_bias<
+        ElementOutput,
+        Shape<_128, _128, _128>,
+        Shape<_2, _1, _1>,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpong>(out, mat_a, mat_b, scales_a, scales_b, bias);
   }
 }
 
-torch::Tensor int8_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b, const torch::Tensor& scales_a,
-                             const torch::Tensor& scales_b, const torch::Dtype& out_dtype,
-                             const c10::optional<torch::Tensor>& bias) {
+torch::Tensor int8_scaled_mm(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype,
+    const c10::optional<torch::Tensor>& bias) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");

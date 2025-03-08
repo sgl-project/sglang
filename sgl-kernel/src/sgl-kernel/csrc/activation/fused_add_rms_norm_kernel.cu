@@ -41,10 +41,15 @@ void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::T
   // support float16, bfloat16 and float32
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::FusedAddRMSNorm(
-        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
-        static_cast<c_type*>(weight.data_ptr()), batch_size, hidden_size, eps, torch_current_stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "FusedAddRMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
+        static_cast<c_type*>(input.data_ptr()),
+        static_cast<c_type*>(residual.data_ptr()),
+        static_cast<c_type*>(weight.data_ptr()),
+        batch_size,
+        hidden_size,
+        eps,
+        torch_current_stream);
+    TORCH_CHECK(
+        status == cudaSuccess, "FusedAddRMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
   });
 }
