@@ -61,26 +61,27 @@ hipcc_flags = [
     "-DENABLE_FP8",
 ]
 
+ext_modules = [
+    CUDAExtension(
+        name="sgl_kernel.common_ops",
+        sources=sources,
+        include_dirs=include_dirs,
+        extra_compile_args={
+            "nvcc": hipcc_flags,
+            "cxx": cxx_flags,
+        },
+        libraries=libraries,
+        extra_link_args=extra_link_args,
+        py_limited_api=True,
+    ),
+]
+
 setup(
     name="sgl-kernel",
     version=_get_version(),
     packages=find_packages(),
-    package_dir={"": "src"},
-    ext_modules=[
-        CUDAExtension(
-            name="sgl_kernel.ops._kernels",
-            sources=sources,
-            include_dirs=include_dirs,
-            extra_compile_args={
-                "nvcc": hipcc_flags,
-                "cxx": cxx_flags,
-            },
-            libraries=libraries,
-            extra_link_args=extra_link_args,
-            py_limited_api=True,
-        ),
-    ],
+    package_dir={"": "python"},
+    ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
-    install_requires=["torch"],
 )
