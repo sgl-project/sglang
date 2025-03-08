@@ -8,8 +8,8 @@
 #include "utils.h"
 
 template <typename T>
-__global__ void per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s,
-                                         const int64_t num_elements) {
+__global__ void
+per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output_s, const int64_t num_elements) {
   float max_value = 0.0f;
   unsigned int tid = threadIdx.x;
   unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -56,8 +56,11 @@ __global__ void per_tensor_absmax_kernel(const T* __restrict__ input, float* __r
 }
 
 template <typename T>
-__global__ void per_tensor_quant_fp8_kernel(const T* __restrict__ input, FP8_TYPE* __restrict__ output,
-                                            const float* __restrict__ scale, const int64_t num_elements) {
+__global__ void per_tensor_quant_fp8_kernel(
+    const T* __restrict__ input,
+    FP8_TYPE* __restrict__ output,
+    const float* __restrict__ scale,
+    const int64_t num_elements) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   const int grid_size = blockDim.x * gridDim.x;
   const float scale_val = 1.0f / (*scale);
@@ -124,8 +127,10 @@ void sgl_per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch
     }
 
     per_tensor_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<scalar_t*>(input.data_ptr()), static_cast<FP8_TYPE*>(output_q.data_ptr()),
-        static_cast<float*>(output_s.data_ptr()), num_elements);
+        static_cast<scalar_t*>(input.data_ptr()),
+        static_cast<FP8_TYPE*>(output_q.data_ptr()),
+        static_cast<float*>(output_s.data_ptr()),
+        num_elements);
     return true;
   });
 }

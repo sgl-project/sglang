@@ -29,9 +29,14 @@ using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 
 class AllReduceMeta {
  public:
-  AllReduceMeta(int64_t rank_id, int64_t world_size, torch::Tensor& rank_data, const std::vector<fptr_t>& buffers,
-                const std::vector<fptr_t>& tmp_result_buffers, const std::vector<fptr_t>& barrier_in,
-                const std::vector<fptr_t>& barrier_out) {
+  AllReduceMeta(
+      int64_t rank_id,
+      int64_t world_size,
+      torch::Tensor& rank_data,
+      const std::vector<fptr_t>& buffers,
+      const std::vector<fptr_t>& tmp_result_buffers,
+      const std::vector<fptr_t>& barrier_in,
+      const std::vector<fptr_t>& barrier_out) {
     this->rank_id = (int)rank_id;
     this->world_size = (int)world_size;
     this->barrier_in = barrier_in;
@@ -86,9 +91,14 @@ inline bool CanApplyCustomAllReduce(int64_t num_elements, at::ScalarType dtype) 
   return num_elements % (16 / ((get_bits(dtype) + 7) / 8)) == 0;
 }
 
-fptr_t init_custom_ar(int64_t rank_id, int64_t world_size, torch::Tensor& rank_data, const std::vector<fptr_t>& buffers,
-                      const std::vector<fptr_t>& tmp_result_buffers, const std::vector<fptr_t>& barrier_in,
-                      const std::vector<fptr_t>& barrier_out) {
+fptr_t init_custom_ar(
+    int64_t rank_id,
+    int64_t world_size,
+    torch::Tensor& rank_data,
+    const std::vector<fptr_t>& buffers,
+    const std::vector<fptr_t>& tmp_result_buffers,
+    const std::vector<fptr_t>& barrier_in,
+    const std::vector<fptr_t>& barrier_out) {
   auto m = new AllReduceMeta(rank_id, world_size, rank_data, buffers, tmp_result_buffers, barrier_in, barrier_out);
   return (fptr_t)m;
 }
@@ -124,8 +134,8 @@ char* open_ipc_handle(AllReduceMeta* meta, const void* ipc_handle) {
   auto [it, new_handle] = meta->ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
   if (new_handle) {
     char* ipc_ptr;
-    CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle((void**)&ipc_ptr, *((const cudaIpcMemHandle_t*)ipc_handle),
-                                            cudaIpcMemLazyEnablePeerAccess));
+    CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle(
+        (void**)&ipc_ptr, *((const cudaIpcMemHandle_t*)ipc_handle), cudaIpcMemLazyEnablePeerAccess));
     it->second = ipc_ptr;
   }
   return it->second;
@@ -138,8 +148,8 @@ char* open_ipc_handle(AllReduceMeta* meta, const void* ipc_handle) {
 // rank 1 may get the same input address for the second allreduce, but rank 2
 // got a different address. IPC handles have internal reference counting
 // mechanism so overhead should be small.
-void register_graph_buffers(fptr_t _fa, const std::vector<std::vector<int64_t>>& handles,
-                            const std::vector<std::vector<int64_t>>& offsets) {
+void register_graph_buffers(
+    fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets) {
   AllReduceMeta* m = reinterpret_cast<AllReduceMeta*>(_fa);
   std::vector<std::string> handle_bytes;
   handle_bytes.reserve(handles.size());
