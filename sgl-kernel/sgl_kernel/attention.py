@@ -1,4 +1,3 @@
-import sgl_kernel.ops._kernels
 import torch
 
 

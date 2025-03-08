@@ -1,6 +1,5 @@
-import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops.utils import get_cuda_stream
+from sgl_kernel.utils import get_cuda_stream
 
 
 def tree_speculative_sampling_target_only(

@@ -1,8 +1,7 @@
 from typing import Optional
 
-import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops.utils import get_cuda_stream
+from sgl_kernel.utils import get_cuda_stream
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer

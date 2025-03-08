@@ -1,8 +1,7 @@
 from typing import Optional, Tuple, Union
 
-import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops.utils import _to_tensor_scalar_tuple, get_cuda_stream
+from sgl_kernel.utils import _to_tensor_scalar_tuple, get_cuda_stream
 
 
 def _top_k_renorm_probs_internal(

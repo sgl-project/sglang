@@ -9,7 +9,9 @@ if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
         mode=ctypes.RTLD_GLOBAL,
     )
 
-from sgl_kernel.ops.activation import (
+from sgl_kernel.ops.allreduce import *
+from sgl_kernel.ops.attention import lightning_attention_decode
+from sgl_kernel.ops.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     gelu_and_mul,
@@ -19,8 +21,6 @@ from sgl_kernel.ops.activation import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.ops.allreduce import *
-from sgl_kernel.ops.attention import lightning_attention_decode
 from sgl_kernel.ops.gemm import (
     bmm_fp8,
     cublas_grouped_gemm,

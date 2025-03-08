@@ -1,6 +1,5 @@
 from typing import List, Tuple
 
-import sgl_kernel.ops._kernels
 import torch
 
 if torch.version.hip is not None:

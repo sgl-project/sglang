@@ -56,8 +56,8 @@ turbomind = root / "3rdparty" / "turbomind"
 include_dirs = [
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
-    root / "src" / "sgl-kernel" / "include",
-    root / "src" / "sgl-kernel" / "csrc",
+    root / "include",
+    root / "csrc",
     flashinfer.resolve() / "include",
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
@@ -97,10 +97,10 @@ nvcc_flags_fp8 = [
 
 sources = [
     "src/sgl-kernel/torch_extension.cc",
-    "src/sgl-kernel/csrc/activation/fused_add_rms_norm_kernel.cu",
     "src/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu",
     "src/sgl-kernel/csrc/allreduce/trt_reduce_kernel.cu",
     "src/sgl-kernel/csrc/attention/lightning_attention_decode_kernel.cu",
+    "src/sgl-kernel/csrc/elementwise/fused_add_rms_norm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/cublas_grouped_gemm.cu",
     "src/sgl-kernel/csrc/gemm/fp8_gemm_kernel.cu",
     "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
@@ -158,7 +158,7 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linu
 
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels",
+        name="sgl_kernel.common_ops",
         sources=sources,
         include_dirs=include_dirs,
         extra_compile_args={
@@ -172,10 +172,10 @@ ext_modules = [
 ]
 
 setup(
-    name="sgl-kernel",
+    name="sgl_kernel",
     version=_get_version(),
     packages=find_packages(),
-    package_dir={"": "src"},
+    package_dir={"": "sgl_kernel"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
