@@ -123,7 +123,7 @@ class TestEAGLEEngine(unittest.TestCase):
     def _test_acc_length(self, engine):
         prompt = [
             "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
-        ]
+        ] * 5
         sampling_params = {"temperature": 0, "max_new_tokens": 512}
         output = engine.generate(prompt, sampling_params)
         output = output[0]

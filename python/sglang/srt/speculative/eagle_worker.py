@@ -303,13 +303,10 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
+            out_cache_loc = out_cache_loc.view(forward_batch.batch_size, -1)
             forward_batch.out_cache_loc = out_cache_loc[
-                forward_batch.batch_size
-                * self.topk
-                * i : forward_batch.batch_size
-                * self.topk
-                * (i + 1)
-            ]
+                :, self.topk * i : self.topk * (i + 1)
+            ].flatten()
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states

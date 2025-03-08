@@ -300,10 +300,11 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
+            # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(self.capture_bs)
+                tqdm.tqdm(reversed(self.capture_bs))
                 if get_tensor_model_parallel_rank() == 0
-                else self.capture_bs
+                else reversed(self.capture_bs)
             )
             for bs in capture_range:
                 with patch_model(
