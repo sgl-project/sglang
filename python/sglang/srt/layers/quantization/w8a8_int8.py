@@ -1,3 +1,4 @@
+import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -41,10 +42,10 @@ class W8A8Int8Config(QuantizationConfig):
             return 75
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> int:
+    def get_availability(cls) -> int:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 75

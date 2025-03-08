@@ -61,7 +61,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         """Whether the quantization config is available on current device.
 
         This requirement is due to the custom kernels used by the
