@@ -79,14 +79,14 @@ void register_graph_buffers(
 /*
  * From csrc/elementwise
  */
- void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
- void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
- void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
- void gemma_fused_add_rmsnorm(
-     at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
- void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
- void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
- void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
+void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
+void gemma_fused_add_rmsnorm(
+    at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 
 /*
  * From csrc/gemm
