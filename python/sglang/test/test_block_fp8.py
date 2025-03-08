@@ -1,5 +1,4 @@
 import itertools
-import os
 import unittest
 
 import torch
@@ -209,36 +208,13 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(unittest.TestCase):
-    _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
-
-    if not _enable_jit_deepgemm:
-        OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
-        M = [1, 7, 83, 512, 2048]
-        NKs = [
-            (N, K)
-            for N in [128, 512, 1024, 4096, 7748, 13824]
-            for K in [256, 4096, 5120, 3884, 13824]
-        ]
-        # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-        BLOCK_SIZE = [[128, 128]]
-        SEEDS = [0]
-    else:
-        # use practical shape in DeepSeek V3 for test
-        OUT_DTYPES = [torch.bfloat16]
-        M = [64, 128, 512, 1024, 4096]
-        NKs = [
-            (1536, 7168),
-            (3072, 1536),
-            (24576, 7168),
-            (4096, 512),
-            (7168, 2048),
-            (4608, 7168),
-            (512, 7168),
-            (7168, 2304),
-            (7168, 512),
-        ]
-        BLOCK_SIZE = [[128, 128]]
-        SEEDS = [0]
+    OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
+    M = [1, 7, 83, 512, 2048]
+    N = [128, 512, 1024, 4096, 7748, 13824]
+    K = [256, 4096, 5120, 3884, 13824]
+    # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
+    BLOCK_SIZE = [[128, 128]]
+    SEEDS = [0]
 
     @classmethod
     def setUpClass(cls):
@@ -246,8 +222,7 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _w8a8_block_fp8_matmul(self, M, NK, block_size, out_dtype, seed):
-        N, K = NK
+    def _w8a8_block_fp8_matmul(self, M, N, K, block_size, out_dtype, seed):
         torch.manual_seed(seed)
         # NOTE(HandH1998): to avoid overflow when out_dtype = torch.half
         factor_for_scale = 1e-2
@@ -282,17 +257,19 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
     def test_w8a8_block_fp8_matmul(self):
         for params in itertools.product(
             self.M,
-            self.NKs,
+            self.N,
+            self.K,
             self.BLOCK_SIZE,
             self.OUT_DTYPES,
             self.SEEDS,
         ):
             with self.subTest(
                 M=params[0],
-                NKs=params[1],
-                block_size=params[2],
-                out_dtype=params[3],
-                seed=params[4],
+                N=params[1],
+                K=params[2],
+                block_size=params[3],
+                out_dtype=params[4],
+                seed=params[5],
             ):
                 self._w8a8_block_fp8_matmul(*params)
 
