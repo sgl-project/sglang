@@ -13,12 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing
-import os
 import sys
 from pathlib import Path
 
-import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -35,16 +32,16 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-operator_namespace = "sgl_kernels"
+operator_namespace = "sgl_kernel"
 include_dirs = [
-    root / "src" / "sgl-kernel" / "include",
-    root / "src" / "sgl-kernel" / "csrc",
+    root / "include",
+    root / "csrc",
 ]
 
 sources = [
-    "src/sgl-kernel/csrc/allreduce/custom_all_reduce.hip",
-    "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
-    "src/sgl-kernel/csrc/torch_extension_rocm.cc",
+    "csrc/allreduce/custom_all_reduce.hip",
+    "csrc/moe/moe_align_kernel.cu",
+    "csrc/torch_extension_rocm.cc",
 ]
 
 cxx_flags = ["-O3"]

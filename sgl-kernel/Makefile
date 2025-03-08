@@ -24,7 +24,7 @@ ln: submodule ## Create compilation database
 install: submodule ## Install package in development mode
 	@pip install -e .
 
-build: submodule ## Build and install wheel package
+build: #submodule ## Build and install wheel package
 	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
