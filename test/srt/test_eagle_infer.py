@@ -142,7 +142,7 @@ class TestEAGLEEngine(unittest.TestCase):
         )
         print(f"{acc_length=}")
 
-        if engine.server_args["model_path"] == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
+        if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
             self.assertGreater(acc_length, 3.6)
         else:
             self.assertGreater(acc_length, 2.6)
