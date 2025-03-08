@@ -413,6 +413,53 @@ class TestEAGLEServer(unittest.TestCase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
 
+    def run_decode(self, sampling_params):
+        return_logprob = True
+        top_logprobs_num = 5
+        return_text = True
+        n = 1
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
+                "sampling_params": {
+                    "max_new_tokens": 48,
+                    "n": n,
+                    "temperature": 0.7,
+                    **sampling_params,
+                },
+                "return_logprob": return_logprob,
+                "top_logprobs_num": top_logprobs_num,
+                "return_text_in_logprobs": return_text,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        print(json.dumps(response.json()))
+        print("=" * 100)
+
+    def test_penalty_mixed(self):
+        args = [
+            {},
+            {},
+            {},
+            {"frequency_penalty": 2},
+            {"presence_penalty": 1},
+            {"min_new_tokens": 16},
+            {"frequency_penalty": 0.2},
+            {"presence_penalty": 0.4},
+            {"min_new_tokens": 8},
+            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"frequency_penalty": 0.4, "min_new_tokens": 12},
+            {"presence_penalty": 0.8, "min_new_tokens": 12},
+            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
+            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
+        ]
+        random.shuffle(args * 5)
+        with ThreadPoolExecutor(8) as executor:
+            list(executor.map(self.run_decode, args))
+
 
 class TestEAGLERetract(TestEAGLEServer):
     @classmethod
