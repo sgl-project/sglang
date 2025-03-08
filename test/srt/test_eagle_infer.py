@@ -245,8 +245,25 @@ class TestEAGLEServer(unittest.TestCase):
         for p in threads:
             p.join()
 
+    def test_max_token_one(self):
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=1,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+
+        # Just run and check it does not hang
+        metrics = run_eval(args)
+        self.assertGreater(metrics["output_throughput"], 50)
+
     def test_gsm8k(self):
-        server_info = requests.get(self.base_url + "/flush_cache")
+        requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=5,
