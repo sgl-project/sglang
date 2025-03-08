@@ -385,6 +385,7 @@ class Scheduler:
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
+            is_context_extended=server_args.enable_hip_attention,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
@@ -1113,6 +1114,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         new_batch.prepare_for_extend()
 
@@ -1883,6 +1885,7 @@ class Scheduler:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
