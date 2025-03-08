@@ -68,7 +68,7 @@ def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
 
 
-def generate_completion_prompt(
+def generate_completion_prompt_from_request(
     request: ChatCompletionRequest, template_name: str
 ) -> str:
     return generate_completion_prompt(request.prompt, request.suffix, template_name)
