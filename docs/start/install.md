@@ -55,7 +55,7 @@ pip install -e "python[all_hip]"
 Note: To Intel GPU, do following instead:
 
 ```
-git clone -b v0.4.2.post3 https://github.com/sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 pip install --upgrade pip
 pip install -e "python[all_xpu]"

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
+import sys
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -57,10 +58,10 @@ class ModelOptFp8Config(QuantizationConfig):
             return 89
 
         # Vendors can update
-        return 999
+        return sys.maxsize
 
     @classmethod
-    def get_available(cls) -> bool:
+    def get_availability(cls) -> bool:
         major, minor = get_device_capability()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             return major * 10 + minor > 89
