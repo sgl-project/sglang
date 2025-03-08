@@ -21,7 +21,7 @@ dependencies = []
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools]
-package-dir = {"sgl_kernel" = "src/sgl-kernel"}
+package-dir = {"sgl_kernel" = "python/sgl_kernel"}
 packages = ["sgl_kernel", "sgl_kernel.ops", "sgl_kernel.csrc"]
 
 [tool.wheel]
