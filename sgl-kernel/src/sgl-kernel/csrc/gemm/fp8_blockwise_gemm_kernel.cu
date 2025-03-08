@@ -35,8 +35,12 @@
 using namespace cute;
 
 template <typename OutType, typename TileShape, typename ClusterShape, int ScaleGranularityM = 1>
-void launch_sm90_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                                         const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
+void launch_sm90_fp8_blockwise_scaled_mm(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b) {
   using ElementAccumulator = float;
   using ElementCompute = float;
   using ElementBlockScale = float;
@@ -66,19 +70,43 @@ void launch_sm90_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tensor
   using KernelSchedule =
       cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledSubGroupMAccum<ScaleGranularityM>;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, TileShape, ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC,
-      LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule, StoreEpilogueCompute>::CollectiveOp;
+      ArchTag,
+      OperatorClass,
+      TileShape,
+      ClusterShape,
+      EpilogueTileType,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      LayoutC,
+      AlignmentC,
+      ElementD,
+      LayoutD,
+      AlignmentD,
+      EpilogueSchedule,
+      StoreEpilogueCompute>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB, ElementAccumulator,
-      TileShape, ClusterShape,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutA,
+      AlignmentA,
+      ElementB,
+      LayoutB,
+      AlignmentB,
+      ElementAccumulator,
+      TileShape,
+      ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule>::CollectiveOp;
 
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,  // Indicates ProblemShape
-                                           CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,  // Indicates ProblemShape
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   Gemm gemm_op;
@@ -127,16 +155,23 @@ void launch_sm90_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tensor
 }
 
 template <typename OutType>
-void sm90_fp8_blockwise_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                                       const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
+void sm90_fp8_blockwise_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b) {
   using TileShape = Shape<_128, _128, _128>;
   using ClusterShape = Shape<_1, _1, _1>;
   launch_sm90_fp8_blockwise_scaled_mm<OutType, TileShape, ClusterShape>(out, a, b, scales_a, scales_b);
 }
 
-torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::Tensor& mat_b,
-                                      const torch::Tensor& scales_a, const torch::Tensor& scales_b,
-                                      const torch::Dtype& out_dtype) {
+torch::Tensor fp8_blockwise_scaled_mm(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -145,10 +180,10 @@ torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::T
   TORCH_CHECK(mat_b.stride(0) == 1, "mat_a must be a column major tensor");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
 
-  TORCH_CHECK((mat_a.size(1) * mat_a.element_size()) % 16 == 0,
-              "mat_a must be multiple of 16 bytes for memory alignment");
-  TORCH_CHECK((mat_b.size(0) * mat_b.element_size()) % 16 == 0,
-              "mat_b must be multiple of 16 bytes for memory alignment");
+  TORCH_CHECK(
+      (mat_a.size(1) * mat_a.element_size()) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
+  TORCH_CHECK(
+      (mat_b.size(0) * mat_b.element_size()) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
   TORCH_CHECK(mat_a.scalar_type() == torch::kFloat8_e4m3fn, "mat_a must be Float8_e4m3fn");
   TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
@@ -186,6 +221,6 @@ torch::Tensor fp8_blockwise_scaled_mm(const torch::Tensor& mat_a, const torch::T
 #endif
 #endif
 
-  TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
 }

@@ -103,7 +103,7 @@ inline AllReduceStrategyType SelectImplementation(size_t message_size, int world
   return AllReduceStrategyType::TWOSHOT;
 }
 
-void trtCustomAllReduce(AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat,
-                        cudaStream_t stream);
+void trtCustomAllReduce(
+    AllReduceParams& params, at::ScalarType data_type, AllReduceStrategyType strat, cudaStream_t stream);
 
 }  // namespace trt_llm

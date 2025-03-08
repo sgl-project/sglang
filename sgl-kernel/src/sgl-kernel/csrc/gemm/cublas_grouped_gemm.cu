@@ -21,10 +21,13 @@
 
 #include "utils.h"
 
-static void check_group_count(const std::vector<torch::Tensor>& inputs, const std::vector<torch::Tensor>& weights,
-                              const std::vector<torch::Tensor>& outputs) {
-  TORCH_CHECK(((inputs.size() == weights.size()) && (inputs.size() == outputs.size())),
-              "The group count of inputs, weights and outputs should be the same.");
+static void check_group_count(
+    const std::vector<torch::Tensor>& inputs,
+    const std::vector<torch::Tensor>& weights,
+    const std::vector<torch::Tensor>& outputs) {
+  TORCH_CHECK(
+      ((inputs.size() == weights.size()) && (inputs.size() == outputs.size())),
+      "The group count of inputs, weights and outputs should be the same.");
 }
 
 static void check_device_dtype(const torch::Dtype& dtype, const std::vector<torch::Tensor>& tensors) {
@@ -68,21 +71,26 @@ static std::vector<void*> get_tensor_ptrs(const std::vector<torch::Tensor>& tens
 static torch::Tensor create_ptr_pointer(const std::vector<void*>& ptrs, cudaStream_t stream) {
   auto options = torch::TensorOptions().dtype(torch::kDouble).device(torch::kCUDA);
   torch::Tensor gpu_ptrs = torch::empty({static_cast<int>(ptrs.size())}, options);
-  TORCH_CHECK(cudaMemcpyAsync(gpu_ptrs.data_ptr(), ptrs.data(), sizeof(void*) * ptrs.size(), cudaMemcpyHostToDevice,
-                              stream) == CUBLAS_STATUS_SUCCESS);
+  TORCH_CHECK(
+      cudaMemcpyAsync(gpu_ptrs.data_ptr(), ptrs.data(), sizeof(void*) * ptrs.size(), cudaMemcpyHostToDevice, stream) ==
+      CUBLAS_STATUS_SUCCESS);
   return gpu_ptrs;
 }
 
 // We want compute input @ weight^T in row major
 // This is equivalent to computing weight @ input^T in col major
 // Cublas only accepts matrix in column major, so this arrangement is needed
-void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs,   // b: (m, k) row major = (k, m) col major
-                         const std::vector<torch::Tensor>& weights,  // a: (n, k) row major = (n, k)^T col major
-                         const std::vector<torch::Tensor>& outputs,  // c: (m, n) row major = (n, m) col major
-                         const torch::Dtype& out_dtype, int64_t cublas_handle, int64_t cuda_stream) {
-  TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16,
-              "cublas grouped_gemm can"
-              "only be applied to float16 and bfloat16 dtype");
+void cublas_grouped_gemm(
+    const std::vector<torch::Tensor>& inputs,   // b: (m, k) row major = (k, m) col major
+    const std::vector<torch::Tensor>& weights,  // a: (n, k) row major = (n, k)^T col major
+    const std::vector<torch::Tensor>& outputs,  // c: (m, n) row major = (n, m) col major
+    const torch::Dtype& out_dtype,
+    int64_t cublas_handle,
+    int64_t cuda_stream) {
+  TORCH_CHECK(
+      out_dtype == torch::kHalf || out_dtype == torch::kBFloat16,
+      "cublas grouped_gemm can"
+      "only be applied to float16 and bfloat16 dtype");
 
   int group_count = inputs.size();
   check_group_count(inputs, weights, outputs);
@@ -133,16 +141,32 @@ void cublas_grouped_gemm(const std::vector<torch::Tensor>& inputs,   // b: (m, k
   torch::Tensor d_c = create_ptr_pointer(c_array, stream);
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12050
-  auto status = cublasGemmGroupedBatchedEx(handle, transa_array.data(), transb_array.data(), m_array.data(),
-                                           n_array.data(), k_array.data(), alpha_array.data(), (void**)d_a.data_ptr(),
-                                           cuda_data_type, lda_array.data(), (void**)d_b.data_ptr(), cuda_data_type,
-                                           ldb_array.data(), beta_array.data(), (void**)d_c.data_ptr(), cuda_data_type,
-                                           ldc_array.data(), group_count, group_size.data(), CUBLAS_COMPUTE_32F);
+  auto status = cublasGemmGroupedBatchedEx(
+      handle,
+      transa_array.data(),
+      transb_array.data(),
+      m_array.data(),
+      n_array.data(),
+      k_array.data(),
+      alpha_array.data(),
+      (void**)d_a.data_ptr(),
+      cuda_data_type,
+      lda_array.data(),
+      (void**)d_b.data_ptr(),
+      cuda_data_type,
+      ldb_array.data(),
+      beta_array.data(),
+      (void**)d_c.data_ptr(),
+      cuda_data_type,
+      ldc_array.data(),
+      group_count,
+      group_size.data(),
+      CUBLAS_COMPUTE_32F);
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "cublas grouped gemm failed: ", cublasGetStatusString(status));
   TORCH_CHECK(cudaStreamSynchronize(stream) == cudaSuccess, "Failed when stream synchronization");
   return;
 #endif
 
-  TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "Cublas GroupGemm is not implemented with current compute capability: ", getSMVersion());
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "Cublas GroupGemm is not implemented with current compute capability: ", getSMVersion());
 }
