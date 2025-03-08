@@ -77,6 +77,18 @@ void register_graph_buffers(
 #endif
 
 /*
+ * From csrc/attention
+ */
+void lightning_attention_decode(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& past_kv,
+    const torch::Tensor& slope,
+    torch::Tensor output,
+    torch::Tensor new_kv);
+
+/*
  * From csrc/elementwise
  */
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
@@ -255,15 +267,3 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     int64_t cuda_stream);
-
-/*
- * Other
- */
-void lightning_attention_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& past_kv,
-    const torch::Tensor& slope,
-    torch::Tensor output,
-    torch::Tensor new_kv);
