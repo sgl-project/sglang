@@ -141,10 +141,14 @@ class TestEAGLEEngine(unittest.TestCase):
             / output["meta_info"]["e2e_latency"]
         )
         print(f"{acc_length=}")
-        self.assertGreater(acc_length, 3.6)
+
+        if engine.server_args["model_path"] == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
+            self.assertGreater(acc_length, 3.6)
+        else:
+            self.assertGreater(acc_length, 2.6)
 
 
-class TestEAGLEEngineTokenMap(unittest.TestCase):
+class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     BASE_CONFIG = {
         "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
         "speculative_draft_model_path": "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B",
@@ -155,6 +159,7 @@ class TestEAGLEEngineTokenMap(unittest.TestCase):
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 5,
+        "dtype": "float16",
     }
     NUM_CONFIGS = 1
 
