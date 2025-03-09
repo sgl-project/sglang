@@ -1052,8 +1052,8 @@ class Fp8MoEMethod:
             w2_s=(
                 layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
             ),
-            score=router_logits,
-            topk=top_k,
+            topk_weight=topk_weights,
+            topk_ids=topk_ids,
             block_shape=self.quant_config.weight_block_size,
         )
 
