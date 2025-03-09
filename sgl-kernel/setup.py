@@ -85,10 +85,9 @@ class CustomBuildPy(build_py):
         ]
 
         for d in third_party_include_dirs:
-            dirname = str(d).split('/')[-1]
+            dirname = str(d).split("/")[-1]
             src_dir = d
-            dst_dir = f'{build_include_dir}/{dirname}'
-            print("########", src_dir, dst_dir)
+            dst_dir = f"{build_include_dir}/{dirname}"
             assert os.path.exists(src_dir)
             if os.path.exists(dst_dir):
                 assert os.path.islink(dst_dir)
