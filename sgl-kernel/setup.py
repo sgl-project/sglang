@@ -68,71 +68,27 @@ include_dirs = [
     "cublas",
 ]
 
-deepgemm_third_party_include_dirs = (
-    "third-party/cutlass/include/cute",
-    "third-party/cutlass/include/cutlass",
-)
-
-deepgemm_third_party_module_dirs = [
-    "deep_gemm/",
-]
-
-class PostBuildCommand(bdist_wheel):
-    """post process for deep gemm build"""
-
-    def run(self):
-        bdist_wheel.run(self)
-        self.make_jit_include_symlinks()
-
-    @staticmethod
-    def make_jit_include_symlinks():
-        """
-        This function is for your include dir has some symlink case.
-        Like deepgemm, they use linked cute and cutlass dir.
-        """
-        current_dir = str(deepgemm.resolve())
-        # Make symbolic links of third-party include directories
-        for d in deepgemm_third_party_include_dirs:
-            dirname = d.split("/")[-1]
-            src_dir = f"{current_dir}/{d}"
-            dst_dir = f"{current_dir}/deep_gemm/include/{dirname}"
-            assert os.path.exists(src_dir)
-            if os.path.exists(dst_dir):
-                assert os.path.islink(dst_dir)
-                os.unlink(dst_dir)
-            os.symlink(src_dir, dst_dir, target_is_directory=True)
-
-
 class CustomBuildPy(build_py):
     def run(self):
-        # First, prepare the include directories
-        self.prepare_includes()
-
-        # Then run the regular build
+        self.copy_deepgemm_to_build_lib()
         build_py.run(self)
 
-    def prepare_includes(self):
-        # Create temporary build directory instead of modifying package directory
-        """
-        This is a copy function for JIT, we just copy the library to package dir.
-        """
-        build_include_dir = os.path.join(self.build_lib, "deep_gemm")
-        os.makedirs(build_include_dir, exist_ok=True)
+    def copy_deepgemm_to_build_lib(self):
+        '''
+        This function copies DeepGemm to python's site-packages
+        '''
+        dst_dir = os.path.join(self.build_lib, "deep_gemm")
+        os.makedirs(dst_dir, exist_ok=True)
 
-        current_dir = str(deepgemm.resolve())
+        # Copy deepgemm/deep_gemm to the build directory
+        src_dir = os.path.join(str(deepgemm.resolve()), "deep_gemm")
+        
+        # Remove existing directory if it exists
+        if os.path.exists(dst_dir):
+            shutil.rmtree(dst_dir)
 
-        # Copy third-party includes to the build directory
-        for d in deepgemm_third_party_module_dirs:
-            dirname = d.split("/")[-1]
-            src_dir = os.path.join(current_dir, d)
-            dst_dir = os.path.join(build_include_dir, dirname)
-
-            # Remove existing directory if it exists
-            if os.path.exists(dst_dir):
-                shutil.rmtree(dst_dir)
-
-            # Copy the directory
-            shutil.copytree(src_dir, dst_dir)
+        # Copy the directory
+        shutil.copytree(src_dir, dst_dir)
 
 
 nvcc_flags = [
@@ -249,7 +205,6 @@ setup(
     cmdclass={
         "build_ext": BuildExtension.with_options(use_ninja=True),
         "build_py": CustomBuildPy,
-        "bdist_wheel": PostBuildCommand,
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
