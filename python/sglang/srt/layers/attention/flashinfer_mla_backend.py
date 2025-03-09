@@ -114,7 +114,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
             # FlashinferMLA backend uses mla wrapper for target verify
-            self.prifill_wrapper_verify = BatchMLAPagedAttentionWrapper(
+            self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
                 backend="auto",
             )
@@ -333,7 +333,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache: bool = True,
     ):
 
         cache_loc = forward_batch.out_cache_loc
@@ -376,7 +376,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache: bool = True,
     ):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
