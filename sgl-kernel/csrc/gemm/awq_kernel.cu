@@ -1,3 +1,5 @@
+// Adapted from
+// https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <torch/all.h>
@@ -42,19 +44,11 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
                : "=r"(h[3])
                : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
 
-  // I use inline PTX below because I am not sure if the compiler will emit
-  // float2half instructions if I use the half2 ctor. In this case, I chose
-  // performance reliability over code readability.
-
-  // This is the half2 {1032, 1032} represented as an integer.
-  // static constexpr uint32_t FP16_TOP_MAGIC_NUM = 0x64086408;
-  // Haotian: subtract {1024, 1024} instead, we do not need to map to [-8, 7]
+  // This is the half2 {1024, 1024} represented as an integer.
   static constexpr uint32_t FP16_TOP_MAGIC_NUM = 0x64006400;
   // This is the half2 {1 / 16, 1 / 16} represented as an integer.
   static constexpr uint32_t ONE_SIXTEENTH = 0x2c002c00;
-  // This is the half2 {-72, -72} represented as an integer.
-  // static constexpr uint32_t NEG_72 = 0xd480d480;
-  // Haotian: Let's use {-64, -64}.
+  // This is the half2 {-64, -64} represented as an integer.
   static constexpr uint32_t NEG_64 = 0xd400d400;
 
   // Finally, we construct the output numbers.
