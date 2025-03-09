@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 
 QUANTIZATION_METHODS: List[str] = {
     "aqlm",
@@ -58,7 +58,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
 
     from .blockwise_int8 import BlockInt8Config
     from .fp8 import Fp8Config
-    from .gptq import GPTQConfig
     from .modelopt_quant import ModelOptFp8Config
     from .w8a8_fp8 import W8A8Fp8Config
     from .w8a8_int8 import W8A8Int8Config
