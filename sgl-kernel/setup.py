@@ -73,6 +73,9 @@ deepgemm_third_party_include_dirs = (
     "third-party/cutlass/include/cutlass",
 )
 
+deepgemm_third_party_module_dirs = [
+    "deep_gemm/",
+]
 
 class PostBuildCommand(bdist_wheel):
     """post process for deep gemm build"""
@@ -131,33 +134,6 @@ class CustomBuildPy(build_py):
             # Copy the directory
             shutil.copytree(src_dir, dst_dir)
 
-
-operator_namespace = "sgl_kernels"
-cutlass_default = root / "3rdparty" / "cutlass"
-cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
-flashinfer = root / "3rdparty" / "flashinfer"
-turbomind = root / "3rdparty" / "turbomind"
-deepgemm = root / "3rdparty" / "deepgemm"
-include_dirs = [
-    cutlass.resolve() / "include",
-    cutlass.resolve() / "tools" / "util" / "include",
-    root / "src" / "sgl-kernel" / "include",
-    root / "src" / "sgl-kernel" / "csrc",
-    flashinfer.resolve() / "include",
-    flashinfer.resolve() / "include" / "gemm",
-    flashinfer.resolve() / "csrc",
-    "cublas",
-    turbomind.resolve(),
-    turbomind.resolve() / "src",
-]
-
-deepgemm_third_party_include_dirs = [
-    "third-party/cutlass/include/cute",
-    "third-party/cutlass/include/cutlass",
-]
-deepgemm_third_party_module_dirs = [
-    "deep_gemm/",
-]
 
 nvcc_flags = [
     "-DNDEBUG",
@@ -274,7 +250,6 @@ setup(
         "build_ext": BuildExtension.with_options(use_ninja=True),
         "build_py": CustomBuildPy,
         "bdist_wheel": PostBuildCommand,
-        "develop": PostBuildCommand,
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
