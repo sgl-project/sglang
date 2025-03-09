@@ -123,6 +123,16 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
+        elif self.server_args.attention_backend == "flashinfer_mla":
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
+                self.model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
         else:
             raise ValueError(
                 f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
