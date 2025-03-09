@@ -1,3 +1,4 @@
+import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.utils import get_device_capability
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -36,7 +38,20 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return 75
+
+        # Vendors can update
+        return sys.maxsize
+
+    @classmethod
+    def get_availability(cls) -> int:
+        major, minor = get_device_capability()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            return major * 10 + minor > 75
+
+        # Vendors can update
+        return False
 
     @classmethod
     def get_name(self) -> str:
