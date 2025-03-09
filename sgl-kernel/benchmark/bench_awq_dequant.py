@@ -9,17 +9,13 @@ from vllm import _custom_ops as ops
 
 
 def vllm_awq_dequantize(
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
 
 
 def sglang_awq_dequantize(
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     return awq_dequantize(qweight, scales, qzeros)
@@ -28,22 +24,24 @@ def sglang_awq_dequantize(
 def calculate_diff(qweight_row: int, qweight_col: int):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
-    qweight = torch.randint(0,
-                            torch.iinfo(torch.int32).max,
-                            (qweight_row, qweight_col),
-                            dtype=torch.int32,
-                            device=device)
+    qweight = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (qweight_row, qweight_col),
+        dtype=torch.int32,
+        device=device,
+    )
     group_size = qweight_row
     scales_row = qweight_row // group_size
     scales_col = qweight_col * 8
-    scales = torch.rand(scales_row,
-                        scales_col,
-                        dtype=torch.float16,
-                        device=device)
-    qzeros = torch.randint(0, torch.iinfo(torch.int32).max,
-                          (scales_row, qweight_col),
-                          dtype=torch.int32,
-                          device=device)
+    scales = torch.rand(scales_row, scales_col, dtype=torch.float16, device=device)
+    qzeros = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (scales_row, qweight_col),
+        dtype=torch.int32,
+        device=device,
+    )
 
     vllm_out = vllm_awq_dequantize(qweight, scales, qzeros)
     sglang_out = sglang_awq_dequantize(qweight, scales, qzeros)
@@ -80,29 +78,35 @@ configs = list(itertools.product(qweight_row_range, qweight_cols_range))
 def benchmark(qweight_row, qweight_col, provider):
     dtype = torch.float16
     device = torch.device("cuda")
-    qweight = torch.randint(0,
-                            torch.iinfo(torch.int32).max,
-                            (qweight_row, qweight_col),
-                            dtype=torch.int32,
-                            device=device)
+    qweight = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (qweight_row, qweight_col),
+        dtype=torch.int32,
+        device=device,
+    )
     group_size = qweight_row
     scales_row = qweight_row // group_size
     scales_col = qweight_col * 8
-    scales = torch.rand(scales_row,
-                        scales_col,
-                        dtype=torch.float16,
-                        device=device)
-    qzeros = torch.randint(0, torch.iinfo(torch.int32).max,
-                          (scales_row, qweight_col),
-                          dtype=torch.int32,
-                          device=device)
+    scales = torch.rand(scales_row, scales_col, dtype=torch.float16, device=device)
+    qzeros = torch.randint(
+        0,
+        torch.iinfo(torch.int32).max,
+        (scales_row, qweight_col),
+        dtype=torch.int32,
+        device=device,
+    )
 
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "vllm":
-        fn = lambda: vllm_awq_dequantize(qweight.clone(), scales.clone(), qzeros.clone())
+        fn = lambda: vllm_awq_dequantize(
+            qweight.clone(), scales.clone(), qzeros.clone()
+        )
     elif provider == "sglang":
-        fn = lambda: sglang_awq_dequantize(qweight.clone(), scales.clone(), qzeros.clone())
+        fn = lambda: sglang_awq_dequantize(
+            qweight.clone(), scales.clone(), qzeros.clone()
+        )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
@@ -112,4 +116,3 @@ def benchmark(qweight_row, qweight_col, provider):
 if __name__ == "__main__":
     calculate_diff(qweight_row=3584, qweight_col=448)
     benchmark.run(print_data=True)
-    
