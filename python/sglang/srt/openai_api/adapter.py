@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List, Set, Any
+from typing import Any, Dict, List, Set
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -914,13 +914,15 @@ def v1_chat_generate_request(
                         if tool.get("use_strict", False):
                             schema = tool["parameters"]["properties"]
                         else:
-                            schema = True # accept any valid json
+                            schema = True  # accept any valid json
 
-                        tool_structures.append({
-                            "begin": info.begin,
-                            "schema": schema,
-                            "end": info.finish,
-                        })
+                        tool_structures.append(
+                            {
+                                "begin": info.begin,
+                                "schema": schema,
+                                "end": info.finish,
+                            }
+                        )
                         tool_trigger_set.add(info.trigger)
 
                 enforced_tag = {
@@ -1034,8 +1036,12 @@ def v1_chat_generate_request(
             )
 
         if enforced_tag is not None:
-            if sampling_params.get("regex") or sampling_params.get("ebnf") or \
-                sampling_params.get("structural_tag") or sampling_params.get("json_schema"):
+            if (
+                sampling_params.get("regex")
+                or sampling_params.get("ebnf")
+                or sampling_params.get("structural_tag")
+                or sampling_params.get("json_schema")
+            ):
                 logger.warning(
                     "Constrained decoding is not compatible with tool calls."
                 )

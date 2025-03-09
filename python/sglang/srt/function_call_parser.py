@@ -1,13 +1,13 @@
 import json
 import logging
 import re
+from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel, Field
-from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +74,13 @@ class StreamingParseResult:
         self.normal_text = normal_text
         self.calls = calls or []
 
+
 @dataclass
 class StructureInfo:
     begin: str
     finish: str
     trigger: str
+
 
 _GetInfoFunc = Callable[[str], StructureInfo]
 """
@@ -321,6 +323,7 @@ class BaseFormatDetector(ABC):
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
 
+
 class Qwen25Detector(BaseFormatDetector):
     """
     Detector for Qwen 2.5 models.
@@ -357,9 +360,10 @@ class Qwen25Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<tool_call>{"name":"' + name + '", "arguments":',
-            finish='}</tool_call>',
-            trigger='<tool_call>',
+            finish="}</tool_call>",
+            trigger="<tool_call>",
         )
+
 
 class MistralDetector(BaseFormatDetector):
     """
@@ -412,9 +416,10 @@ class MistralDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
-            finish='}]',
-            trigger='[TOOL_CALLS]',
+            finish="}]",
+            trigger="[TOOL_CALLS]",
         )
+
 
 class Llama32Detector(BaseFormatDetector):
     """
@@ -457,9 +462,10 @@ class Llama32Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<|python_tag|>{"name":"' + name + '", "arguments":',
-            finish='}',
-            trigger='<|python_tag|>',
+            finish="}",
+            trigger="<|python_tag|>",
         )
+
 
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
@@ -559,4 +565,6 @@ class FunctionCallParser:
         """
         Returns a list of structure_info functions for each detector
         """
-        return [detector.structure_info() for detector in self.multi_format_parser.detectors]
+        return [
+            detector.structure_info() for detector in self.multi_format_parser.detectors
+        ]
