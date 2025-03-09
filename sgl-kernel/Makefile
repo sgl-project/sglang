@@ -38,9 +38,9 @@ test: ## Run all tests
 
 format: check-deps ## Format all source files
 	@echo "Formatting source files..."
-	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i
-	@find src tests -name '*.py' | xargs isort
-	@find src tests -name '*.py' | xargs black
+	@find csrc tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i
+	@find python tests -name '*.py' | xargs isort
+	@find python tests -name '*.py' | xargs black
 	@pre-commit run --all-files
 
 FILES_TO_UPDATE = python/sgl_kernel/version.py \
