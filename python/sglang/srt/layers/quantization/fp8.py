@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
-import sys
 import logging
+import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -875,7 +875,9 @@ class Fp8MoEMethod:
             )
             torch.cuda.empty_cache()
     
-    def torch_w8a8_block_fp8_moe(self, a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape):
+    def torch_w8a8_block_fp8_moe(
+        self, a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape
+    ):
         from sglang.srt.layers.activation import SiluAndMul
 
         """This function performs fused moe with block-wise quantization using native torch."""
@@ -1032,8 +1034,8 @@ class Fp8MoEMethod:
             w2_s=(
                 layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
             ),
-            score=router_logits,
-            topk=top_k,
+            topk_weight=topk_weights,
+            topk_ids=topk_ids,
             block_shape=self.quant_config.weight_block_size,
         )
 

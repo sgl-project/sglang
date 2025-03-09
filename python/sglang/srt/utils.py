@@ -114,7 +114,7 @@ def is_cuda_available():
 def is_triton_available():
     if not get_bool_env_var("TRITON_AVAILABLE", default="true"):
         return False
-    return True
+    return is_cuda() or is_xpu() or is_hip()
 
 
 def enable_show_time_cost():
