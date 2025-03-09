@@ -1,8 +1,7 @@
 from typing import Optional
 
-import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops.utils import get_cuda_stream
+from sgl_kernel.utils import get_cuda_stream
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -15,14 +14,14 @@ def rmsnorm(
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(input)
-    torch.ops.sgl_kernels.rmsnorm(out, input, weight, eps, get_cuda_stream())
+    torch.ops.sgl_kernel.rmsnorm(out, input, weight, eps, get_cuda_stream())
     return out
 
 
 def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
-    torch.ops.sgl_kernels.fused_add_rmsnorm(input, residual, weight, eps)
+    torch.ops.sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
@@ -33,14 +32,14 @@ def gemma_rmsnorm(
 ) -> torch.Tensor:
     if out is None:
         out = torch.empty_like(input)
-    torch.ops.sgl_kernels.gemma_rmsnorm(out, input, weight, eps, get_cuda_stream())
+    torch.ops.sgl_kernel.gemma_rmsnorm(out, input, weight, eps, get_cuda_stream())
     return out
 
 
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
-    torch.ops.sgl_kernels.gemma_fused_add_rmsnorm(
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(
         input, residual, weight, eps, get_cuda_stream()
     )
 
@@ -66,7 +65,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernels.silu_and_mul(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.silu_and_mul(out, input, get_cuda_stream())
     return out
 
 
@@ -81,7 +80,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernels.gelu_tanh_and_mul(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.gelu_tanh_and_mul(out, input, get_cuda_stream())
     return out
 
 
@@ -96,7 +95,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernels.gelu_and_mul(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.gelu_and_mul(out, input, get_cuda_stream())
     return out
 
 
@@ -141,7 +140,7 @@ def apply_rope_with_cos_sin_cache_inplace(
         raise ValueError("cos_sin_cache should be float32")
 
     positions = positions.int()
-    torch.ops.sgl_kernels.apply_rope_pos_ids_cos_sin_cache(
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache(
         q=query.view(query.shape[0], -1, head_size),
         k=key.view(key.shape[0], -1, head_size),
         q_rope=query.view(query.shape[0], -1, head_size),
