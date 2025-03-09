@@ -16,10 +16,15 @@ __device__ __forceinline__ float GroupReduceMax(volatile float* smem, const int 
 }
 
 template <typename T>
-__global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, void* __restrict__ output_q,
-                                                 float* __restrict__ output_s, const int group_size,
-                                                 const int num_groups, const float eps, const float fp8_min,
-                                                 const float fp8_max) {
+__global__ void per_token_group_quant_fp8_kernel(
+    const T* __restrict__ input,
+    void* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int group_size,
+    const int num_groups,
+    const float eps,
+    const float fp8_min,
+    const float fp8_max) {
   const int groups_per_block = 16;
   const int block_group_id = blockIdx.x * groups_per_block;
   const int tid = threadIdx.x;
@@ -64,8 +69,14 @@ __global__ void per_token_group_quant_fp8_kernel(const T* __restrict__ input, vo
   }
 }
 
-void sgl_per_token_group_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s,
-                                   int64_t group_size, double eps, double fp8_min, double fp8_max) {
+void sgl_per_token_group_quant_fp8(
+    torch::Tensor input,
+    torch::Tensor output_q,
+    torch::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
@@ -81,8 +92,14 @@ void sgl_per_token_group_quant_fp8(torch::Tensor input, torch::Tensor output_q, 
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     per_token_group_quant_fp8_kernel<scalar_t><<<grid, block, 0, stream>>>(
-        static_cast<scalar_t*>(input.data_ptr()), output_q.data_ptr(), static_cast<float*>(output_s.data_ptr()),
-        group_size, num_groups, (float)eps, (float)fp8_min, (float)fp8_max);
+        static_cast<scalar_t*>(input.data_ptr()),
+        output_q.data_ptr(),
+        static_cast<float*>(output_s.data_ptr()),
+        group_size,
+        num_groups,
+        (float)eps,
+        (float)fp8_min,
+        (float)fp8_max);
     return true;
   });
 }
