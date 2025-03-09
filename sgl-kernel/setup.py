@@ -22,7 +22,6 @@ import torch
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-from wheel.bdist_wheel import bdist_wheel
 
 root = Path(__file__).parent.resolve()
 
@@ -72,7 +71,29 @@ include_dirs = [
 class CustomBuildPy(build_py):
     def run(self):
         self.copy_deepgemm_to_build_lib()
+        self.make_jit_include_symlinks()
         build_py.run(self)
+
+    def make_jit_include_symlinks(self):
+        # Make symbolic links of third-party include directories
+        build_include_dir = os.path.join(self.build_lib, "deep_gemm/include")
+        os.makedirs(build_include_dir, exist_ok=True)
+
+        third_party_include_dirs = [
+            cutlass.resolve() / "include" / "cute",
+            cutlass.resolve() / "include" / "cutlass",
+        ]
+
+        for d in third_party_include_dirs:
+            dirname = str(d).split('/')[-1]
+            src_dir = d
+            dst_dir = f'{build_include_dir}/{dirname}'
+            print("########", src_dir, dst_dir)
+            assert os.path.exists(src_dir)
+            if os.path.exists(dst_dir):
+                assert os.path.islink(dst_dir)
+                os.unlink(dst_dir)
+            os.symlink(src_dir, dst_dir, target_is_directory=True)
 
     def copy_deepgemm_to_build_lib(self):
         """
