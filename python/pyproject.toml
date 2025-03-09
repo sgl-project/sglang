@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.3.post3"
+version = "0.4.3.post4"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -18,12 +18,15 @@ dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle"]
 [project.optional-dependencies]
 runtime_common = [
     "aiohttp",
+    "datasets",
     "decord",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
     "interegular",
+    "llguidance>=0.6.15",
     "modelscope",
+    "ninja",
     "orjson",
     "packaging",
     "pillow",
@@ -33,12 +36,10 @@ runtime_common = [
     "python-multipart",
     "pyzmq>=25.1.2",
     "torchao>=0.7.0",
+    "transformers==4.48.3",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.14",
-    "ninja",
-    "transformers==4.48.3",
-    "llguidance>=0.6.15"
 ]
 
 srt = [

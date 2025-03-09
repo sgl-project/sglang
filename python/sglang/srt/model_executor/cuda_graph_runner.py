@@ -300,10 +300,11 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
+            # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(self.capture_bs)
+                tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
-                else self.capture_bs
+                else reversed(self.capture_bs)
             )
             for bs in capture_range:
                 with patch_model(
@@ -396,15 +397,9 @@ class CudaGraphRunner:
 
             run_once()
 
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
-
         global global_graph_memory_pool
         with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
 
         global_graph_memory_pool = graph.pool()
         return graph, out
@@ -427,7 +422,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size

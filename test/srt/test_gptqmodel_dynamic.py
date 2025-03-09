@@ -143,11 +143,11 @@ class TestGPTQModelDynamic(unittest.TestCase):
 
         print(f"result = `{result}`")
 
-        assert "paris" in result["text"].lower()
+        self.assertIn("paris", result["text"].lower())
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 140
+        self.assertGreaterEqual(throughput, 140)
 
     def test_gptq_module(self):
         check_quant_method(self.MODEL_PATH, use_marlin_kernel=False)
