@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
-import sys
 import logging
+import sys
 from typing import Any, Dict, List, Optional
 
 import torch

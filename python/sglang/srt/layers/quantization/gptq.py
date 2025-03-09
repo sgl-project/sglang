@@ -1,5 +1,5 @@
-import sys
 import logging
+import sys
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Union
 

@@ -108,7 +108,7 @@ def _get_quantization_config(
         quant_config = get_quant_config(model_config, load_config)
         major, minor = get_device_capability()
 
-        if not hasattr(quant_config, "get_available"):
+        if not hasattr(quant_config, "get_availability"):
             # Update VLLM to support get_available
             if major is not None and minor is not None:
                 assert 0 <= minor < 10
