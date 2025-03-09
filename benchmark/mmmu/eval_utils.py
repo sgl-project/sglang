@@ -87,6 +87,7 @@ def set_seed(seed_value):
 
 
 def prepare_samples(eval_args: EvalArgs):
+    print("preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
 
