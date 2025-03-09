@@ -39,7 +39,6 @@ Third-party libraries:
 - [CCCL](https://github.com/NVIDIA/cccl)
 - [CUTLASS](https://github.com/NVIDIA/cutlass)
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
-- [TurboMind](https://github.com/InternLM/turbomind)
 
 ### Kernel Development
 
