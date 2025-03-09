@@ -27,15 +27,29 @@ namespace sampling {
 
 using namespace cub;
 
-template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM, BlockReduceAlgorithm REDUCE_ALGORITHM,
-          uint32_t VEC_SIZE, bool DETERMINISTIC, typename DType, typename IdType>
-__global__ void TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* accept_index,
-                                                  IdType* accept_token_num,  // mutable
-                                                  IdType* candidates, IdType* retrive_index, IdType* retrive_next_token,
-                                                  IdType* retrive_next_sibling, DType* uniform_samples,
-                                                  DType* target_probs, DType* draft_probs, uint32_t batch_size,
-                                                  uint32_t num_speculative_tokens, uint32_t num_draft_tokens,
-                                                  uint32_t d) {
+template <
+    uint32_t BLOCK_THREADS,
+    BlockScanAlgorithm SCAN_ALGORITHM,
+    BlockReduceAlgorithm REDUCE_ALGORITHM,
+    uint32_t VEC_SIZE,
+    bool DETERMINISTIC,
+    typename DType,
+    typename IdType>
+__global__ void TreeSpeculativeSamplingTargetOnly(
+    IdType* predicts,
+    IdType* accept_index,
+    IdType* accept_token_num,  // mutable
+    IdType* candidates,
+    IdType* retrive_index,
+    IdType* retrive_next_token,
+    IdType* retrive_next_sibling,
+    DType* uniform_samples,
+    DType* target_probs,
+    DType* draft_probs,
+    uint32_t batch_size,
+    uint32_t num_speculative_tokens,
+    uint32_t num_draft_tokens,
+    uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -140,37 +154,54 @@ __global__ void TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* acce
 }
 
 template <typename DType, typename IdType>
-cudaError_t TreeSpeculativeSamplingTargetOnly(IdType* predicts, IdType* output_token_ids,
-                                              IdType* output_accepted_token_num,  // mutable
-                                              IdType* candidates, IdType* retrive_index, IdType* retrive_next_token,
-                                              IdType* retrive_next_sibling, DType* uniform_samples, DType* target_probs,
-                                              DType* draft_probs, uint32_t batch_size, uint32_t num_speculative_tokens,
-                                              uint32_t num_draft_tokens, uint32_t d, bool deterministic,
-                                              cudaStream_t stream = 0) {
+cudaError_t TreeSpeculativeSamplingTargetOnly(
+    IdType* predicts,
+    IdType* output_token_ids,
+    IdType* output_accepted_token_num,  // mutable
+    IdType* candidates,
+    IdType* retrive_index,
+    IdType* retrive_next_token,
+    IdType* retrive_next_sibling,
+    DType* uniform_samples,
+    DType* target_probs,
+    DType* draft_probs,
+    uint32_t batch_size,
+    uint32_t num_speculative_tokens,
+    uint32_t num_draft_tokens,
+    uint32_t d,
+    bool deterministic,
+    cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&predicts,
-                  &output_token_ids,
-                  &output_accepted_token_num,
-                  &candidates,
-                  &retrive_index,
-                  &retrive_next_token,
-                  &retrive_next_sibling,
-                  &uniform_samples,
-                  &target_probs,
-                  &draft_probs,
-                  &batch_size,
-                  &num_speculative_tokens,
-                  &num_draft_tokens,
-                  &d};
+  void* args[] = {
+      &predicts,
+      &output_token_ids,
+      &output_accepted_token_num,
+      &candidates,
+      &retrive_index,
+      &retrive_next_token,
+      &retrive_next_sibling,
+      &uniform_samples,
+      &target_probs,
+      &draft_probs,
+      &batch_size,
+      &num_speculative_tokens,
+      &num_draft_tokens,
+      &d};
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
-        auto kernel = TreeSpeculativeSamplingTargetOnly<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, DETERMINISTIC,
-                                                        DType, IdType>;
+        auto kernel = TreeSpeculativeSamplingTargetOnly<
+            BLOCK_THREADS,
+            SCAN_ALGO,
+            REDUCE_ALGO,
+            VEC_SIZE,
+            DETERMINISTIC,
+            DType,
+            IdType>;
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});
