@@ -14,7 +14,6 @@ __global__ void per_token_quant_fp8_kernel(
     const int64_t hidden_dim,
     const int64_t num_tokens) {
   const int token_idx = blockIdx.x;
-
   if (token_idx >= num_tokens) return;
 
   const int tid = threadIdx.x;
@@ -25,8 +24,24 @@ __global__ void per_token_quant_fp8_kernel(
 
   float max_value = 0.0f;
 
-  for (int i = tid; i < hidden_dim; i += block_dim) {
-    float val = static_cast<float>(token_input[i]);
+  constexpr uint32_t vec_size = 16 / sizeof(T);
+  using vec_t = flashinfer::vec_t<T, vec_size>;
+  const int32_t num_vec_elems = hidden_dim / vec_size;
+
+  for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
+    vec_t input_vec;
+    input_vec.cast_load(token_input + i * vec_size);
+
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      float val = static_cast<float>(input_vec[j]);
+      max_value = fmaxf(max_value, fabsf(val));
+    }
+  }
+
+  const int32_t remaining_start = num_vec_elems * vec_size;
+  for (int32_t idx = remaining_start + tid; idx < hidden_dim; idx += block_dim) {
+    float val = static_cast<float>(token_input[idx]);
     max_value = fmaxf(max_value, fabsf(val));
   }
 
@@ -40,11 +55,6 @@ __global__ void per_token_quant_fp8_kernel(
   __syncthreads();
 
   const float scale_val = 1.0f / block_max;
-
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
-
-  const int32_t num_vec_elems = hidden_dim / vec_size;
 
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
     vec_t input_vec;
@@ -69,7 +79,6 @@ __global__ void per_token_quant_fp8_kernel(
     }
   }
 
-  const int32_t remaining_start = num_vec_elems * vec_size;
   for (int32_t idx = remaining_start + tid; idx < hidden_dim; idx += block_dim) {
     float val = fmax(-FP8_E4M3_MAX, fmin(static_cast<float>(token_input[idx]) * scale_val, FP8_E4M3_MAX));
 #ifndef USE_ROCM
@@ -91,7 +100,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const int64_t num_tokens = input_sizes[0];
   const int64_t hidden_dim = input_sizes[1];
 
-  const int block_size = 128;
+  const int block_size = 256;
   const int num_blocks = num_tokens;
 
   dim3 grid(num_blocks);
