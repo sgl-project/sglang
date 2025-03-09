@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
 
+from sglang.srt.custom_op import scaled_fp8_quant
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -305,7 +306,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
+            qweight, weight_scale = scaled_fp8_quant(layer.weight, scale=None)
 
             # If using marlin (w8a16), kernel uses channelwise weights,
             # so extend the weight scales to be channelwise.
@@ -726,10 +727,10 @@ class Fp8MoEMethod:
             )
             for expert in range(layer.num_experts):
                 w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                 )
                 w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
                 )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
@@ -833,7 +834,7 @@ class Fp8MoEMethod:
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
                     layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     )
                     start += shard_size
 
