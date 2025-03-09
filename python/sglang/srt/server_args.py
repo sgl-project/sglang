@@ -16,6 +16,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 import random
 import tempfile
 from typing import List, Optional
@@ -190,15 +191,25 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif torch.cuda.is_available():
-            gpu_mem = get_nvgpu_memory_capacity()
-        elif self.device == "hpu":
-            gpu_mem = get_hpu_memory_capacity()
-        else:
-            # GPU memory is not known yet or no GPU is available.
-            gpu_mem = None
+        try:
+            if is_hip():
+                gpu_mem = get_amdgpu_memory_capacity()
+            elif torch.cuda.is_available():
+                gpu_mem = get_nvgpu_memory_capacity()
+            elif self.device == "hpu":
+                gpu_mem = get_hpu_memory_capacity()
+            else:
+                # GPU memory is not known yet or no GPU is available.
+                gpu_mem = None
+        except ValueError as e:
+            fallback_value = os.environ.get("SGLANG_GPU_MEMORY_TOTAL_FALLBACK", None)
+            if fallback_value:
+                gpu_mem = float(fallback_value)
+            else:
+                logger.info(
+                    "Impossible to get the memory capacity, you might set it manually via SGLANG_GPU_MEMORY_TOTAL_FALLBACK environment"
+                )
+                raise e
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
