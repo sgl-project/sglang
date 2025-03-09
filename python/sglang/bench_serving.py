@@ -53,6 +53,7 @@ class RequestFuncInput:
     model: str
     lora_name: str
     extra_request_body: Dict[str, Any]
+    model_name: Optional[str] = None
 
 
 @dataclass
@@ -168,7 +169,8 @@ async def async_request_openai_completions(
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
-            "model": request_func_input.model,
+            "model": request_func_input.model_name \
+                if request_func_input.model_name else request_func_input.model,
             "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
@@ -958,6 +960,7 @@ async def benchmark(
     api_url: str,
     base_url: str,
     model_id: str,
+    model_name: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -988,6 +991,7 @@ async def benchmark(
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
     test_input = RequestFuncInput(
         model=model_id,
+        model_name=model_name,
         prompt=test_prompt,
         api_url=api_url,
         prompt_len=test_prompt_len,
@@ -1028,6 +1032,7 @@ async def benchmark(
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
             model=model_id,
+            model_name=model_name,
             prompt=prompt,
             api_url=api_url,
             prompt_len=prompt_len,
@@ -1330,6 +1335,7 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.model
+    model_name = args.served_model_name
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
@@ -1340,6 +1346,7 @@ def run_benchmark(args_: argparse.Namespace):
             api_url=api_url,
             base_url=base_url,
             model_id=model_id,
+            model_name=model_name,
             tokenizer=tokenizer,
             input_requests=input_requests,
             request_rate=args.request_rate,
@@ -1402,6 +1409,13 @@ if __name__ == "__main__":
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="The model name used in the API. "
+             "If not specified, the model name will be the "
+             "same as the ``--model`` argument. ")
     parser.add_argument(
         "--tokenizer",
         type=str,
