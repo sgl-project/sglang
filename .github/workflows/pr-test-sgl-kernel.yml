@@ -127,7 +127,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test, lint]
+    needs: [unit-test, mla-test, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
