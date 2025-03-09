@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 import torch
-from sgl_kernel.ops.utils import _get_cache_buf, get_cuda_stream
+from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
 
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
