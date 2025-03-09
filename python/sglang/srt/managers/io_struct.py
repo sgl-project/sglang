@@ -723,3 +723,15 @@ class SeparateReasoningReqInput:
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None
+
+
+@dataclass
+class RpcReqInput:
+    method: str
+    parameters: Optional[Dict] = None
+
+
+@dataclass
+class RpcReqOutput:
+    success: bool
+    message: str

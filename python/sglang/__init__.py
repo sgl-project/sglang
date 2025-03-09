@@ -30,6 +30,7 @@ from sglang.lang.choices import (
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.utils import LazyImport
 
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
