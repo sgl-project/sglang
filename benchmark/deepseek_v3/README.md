@@ -184,21 +184,29 @@ AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for qua
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
 ```
 
-### Example: Serving with two A100\*8 nodes with INT8 Quantization
 
-INT8 weights for DeepSeek R1 are available [here](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8). This checkpoint is converted from BF16 with [script](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8/blob/main/inference/bf16_cast_block_int8.py).
+### Example: Serving with 16 A100/A800 with int8 Quantization
 
-Assuming that head node IP is `HEAD_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
+There are block-wise and per-channel quantization methods, and the quantization parameters have already been uploaded to Huggingface. One example is as follows:
+
+- [meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
 ```bash
-# head node
-python3 -m sglang.launch_server --model /path/to/DeepSeek-R1-INT8 --tp 16 --dist-init-addr HEAD_IP:5000 --nnodes 2 --node-rank 0 --trust-remote
-# another node
-python3 -m sglang.launch_server --model /path/to/DeepSeek-R1-INT8 --tp 16 --dist-init-addr HEAD_IP:5000 --nnodes 2 --node-rank 1 --trust-remote
+#master
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+#cluster
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
 ```
 
-> **Note that the launch command here does not enable `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+> **Note that the launch command here enables `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
-Then on the head node, supposing the ShareGPT data is located at `/path/to/ShareGPT_V3_unfiltered_cleaned_split.json`, you can run the following commands to benchmark the launched server:
+Then on the **master node**, supposing the ShareGPT data is located at `/path/to/ShareGPT_V3_unfiltered_cleaned_split.json`, you can run the following commands to benchmark the launched server:
 
 ```bash
 # bench accuracy

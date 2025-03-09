@@ -40,7 +40,7 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[dict] = None,
+        model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
@@ -81,7 +81,7 @@ class ModelConfig:
         if context_length is not None:
             if context_length > derived_context_len:
                 if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="False"
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "

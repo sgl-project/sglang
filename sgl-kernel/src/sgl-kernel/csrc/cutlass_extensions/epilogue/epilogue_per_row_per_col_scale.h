@@ -25,9 +25,15 @@ namespace cutlass {
 namespace epilogue {
 namespace threadblock {
 
-template <typename ThreadblockShape_, int ThreadCount, typename ScaleTileIterator_, typename OutputTileIterator_,
-          typename ElementAccumulator_, typename ElementCompute_, typename ElementwiseFunctor_,
-          bool UseMasking_ = false>
+template <
+    typename ThreadblockShape_,
+    int ThreadCount,
+    typename ScaleTileIterator_,
+    typename OutputTileIterator_,
+    typename ElementAccumulator_,
+    typename ElementCompute_,
+    typename ElementwiseFunctor_,
+    bool UseMasking_ = false>
 class EpilogueVisitorPerRowPerCol {
  public:
   using ThreadblockShape = ThreadblockShape_;
@@ -69,8 +75,11 @@ class EpilogueVisitorPerRowPerCol {
     Arguments(typename ElementwiseFunctor::Params elementwise_)
         : elementwise(elementwise_), batch_stride_alpha(0), batch_stride_C(0), batch_stride_D(0) {}
 
-    Arguments(typename ElementwiseFunctor::Params elementwise_, int64_t batch_stride_alpha_, int64_t batch_stride_C_,
-              int64_t batch_stride_D_)
+    Arguments(
+        typename ElementwiseFunctor::Params elementwise_,
+        int64_t batch_stride_alpha_,
+        int64_t batch_stride_C_,
+        int64_t batch_stride_D_)
         : elementwise(elementwise_),
           batch_stride_alpha(batch_stride_alpha_),
           batch_stride_C(batch_stride_C_),
@@ -131,17 +140,26 @@ class EpilogueVisitorPerRowPerCol {
 
  public:
   CUTLASS_DEVICE
-  EpilogueVisitorPerRowPerCol(Params const& params, SharedStorage& shared_storage,
-                              cutlass::MatrixCoord const& problem_size, int thread_idx, int warp_idx, int lane_idx,
-                              typename ScaleTileIterator::Params params_alpha_col,
-                              typename OutputTileIterator::Params params_C,
-                              typename OutputTileIterator::Params params_D, bool with_bias, bool per_token_quant,
-                              bool per_channel_quant, AlphaScaleElementType* ptr_alpha_row,
-                              AlphaScaleElementType* ptr_alpha_col, typename OutputTileIterator::Element* ptr_C,
-                              typename OutputTileIterator::Element* ptr_D,
-                              cutlass::MatrixCoord const& threadblock_offset = cutlass::MatrixCoord(0, 0),
-                              int column_offset = 0,
-                              cutlass::MatrixCoord const& problem_size_real = cutlass::MatrixCoord(0, 0))
+  EpilogueVisitorPerRowPerCol(
+      Params const& params,
+      SharedStorage& shared_storage,
+      cutlass::MatrixCoord const& problem_size,
+      int thread_idx,
+      int warp_idx,
+      int lane_idx,
+      typename ScaleTileIterator::Params params_alpha_col,
+      typename OutputTileIterator::Params params_C,
+      typename OutputTileIterator::Params params_D,
+      bool with_bias,
+      bool per_token_quant,
+      bool per_channel_quant,
+      AlphaScaleElementType* ptr_alpha_row,
+      AlphaScaleElementType* ptr_alpha_col,
+      typename OutputTileIterator::Element* ptr_C,
+      typename OutputTileIterator::Element* ptr_D,
+      cutlass::MatrixCoord const& threadblock_offset = cutlass::MatrixCoord(0, 0),
+      int column_offset = 0,
+      cutlass::MatrixCoord const& problem_size_real = cutlass::MatrixCoord(0, 0))
       : params_(params),
         shared_storage_(shared_storage),
         extent_(problem_size),
@@ -166,8 +184,9 @@ class EpilogueVisitorPerRowPerCol {
 
   /// Helper to indicate split-K behavior
   CUTLASS_DEVICE
-  void set_k_partition(int split_k_index,     ///< Index of this threadblock within split-K partitioned scheme
-                       int split_k_slices) {  ///< Total number of split-K slices
+  void set_k_partition(
+      int split_k_index,     ///< Index of this threadblock within split-K partitioned scheme
+      int split_k_slices) {  ///< Total number of split-K slices
   }
 
   /// Called to set the batch index
@@ -251,8 +270,8 @@ class EpilogueVisitorPerRowPerCol {
 
  private:
   CUTLASS_DEVICE
-  ComputeFragment per_token_channel_scale_accumulator_(ComputeFragment const& accum, ComputeFragment const& scale_col,
-                                                       AlphaScaleElementType const& scale_row) {
+  ComputeFragment per_token_channel_scale_accumulator_(
+      ComputeFragment const& accum, ComputeFragment const& scale_col, AlphaScaleElementType const& scale_row) {
     ComputeFragment result;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < ComputeFragment::kElements; ++i) {
@@ -263,8 +282,8 @@ class EpilogueVisitorPerRowPerCol {
   }
 
   CUTLASS_DEVICE
-  ComputeFragment per_token_scale_accumulator_(ComputeFragment const& accum, AlphaScaleElementType const& scale_col,
-                                               AlphaScaleElementType const& scale_row) {
+  ComputeFragment per_token_scale_accumulator_(
+      ComputeFragment const& accum, AlphaScaleElementType const& scale_col, AlphaScaleElementType const& scale_row) {
     ComputeFragment result;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < ComputeFragment::kElements; ++i) {

@@ -23,15 +23,18 @@ limitations under the License.
 #define THREADS_PER_BLOCK 128
 
 template <typename T>
-__global__ void lightning_attention_decode_kernel(const T* __restrict__ q,            // [b, h, 1, d]
-                                                  const T* __restrict__ k,            // [b, h, 1, d]
-                                                  const T* __restrict__ v,            // [b, h, 1, e]
-                                                  const float* __restrict__ past_kv,  // [b, h, d, e]
-                                                  const float* __restrict__ slope,    // [h, 1, 1]
-                                                  T* __restrict__ output,             // [b, h, 1, e]
-                                                  float* __restrict__ new_kv,         // [b, h, d, e]
-                                                  const int batch_size, const int num_heads, const int qk_dim,
-                                                  const int v_dim) {
+__global__ void lightning_attention_decode_kernel(
+    const T* __restrict__ q,            // [b, h, 1, d]
+    const T* __restrict__ k,            // [b, h, 1, d]
+    const T* __restrict__ v,            // [b, h, 1, e]
+    const float* __restrict__ past_kv,  // [b, h, d, e]
+    const float* __restrict__ slope,    // [h, 1, 1]
+    T* __restrict__ output,             // [b, h, 1, e]
+    float* __restrict__ new_kv,         // [b, h, d, e]
+    const int batch_size,
+    const int num_heads,
+    const int qk_dim,
+    const int v_dim) {
   extern __shared__ char smem[];
   T* __restrict__ q_shared = reinterpret_cast<T*>(smem);
   T* __restrict__ k_shared = reinterpret_cast<T*>(smem + qk_dim * sizeof(T));
@@ -109,9 +112,14 @@ __global__ void lightning_attention_decode_kernel(const T* __restrict__ q,      
   }
 }
 
-void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
-                                const torch::Tensor& past_kv, const torch::Tensor& slope, torch::Tensor output,
-                                torch::Tensor new_kv) {
+void lightning_attention_decode(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& past_kv,
+    const torch::Tensor& slope,
+    torch::Tensor output,
+    torch::Tensor new_kv) {
   TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
   TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
   TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
@@ -131,8 +139,16 @@ void lightning_attention_decode(const torch::Tensor& q, const torch::Tensor& k, 
       at::ScalarType::Half, at::ScalarType::BFloat16, q.scalar_type(), "lightning_attention_decode_kernel", ([&] {
         size_t smem_size = (2 * qk_dim + 2 * v_dim) * sizeof(scalar_t) + qk_dim * (v_dim + 1) * sizeof(float);
         lightning_attention_decode_kernel<scalar_t><<<grid, block, smem_size, stream>>>(
-            q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), past_kv.data_ptr<float>(),
-            slope.data_ptr<float>(), output.data_ptr<scalar_t>(), new_kv.data_ptr<float>(), batch_size, num_heads,
-            qk_dim, v_dim);
+            q.data_ptr<scalar_t>(),
+            k.data_ptr<scalar_t>(),
+            v.data_ptr<scalar_t>(),
+            past_kv.data_ptr<float>(),
+            slope.data_ptr<float>(),
+            output.data_ptr<scalar_t>(),
+            new_kv.data_ptr<float>(),
+            batch_size,
+            num_heads,
+            qk_dim,
+            v_dim);
       }));
 }

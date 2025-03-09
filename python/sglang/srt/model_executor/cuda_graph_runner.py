@@ -200,6 +200,9 @@ class CudaGraphRunner:
         )
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
+        self.seq_lens_cpu = torch.full(
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -297,10 +300,11 @@ class CudaGraphRunner:
     def capture(self):
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
+            # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(self.capture_bs)
+                tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
-                else self.capture_bs
+                else reversed(self.capture_bs)
             )
             for bs in capture_range:
                 with patch_model(
@@ -393,15 +397,9 @@ class CudaGraphRunner:
 
             run_once()
 
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
-
         global global_graph_memory_pool
         with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
-
-        torch.cuda.synchronize()
-        self.model_runner.tp_group.barrier()
 
         global_graph_memory_pool = graph.pool()
         return graph, out
@@ -424,7 +422,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
@@ -448,6 +446,10 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.decode_seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(1)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.decode_seq_lens_cpu)
 
         if self.is_encoder_decoder:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
@@ -466,6 +468,7 @@ class CudaGraphRunner:
             self.encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            seq_lens_cpu=self.seq_lens_cpu,
         )
 
         # Replay
