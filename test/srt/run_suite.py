@@ -1,7 +1,15 @@
 import argparse
 import glob
+from dataclasses import dataclass
 
 from sglang.test.test_utils import run_unittest_files
+
+
+@dataclass
+class TestFile:
+    name: str
+    estimated_time: float = 60
+
 
 suites = {
     "per-commit": [
@@ -41,8 +49,6 @@ suites = {
         "test_request_length_validation.py",
         "test_retract_decode.py",
         "test_server_args.py",
-        # Disabled temporarily
-        # "test_session_control.py",
         "test_skip_tokenizer_init.py",
         "test_srt_engine.py",
         "test_srt_endpoint.py",
@@ -67,19 +73,53 @@ suites = {
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
-        # Disable temporarily
-        # "test_nightly_math_eval.py",
     ],
 }
 
-# Expand suite
-for target_suite_name, target_tests in suites.items():
-    for suite_name, tests in suites.items():
-        if suite_name == target_suite_name:
-            continue
-        if target_suite_name in tests:
-            tests.remove(target_suite_name)
-            tests.extend(target_tests)
+
+def auto_partition(files, rank, size):
+    """
+    Partition files into size sublists with approximately equal sums of estimated times
+    using stable sorting, and return the partition for the specified rank.
+
+    Args:
+        files (list): List of file objects with estimated_time attribute
+        rank (int): Index of the partition to return (0 to size-1)
+        size (int): Number of partitions
+
+    Returns:
+        list: List of file objects in the specified rank's partition
+    """
+    weights = [f.estimated_time for f in files]
+
+    if not weights or size <= 0 or size > len(weights):
+        return []
+
+    # Create list of (weight, original_index) tuples
+    # Using negative index as secondary key to maintain original order for equal weights
+    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
+    # Stable sort in descending order by weight
+    # If weights are equal, larger (negative) index comes first (i.e., earlier original position)
+    indexed_weights = sorted(indexed_weights, reverse=True)
+
+    # Extract original indices (negate back to positive)
+    indexed_weights = [(w, -i) for w, i in indexed_weights]
+
+    # Initialize partitions and their sums
+    partitions = [[] for _ in range(size)]
+    sums = [0.0] * size
+
+    # Greedy approach: assign each weight to partition with smallest current sum
+    for weight, idx in indexed_weights:
+        # Find partition with minimum sum
+        min_sum_idx = sums.index(min(sums))
+        partitions[min_sum_idx].append(idx)
+        sums[min_sum_idx] += weight
+
+    # Return the files corresponding to the indices in the specified rank's partition
+    indices = partitions[rank]
+    return [files[i] for i in indices]
+
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
@@ -108,17 +148,30 @@ if __name__ == "__main__":
         default=None,
         help="The end index of the range of the files to run.",
     )
+    arg_parser.add_argument(
+        "--auto-partition-id",
+        type=int,
+        help="Use auto load balancing. The part id.",
+    )
+    arg_parser.add_argument(
+        "--auto-partition-size",
+        type=int,
+        help="Use auto load balancing. The number of parts.",
+    )
     args = arg_parser.parse_args()
+    print(f"{args=}")
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
     else:
         files = suites[args.suite]
 
-    files = files[args.range_begin : args.range_end]
+    if args.auto_partition_size:
+        files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
+    else:
+        files = files[args.range_begin : args.range_end]
 
-    print(f"{args=}")
-    print("The running tests are ", files)
+    print("The running tests are ", [f.name for f in files])
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
     exit(exit_code)
