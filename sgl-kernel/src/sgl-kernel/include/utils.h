@@ -94,7 +94,7 @@ inline int getSMVersion() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
-#define CEILDIV(x, y) (((x) + (y)-1) / (y))
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #define WARP_SIZE 32
 
 #ifndef USE_ROCM
@@ -122,6 +122,22 @@ __device__ __forceinline__ float warpReduceMax(float max_value) {
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 4));
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 2));
   max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffff, max_value, 1));
+  return max_value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float max_value) {
+  static __shared__ float warpLevelMaxs[WARP_SIZE];
+  const int laneId = threadIdx.x % WARP_SIZE;
+  const int warpId = threadIdx.x / WARP_SIZE;
+
+  max_value = warpReduceMax(max_value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = max_value;
+  __syncthreads();
+
+  max_value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) max_value = warpReduceMax(max_value);
+
   return max_value;
 }
 #endif
