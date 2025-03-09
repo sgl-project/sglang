@@ -13,12 +13,11 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.utils import set_weight_attrs
 
