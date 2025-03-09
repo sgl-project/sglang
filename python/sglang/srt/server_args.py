@@ -1103,8 +1103,14 @@ class PortArgs:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
+
+                port, host = PortArgs.configure_ipv6(server_args)
+
+                dist_init_addr = (host, str(port))
             else:
                 dist_init_addr = server_args.dist_init_addr.split(":")
+
             assert (
                 len(dist_init_addr) == 2
             ), "please provide --dist-init-addr as host:port of head node"
