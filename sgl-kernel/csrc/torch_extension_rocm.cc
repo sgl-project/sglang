@@ -16,9 +16,9 @@ limitations under the License.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
 
-#include "sgl_kernels_ops.h"
+#include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_EXPAND(sgl_kernels, m) {
+TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
