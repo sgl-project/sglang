@@ -90,6 +90,9 @@ def is_hpu() -> bool:
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
 
 def is_flashinfer_available():
     """
@@ -221,6 +224,16 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
+    elif device == "npu":
+        import torch_npu
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus    
+        if torch.npu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
+                "which may cause useless memory allocation for torch NPU context.",
+            )   
+        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()    
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -1044,6 +1057,9 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
+
 
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
@@ -1079,6 +1095,13 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+    
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        import torch_npu
+        import torchair
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        return npu_backend
 
     return "inductor"
 
