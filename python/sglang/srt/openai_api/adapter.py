@@ -1126,7 +1126,7 @@ def v1_chat_generate_response(
                 finish_reason = "tool_calls"
             try:
                 parser = FunctionCallParser(tools, tool_call_parser)
-                full_normal_text, call_info_list = parser.parse_non_stream(text)
+                text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = [
                     ToolCall(
                         id=str(call_info.tool_index),
@@ -1149,7 +1149,7 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": text if tool_calls is None else None,
+                    "content": text,
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text,
                 },
@@ -1166,7 +1166,7 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if tool_calls is None else None,
+                    content=text,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text,
                 ),
