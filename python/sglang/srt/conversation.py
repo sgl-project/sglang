@@ -44,6 +44,7 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
+    DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
 
 
@@ -74,6 +75,7 @@ class Conversation:
 
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
+    stop_token_ids: Optional[int] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -279,6 +281,18 @@ class Conversation:
         elif self.sep_style == SeparatorStyle.DEEPSEEK_CHAT:
             seps = [self.sep, self.sep2]
             ret = system_prompt
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ": " + message + seps[i % 2]
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.DeepSeekVL2:
+            seps = [self.sep, self.sep2]
+            if system_prompt == "" or system_prompt is None:
+                ret = ""
+            else:
+                ret = system_prompt + seps[0]
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += role + ": " + message + seps[i % 2]
@@ -605,6 +619,23 @@ register_conv_template(
     )
 )
 
+
+register_conv_template(
+    Conversation(
+        name="deepseek-vl2",
+        system_template="{system_message}",
+        # system_message="You are a helpful assistant. Please answer truthfully and write out your "
+        # "thinking step by step to be sure you get the right answer.",
+        system_message="",
+        roles=("<|User|>", "<|Assistant|>"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.DeepSeekVL2,
+        sep="\n\n",
+        sep2="<｜end▁of▁sentence｜>",
+        stop_token_ids=[100001],
+        stop_str=["User:", "<｜end▁of▁sentence｜>"],
+
 # Reference: https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct#usage
 register_conv_template(
     Conversation(
@@ -616,6 +647,7 @@ register_conv_template(
         sep_style=SeparatorStyle.QWEN2_VL_EMBED,
         stop_str="<|endoftext|>",
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+
     )
 )
 
