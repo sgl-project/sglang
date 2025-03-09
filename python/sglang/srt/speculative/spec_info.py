@@ -17,8 +17,6 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             None: SpeculativeAlgorithm.NONE,
         }
+        if name is not None:
+            name = name.upper()
         return name_map[name]
-
-
-class SpecInfo:
-    pass

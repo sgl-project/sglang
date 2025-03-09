@@ -63,6 +63,7 @@ class SglSamplingParams:
             warnings.warn("Regular expression is not supported in the OpenAI backend.")
         return {
             "max_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,
             "stop": self.stop or None,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -456,7 +457,7 @@ class SglGen(SglExpr):
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+        """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(

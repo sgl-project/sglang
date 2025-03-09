@@ -38,6 +38,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AWQLinearMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
+    "BlockInt8LinearMethod",
     "MarlinLinearMethod",
     "QQQLinearMethod",
     "GPTQMarlin24LinearMethod",
@@ -421,11 +422,19 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(
-            loaded_weight,
-            tp_rank=self.tp_rank,
-            use_presharded_weights=self.use_presharded_weights,
-        )
+
+        from sglang.srt.layers.parameter import _ColumnvLLMParameter
+
+        if isinstance(param, _ColumnvLLMParameter):
+            param.load_column_parallel_weight(
+                loaded_weight,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=self.use_presharded_weights,
+            )
+        else:
+            # FIXME: This branch is needed to load deepseek v3 awq.
+            # However, we should fix this and avoid the branching here.
+            param.load_column_parallel_weight(loaded_weight)
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None

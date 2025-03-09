@@ -43,7 +43,8 @@ include_dirs = [
 
 sources = [
     "src/sgl-kernel/torch_extension_rocm.cc",
-    "src/sgl-kernel/csrc/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/allreduce/custom_all_reduce.hip",
+    "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
 ]
 
 cxx_flags = ["-O3"]
@@ -82,11 +83,7 @@ setup(
             py_limited_api=True,
         ),
     ],
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
     install_requires=["torch"],
 )

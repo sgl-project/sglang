@@ -14,6 +14,7 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
+import json
 import logging
 import os
 import signal
@@ -27,12 +28,21 @@ import zmq
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
+    BatchMultimodalDecodeReq,
     BatchStrOut,
     BatchTokenIDOut,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_zmq_socket
-from sglang.utils import find_printable_text, get_exception_traceback
+from sglang.srt.utils import (
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
+)
+from sglang.utils import (
+    TypeBasedDispatcher,
+    find_printable_text,
+    get_exception_traceback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +57,6 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 class DecodeStatus:
     """Store the status of incremental decoding."""
 
-    vid: int
     decoded_text: str
     decode_ids: List[int]
     surr_offset: int
@@ -82,6 +91,22 @@ class DetokenizerManager:
             )
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
+        self.is_dummy = server_args.load_format == "dummy"
+
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (BatchEmbeddingOut, self.handle_batch_embedding_out),
+                (BatchTokenIDOut, self.handle_batch_token_id_out),
+                (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
+            ]
+        )
+
+    def event_loop(self):
+        """The event loop that handles requests"""
+        while True:
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            output = self._request_dispatcher(recv_obj)
+            self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -106,112 +131,109 @@ class DetokenizerManager:
             return output[:-1]
         return output
 
-    def event_loop(self):
-        """The event loop that handles requests"""
+    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
+        # If it is embedding model, no detokenization is needed.
+        return recv_obj
 
-        while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+        bs = len(recv_obj.rids)
 
-            if isinstance(recv_obj, BatchEmbeddingOut):
-                # If it is embedding model, no detokenization is needed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
+        # Initialize decode status
+        read_ids, surr_ids = [], []
+        for i in range(bs):
+            rid = recv_obj.rids[i]
+            if rid not in self.decode_status:
+                s = DecodeStatus(
+                    decoded_text=recv_obj.decoded_texts[i],
+                    decode_ids=recv_obj.decode_ids[i],
+                    surr_offset=0,
+                    read_offset=recv_obj.read_offsets[i],
+                )
+                self.decode_status[rid] = s
             else:
-                assert isinstance(recv_obj, BatchTokenIDOut)
+                s = self.decode_status[rid]
+                s.decode_ids = recv_obj.decode_ids[i]
 
-            bs = len(recv_obj.rids)
+            read_ids.append(
+                self.trim_matched_stop(
+                    s.decode_ids[s.surr_offset :],
+                    recv_obj.finished_reasons[i],
+                    recv_obj.no_stop_trim[i],
+                )
+            )
+            surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
-            # Initialize decode status
-            read_ids, surr_ids = [], []
-            for i in range(bs):
-                rid = recv_obj.rids[i]
-                vid = recv_obj.vids[i]
-                if rid not in self.decode_status or self.decode_status[rid].vid != vid:
-                    s = DecodeStatus(
-                        vid=vid,
-                        decoded_text=recv_obj.decoded_texts[i],
-                        decode_ids=recv_obj.decode_ids[i],
-                        surr_offset=0,
-                        read_offset=recv_obj.read_offsets[i],
-                    )
-                    self.decode_status[rid] = s
+        # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
+        surr_texts = self.tokenizer.batch_decode(
+            surr_ids,
+            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+        )
+        read_texts = self.tokenizer.batch_decode(
+            read_ids,
+            skip_special_tokens=recv_obj.skip_special_tokens[0],
+            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+        )
+
+        # Incremental decoding
+        output_strs = []
+        for i in range(bs):
+            try:
+                s = self.decode_status[recv_obj.rids[i]]
+            except KeyError:
+                raise RuntimeError(
+                    f"Decode status not found for request {recv_obj.rids[i]}. "
+                    "It may be due to the request being evicted from the decode status due to memory pressure. "
+                    "Please increase the maximum number of requests by setting "
+                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                    f"The current value is {DETOKENIZER_MAX_STATES}. "
+                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
+                )
+            new_text = read_texts[i][len(surr_texts[i]) :]
+            if recv_obj.finished_reasons[i] is None:
+                # Streaming chunk: update the decode status
+                if len(new_text) > 0 and not new_text.endswith("�"):
+                    s.decoded_text = s.decoded_text + new_text
+                    s.surr_offset = s.read_offset
+                    s.read_offset = len(s.decode_ids)
+                    new_text = ""
                 else:
-                    s = self.decode_status[rid]
-                    s.decode_ids = recv_obj.decode_ids[i]
+                    new_text = find_printable_text(new_text)
 
-                read_ids.append(
-                    self.trim_matched_stop(
-                        s.decode_ids[s.surr_offset :],
-                        recv_obj.finished_reasons[i],
-                        recv_obj.no_stop_trim[i],
-                    )
-                )
-                surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
-
-            # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-            surr_texts = self.tokenizer.batch_decode(
-                surr_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-            read_texts = self.tokenizer.batch_decode(
-                read_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-
-            # Incremental decoding
-            output_strs = []
-            for i in range(bs):
-                try:
-                    s = self.decode_status[recv_obj.rids[i]]
-                except KeyError:
-                    raise RuntimeError(
-                        f"Decode status not found for request {recv_obj.rids[i]}. "
-                        "It may be due to the request being evicted from the decode status due to memory pressure. "
-                        "Please increase the maximum number of requests by setting "
-                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                        f"The current value is {DETOKENIZER_MAX_STATES}. "
-                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                    )
-                new_text = read_texts[i][len(surr_texts[i]) :]
-                if recv_obj.finished_reasons[i] is None:
-                    # Streaming chunk: update the decode status
-                    if len(new_text) > 0 and not new_text.endswith("�"):
-                        s.decoded_text = s.decoded_text + new_text
-                        s.surr_offset = s.read_offset
-                        s.read_offset = len(s.decode_ids)
-                        new_text = ""
-                    else:
-                        new_text = find_printable_text(new_text)
-
-                output_strs.append(
-                    self.trim_matched_stop(
-                        s.decoded_text + new_text,
-                        recv_obj.finished_reasons[i],
-                        recv_obj.no_stop_trim[i],
-                    )
-                )
-
-            self.send_to_tokenizer.send_pyobj(
-                BatchStrOut(
-                    rids=recv_obj.rids,
-                    finished_reasons=recv_obj.finished_reasons,
-                    output_strs=output_strs,
-                    prompt_tokens=recv_obj.prompt_tokens,
-                    completion_tokens=recv_obj.completion_tokens,
-                    cached_tokens=recv_obj.cached_tokens,
-                    spec_verify_ct=recv_obj.spec_verify_ct,
-                    input_token_logprobs_val=recv_obj.input_token_logprobs_val,
-                    input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
-                    output_token_logprobs_val=recv_obj.output_token_logprobs_val,
-                    output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
-                    input_top_logprobs_val=recv_obj.input_top_logprobs_val,
-                    input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
-                    output_top_logprobs_val=recv_obj.output_top_logprobs_val,
-                    output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+            output_strs.append(
+                self.trim_matched_stop(
+                    s.decoded_text + new_text,
+                    recv_obj.finished_reasons[i],
+                    recv_obj.no_stop_trim[i],
                 )
             )
+
+        return BatchStrOut(
+            rids=recv_obj.rids,
+            finished_reasons=recv_obj.finished_reasons,
+            output_strs=output_strs,
+            output_ids=None,
+            prompt_tokens=recv_obj.prompt_tokens,
+            completion_tokens=recv_obj.completion_tokens,
+            cached_tokens=recv_obj.cached_tokens,
+            spec_verify_ct=recv_obj.spec_verify_ct,
+            input_token_logprobs_val=recv_obj.input_token_logprobs_val,
+            input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
+            output_token_logprobs_val=recv_obj.output_token_logprobs_val,
+            output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
+            input_top_logprobs_val=recv_obj.input_top_logprobs_val,
+            input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+            output_top_logprobs_val=recv_obj.output_top_logprobs_val,
+            output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
+            input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
+            output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
+            output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_hidden_states=recv_obj.output_hidden_states,
+        )
+
+    def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
+        raise NotImplementedError()
 
 
 class LimitedCapacityDict(OrderedDict):
@@ -231,6 +253,7 @@ def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()

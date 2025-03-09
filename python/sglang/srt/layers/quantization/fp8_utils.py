@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -7,9 +8,15 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 is_hip_ = is_hip()
+if is_hip_ and get_bool_env_var("CK_MOE"):
+    from aiter import gemm_a8w8_blockscale
+
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+if _is_cuda:
+    from sgl_kernel import fp8_blockwise_scaled_mm
 
 
 def normalize_e4m3fn_to_e4m3fnuz(
@@ -36,6 +43,21 @@ def normalize_e4m3fn_to_e4m3fnuz(
     return weight, weight_scale, input_scale
 
 
+def cutlass_block_fp8_supported() -> bool:
+    if os.environ.get("SUPPORT_CUTLASS_BLOCK_FP8") is None:
+        return False
+    if _is_cuda:
+        major, minor = torch.cuda.get_device_capability()
+        sm_version = major * 10 + minor
+        cuda_version = tuple(map(int, torch.version.cuda.split(".")))
+        if cuda_version >= (12, 0) and sm_version >= 90:
+            return True
+    return False
+
+
+CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
+
+
 def apply_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -48,11 +70,34 @@ def apply_w8a8_block_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
-
-    q_input, x_scale = per_token_group_quant_fp8(input_2d, block_size[1])
-    output = w8a8_block_fp8_matmul(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
+    # TODO: add more robust shape check here
+    shape_supported_by_cutlass = (
+        weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
     )
+    if CUTLASS_BLOCK_FP8_SUPPORTED and shape_supported_by_cutlass:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=True
+        )
+        output = fp8_blockwise_scaled_mm(
+            q_input, weight.T, x_scale, weight_scale.T, out_dtype=input.dtype
+        )
+    elif is_hip_ and get_bool_env_var("CK_MOE"):
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
+        output = torch.zeros(
+            [q_input.shape[0], weight.shape[0]],
+            dtype=input.dtype,
+            device=q_input.device,
+        )
+        gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
+    else:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
+        output = w8a8_block_fp8_matmul(
+            q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
+        )
 
     if bias is not None:
         output = output + bias

@@ -50,7 +50,7 @@ def _fwd_kernel(
     kv_indptr,
     kv_indices,
     mask_ptr,
-    mask_offsets,
+    mask_indptr,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -74,6 +74,8 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -87,7 +89,7 @@ def _fwd_kernel(
     cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
 
     if USE_CUSTOM_MASK:
-        cur_seq_mask_start_idx = tl.load(mask_offsets + cur_seq)
+        cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -159,7 +161,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        if USE_CUSTOM_MASK:
+        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
@@ -272,9 +274,18 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
-    tl.store(
-        O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
-    )
+    if STORE_TRANSPOSE:
+        tl.store(
+            O_Extend + offs_o.T,
+            (acc / deno[:, None]).T,
+            mask=(mask_m[:, None] & mask_dv[None, :]).T,
+        )
+    else:
+        tl.store(
+            O_Extend + offs_o,
+            acc / deno[:, None],
+            mask=mask_m[:, None] & mask_dv[None, :],
+        )
 
 
 def extend_attention_fwd(
@@ -288,10 +299,11 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
-    mask_offsets,
+    mask_indptr,
     max_len_extend,
     sm_scale=None,
     logit_cap=0.0,
+    skip_prefix_custom_mask=True,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -345,6 +357,8 @@ def extend_attention_fwd(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
+    # Skip custom mask for prefix part
+    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
@@ -364,7 +378,7 @@ def extend_attention_fwd(
         kv_indptr,
         kv_indices,
         custom_mask,
-        mask_offsets,
+        mask_indptr,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -388,6 +402,8 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_TRANSPOSE=is_hip_,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

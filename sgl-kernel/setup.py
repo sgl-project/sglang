@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -63,7 +62,6 @@ include_dirs = [
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    "cublasLt",
     turbomind.resolve(),
     turbomind.resolve() / "src",
 ]
@@ -81,6 +79,13 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
+    "-DCUTLASS_VERSIONS_GENERATED",
+    "-DCUTE_USE_PACKED_TUPLE=1",
+    "-DCUTLASS_TEST_LEVEL=0",
+    "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "--ptxas-options=-v",
+    "--expt-relaxed-constexpr",
     "-Xcompiler=-Wconversion",
     "-Xcompiler=-fno-strict-aliasing",
 ]
@@ -92,15 +97,20 @@ nvcc_flags_fp8 = [
 
 sources = [
     "src/sgl-kernel/torch_extension.cc",
-    "src/sgl-kernel/csrc/trt_reduce_internal.cu",
-    "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
-    "src/sgl-kernel/csrc/moe_align_kernel.cu",
-    "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/fp8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/fused_add_rms_norm_kernel.cu",
-    "src/sgl-kernel/csrc/eagle_utils.cu",
-    "src/sgl-kernel/csrc/speculative_sampling.cu",
+    "src/sgl-kernel/csrc/activation/fused_add_rms_norm_kernel.cu",
+    "src/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu",
+    "src/sgl-kernel/csrc/allreduce/trt_reduce_kernel.cu",
+    "src/sgl-kernel/csrc/attention/lightning_attention_decode_kernel.cu",
+    "src/sgl-kernel/csrc/gemm/cublas_grouped_gemm.cu",
+    "src/sgl-kernel/csrc/gemm/fp8_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/gemm/int8_gemm_kernel.cu",
+    "src/sgl-kernel/csrc/gemm/per_token_group_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_token_quant_fp8.cu",
+    "src/sgl-kernel/csrc/gemm/per_tensor_quant_fp8.cu",
+    "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
+    "src/sgl-kernel/csrc/speculative/eagle_utils.cu",
+    "src/sgl-kernel/csrc/speculative/speculative_sampling.cu",
     "3rdparty/flashinfer/csrc/activation.cu",
     "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
@@ -143,7 +153,7 @@ for flag in [
         pass
 
 cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda", "cublas", "cublasLt"]
+libraries = ["c10", "torch", "torch_python", "cuda", "cublas"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
 
 ext_modules = [
@@ -167,10 +177,6 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=True, max_jobs=multiprocessing.cpu_count()
-        )
-    },
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

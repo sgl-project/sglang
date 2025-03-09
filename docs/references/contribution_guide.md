@@ -22,6 +22,7 @@ We use [pre-commit](https://pre-commit.com/) to maintain consistent code style c
 
 ```bash
 pip3 install pre-commit
+pre-commit install
 pre-commit run --all-files
 ```
 
@@ -42,4 +43,4 @@ If you want to contribute but don’t have a specific idea in mind, pick issues 
 
 If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2um0ad92q-LkU19KQTxCGzlCgRiOiQEw).
 
-Thank you for your interest in SGLang—**happy coding**!
+Thank you for your interest in SGLang. Happy coding!

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import triton
@@ -41,12 +41,13 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention import AttentionBackend
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -112,7 +113,9 @@ class ForwardMode(IntEnum):
 
 class CaptureHiddenMode(IntEnum):
     NULL = auto()
+    # Capture hidden states of all tokens.
     FULL = auto()
+    # Capture a hidden state of the last token.
     LAST = auto()
 
     def need_capture(self):
@@ -148,9 +151,13 @@ class ForwardBatch:
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
+    token_ids_logprobs: Optional[List[List[int]]] = None
 
     # Position information
     positions: torch.Tensor = None
+
+    # For decode
+    decode_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -160,6 +167,7 @@ class ForwardBatch:
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For multimodal
     image_inputs: Optional[List[ImageInputs]] = None
@@ -185,14 +193,26 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
-    global_num_tokens: Optional[List[int]] = None
+    global_num_tokens_cpu: Optional[List[int]] = None
+    global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Has to be None when cuda graph is captured.
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # for extend, local start pos and num tokens is different in logits processor
+    # this will be computed in get_dp_local_info
+    # this will be recomputed in LogitsMetadata.from_forward_batch
+    dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
+    dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
 
     # Speculative decoding
-    spec_info: SpecInfo = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # For padding
+    padded_static_len: int = -1  # -1 if not padded
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -203,8 +223,13 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-
         device = model_runner.device
+        extend_input_logprob_token_ids_gpu = None
+        if batch.extend_input_logprob_token_ids is not None:
+            extend_input_logprob_token_ids_gpu = (
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            )
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -220,7 +245,7 @@ class ForwardBatch:
             seq_lens_sum=batch.seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
-            global_num_tokens=batch.global_num_tokens,
+            token_ids_logprobs=batch.token_ids_logprobs,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
@@ -231,10 +256,12 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
-        if ret.global_num_tokens is not None:
-            max_len = max(ret.global_num_tokens)
+        if batch.global_num_tokens is not None:
+            ret.global_num_tokens_cpu = batch.global_num_tokens
+            max_len = max(ret.global_num_tokens_cpu)
             ret.gathered_buffer = torch.zeros(
                 (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
@@ -256,6 +283,8 @@ class ForwardBatch:
         if ret.forward_mode.is_decode():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+            if ret.decode_seq_lens_cpu is None:
+                ret.decode_seq_lens_cpu = batch.decode_seq_lens
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -266,7 +295,9 @@ class ForwardBatch:
             if model_runner.server_args.attention_backend != "torch_native":
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
                 )
             else:
                 positions, ret.extend_start_loc = compute_position_torch(
@@ -338,6 +369,7 @@ class ForwardBatch:
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
+
         self.mrope_positions = torch.concat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
@@ -350,6 +382,8 @@ def compute_position_triton(
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
+    has_prefix = extend_prefix_lens.shape[0] == batch_size
+
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
     )
@@ -363,6 +397,7 @@ def compute_position_triton(
         extend_start_loc,
         extend_prefix_lens,
         extend_seq_lens,
+        has_prefix,
     )
 
     return positions, extend_start_loc
@@ -374,11 +409,12 @@ def compute_position_kernel(
     extend_start_loc,
     extend_prefix_lens,
     extend_seq_lens,
+    has_prefix: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
 
-    prefix_len = tl.load(extend_prefix_lens + pid)
+    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
     # TODO: optimize this?

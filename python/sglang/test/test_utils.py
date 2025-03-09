@@ -8,10 +8,11 @@ import random
 import subprocess
 import threading
 import time
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -34,6 +35,7 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
+DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
@@ -41,9 +43,14 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Ins
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
+
 
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmzheng/sglang-EAGLE-llama2-chat-7B"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
+
+DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 
 def is_in_ci():
@@ -158,45 +165,6 @@ def call_generate_guidance(
     return rets if n > 1 else rets[0]
 
 
-async def call_generate_lmql(
-    prompt, temperature, max_tokens, stop=None, n=1, max_len=4096, model=None, **kwargs
-):
-    assert model is not None
-    import lmql
-
-    if stop != None:
-
-        @lmql.query(model=model)
-        async def program(question, max_tokens, stop):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens and STOPS_AT(ANSWER, stop)
-            return ANSWER
-            '''
-
-    else:
-
-        @lmql.query(model=model)
-        async def program(question, max_tokens):
-            '''lmql
-            """{question}[ANSWER]""" where len(TOKENS(ANSWER)) < max_tokens
-            return ANSWER
-            '''
-
-    tasks = [
-        program(
-            question=prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stop=stop,
-            max_len=max_len,
-            **kwargs,
-        )
-        for _ in range(n)
-    ]
-    rets = await asyncio.gather(*tasks)
-    return rets if n > 1 else rets[0]
-
-
 def call_select_lightllm(context, choices, url=None):
     assert url is not None
 
@@ -246,23 +214,6 @@ def call_select_guidance(context, choices, model=None):
     return choices.index(out["answer"])
 
 
-async def call_select_lmql(context, choices, temperature=0, max_len=4096, model=None):
-    assert model is not None
-    import lmql
-
-    @lmql.query(model=model)
-    async def program(ctx, choices):
-        '''lmql
-        """{ctx}[ANSWER]""" where ANSWER in set(choices)
-        return ANSWER
-        '''
-
-    answer = await program(
-        ctx=context, choices=choices, temperature=temperature, max_len=max_len
-    )
-    return choices.index(answer)
-
-
 def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
@@ -277,7 +228,6 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "lightllm",
             "gserver",
             "guidance",
-            "lmql",
             "srt-raw",
             "llama.cpp",
         ],
@@ -294,7 +244,6 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "vllm": 21000,
             "outlines": 21000,
             "lightllm": 22000,
-            "lmql": 23000,
             "srt-raw": 30000,
             "gserver": 9988,
         }
@@ -342,11 +291,6 @@ def _get_call_generate(args: argparse.Namespace):
         call_generate = partial(call_generate_guidance, model=model)
         call_generate("Hello,", 1.0, 8, ".")
         return call_generate
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
-        return partial(call_generate_lmql, model=model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -364,12 +308,6 @@ def _get_call_select(args: argparse.Namespace):
 
         call_select("Hello,", ["world", "earth"])
         return call_select
-
-    elif args.backend == "lmql":
-        import lmql
-
-        model = lmql.model(args.model_path, endpoint=f"{args.host}:{args.port}")
-        return partial(call_select_lmql, model=model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 
@@ -408,25 +346,48 @@ def popen_launch_server(
     other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    pd_seperated: bool = False,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
 
+    if pd_seperated:
+        command = "sglang.launch_pd_server"
+    else:
+        command = "sglang.launch_server"
+
     command = [
         "python3",
         "-m",
-        "sglang.launch_server",
+        command,
         "--model-path",
         model,
-        "--host",
-        host,
-        "--port",
-        port,
-        *other_args,
+        *[str(x) for x in other_args],
     ]
+
+    if pd_seperated:
+        command.extend(
+            [
+                "--lb-host",
+                host,
+                "--lb-port",
+                port,
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--host",
+                host,
+                "--port",
+                port,
+            ]
+        )
 
     if api_key:
         command += ["--api-key", api_key]
+
+    print(f"command={' '.join(command)}")
 
     if return_stdout_stderr:
         process = subprocess.Popen(
@@ -456,6 +417,8 @@ def popen_launch_server(
             except requests.RequestException:
                 pass
             time.sleep(10)
+
+    kill_process_tree(process.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
@@ -488,9 +451,11 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
     success = True
 
     for filename in files:
-        global process
+        process = None
 
         def run_one_file(filename):
+            nonlocal process
+
             filename = os.path.join(os.getcwd(), filename)
             print(f"\n\nRun:\npython3 {filename}\n\n", flush=True)
             process = subprocess.Popen(
@@ -503,7 +468,9 @@ def run_unittest_files(files: List[str], timeout_per_file: float):
             ret_code = run_with_timeout(
                 run_one_file, args=(filename,), timeout=timeout_per_file
             )
-            assert ret_code == 0
+            assert (
+                ret_code == 0
+            ), f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
@@ -532,11 +499,15 @@ def get_benchmark_args(
     dataset_path="",
     tokenizer="",
     num_prompts=500,
+    sharegpt_output_len=None,
     random_input_len=4096,
     random_output_len=2048,
+    sharegpt_context_len=None,
     request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
+    seed: int = 0,
+    pd_seperated: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -548,8 +519,8 @@ def get_benchmark_args(
         model=None,
         tokenizer=tokenizer,
         num_prompts=num_prompts,
-        sharegpt_output_len=None,
-        sharegpt_context_len=None,
+        sharegpt_output_len=sharegpt_output_len,
+        sharegpt_context_len=sharegpt_context_len,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
         random_range_ratio=0.0,
@@ -559,12 +530,14 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
-        seed=0,
+        seed=seed,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
         lora_name=None,
+        prompt_suffix="",
+        pd_seperated=pd_seperated,
     )
 
 
@@ -578,9 +551,11 @@ def run_bench_serving(
     tokenizer=None,
     random_input_len=4096,
     random_output_len=2048,
+    sharegpt_context_len=None,
     disable_stream=False,
     disable_ignore_eos=False,
     need_warmup=False,
+    seed: int = 0,
 ):
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
@@ -600,9 +575,11 @@ def run_bench_serving(
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
+        sharegpt_context_len=sharegpt_context_len,
         request_rate=request_rate,
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
+        seed=seed,
     )
 
     try:
@@ -624,6 +601,7 @@ def run_bench_serving_multi(
     other_server_args,
     benchmark_args,
     need_warmup=False,
+    pd_seperated=False,
 ):
     # Launch the server
     process = popen_launch_server(
@@ -631,6 +609,7 @@ def run_bench_serving_multi(
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
+        pd_seperated=pd_seperated,
     )
 
     # run benchmark for all
@@ -663,7 +642,7 @@ def run_bench_one_batch(model, other_args):
         "128",
         "--output",
         "8",
-        *other_args,
+        *[str(x) for x in other_args],
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -814,7 +793,7 @@ def run_command_and_capture_output(command, env: Optional[dict] = None):
     stdout = open(STDOUT_FILENAME, "w")
     stderr = open(STDERR_FILENAME, "w")
     process = subprocess.Popen(
-        command, stdout=stdout, stderr=stderr, env=env, text=True
+        command, stdout=stdout, stderr=stdout, env=env, text=True
     )
 
     # Launch a thread to stream the output
@@ -912,3 +891,78 @@ def run_mulit_request_test(
 def write_github_step_summary(content):
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
+
+
+def run_logprob_check(self: unittest.TestCase, arg: Tuple):
+    (
+        input_len,
+        output_len,
+        temperature,
+        logprob_start_len,
+        return_logprob,
+        top_logprobs_num,
+    ) = arg
+    input_ids = list(range(input_len))
+
+    response = requests.post(
+        self.base_url + "/generate",
+        json={
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": output_len,
+                "ignore_eos": True,
+            },
+            "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
+            "top_logprobs_num": top_logprobs_num,
+        },
+    )
+    response_json = response.json()
+
+    res = response_json
+    self.assertEqual(res["meta_info"]["prompt_tokens"], input_len)
+    self.assertEqual(res["meta_info"]["completion_tokens"], output_len)
+
+    # Test the number of tokens are correct
+    if return_logprob:
+        self.assertEqual(
+            len(res["meta_info"]["input_token_logprobs"]) + logprob_start_len,
+            res["meta_info"]["prompt_tokens"],
+        )
+        self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), output_len)
+
+        if top_logprobs_num:
+            self.assertEqual(
+                len(res["meta_info"]["input_top_logprobs"]) + logprob_start_len,
+                res["meta_info"]["prompt_tokens"],
+            )
+            self.assertEqual(len(res["meta_info"]["output_top_logprobs"]), output_len)
+
+            for i in range(output_len):
+                self.assertEqual(
+                    len(res["meta_info"]["output_top_logprobs"][i]),
+                    top_logprobs_num,
+                )
+
+                # Test the top-1 tokens are the same as output tokens if temperature == 0
+                if temperature == 0:
+                    rank = 0
+                    while rank < len(res["meta_info"]["output_top_logprobs"][i]):
+                        try:
+                            self.assertListEqual(
+                                res["meta_info"]["output_token_logprobs"][i],
+                                res["meta_info"]["output_top_logprobs"][i][rank],
+                            )
+                            break
+                        except AssertionError:
+                            # There's a tie. Allow the second item in this case.
+                            if (
+                                res["meta_info"]["output_top_logprobs"][i][rank][0]
+                                == res["meta_info"]["output_top_logprobs"][i][rank + 1][
+                                    0
+                                ]
+                            ):
+                                rank += 1
+                            else:
+                                raise
