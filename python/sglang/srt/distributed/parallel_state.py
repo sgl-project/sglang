@@ -1183,7 +1183,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
         ray.shutdown()
     gc.collect()
     if not current_platform.is_cpu():
-        if torch.cuda.is_available():
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
                 torch._C._host_emptyCache()
@@ -1191,7 +1191,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
                 logger.warning(
                     "torch._C._host_emptyCache() only available in Pytorch >=2.5"
                 )
-        elif torch.xpu.is_available():
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
 
 
