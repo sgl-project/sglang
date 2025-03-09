@@ -217,7 +217,6 @@ class LoRAMemoryPool:
                 else:
                     self.B_buffer[name][layer_id][0][buffer_id].copy_(weights)
 
-
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:

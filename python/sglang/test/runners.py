@@ -284,6 +284,7 @@ class SRTRunner:
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         mem_fraction_static: float = 0.65,
+        disable_custom_all_reduce: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -300,6 +301,7 @@ class SRTRunner:
             lora_backend=lora_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            disable_custom_all_reduce=disable_custom_all_reduce,
         )
         self.tokenizer = get_tokenizer(model_path)
 
