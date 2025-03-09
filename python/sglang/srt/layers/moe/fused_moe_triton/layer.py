@@ -279,6 +279,7 @@ class FusedMoE(torch.nn.Module):
         use_presharded_weights: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
+        scoring_func: str = "softmax",
     ):
         super().__init__()
 
@@ -318,11 +319,10 @@ class FusedMoE(torch.nn.Module):
             layer=self,
             num_experts=num_experts,
             hidden_size=hidden_size,
-            # FIXME: figure out which intermediate_size to use
-            intermediate_size=self.intermediate_size_per_partition,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            intermediate_size_full=intermediate_size,
         )
 
     def _load_per_tensor_weight_scale(
@@ -627,10 +627,9 @@ class FusedMoE(torch.nn.Module):
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
-            correction_bias=self.correction_bias,
-            activation=self.activation,
-            inplace=self.inplace,
-            no_combine=self.no_combine,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.correction_bias,
+            # activation=self.activation,
         )
 
         if self.reduce_results and self.tp_size > 1:
