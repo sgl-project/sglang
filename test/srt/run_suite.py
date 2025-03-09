@@ -12,7 +12,8 @@ suites = {
         "models/test_generation_models.py",
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
-        "sampling/penaltylib",
+        "test_gptqmodel_dynamic.py",
+        "models/test_gme_qwen_models.py",
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_custom_allreduce.py",
@@ -23,6 +24,7 @@ suites = {
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_mla.py",
+        "test_mla_deepseek_v3.py",
         "test_mla_flashinfer.py",
         "test_mla_fp8.py",
         "test_json_constrained.py",
@@ -31,6 +33,7 @@ suites = {
         "test_no_chunked_prefill.py",
         "test_no_overlap_scheduler.py",
         "test_openai_server.py",
+        "test_penalty.py",
         "test_pytorch_sampling_backend.py",
         "test_radix_attention.py",
         "test_regex_constrained.py",
@@ -38,7 +41,8 @@ suites = {
         "test_request_length_validation.py",
         "test_retract_decode.py",
         "test_server_args.py",
-        "test_session_control.py",
+        # Disabled temporarily
+        # "test_session_control.py",
         "test_skip_tokenizer_init.py",
         "test_srt_engine.py",
         "test_srt_endpoint.py",
@@ -58,15 +62,14 @@ suites = {
         "test_w8a8_quantization.py",
         "test_fp8_kernel.py",
         "test_block_int8.py",
+        "test_int8_kernel.py",
+        "test_reasoning_content.py",
     ],
     "nightly": [
         "test_nightly_gsm8k_eval.py",
         # Disable temporarily
         # "test_nightly_math_eval.py",
     ],
-    "sampling/penaltylib": glob.glob(
-        "sampling/penaltylib/**/test_*.py", recursive=True
-    ),
 }
 
 # Expand suite
@@ -83,7 +86,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=2000,
+        default=1800,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(

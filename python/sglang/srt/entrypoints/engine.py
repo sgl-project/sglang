@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -105,6 +106,8 @@ class Engine:
         tokenizer_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args
         )
+
+        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -121,8 +124,10 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -141,9 +146,11 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
+            return_hidden_states=return_hidden_states,
             stream=stream,
         )
         loop = asyncio.get_event_loop()
@@ -177,6 +184,7 @@ class Engine:
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
+        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         stream: bool = False,
@@ -193,6 +201,7 @@ class Engine:
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
@@ -207,13 +216,13 @@ class Engine:
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-
-        obj = EmbeddingReqInput(text=prompt)
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -224,15 +233,22 @@ class Engine:
         kill_process_tree(os.getpid(), include_parent=False)
 
     def start_profile(self):
-        self.tokenizer_manager.start_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
         self.tokenizer_manager.stop_profile()
 
     def get_server_info(self):
+        loop = asyncio.get_event_loop()
+        internal_states = loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
+
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),  # server args
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
+            **internal_states,
             "version": __version__,
         }
 
@@ -289,6 +305,27 @@ class Engine:
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: Optional[str] = None,
+    ):
+        """Update the weights from disk inplace without re-launching the engine.
+
+        This method allows updating the model weights from disk without restarting
+        the engine. It can be used to load a different model or update weights with
+        new training.
+        """
+        obj = UpdateWeightFromDiskReqInput(
+            model_path=model_path,
+            load_format=load_format,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_disk(obj, None)
+        )
+
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
@@ -321,6 +358,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -344,12 +382,23 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        if exitcode != 0:
+            logger.warning(
+                "Child process unexpectedly failed with an exit code %d. pid=%d",
+                exitcode,
+                pid,
+            )
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
+
     # Register the signal handler.
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
         logger.error(
-            "Received sigquit from a child proces. It usually means the child failed."
+            "Received sigquit from a child process. It usually means the child failed."
         )
         kill_process_tree(os.getpid())
 

@@ -138,18 +138,20 @@ def moe_align_block_size_triton(
 
 
 @pytest.mark.parametrize(
-    "block_size,num_tokens,topk",
+    "block_size,num_tokens,topk,num_experts",
     list(
         itertools.product(
             [32, 64, 128, 256],  # block_size
             [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
             [1, 2, 4, 8, 16, 32, 64],  # topk
+            [64, 160, 256],  #  num_experts
         )
     ),
 )
-def test_moe_align_block_size_compare_implementations(block_size, num_tokens, topk):
+def test_moe_align_block_size_compare_implementations(
+    block_size, num_tokens, topk, num_experts
+):
     # For DeepSeek V3, we have 256 experts
-    num_experts = 256
 
     topk_ids = torch.stack(
         [
@@ -171,12 +173,12 @@ def test_moe_align_block_size_compare_implementations(block_size, num_tokens, to
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.zeros(
+    token_cnts_buffer = torch.empty(
         (num_experts + 1) * num_experts,
         dtype=torch.int32,
         device=topk_ids.device,
     )
-    cumsum_buffer = torch.zeros(
+    cumsum_buffer = torch.empty(
         num_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
 
