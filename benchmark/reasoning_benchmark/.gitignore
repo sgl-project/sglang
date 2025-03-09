@@ -1,0 +1,7 @@
+# temp file for reasoning benchmark
+*.sh
+*.txt
+*.jsonl
+
+# pycache
+__pycache__/
