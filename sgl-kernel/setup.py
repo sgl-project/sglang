@@ -68,21 +68,22 @@ include_dirs = [
     "cublas",
 ]
 
+
 class CustomBuildPy(build_py):
     def run(self):
         self.copy_deepgemm_to_build_lib()
         build_py.run(self)
 
     def copy_deepgemm_to_build_lib(self):
-        '''
+        """
         This function copies DeepGemm to python's site-packages
-        '''
+        """
         dst_dir = os.path.join(self.build_lib, "deep_gemm")
         os.makedirs(dst_dir, exist_ok=True)
 
         # Copy deepgemm/deep_gemm to the build directory
         src_dir = os.path.join(str(deepgemm.resolve()), "deep_gemm")
-        
+
         # Remove existing directory if it exists
         if os.path.exists(dst_dir):
             shutil.rmtree(dst_dir)
