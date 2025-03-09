@@ -284,9 +284,13 @@ class ServerArgs:
                 "Overlap scheduler are disabled because of using "
                 "eagle speculative decoding."
             )
-            # The token generated from the verify step is counted.
+            # The token generated from the verify step is counted in speculative_num_draft_tokens.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
-            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+            assert self.speculative_num_steps < self.speculative_num_draft_tokens
+            assert (
+                self.speculative_num_draft_tokens - 1
+                <= self.speculative_num_steps * self.speculative_eagle_topk
+            )
 
         # GGUF
         if (
@@ -405,6 +409,7 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "w8a8_int8",
+                "w8a8_fp8",
             ],
             help="The quantization method.",
         )
