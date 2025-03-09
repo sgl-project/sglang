@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: ${{ github.ref != 'refs/heads/main' }}
       matrix:
-        range: [0, 1, 2, 3, 4, 5]
+        part: [0, 1, 2, 3, 4, 5]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -109,9 +109,6 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          RANGE=${{ matrix.range }}
-          range_begin=${RANGE%-*}
-          range_end=${RANGE#*-}
           cd test/srt
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
 
