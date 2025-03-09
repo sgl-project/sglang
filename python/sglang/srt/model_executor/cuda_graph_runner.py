@@ -302,7 +302,7 @@ class CudaGraphRunner:
             self.stream = graph_capture_context.stream
             # Reverse the order to enable better memory sharing across cuda graphs.
             capture_range = (
-                tqdm.tqdm(reversed(self.capture_bs))
+                tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
