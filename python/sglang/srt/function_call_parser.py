@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, Callable, Dict, List, Optional, Tuple

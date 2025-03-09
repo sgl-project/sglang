@@ -911,7 +911,7 @@ def v1_chat_generate_request(
                         info = wrapper(tool["name"])
 
                         # use schema in strict mode, else accept any tool
-                        if tool.get("use_strict", False):
+                        if tool["strict"]:
                             schema = tool["parameters"]["properties"]
                         else:
                             schema = True  # accept any valid json
