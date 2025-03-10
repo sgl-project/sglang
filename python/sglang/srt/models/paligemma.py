@@ -119,7 +119,28 @@ class PaliGemmaForConditionalGeneration(nn.module):
         self.vision_tower = SiglipVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
             ).cuda()
-        pass #TODO(Xiao)
+
+        self.vision_tower.eval()
+
+        #load mm_projector
+        projector_weights = {
+            "model.mm_projector.0": "multi_modal_projector.linear",
+            "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+        }
+
+        params_dict = dict(self.named_parameters())
+        weights = list(weights)
+        for name, loaded_weight in weights:
+            if "projector" in name or "vision_tower" in name:
+                for weight_name, param_name in projector_weights.items():
+                    if weight_name in name:
+                        name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+        #load language model
+        self.language_model.load_weights(weights)
 
 EntryClass = PaliGemmaForConditionalGeneration
     
