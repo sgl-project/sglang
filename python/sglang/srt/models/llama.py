@@ -286,9 +286,6 @@ class LlamaModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.capture_aux_hidden_states = False
-        self.layers_to_capture = []
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -315,7 +312,7 @@ class LlamaModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
+        if not self.capture_aux_hidden_states:
             return hidden_states
 
         return hidden_states, aux_hidden_states
@@ -401,6 +398,9 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+
+        self.capture_aux_hidden_states = False
+        self.layers_to_capture = []
 
     @torch.no_grad()
     def forward(
