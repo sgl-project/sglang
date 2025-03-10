@@ -32,15 +32,15 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
-  m.def("get_graph_buffer_ipc_meta(int fa) -> (int[], int[])");
-  m.impl("get_graph_buffer_ipc_meta", torch::kCUDA, &get_graph_buffer_ipc_meta);
-
-  m.def("register_graph_buffers(int fa, int[][] handles, int[][] offsets) -> ()");
-  m.impl("register_graph_buffers", torch::kCUDA, &register_graph_buffers);
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
 
   /*
    * From csrc/attention
    */
+  m.def(
+      "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
+      "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
   /*
@@ -66,6 +66,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
+
+  m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   /*
    * From csrc/gemm
@@ -108,10 +113,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
-
-  m.def(
-      "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
-      "new_kv) -> ()");
 
   /*
    * From csrc/speculative
@@ -169,11 +170,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
-
-  m.def(
-      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
-      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
-  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 }
 
 REGISTER_EXTENSION(common_ops)
