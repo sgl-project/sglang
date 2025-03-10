@@ -1355,7 +1355,7 @@ class Scheduler:
                                 )
                             ]
                             .cpu()
-                            .clone()
+                            .clone().tolist()
                         )
 
                     if req.grammar is not None:
@@ -1482,7 +1482,9 @@ class Scheduler:
                     )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
+                req.hidden_states.append(
+                    logits_output.hidden_states[i].cpu().clone().tolist()
+                )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 req.grammar.accept_token(next_token_id)
@@ -1689,7 +1691,7 @@ class Scheduler:
             completion_tokens = []
             cached_tokens = []
             spec_verify_ct = []
-            output_hidden_states = None
+            output_hidden_states: Optional[List[List[float]]] = None
 
             if return_logprob:
                 input_token_logprobs_val = []
