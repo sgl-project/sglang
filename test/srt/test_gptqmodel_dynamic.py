@@ -129,6 +129,7 @@ class TestGPTQModelDynamic(unittest.TestCase):
                 "text": "The capital of France is",
                 "sampling_params": {
                     "max_new_tokens": max_new_tokens,
+                    "temperature": 0.001,
                 },
             },
         )
