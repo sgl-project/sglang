@@ -456,38 +456,9 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if num_experts >= 224:
-        if enable_moe_align_block_size_triton:
-            moe_align_block_size_triton(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-            )
-        else:
-            token_cnts_buffer = torch.zeros(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
-            )
 
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                token_cnts_buffer,
-                cumsum_buffer,
-            )
-    else:
-        ops.moe_align_block_size(
+    if enable_moe_align_block_size_triton:
+        moe_align_block_size_triton(
             topk_ids,
             num_experts,
             block_size,
@@ -495,6 +466,27 @@ def moe_align_block_size(
             expert_ids,
             num_tokens_post_pad,
         )
+    else:
+        token_cnts_buffer = torch.zeros(
+            (num_experts + 1) * num_experts,
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+        cumsum_buffer = torch.zeros(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            token_cnts_buffer,
+            cumsum_buffer,
+        )
+
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
