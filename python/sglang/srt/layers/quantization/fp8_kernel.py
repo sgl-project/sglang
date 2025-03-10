@@ -723,11 +723,6 @@ def w8a8_block_fp8_matmul(
     num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
         N, config["BLOCK_SIZE_N"]
     )
-    kernel = (
-        _w8a8_block_fp8_matmul_unrolledx4
-        if (is_hip_ == True and num_workgroups <= get_device_core_count())
-        else _w8a8_block_fp8_matmul
-    )
 
     if _is_cuda:
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
