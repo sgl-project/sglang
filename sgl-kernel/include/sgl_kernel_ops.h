@@ -99,6 +99,15 @@ void gemma_fused_add_rmsnorm(
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void apply_rope_pos_ids_cos_sin_cache(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor q_rope,
+    at::Tensor k_rope,
+    at::Tensor cos_sin_cache,
+    at::Tensor pos_ids,
+    bool interleave,
+    int64_t cuda_stream);
 
 /*
  * From csrc/gemm
@@ -138,6 +147,15 @@ void cublas_grouped_gemm(
     const std::vector<torch::Tensor>& weights,
     const std::vector<torch::Tensor>& outputs,
     const torch::Dtype& out_dtype,
+    int64_t cublas_handle,
+    int64_t cuda_stream);
+void bmm_fp8(
+    at::Tensor A,
+    at::Tensor B,
+    at::Tensor D,
+    at::Tensor A_scale,
+    at::Tensor B_scale,
+    at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream);
 
@@ -198,15 +216,6 @@ void build_tree_kernel(
 /*
  * From FlashInfer
  */
-void bmm_fp8(
-    at::Tensor A,
-    at::Tensor B,
-    at::Tensor D,
-    at::Tensor A_scale,
-    at::Tensor B_scale,
-    at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
 void min_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor uniform_samples,
@@ -257,13 +266,4 @@ void top_p_sampling_from_probs(
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,
-    int64_t cuda_stream);
-void apply_rope_pos_ids_cos_sin_cache(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor q_rope,
-    at::Tensor k_rope,
-    at::Tensor cos_sin_cache,
-    at::Tensor pos_ids,
-    bool interleave,
     int64_t cuda_stream);
