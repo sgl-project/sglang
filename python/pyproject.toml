@@ -18,12 +18,15 @@ dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle"]
 [project.optional-dependencies]
 runtime_common = [
     "aiohttp",
+    "datasets",
     "decord",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
     "interegular",
+    "llguidance>=0.6.15",
     "modelscope",
+    "ninja",
     "orjson",
     "packaging",
     "pillow",
@@ -33,18 +36,15 @@ runtime_common = [
     "python-multipart",
     "pyzmq>=25.1.2",
     "torchao>=0.7.0",
+    "transformers==4.48.3",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.14",
-    "ninja",
-    "transformers==4.48.3",
-    "llguidance>=0.6.15",
-    "datasets"
 ]
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.0.3.post6",
+    "sgl-kernel==0.0.4",
     "flashinfer_python==0.2.2.post1",
     "torch==2.5.1",
     "vllm>=0.6.4.post1,<=0.7.2",

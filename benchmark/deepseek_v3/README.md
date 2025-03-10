@@ -184,6 +184,26 @@ AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for qua
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
 ```
 
+### Example: Serving with 16 A100/A800 with int8 Quantization
+
+There are block-wise and per-channel quantization methods, and the quantization parameters have already been uploaded to Huggingface. One example is as follows:
+
+- [meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+```bash
+#master
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	HEAD_IP:5000 --nnodes 2 --node-rank 0 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+#cluster
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	HEAD_IP:5000 --nnodes 2 --node-rank 1 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+```
+
+
+
 ### Example: Serving on any cloud or Kubernetes with SkyPilot
 
 SkyPilot helps find cheapest available GPUs across any cloud or existing Kubernetes clusters and launch distributed serving with a single command. See details [here](https://github.com/skypilot-org/skypilot/tree/master/llm/deepseek-r1).

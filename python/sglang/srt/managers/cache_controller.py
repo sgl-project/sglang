@@ -155,7 +155,6 @@ class HiCacheController:
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
     ):
-
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
