@@ -94,12 +94,16 @@ class CuDNNBackend(AttentionBackend):
         """
 
         logging.info("Running decode")
+        print("output shape: ",output.shape)
+        assert query.shape[0] == seq_lens.shape[0], "batch size must be the same"
 
-        max_seq_len = req_to_token.shape[1]
+        max_seq_len = k_cache.shape[0]
         # Convert into CuDNN Query format (B, H, S, D)
         # where B is number of queries and S is sequence per query (1 in decoding)
         # [num_tokens, num_heads, head_size] -> [num_token, num_heads, 1,  head_size]
-        query = query.squeeze(1).movedim(1,2)
+        query = query.unsqueeze(1).movedim(1,2)
+        print(query.shape)
+        print(query.device)
 
         # heads, tokens, head size
         # The tokens of queries are indexed by req_to_token
@@ -122,20 +126,21 @@ class CuDNNBackend(AttentionBackend):
         q = graph.tensor_like(q_gpu)
 
 
-        dims = (b, h, s, d)
-        strides = (s * h * d, d, h * d, 1)
-
         # get the request id of each query up to t
         # per_req_tokens = req_to_token[req_pool_indices, :seq_len_kv]
 
         # get the token location in kvcache, only up to seq_len_kv is valid
         # cudnn required shape: (num_block, 1, ceil(s/num_block), 1)
+        print("req index shape: ",req_pool_indices.shape,"req to token shape: ",req_to_token.shape)
         per_req_tokens = req_to_token[req_pool_indices, :]
+        print("per req token shape: ",per_req_tokens.shape)
 
         # get the kv cache with request id
         # container: num_blocks, num heads, tokens_per_block, dim
-        container_k_gpu = k_cache.view(s,h,1,d)
-        container_v_gpu = v_cache.view(s,h,1,d)
+        # TODO: permute for correctness
+        container_k_gpu = k_cache.view(s,h,b,d)
+        print('cache shape: ',container_k_gpu.shape)
+        container_v_gpu = v_cache.view(s,h,b,d)
 
 
         container_k = graph.tensor_like(container_k_gpu)
@@ -143,7 +148,9 @@ class CuDNNBackend(AttentionBackend):
 
 
         page_table_k_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
+        print("paged table k shape: ",page_table_k_gpu.shape)
         page_table_v_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
+        print("page table v shape: ",page_table_v_gpu.shape)
         page_table_k = graph.tensor_like(page_table_k_gpu)
         page_table_v = graph.tensor_like(page_table_v_gpu)
 
@@ -170,6 +177,12 @@ class CuDNNBackend(AttentionBackend):
             paged_attention_max_seq_len_kv=max_seq_len,  # The maximum sequence length for K caches (this is optional, but recommended)
         )
         logging.info(graph)
+
+        output = output.view(*query.shape)
+        dims = output.shape
+        strides = output.stride()
+        print("output shape: ",output.shape)
+
 
         o.set_output(True).set_dim(dims).set_stride(strides)
         graph.validate()
