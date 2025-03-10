@@ -446,22 +446,31 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: List[str], timeout_per_file: float):
+def run_unittest_files(files: List, timeout_per_file: float):
     tic = time.time()
     success = True
 
-    for filename in files:
+    for file in files:
+        filename, estimated_time = file.name, file.estimated_time
         process = None
 
         def run_one_file(filename):
             nonlocal process
 
             filename = os.path.join(os.getcwd(), filename)
-            print(f"\n\nRun:\npython3 {filename}\n\n", flush=True)
+            print(f".\n.\nBegin:\npython3 {filename}\n.\n.\n", flush=True)
+            tic = time.time()
+
             process = subprocess.Popen(
                 ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
             process.wait()
+            elapsed = time.time() - tic
+
+            print(
+                f".\n.\nEnd:\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                flush=True,
+            )
             return process.returncode
 
         try:
