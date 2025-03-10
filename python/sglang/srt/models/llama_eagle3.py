@@ -126,7 +126,6 @@ class LlamaModel(nn.Module):
             hidden_states = self.fc(hidden_states)
 
         residual = None
-        # print("hidden states after fc: ", hidden_states)
         hidden_states, residual = self.midlayer(
             positions,
             embeds,
