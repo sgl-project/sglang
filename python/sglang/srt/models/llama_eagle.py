@@ -105,7 +105,7 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        return hidden_states + residual, None
+        return hidden_states + residual
 
 
 class LlamaForCausalLMEagle(LlamaForCausalLM):
@@ -134,6 +134,7 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
             )
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:

@@ -285,6 +285,7 @@ class LlamaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -312,7 +313,7 @@ class LlamaModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        if not self.capture_aux_hidden_states:
+        if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
@@ -343,7 +344,6 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -400,7 +400,6 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
-        self.layers_to_capture = []
 
     @torch.no_grad()
     def forward(

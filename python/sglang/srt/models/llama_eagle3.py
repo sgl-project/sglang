@@ -172,7 +172,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             )
 
         self.logits_processor = LogitsProcessor(config)
-
         self.capture_aux_hidden_states = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
