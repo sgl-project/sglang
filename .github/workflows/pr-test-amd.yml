@@ -4,12 +4,14 @@ on:
   push:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
       - "sgl-kernel/**"
   pull_request:
     branches: [ main ]
     paths:
+      - "python/pyproject.toml"
       - "python/sglang/**"
       - "test/**"
       - "sgl-kernel/**"
