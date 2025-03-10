@@ -48,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_device_capability,
     is_pin_memory_available,
     set_weight_attrs,
@@ -197,7 +198,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
-        if os.environ.get("SGLANG_USE_MODELSCOPE", None) == "True":
+        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.

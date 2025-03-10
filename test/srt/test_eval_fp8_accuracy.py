@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEvalFP8AccuracyMini(unittest.TestCase):
+class TestEvalFP8Accuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST
@@ -39,7 +39,7 @@ class TestEvalFP8AccuracyMini(unittest.TestCase):
         self.assertGreaterEqual(metrics["score"], 0.64)
 
 
-class TestEvalFP8DynamicQuantAccuracyMini(unittest.TestCase):
+class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST
