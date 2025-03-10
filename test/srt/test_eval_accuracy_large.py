@@ -44,10 +44,11 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.71)
 
         if is_in_ci():
             write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+
+        self.assertGreater(metrics["score"], 0.71)
 
     def test_human_eval(self):
         args = SimpleNamespace(
@@ -59,12 +60,13 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.64)
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
             )
+
+        self.assertGreater(metrics["score"], 0.64)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -76,12 +78,13 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.835)
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
             )
+
+        self.assertGreater(metrics["score"], 0.835)
 
 
 if __name__ == "__main__":
