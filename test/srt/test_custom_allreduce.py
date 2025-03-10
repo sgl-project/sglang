@@ -42,10 +42,8 @@ def multi_process_parallel(
     # as compared to multiprocessing.
     # NOTE: We need to set working_dir for distributed tests,
     # otherwise we may get import errors on ray workers
-    import sglang
 
-    SGLANG_PATH = sglang.__path__
-    ray.init(log_to_driver=True, runtime_env={"working_dir": SGLANG_PATH})
+    ray.init(log_to_driver=True)
 
     distributed_init_port = get_open_port()
     refs = []
