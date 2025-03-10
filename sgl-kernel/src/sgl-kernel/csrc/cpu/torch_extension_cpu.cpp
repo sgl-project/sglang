@@ -37,7 +37,13 @@ void grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
 void decode_attention_cpu(at::Tensor& query, at::Tensor& output,
     at::Tensor& k_cache, at::Tensor& v_cahce, at::Tensor& attn_logits,
     at::Tensor& req_to_token, at::Tensor& req_pool_indices,
-    at::Tensor& seq_lens, double scaling, double logit_cap);
+    at::Tensor& seq_lens, double sm_scale, double logit_cap);
+
+void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor& v_extend,
+    at::Tensor& o_extend, at::Tensor& k_buffer, at::Tensor& v_buffer,
+    at::Tensor& req_to_token, at::Tensor& req_pool_indices, at::Tensor& seq_lens,
+    at::Tensor& extend_seq_lens, at::Tensor& extend_start_loc,
+    int64_t max_len_extend, double sm_scale, double logit_cap);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -65,6 +71,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // decode
   m.def("decode_attention_cpu", &decode_attention_cpu, "Attention decoding for CPU");
+
+  // extend
+  m.def("extend_attention_cpu", &extend_attention_cpu, "Attention extend for CPU");
 
   // weight prepack
   m.def("convert_weight_packed", &convert_weight_packed, "prepack weight to vnni format for intel AMX");
