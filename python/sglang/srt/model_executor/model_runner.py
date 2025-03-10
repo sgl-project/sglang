@@ -159,9 +159,7 @@ class ModelRunner:
                 server_args.disable_radix_cache = True
 
         if self.server_args.enable_deepep_moe:
-            logger.info(
-                "DeepEP is turned on."
-            )
+            logger.info("DeepEP is turned on.")
 
         # Global vars
         if server_args.show_time_cost:

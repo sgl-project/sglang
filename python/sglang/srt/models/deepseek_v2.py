@@ -43,10 +43,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE, DeepEPMoE
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPTokenDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
@@ -161,7 +161,11 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config)
 
-        MoEImpl = DeepEPMoE if global_server_args_dict["enable_deepep_moe"] else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+        MoEImpl = (
+            DeepEPMoE
+            if global_server_args_dict["enable_deepep_moe"]
+            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+        )
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -203,20 +207,22 @@ class DeepseekV2MoE(nn.Module):
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
             self.num_expert_group = config.n_group
-            self.correction_bias = self.gate.e_score_correction_bias.data if self.gate.e_score_correction_bias is not None else None
+            self.correction_bias = (
+                self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None
+            )
 
             self.deepep_dispatcher = DeepEPTokenDispatcher(
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 tok_k=self.top_k,
                 num_experts=config.n_routed_experts,
                 hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype
+                params_dtype=config.torch_dtype,
             )
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_mode: Optional[ForwardMode] = None
+        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
         if not global_server_args_dict["enable_deepep_moe"]:
             return self.forward_normal(hidden_states)
@@ -228,8 +234,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
-        else:
-            shared_output = None
+        # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
@@ -242,16 +247,19 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
-        self,
-        hidden_states: torch.Tensor,
-        forward_mode: ForwardMode
+        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
-        topk_ids = torch.full((0, self.top_k), -1, dtype=torch.int, device=hidden_states.device)
-        topk_weights = torch.empty((0, self.top_k), dtype=torch.float32, device=hidden_states.device)
+        topk_ids = torch.full(
+            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+        )
+        topk_weights = torch.empty(
+            (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+        )
         if forward_mode is not None and not forward_mode.is_idle():
+            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if self.n_shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
@@ -266,14 +274,28 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.tp_size > 1:
-            recv_hidden_states, recv_topk_ids, recv_topk_weights, tokens_per_expert = self.deepep_dispatcher.token_permutation(
-                hidden_states, topk_ids, topk_weights, self.num_experts, forward_mode)
+            recv_hidden_states, recv_topk_ids, recv_topk_weights, tokens_per_expert = (
+                self.deepep_dispatcher.token_permutation(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    self.num_experts,
+                    forward_mode,
+                )
+            )
         final_hidden_states = (
-            self.experts(hidden_states=recv_hidden_states, topk_ids=recv_topk_ids, topk_weights=recv_topk_weights, tokens_per_expert=tokens_per_expert)
+            self.experts(
+                hidden_states=recv_hidden_states,
+                topk_ids=recv_topk_ids,
+                topk_weights=recv_topk_weights,
+                tokens_per_expert=tokens_per_expert,
+            )
             * self.routed_scaling_factor
         )
         if self.tp_size > 1:
-            final_hidden_states = self.deepep_dispatcher.token_unpermutation(final_hidden_states, forward_mode)
+            final_hidden_states = self.deepep_dispatcher.token_unpermutation(
+                final_hidden_states, forward_mode
+            )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
@@ -1030,11 +1052,17 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         if self.enable_dp_attention:
-            if global_server_args_dict["enable_deepep_moe"] and isinstance(self.mlp, DeepseekV2MoE):
+            if global_server_args_dict["enable_deepep_moe"] and isinstance(
+                self.mlp, DeepseekV2MoE
+            ):
                 hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
             else:
                 hidden_states, start_idx, end_idx = all_gather(
-                    hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
+                    hidden_states,
+                    forward_batch,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.tp_group,
                 )
                 hidden_states = self.mlp(hidden_states)
                 hidden_states = hidden_states[start_idx:end_idx]
@@ -1137,7 +1165,11 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = DeepEPMoE if global_server_args_dict["enable_deepep_moe"] else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+        MoEImpl = (
+            DeepEPMoE
+            if global_server_args_dict["enable_deepep_moe"]
+            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+        )
         expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -1175,7 +1207,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1200,6 +1231,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

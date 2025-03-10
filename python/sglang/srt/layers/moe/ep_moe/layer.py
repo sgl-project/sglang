@@ -1,8 +1,7 @@
 import logging
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch.nn import Module
 from vllm import _custom_ops as ops
 
@@ -18,6 +17,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPTokenDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -27,7 +27,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.utils import is_hip, set_weight_attrs
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPTokenDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -755,7 +754,9 @@ class DeepEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
     """
+
     _has_printed = False
+
     def __init__(
         self,
         num_experts: int,
@@ -774,21 +775,23 @@ class DeepEPMoE(EPMoE):
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
     ):
-        super().__init__(num_experts,
-                         top_k,
-                         hidden_size,
-                         intermediate_size,
-                         params_dtype,
-                         renormalize,
-                         use_grouped_topk,
-                         num_expert_group,
-                         topk_group,
-                         quant_config,
-                         tp_size,
-                         prefix,
-                         correction_bias,
-                         custom_routing_function,
-                         activation)
+        super().__init__(
+            num_experts,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            params_dtype,
+            renormalize,
+            use_grouped_topk,
+            num_expert_group,
+            topk_group,
+            quant_config,
+            tp_size,
+            prefix,
+            correction_bias,
+            custom_routing_function,
+            activation,
+        )
 
         self.token_dispatcher = DeepEPTokenDispatcher(
             num_local_experts=self.num_experts_per_partition,
@@ -798,15 +801,32 @@ class DeepEPMoE(EPMoE):
             params_dtype=params_dtype,
         )
 
-    def forward(self, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor, tokens_per_expert: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+    ):
         assert self.quant_method is not None
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
-        seg_indptr_cur_rank = torch.cat([torch.zeros(1, device=tokens_per_expert.device, dtype=tokens_per_expert.dtype), torch.cumsum(tokens_per_expert, dim=0)])
-        reorder_topk_ids = torch.tensor([idx for idx, count in enumerate(tokens_per_expert) for _ in range(count)], device=tokens_per_expert.device, dtype=torch.int32)
+        seg_indptr_cur_rank = torch.cat(
+            [
+                torch.zeros(
+                    1, device=tokens_per_expert.device, dtype=tokens_per_expert.dtype
+                ),
+                torch.cumsum(tokens_per_expert, dim=0),
+            ]
+        )
+        reorder_topk_ids = torch.tensor(
+            [idx for idx, count in enumerate(tokens_per_expert) for _ in range(count)],
+            device=tokens_per_expert.device,
+            dtype=torch.int32,
+        )
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
                 torch.max(hidden_states)
@@ -873,7 +893,7 @@ class DeepEPMoE(EPMoE):
                 reorder_topk_ids,
                 self.w2_input_scale,
                 0,
-                self.num_experts_per_partition-1,
+                self.num_experts_per_partition - 1,
                 BLOCK_SIZE=512,
             )
         else:
@@ -889,19 +909,19 @@ class DeepEPMoE(EPMoE):
         if down_input.shape[0] > 0:
             down_output = self.grouped_gemm_runner(
                 a=down_input,
-            b=self.w2_weight,
-            c=down_output,
-            batch_size=self.num_experts_per_partition,
-            weight_column_major=True,
-            seg_indptr=seg_indptr_cur_rank,
-            weight_indices=weight_indices_cur_rank,
-            use_fp8_w8a8=self.use_fp8_w8a8,
-            scale_a=self.w2_input_scale,
-            scale_b=(
-                self.w2_weight_scale_inv
-                if self.use_block_quant
-                else self.w2_weight_scale
-            ),
-            block_shape=self.block_shape,
-        )
+                b=self.w2_weight,
+                c=down_output,
+                batch_size=self.num_experts_per_partition,
+                weight_column_major=True,
+                seg_indptr=seg_indptr_cur_rank,
+                weight_indices=weight_indices_cur_rank,
+                use_fp8_w8a8=self.use_fp8_w8a8,
+                scale_a=self.w2_input_scale,
+                scale_b=(
+                    self.w2_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w2_weight_scale
+                ),
+                block_shape=self.block_shape,
+            )
         return down_output

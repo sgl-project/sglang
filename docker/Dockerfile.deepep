@@ -73,4 +73,3 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install python setup.py install
-

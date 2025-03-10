@@ -686,10 +686,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0, tp_rank=self.tp_rank, tp_size=self.tp_size)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    shard_id=0,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, tp_rank=self.tp_rank, tp_size=self.tp_size)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
