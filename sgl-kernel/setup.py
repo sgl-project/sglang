@@ -76,6 +76,7 @@ nvcc_flags = [
     "-std=c++17",
     "-use_fast_math",
     "-DFLASHINFER_ENABLE_F16",
+    "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
     "-DCUTLASS_VERSIONS_GENERATED",
     "-DCUTE_USE_PACKED_TUPLE=1",
     "-DCUTLASS_TEST_LEVEL=0",
