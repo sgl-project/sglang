@@ -42,8 +42,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    * From csrc/attention
    */
   m.def(
-    "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
-    "new_kv) -> ()");
+      "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
+      "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
 
   /*
@@ -71,8 +71,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   m.def(
-    "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
-    "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   /*
