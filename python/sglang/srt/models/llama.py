@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -285,6 +285,7 @@ class LlamaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -292,13 +293,16 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
         residual = None
+        aux_hidden_states = []
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -306,8 +310,13 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states, None
+
+        return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -400,10 +409,13 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states, aux_hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds
+        )
+
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, aux_hidden_states, self.lm_head, forward_batch
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -586,8 +598,20 @@ class LlamaForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
+    def set_layers_to_capture(self, layers_to_capture: List[int]):
+        self.model.layers_to_capture = layers_to_capture
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
