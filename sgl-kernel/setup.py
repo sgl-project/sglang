@@ -42,6 +42,7 @@ include_dirs = []
 sources = [
     "src/sgl-kernel/csrc/cpu/activation.cpp",
     "src/sgl-kernel/csrc/cpu/decode.cpp",
+    "src/sgl-kernel/csrc/cpu/extend.cpp",
     "src/sgl-kernel/csrc/cpu/gemm.cpp",
     "src/sgl-kernel/csrc/cpu/moe.cpp",
     "src/sgl-kernel/csrc/cpu/norm.cpp",
