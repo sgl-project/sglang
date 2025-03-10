@@ -93,7 +93,7 @@ jobs:
         needs.filter.outputs.run_tests == 'true'
     runs-on: 1-gpu-runner
     strategy:
-      fail-fast: ${{ github.ref != 'refs/heads/main' }}
+      fail-fast: false
       matrix:
         part: [0, 1, 2, 3, 4, 5]
     steps:
