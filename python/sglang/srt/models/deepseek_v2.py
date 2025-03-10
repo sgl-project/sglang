@@ -555,6 +555,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return (
                     not global_server_args_dict["flashinfer_mla_disable_ragged"]
                     and forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and not forward_batch.forward_mode.is_draft_extend()
                     and forward_batch.extend_prefix_lens.sum() == 0
                 )
             else:
@@ -846,11 +848,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
-    if world_size == 1:
-        return input_tensor
-
     all_lens = forward_batch.global_num_tokens_cpu
     max_len = max(forward_batch.global_num_tokens_cpu)
+
+    if world_size == 1:
+        return input_tensor, 0, all_lens[0]
 
     padded_tensor = torch.nn.functional.pad(
         input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])

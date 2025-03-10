@@ -38,12 +38,12 @@ test: ## Run all tests
 
 format: check-deps ## Format all source files
 	@echo "Formatting source files..."
-	@find src tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i
-	@find src tests -name '*.py' | xargs isort
-	@find src tests -name '*.py' | xargs black
+	@find csrc tests -name '*.cc' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i
+	@find python tests -name '*.py' | xargs isort
+	@find python tests -name '*.py' | xargs black
 	@pre-commit run --all-files
 
-FILES_TO_UPDATE = src/sgl-kernel/version.py \
+FILES_TO_UPDATE = python/sgl_kernel/version.py \
                  pyproject.toml
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
@@ -51,7 +51,7 @@ update: ## Update version numbers across project files. Usage: make update <new_
 		echo "Version required. Usage: make update <new_version>"; \
 		exit 1; \
 	fi
-	@OLD_VERSION=$$(grep "version" src/sgl-kernel/version.py | cut -d '"' -f2); \
+	@OLD_VERSION=$$(grep "version" python/sgl_kernel/version.py | cut -d '"' -f2); \
 	NEW_VERSION=$(filter-out $@,$(MAKECMDGOALS)); \
 	echo "Updating version from $$OLD_VERSION to $$NEW_VERSION"; \
 	for file in $(FILES_TO_UPDATE); do \
