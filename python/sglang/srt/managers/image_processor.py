@@ -451,11 +451,8 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
     
 
     @staticmethod
-    def _process_single_image_task(
-        image_data: Union[str, bytes],
-        image_processor=None,
-    ):
-        pass #TODO(Xiao)
+    def _process_images_task(images, input_text):
+        return global_processor(images, input_text, return_tensors="pt")
 
     async def _process_single_image(self, image_data: Union[bytes, str]):
         if self.executor is not None:
@@ -469,17 +466,29 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
             return self._process_single_image_task(image_data)
 
     async def process_images_async(
-        self,
-        image_data: List[Union[str, bytes]],
-        input_text,
-        request_obj,
-        *args,
-        **kwargs,
+        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
-        pass  #TODO(Xiao)
-
-
+        if not image_data:
+            return None
+            
+        if isinstance(input_text, list):
+            assert len(input_text) and isinstance(input_text[0], int)
+            input_text = self._processor.tokenizer.decode(input_text)
         
+        if not isinstance(image_data, list):
+            image_data = [image_data]
+        
+        if len(image_data) > 0:
+            images = [load_image(image)[0] for image in image_data]
+        
+        else:
+            images = load_image(image_data[0])[0]
+        
+        image_inputs = await self._process_single_image(images, input_text)
+        image_inputs["image_hashes"] = [hash(str(image_data))]
+        image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
+
+        return image_inputs
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _image_processor):
