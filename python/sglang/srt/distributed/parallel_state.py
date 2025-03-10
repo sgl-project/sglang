@@ -398,7 +398,7 @@ class GroupCoordinator:
             ipex.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        if not supports_custom_op():
+        if not supports_custom_op() or self.use_pynccl:
             self._all_reduce_in_place(input_)
             return input_
 
@@ -445,7 +445,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
+        if not supports_custom_op() or self.use_pynccl:
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
