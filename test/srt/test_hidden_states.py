@@ -4,18 +4,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, is_in_ci
-from sglang.utils import terminate_process
-
-
-if is_in_ci():
-    from docs.backend.patch import launch_server_cmd
-else:
-    from sglang.utils import launch_server_cmd
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestHiddenState(unittest.TestCase):
-    def test_return_hidden_states_from_engine(self):
+    def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
