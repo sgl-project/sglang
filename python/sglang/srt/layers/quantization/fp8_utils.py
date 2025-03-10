@@ -1,8 +1,6 @@
-import os
 from typing import List, Optional, Tuple
 
 import torch
-from packaging.version import Version
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -13,18 +11,17 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    is_cuda,
     is_hip,
 )
 
-use_vllm_cutlass_w8a8_fp8_kernel = os.environ.get(
-    "USE_VLLM_CUTLASS_W8A8_FP8_KERNEL", default=False
-)
+use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
 is_hip_ = is_hip()
 if is_hip_ and get_bool_env_var("CK_MOE"):
     from aiter import gemm_a8w8_blockscale
 
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
+_is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm
 
@@ -34,6 +31,10 @@ if _is_cuda:
         from vllm import _custom_ops as ops
     else:
         from sgl_kernel import fp8_scaled_mm
+
+# Input scaling factors are no longer optional in _scaled_mm starting
+# from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
+TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 
 
 def cutlass_fp8_supported():
@@ -73,7 +74,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if os.environ.get("SUPPORT_CUTLASS_BLOCK_FP8") is None:
+    if get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
