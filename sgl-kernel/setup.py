@@ -54,7 +54,6 @@ operator_namespace = "sgl_kernel"
 cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
-turbomind = root / "3rdparty" / "turbomind"
 deepgemm = root / "3rdparty" / "deepgemm"
 include_dirs = [
     root / "include",
