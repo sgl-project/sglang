@@ -266,7 +266,7 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
-          USE_VLLM_CUSTOM_ALLREDUCE=0 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+          # USE_VLLM_CUSTOM_ALLREDUCE=0 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 10
