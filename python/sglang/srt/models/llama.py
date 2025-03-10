@@ -315,7 +315,7 @@ class LlamaModel(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        if not self.capture_aux_hidden_states:
+        if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
