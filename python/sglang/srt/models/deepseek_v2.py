@@ -555,6 +555,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return (
                     not global_server_args_dict["flashinfer_mla_disable_ragged"]
                     and forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and not forward_batch.forward_mode.is_draft_extend()
                     and forward_batch.extend_prefix_lens.sum() == 0
                 )
             else:
