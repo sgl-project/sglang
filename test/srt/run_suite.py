@@ -69,6 +69,7 @@ suites = {
         TestFile("test_vision_llm.py", 18.4),
         TestFile("test_vision_openai_server.py", 344),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_eval_fp8_accuracy.py", 172),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
