@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-  "setuptools>=61.0",
+  "setuptools>=75.0",
   "scikit-build-core>=0.10",
   "torch==2.5.1",
   "wheel",
