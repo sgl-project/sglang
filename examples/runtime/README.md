@@ -1,8 +1,8 @@
 # Runtime examples
 
-## Native API
+The below examples will mostly need you to start a server in a separate terminal before you can execute them. Please see in the code for detailed instruction.
 
-Please note, that the below examples will mostly need you to start a server in a separate terminal before you can execute them. Please see in the code for detailed instruction.
+## Native API
 
 * `lora.py`: An example how to use LoRA adapters.
 * `multimodal_embedding.py`: An example how perform [multi modal embedding](Alibaba-NLP/gme-Qwen2-VL-2B-Instruct).
@@ -16,7 +16,7 @@ Please note, that the below examples will mostly need you to start a server in a
 
 The `engine` folder contains that examples that show how to use [Offline Engine API](https://docs.sglang.ai/backend/offline_engine_api.html#Offline-Engine-API) for common workflows.
 
-* `custom_server.py`: An example how to deploy a custom server
+* `custom_server.py`: An example how to deploy a custom server.
 * `embedding.py`: An example how to extract embeddings.
 * `launch_engine.py`: An example how to launch the Engine.
 * `offline_batch_inference_eagle.py`: An example how to perform speculative decoding using [EAGLE](https://docs.sglang.ai/backend/speculative_decoding.html).
@@ -26,10 +26,10 @@ The `engine` folder contains that examples that show how to use [Offline Engine 
 
 ## Hidden States
 
-The `hidden_states` folder contains examples on how to extract hidden states using SGLang. Please note that this might degrade performance.
+The `hidden_states` folder contains examples on how to extract hidden states using SGLang. Please note that this might degrade throughput due to cuda graph rebuilding.
 
 * `hidden_states_engine.py`: An example how to extract hidden states using the Engine API.
-* `hidden_states_server.py`: An example how to extract hidden states using the native API.
+* `hidden_states_server.py`: An example how to extract hidden states using the Server API.
 
 ## LLaVA-NeXT
 
