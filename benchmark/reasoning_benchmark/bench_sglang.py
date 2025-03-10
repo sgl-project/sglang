@@ -66,14 +66,18 @@ def main(args):
     outcomes = []
     for i, state in enumerate(states):
         try:
-            pred_answer = answer_extraction.extract_math_answer(
-                questions[i]["question"], state["answer"], "limo"
-            )
-            gt_answer = str(answers[i]["answer"])
-            pred_answer = (
-                pred_answer[-1] if isinstance(pred_answer, list) else pred_answer
-            )
-            is_correct = 1 if eval_utils.math_equal(pred_answer, gt_answer) else 0
+            if i >= len(questions) or i >= len(answers):
+                print(f"Index {i} out of range for questions or answers list")
+                break
+            else:
+                pred_answer = answer_extraction.extract_math_answer(
+                    questions[i]["question"], state["answer"], "limo"
+                )
+                gt_answer = str(answers[i]["answer"])
+                pred_answer = (
+                    pred_answer[-1] if isinstance(pred_answer, list) else pred_answer
+                )
+                is_correct = 1 if eval_utils.math_equal(pred_answer, gt_answer) else 0
         except Exception as e:
             print(f"Error extracting answer: {e}")
             is_correct = 0

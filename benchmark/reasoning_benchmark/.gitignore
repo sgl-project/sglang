@@ -2,6 +2,6 @@
 *.sh
 *.txt
 *.jsonl
-
+*.ipynb
 # pycache
 __pycache__/

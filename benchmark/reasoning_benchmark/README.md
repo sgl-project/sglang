@@ -45,7 +45,7 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME
 ```
 
 ## Further Statistic Analysis
-This experiment aims to verify the reliability and stability of the model’s output in statistic method following the evaluation above. Check the `plot_benchmark.ipynb` for details.
+This experiment aims to verify the reliability and stability of the model’s output in statistic method following the evaluation above.
 
 ### **Experiment 1: Fixed num_tries with Multiple Executions**
 - In this experiment, we set a fixed number of attempts (num_tries) and conduct multiple runs to evaluate the model's performance consistency. For each run, we measure accuracy and compute the standard error, then derive the 95% confidence interval (CI) for accuracy. If all accuracy values lie within this CI, the model's performance is deemed stable; otherwise, it suggests potential instability.
