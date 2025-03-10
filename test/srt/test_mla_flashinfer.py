@@ -121,11 +121,11 @@ class TestFlashinferMLAMTP(unittest.TestCase):
                     "--speculative-draft",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "2",
+                    "3",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
-                    "2",
+                    "4",
                     "--enable-flashinfer-mla",
                 ]
             )
