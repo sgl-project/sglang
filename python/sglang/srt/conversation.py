@@ -635,6 +635,8 @@ register_conv_template(
         sep2="<｜end▁of▁sentence｜>",
         stop_token_ids=[100001],
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
+    )
+)
 
 # Reference: https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct#usage
 register_conv_template(
