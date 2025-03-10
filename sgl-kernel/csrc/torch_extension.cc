@@ -32,11 +32,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
-  m.def("get_graph_buffer_ipc_meta(int fa) -> (int[], int[])");
-  m.impl("get_graph_buffer_ipc_meta", torch::kCUDA, &get_graph_buffer_ipc_meta);
-
-  m.def("register_graph_buffers(int fa, int[][] handles, int[][] offsets) -> ()");
-  m.impl("register_graph_buffers", torch::kCUDA, &register_graph_buffers);
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
 
   /*
    * From csrc/attention
