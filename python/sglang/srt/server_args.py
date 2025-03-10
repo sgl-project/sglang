@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
@@ -43,19 +44,19 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    skip_tokenizer_init: bool = False
     load_format: str = "auto"
-    trust_remote_code: bool = True
+    trust_remote_code: bool = False
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
-    quantization_param_path: nullable_str = None
     quantization: Optional[str] = None
+    quantization_param_path: nullable_str = None
     context_length: Optional[int] = None
     device: str = "cuda"
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
-    skip_tokenizer_init: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -67,10 +68,9 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
-    schedule_policy: str = "lpm"
+    schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-    prefill_only_one_req: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -82,19 +82,22 @@ class ServerArgs:
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
+    gpu_id_step: int = 1
 
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = False
+    log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "sglang_storage"
+    file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    reasoning_parser: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
@@ -122,11 +125,14 @@ class ServerArgs:
     grammar_backend: Optional[str] = "outlines"
 
     # Speculative decoding
-    speculative_draft_model_path: Optional[str] = None
     speculative_algorithm: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
     speculative_num_steps: int = 5
-    speculative_eagle_topk: int = 8
-    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 4
+    speculative_num_draft_tokens: int = 8
+    speculative_accept_threshold_single: float = 1.0
+    speculative_accept_threshold_acc: float = 1.0
+    speculative_token_map: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -138,7 +144,6 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    disable_jump_forward: bool = False
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_nccl_nvls: bool = False
@@ -162,11 +167,17 @@ class ServerArgs:
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
-    return_hidden_states: bool = False
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
+    flashinfer_mla_disable_ragged: bool = False
+    warmups: Optional[str] = None
+
+    # Debug tensor dumps
+    debug_tensor_dump_output_folder: Optional[str] = None
+    debug_tensor_dump_input_file: Optional[str] = None
+    debug_tensor_dump_inject: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -260,18 +271,22 @@ class ServerArgs:
             )
 
         # Speculative Decoding
-        if (
-            self.speculative_algorithm == "EAGLE"
-            or self.speculative_algorithm == "NEXTN"
-        ):
-            self.prefill_only_one_req = True
+        if self.speculative_algorithm == "NEXTN":
+            # NEXTN shares the same implementation of EAGLE
+            self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "EAGLE":
+            if self.max_running_requests is None:
+                self.max_running_requests = 32
             self.disable_cuda_graph_padding = True
-            self.disable_radix_cache = True
             self.disable_overlap_schedule = True
-            self.chunked_prefill_size = -1
             logger.info(
-                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
+                "Overlap scheduler is disabled because of using "
+                "eagle speculative decoding."
             )
+            # The token generated from the verify step is counted.
+            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
         if (
@@ -376,15 +391,6 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
         )
         parser.add_argument(
-            "--quantization-param-path",
-            type=nullable_str,
-            default=None,
-            help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
-        )
-        parser.add_argument(
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
@@ -399,8 +405,18 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "w8a8_int8",
+                "w8a8_fp8",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--context-length",
@@ -464,7 +480,7 @@ class ServerArgs:
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -489,13 +505,7 @@ class ServerArgs:
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading",
-        )
-        parser.add_argument(
-            "--prefill-only-one-req",
-            type=bool,
-            help="If true, we only prefill one request at one prefill batch",
-            default=ServerArgs.prefill_only_one_req,
+            help="How many GBs of RAM to reserve for CPU offloading.",
         )
 
         # Other runtime options
@@ -545,13 +555,19 @@ class ServerArgs:
             "--download-dir",
             type=str,
             default=ServerArgs.download_dir,
-            help="Model download directory.",
+            help="Model download directory for huggingface.",
         )
         parser.add_argument(
             "--base-gpu-id",
             type=int,
             default=ServerArgs.base_gpu_id,
             help="The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine.",
+        )
+        parser.add_argument(
+            "--gpu-id-step",
+            type=int,
+            default=ServerArgs.gpu_id_step,
+            help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
         )
 
         # Logging
@@ -570,7 +586,14 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests",
             action="store_true",
-            help="Log the inputs and outputs of all requests.",
+            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+        )
+        parser.add_argument(
+            "--log-requests-level",
+            type=int,
+            default=0,
+            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
+            choices=[0, 1, 2],
         )
         parser.add_argument(
             "--show-time-cost",
@@ -597,15 +620,22 @@ class ServerArgs:
             help="Set API key of the server. It is also used in the OpenAI API compatible server.",
         )
         parser.add_argument(
-            "--file-storage-pth",
+            "--file-storage-path",
             type=str,
-            default=ServerArgs.file_storage_pth,
+            default=ServerArgs.file_storage_path,
             help="The path of the file storage in backend.",
         )
         parser.add_argument(
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--reasoning-parser",
+            type=str,
+            choices=list(ReasoningParser.DetectorMap.keys()),
+            default=ServerArgs.reasoning_parser,
+            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
 
         # Data parallelism
@@ -698,7 +728,7 @@ class ServerArgs:
         parser.add_argument(
             "--grammar-backend",
             type=str,
-            choices=["xgrammar", "outlines"],
+            choices=["xgrammar", "outlines", "llguidance"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
@@ -706,6 +736,11 @@ class ServerArgs:
             "--enable-flashinfer-mla",
             action="store_true",
             help="Enable FlashInfer MLA optimization",
+        )
+        parser.add_argument(
+            "--flashinfer-mla-disable-ragged",
+            action="store_true",
+            help="Not using ragged prefill wrapper when running flashinfer mla",
         )
 
         # Speculative decoding
@@ -729,15 +764,33 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of token sampled from draft model in eagle2 each step.",
+            help="The number of tokens sampled from the draft model in eagle2 each step.",
             choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
             "--speculative-num-draft-tokens",
             type=int,
-            help="The number of token sampled from draft model in Speculative Decoding.",
+            help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-single",
+            type=float,
+            help="Accept a draft token if its probability in the target model is greater than this threshold.",
+            default=ServerArgs.speculative_accept_threshold_single,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-acc",
+            type=float,
+            help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
+            default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-token-map",
+            type=str,
+            help="The path of the draft model's small vocab table.",
+            default=ServerArgs.speculative_token_map,
         )
 
         # Double Sparsity
@@ -782,11 +835,6 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
-        )
-        parser.add_argument(
-            "--disable-jump-forward",
-            action="store_true",
-            help="Disable jump-forward for grammar-guided decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph",
@@ -918,11 +966,6 @@ class ServerArgs:
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
-            "--return-hidden-states",
-            action="store_true",
-            help="Return hidden states in the response.",
-        )
-        parser.add_argument(
             "--tool-call-parser",
             type=str,
             choices=["qwen25", "mistral", "llama3"],
@@ -933,6 +976,35 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+
+        # Server warmups
+        parser.add_argument(
+            "--warmups",
+            type=str,
+            required=False,
+            help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
+            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+
+        # Debug tensor dumps
+        parser.add_argument(
+            "--debug-tensor-dump-output-folder",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_output_folder,
+            help="The output folder for dumping tensors.",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-input-file",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_input_file,
+            help="The input filename for dumping tensors",
+        )
+        parser.add_argument(
+            "--debug-tensor-dump-inject",
+            type=str,
+            default=ServerArgs.debug_tensor_dump_inject,
+            help="Inject the outputs from jax as the input of every layer.",
         )
 
     @classmethod
@@ -963,6 +1035,7 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
