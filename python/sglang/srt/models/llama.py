@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -285,6 +285,8 @@ class LlamaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.capture_aux_hidden_states = False
         self.layers_to_capture = []
 
     def forward(
@@ -293,7 +295,7 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -314,7 +316,7 @@ class LlamaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
-            return hidden_states, None
+            return hidden_states
 
         return hidden_states, aux_hidden_states
 
@@ -409,13 +411,19 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
-        hidden_states, aux_hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds
-        )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+        else:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
 
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, aux_hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -611,6 +619,7 @@ class LlamaForCausalLM(nn.Module):
         self.model.load_kv_cache_scales(quantization_param_path)
 
     def set_layers_to_capture(self, layers_to_capture: List[int]):
+        self.capture_aux_hidden_states = True
         self.model.layers_to_capture = layers_to_capture
 
 
