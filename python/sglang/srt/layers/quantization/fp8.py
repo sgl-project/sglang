@@ -874,7 +874,7 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
-    
+
     def torch_w8a8_block_fp8_moe(
         self, a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape
     ):
