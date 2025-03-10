@@ -29,7 +29,7 @@ class TestBenchOneBatch(unittest.TestCase):
         )
 
         use_vllm_custom_allreduce = get_bool_env_var(
-            "USE_VLLM_CUSTOM_ALLREDUCE", default=True
+            "USE_VLLM_CUSTOM_ALLREDUCE", default="true"
         )
 
         if is_in_ci():
