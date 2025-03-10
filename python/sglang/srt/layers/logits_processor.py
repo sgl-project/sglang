@@ -220,9 +220,9 @@ class LogitsProcessor(nn.Module):
         self,
         input_ids,
         hidden_states,
-        aux_hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
