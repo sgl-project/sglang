@@ -1,6 +1,5 @@
-import sgl_kernel.ops._kernels
 import torch
-from sgl_kernel.ops.utils import get_cuda_stream
+from sgl_kernel.utils import get_cuda_stream
 
 
 def tree_speculative_sampling_target_only(
@@ -16,7 +15,7 @@ def tree_speculative_sampling_target_only(
     draft_probs: torch.Tensor,
     deterministic: bool = True,
 ) -> None:
-    torch.ops.sgl_kernels.tree_speculative_sampling_target_only(
+    torch.ops.sgl_kernel.tree_speculative_sampling_target_only(
         predicts,
         accept_index,
         accept_token_num,
@@ -45,7 +44,7 @@ def build_tree_kernel_efficient(
     depth: int,
     draft_token_num: int,
 ) -> None:
-    torch.ops.sgl_kernels.build_tree_kernel_efficient(
+    torch.ops.sgl_kernel.build_tree_kernel_efficient(
         parent_list,
         selected_index,
         verified_seq_len,
@@ -71,7 +70,7 @@ def build_tree_kernel(
     depth: int,
     draft_token_num: int,
 ) -> None:
-    torch.ops.sgl_kernels.build_tree_kernel(
+    torch.ops.sgl_kernel.build_tree_kernel(
         parent_list,
         selected_index,
         verified_seq_len,
