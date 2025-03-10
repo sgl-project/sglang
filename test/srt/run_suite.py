@@ -13,6 +13,7 @@ suites = {
         "models/test_qwen_models.py",
         "models/test_reward_models.py",
         "test_gptqmodel_dynamic.py",
+        "models/test_gme_qwen_models.py",
         "test_abort.py",
         "test_chunked_prefill.py",
         "test_custom_allreduce.py",
@@ -23,6 +24,7 @@ suites = {
         "test_gguf.py",
         "test_input_embeddings.py",
         "test_mla.py",
+        "test_mla_deepseek_v3.py",
         "test_mla_flashinfer.py",
         "test_mla_fp8.py",
         "test_json_constrained.py",
@@ -60,6 +62,7 @@ suites = {
         "test_w8a8_quantization.py",
         "test_fp8_kernel.py",
         "test_block_int8.py",
+        "test_int8_kernel.py",
         "test_reasoning_content.py",
     ],
     "nightly": [

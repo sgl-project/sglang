@@ -1010,7 +1010,7 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
 
