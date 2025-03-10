@@ -431,7 +431,7 @@ class Scheduler:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_worker.get_tp_cache_group(),
+                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
                 )
             else:
                 self.tree_cache = RadixCache(

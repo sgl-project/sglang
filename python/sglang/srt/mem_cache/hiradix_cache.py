@@ -285,16 +285,13 @@ class HiRadixCache(RadixCache):
         if self.disable:
             return [], self.root_node
 
-        value = []
-        last_nodes = [self.root_node]
-        self._match_prefix_helper(self.root_node, key, value, last_nodes)
+        value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.concat(value)
         else:
             value = torch.tensor([], dtype=torch.int32)
 
-        last_node_global = last_nodes[0]
-        last_node = last_node_global
+        last_node_global = last_node
         while last_node.evicted:
             last_node = last_node.parent
 
@@ -303,9 +300,7 @@ class HiRadixCache(RadixCache):
         else:
             return value, last_node
 
-    def _match_prefix_helper(
-        self, node: TreeNode, key: List, value, last_node: TreeNode
-    ):
+    def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
         value = []
         while len(key) > 0 and key[0] in node.children.keys():
