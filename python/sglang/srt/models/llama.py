@@ -310,7 +310,6 @@ class LlamaModel(nn.Module):
                 forward_batch,
                 residual,
             )
-
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
@@ -617,9 +616,10 @@ class LlamaForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
-    def set_layers_to_capture(self, layers_to_capture: List[int]):
+    def set_eagle3_layers_to_capture(self):
         self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = layers_to_capture
+        num_layers = self.config.num_hidden_layers
+        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

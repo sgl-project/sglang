@@ -230,10 +230,7 @@ class CudaGraphRunner:
                     ),
                     dtype=self.model_runner.dtype,
                 )
-                # auxiliary hidden capture mode. TODO: expose this to server args?
-                num_layers = self.model_runner.model.config.num_hidden_layers
-                layers_to_capture = [2, num_layers // 2, num_layers - 3]
-                self.model_runner.model.set_layers_to_capture(layers_to_capture)
+                self.model_runner.model.set_eagle3_layers_to_capture()
             elif model_runner.spec_algorithm.is_eagle():
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
