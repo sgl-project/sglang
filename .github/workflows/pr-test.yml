@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5]
+        part: [0, 1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -110,7 +110,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
 
   unit-test-backend-2-gpu:
     needs: filter
