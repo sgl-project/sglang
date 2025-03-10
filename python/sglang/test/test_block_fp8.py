@@ -308,15 +308,28 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
 
 
 class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
-    DTYPES = [torch.float32, torch.half, torch.bfloat16]
-    M = [1, 33, 64, 222, 1024 * 128]
-    N = [128, 1024, 2048]
-    K = [256, 4096, 5120]
-    E = [8, 24]
-    TOP_KS = [2, 6]
-    BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-    # BLOCK_SIZE = [[128, 128]]
-    SEEDS = [0]
+    _is_cuda = torch.cuda.is_available() and torch.version.cuda
+    if not _is_cuda:
+        DTYPES = [torch.float32, torch.half, torch.bfloat16]
+        M = [1, 33, 64, 222, 1024 * 128]
+        N = [128, 1024, 2048]
+        K = [256, 4096, 5120]
+        E = [8, 24]
+        TOP_KS = [2, 6]
+        BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
+        # BLOCK_SIZE = [[128, 128]]
+        SEEDS = [0]
+    else:
+        # By default, we use DeepGemm kernel
+        # DeepSeek V3 shapes and tp8
+        DTYPES = [torch.bfloat16]
+        M = [64, 128, 512, 1024]  # , 4096]
+        N = [128, 256]  # , 1024, 2048]
+        K = [256, 4096]  # , 5120, 7168]
+        E = [8, 24, 256]
+        TOP_KS = [2, 6, 8]
+        BLOCK_SIZE = [[128, 128]]
+        SEEDS = [0]
 
     @classmethod
     def setUpClass(cls):

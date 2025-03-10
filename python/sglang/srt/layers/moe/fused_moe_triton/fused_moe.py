@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import deep_gemm
 import torch
 import triton
 import triton.language as tl
@@ -498,6 +499,31 @@ def moe_align_block_size(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
+def apply_token_ids(A, idx, topk, invalid_val):
+    A = A.view(A.shape[0], -1, A.shape[1]).repeat(1, topk, 1).reshape(-1, A.shape[1])
+
+    Adtype = A.dtype
+    if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
+        A = A.view(dtype=torch.uint8)
+
+    TOPKM = A.shape[0]
+    A = torch.concat(
+        [A, torch.zeros([1, A.shape[1]], dtype=A.dtype, device=A.device)], axis=0
+    )
+    A = A[idx]
+    idx_inverse = torch.empty(TOPKM, device=idx.device, dtype=idx.dtype)
+    idx_inverse.fill_(-1)
+    idx_inverse[idx[idx != invalid_val]] = torch.arange(
+        TOPKM, device=idx.device, dtype=idx.dtype
+    )
+    assert (idx_inverse != -1).all()
+
+    if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
+        A = A.view(dtype=Adtype)
+
+    return A, idx_inverse
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -570,43 +596,70 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    fused_moe_kernel[grid](
-        A,
-        B,
-        C,
-        A_scale,
-        B_scale,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        B.shape[1],
-        B.shape[2] - padded_size,
-        sorted_token_ids.shape[0],
-        topk_ids.numel(),
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        C.stride(2),
-        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        even_Ks=even_Ks,
-        **config,
-    )
+    if _is_cuda:
+        invalid_ids = topk_ids.numel()
+        clipped_token_ids = sorted_token_ids[: num_tokens_post_padded[0]]
+
+        A_, idx_inverse = apply_token_ids(A, clipped_token_ids, top_k, invalid_ids)
+        A_scale_, _ = apply_token_ids(A_scale, clipped_token_ids, top_k, invalid_ids)
+
+        expert_ids_ = torch.repeat_interleave(
+            expert_ids, config["BLOCK_SIZE_M"], dim=0
+        )[: num_tokens_post_padded[0]]
+        expert_ids_[clipped_token_ids == invalid_ids] = -1
+
+        C_flatten = torch.empty(
+            (A_.shape[0], B.shape[1]),
+            device=C.device,
+            dtype=C.dtype,
+        )
+
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (A_, A_scale_), (B, B_scale), C_flatten, expert_ids_
+        )
+
+        C_ = C_flatten[clipped_token_ids != invalid_ids][idx_inverse].view(C.shape)
+        if mul_routed_weight:
+            C_ *= topk_weights[:, :, None]
+        C.copy_(C_)
+    else:
+        fused_moe_kernel[grid](
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.shape[1],
+            B.shape[2] - padded_size,
+            sorted_token_ids.shape[0],
+            topk_ids.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            even_Ks=even_Ks,
+            **config,
+        )
 
 
 def get_config_file_name(
@@ -1012,6 +1065,8 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
+    if _is_cuda:
+        config["BLOCK_SIZE_M"] = deep_gemm.get_m_alignment_for_contiguous_layout()
 
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
