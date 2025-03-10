@@ -182,28 +182,30 @@ class LoRAMemoryPool:
                     )
                     temp_B_buffer[lora_weight_name] = weights
 
-            # if self.tp_size > 1:
-            for module_name, module in self.lora_modules[: self.num_modules_per_layer]:
-                if "qkv_proj" in module_name:
-                    temp_A_buffer["qkv_proj"] = module.slice_lora_a_weights(
-                        temp_A_buffer["qkv_proj"], self.tp_rank
-                    )
-                    temp_B_buffer["q_proj"], temp_B_buffer["kv_proj"] = (
-                        module.slice_lora_b_weights(
-                            [temp_B_buffer["q_proj"], temp_B_buffer["kv_proj"]],
-                            self.tp_rank,
+            if self.tp_size > 1:
+                for module_name, module in self.lora_modules[
+                    : self.num_modules_per_layer
+                ]:
+                    if "qkv_proj" in module_name:
+                        temp_A_buffer["qkv_proj"] = module.slice_lora_a_weights(
+                            temp_A_buffer["qkv_proj"], self.tp_rank
                         )
-                    )
-                else:
-                    weight_name = get_weight_name(
-                        module_name, self.lora_weight_names, LoRAType.LORA_A
-                    )
-                    temp_A_buffer[weight_name] = module.slice_lora_a_weights(
-                        temp_A_buffer[weight_name], self.tp_rank
-                    )
-                    temp_B_buffer[weight_name] = module.slice_lora_b_weights(
-                        temp_B_buffer[weight_name], self.tp_rank
-                    )
+                        temp_B_buffer["q_proj"], temp_B_buffer["kv_proj"] = (
+                            module.slice_lora_b_weights(
+                                [temp_B_buffer["q_proj"], temp_B_buffer["kv_proj"]],
+                                self.tp_rank,
+                            )
+                        )
+                    else:
+                        weight_name = get_weight_name(
+                            module_name, self.lora_weight_names, LoRAType.LORA_A
+                        )
+                        temp_A_buffer[weight_name] = module.slice_lora_a_weights(
+                            temp_A_buffer[weight_name], self.tp_rank
+                        )
+                        temp_B_buffer[weight_name] = module.slice_lora_b_weights(
+                            temp_B_buffer[weight_name], self.tp_rank
+                        )
 
             for name, weights in temp_A_buffer.items():
                 self.A_buffer[name][layer_id][buffer_id].copy_(weights)
