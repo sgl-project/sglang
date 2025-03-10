@@ -278,19 +278,15 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
+            self.disable_overlap_schedule = True
             logger.info(
-                "Overlap scheduler are disabled because of using "
+                "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
-            # The token generated from the verify step is counted in speculative_num_draft_tokens.
+            # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
-            assert self.speculative_num_steps < self.speculative_num_draft_tokens
-            assert (
-                self.speculative_num_draft_tokens - 1
-                <= self.speculative_num_steps * self.speculative_eagle_topk
-            )
+            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
         if (

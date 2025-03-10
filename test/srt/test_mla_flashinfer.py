@@ -6,9 +6,7 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -121,7 +119,7 @@ class TestFlashinferMLAMTP(unittest.TestCase):
                     "--speculative-draft",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "4",
+                    "3",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
