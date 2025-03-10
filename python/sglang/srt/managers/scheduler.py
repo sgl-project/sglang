@@ -1059,7 +1059,9 @@ class Scheduler:
                 self.enable_hierarchical_cache,
             )
 
-            res = adder.add_one_req(req, self.chunked_req)
+            res = adder.add_one_req(
+                req, self.chunked_req, self.enable_hierarchical_cache
+            )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -1081,7 +1083,7 @@ class Scheduler:
         ]
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.load_request_cache(can_run_list)
+            self.tree_cache.read_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
