@@ -23,6 +23,7 @@ suites = {
         TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("test_abort.py", 51),
+        TestFile("test_awq.py", 51),
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_custom_allreduce.py", 1),
         TestFile("test_double_sparsity.py", 50),
