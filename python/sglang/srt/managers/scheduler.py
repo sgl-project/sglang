@@ -411,6 +411,35 @@ class Scheduler:
                     revision=server_args.revision,
                 )
 
+        # Initialize token IDs for reasoning sections
+        self.think_start_id = None
+        self.think_end_id = None
+
+        # Get reasoning tokens from server args or use defaults
+        think_start_token = getattr(
+            self.server_args, "reasoning_start_token", "<think>"
+        )
+        think_end_token = getattr(self.server_args, "reasoning_end_token", "</think>")
+
+        try:
+            self.think_start_id = self.tokenizer.encode(
+                think_start_token, add_special_tokens=False
+            )[0]
+            self.think_end_id = self.tokenizer.encode(
+                think_end_token, add_special_tokens=False
+            )[0]
+            print(
+                f"Initialized reasoning tokens: start={think_start_token} (ID={self.think_start_id}), end={think_end_token} (ID={self.think_end_id})"
+            )
+            if getattr(self.server_args, "disable_grammar_in_reasoning", False):
+                print(
+                    f"Grammar restrictions will be disabled within reasoning sections ({think_start_token}...{think_end_token})"
+                )
+        except Exception as e:
+            # If we can't encode these tokens, leave them as None
+            print(f"Failed to encode reasoning tokens: {e}")
+            pass
+
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -748,6 +777,11 @@ class Scheduler:
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
+
+        # Initialize reasoning section state
+        if getattr(self.server_args, "disable_grammar_in_reasoning", False):
+            # Only track reasoning state in output, not input
+            req._in_reasoning_section = False
 
     def _add_request_to_queue(self, req: Req):
         self.waiting_queue.append(req)
@@ -1359,7 +1393,9 @@ class Scheduler:
                         )
 
                     if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
+                        # Only apply grammar restrictions if not in a reasoning section
+                        if not self._is_in_reasoning_section(req, next_token_id):
+                            req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -1485,7 +1521,9 @@ class Scheduler:
                 req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                req.grammar.accept_token(next_token_id)
+                # Only apply grammar restrictions if not in a reasoning section
+                if not self._is_in_reasoning_section(req, next_token_id):
+                    req.grammar.accept_token(next_token_id)
                 req.grammar.finished = req.finished()
 
         if batch.next_batch_sampling_info:
@@ -2230,6 +2268,45 @@ class Scheduler:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
             del self.sessions[session_id]
+
+    def _is_in_reasoning_section(self, req: Req, next_token_id: int) -> bool:
+        """
+        Check if the current token is within a reasoning section (e.g., <think></think>).
+        Only tracks reasoning state in the output tokens, not in the input.
+
+        Args:
+            req: The request object
+            next_token_id: The next token ID
+
+        Returns:
+            bool: True if the token is within a reasoning section, False otherwise
+        """
+        # If grammar in reasoning is not disabled, always return False
+        if not getattr(self.server_args, "disable_grammar_in_reasoning", False):
+            return False
+
+        # If we don't have the token IDs for reasoning tags, assume we're not in a reasoning section
+        if self.think_start_id is None or self.think_end_id is None:
+            return False
+
+        # Check if we're tracking reasoning state in the request
+        if not hasattr(req, "_in_reasoning_section"):
+            req._in_reasoning_section = False
+
+        # Get previous state
+        was_in_reasoning = req._in_reasoning_section
+
+        # Update reasoning state based on the current token
+        if next_token_id == self.think_start_id:
+            req._in_reasoning_section = True
+            if not was_in_reasoning:
+                logger.debug(f"Request {req.rid}: Entering reasoning section")
+        elif next_token_id == self.think_end_id:
+            req._in_reasoning_section = False
+            if was_in_reasoning:
+                logger.debug(f"Request {req.rid}: Exiting reasoning section")
+
+        return req._in_reasoning_section
 
 
 def is_health_check_generate_req(recv_req):
