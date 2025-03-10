@@ -211,7 +211,7 @@ class HiCacheController:
             target=self.write_thread_func_buffer, daemon=True
         )
         self.load_thread = threading.Thread(
-            target=self.load_thread_func_buffer, daemon=True
+            target=self.load_thread_func_layer_by_layer, daemon=True
         )
         self.stop_event.clear()
         self.write_thread.start()
@@ -329,6 +329,7 @@ class HiCacheController:
                     )
                     self.layer_done_counter.increment()
 
+                self.mem_pool_host.complete_io(batch_operation.host_indices)
                 for node_id in batch_operation.node_ids:
                     if node_id != 0:
                         self.ack_load_queue.put(node_id)

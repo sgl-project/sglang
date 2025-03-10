@@ -278,8 +278,18 @@ class HiRadixCache(RadixCache):
 
         return last_node, prefix_indices
 
-    def ready_to_load(self):
-        return self.load_cache_event.is_set()
+    def load_request_cache(self, reqs: List[Req]):
+        for req in reqs:
+            if req.last_node_global is not None and req.last_node_global.evicted:
+                self.dec_lock_ref(req.last_node)
+                req.last_node, req.prefix_indices = self.init_load_back(
+                    req.last_node_global, req.prefix_indices
+                )
+                req.last_node_global = None
+                self.inc_lock_ref(req.last_node)
+                req.init_next_round_input()
+
+        self.load_cache_event.set()
 
     def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
         if self.disable:

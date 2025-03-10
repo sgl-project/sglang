@@ -1059,16 +1059,6 @@ class Scheduler:
                 self.enable_hierarchical_cache,
             )
 
-            if self.enable_hierarchical_cache and req.last_node_global is not None:
-                if req.last_node_global.evicted:
-                    # todo: more diverse loading strategy
-                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                        req.last_node_global,
-                        req.prefix_indices,
-                        adder.rem_total_tokens,
-                    )
-                    req.init_next_round_input()
-
             res = adder.add_one_req(req, self.chunked_req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1091,7 +1081,7 @@ class Scheduler:
         ]
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load()
+            self.tree_cache.load_request_cache(can_run_list)
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
