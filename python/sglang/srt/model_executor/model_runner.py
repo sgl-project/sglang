@@ -196,6 +196,12 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+        # auxiliary hidden capture mode. TODO: expose this to server args?
+        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+            num_layers = self.model.config.num_hidden_layers
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+            self.model.set_layers_to_capture(layers_to_capture)
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
