@@ -40,10 +40,11 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[dict] = None,
+        model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        override_config_file: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
@@ -51,11 +52,16 @@ class ModelConfig:
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
         self.hf_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
@@ -64,6 +70,9 @@ class ModelConfig:
             self.hf_config.architectures, is_embedding
         )
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
+        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
+        self.is_audio_model = is_audio_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -71,7 +80,9 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
+                if get_bool_env_var(
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
@@ -239,9 +250,11 @@ class ModelConfig:
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
+            "w8a8_fp8",
         ]
         compatible_quantization_methods = {
-            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
+            "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -416,6 +429,8 @@ def is_multimodal_model(model_architectures: List[str]):
         or "LlavaQwenForCausalLM" in model_architectures
         or "LlavaMistralForCausalLM" in model_architectures
         or "LlavaVidForCausalLM" in model_architectures
+        or "Grok1VForCausalLM" in model_architectures
+        or "Grok1AForCausalLM" in model_architectures
         or "MllamaForConditionalGeneration" in model_architectures
         or "Qwen2VLForConditionalGeneration" in model_architectures
         or "Qwen2_5_VLForConditionalGeneration" in model_architectures
@@ -424,6 +439,18 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
+
+
+def is_multimodal_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_image_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_audio_model(model_architectures: List[str]):
+    return False
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
