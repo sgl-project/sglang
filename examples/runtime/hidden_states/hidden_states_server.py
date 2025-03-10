@@ -10,6 +10,7 @@ So avoid getting hidden states and completions alternately.
 
 import requests
 import torch
+
 from sglang.test.test_utils import is_in_ci
 from sglang.utils import print_highlight, terminate_process, wait_for_server
 

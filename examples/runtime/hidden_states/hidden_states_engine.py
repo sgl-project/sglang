@@ -7,8 +7,9 @@ the cuda graph will be recaptured, which might lead to a performance hit.
 So avoid getting hidden states and completions alternately.
 """
 
-import sglang as sgl
 import torch
+
+import sglang as sgl
 
 
 def main():

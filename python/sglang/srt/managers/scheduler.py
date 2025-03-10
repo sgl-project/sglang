@@ -1355,7 +1355,8 @@ class Scheduler:
                                 )
                             ]
                             .cpu()
-                            .clone().tolist()
+                            .clone()
+                            .tolist()
                         )
 
                     if req.grammar is not None:
