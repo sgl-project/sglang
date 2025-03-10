@@ -23,7 +23,6 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
-    is_cuda_available,
     is_hip,
 )
 
