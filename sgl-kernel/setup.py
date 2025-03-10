@@ -48,22 +48,19 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-operator_namespace = "sgl_kernels"
+operator_namespace = "sgl_kernel"
 cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
-turbomind = root / "3rdparty" / "turbomind"
 include_dirs = [
+    root / "include",
+    root / "csrc",
     cutlass.resolve() / "include",
     cutlass.resolve() / "tools" / "util" / "include",
-    root / "src" / "sgl-kernel" / "include",
-    root / "src" / "sgl-kernel" / "csrc",
     flashinfer.resolve() / "include",
     flashinfer.resolve() / "include" / "gemm",
     flashinfer.resolve() / "csrc",
     "cublas",
-    turbomind.resolve(),
-    turbomind.resolve() / "src",
 ]
 
 nvcc_flags = [
@@ -96,27 +93,27 @@ nvcc_flags_fp8 = [
 ]
 
 sources = [
-    "src/sgl-kernel/torch_extension.cc",
-    "src/sgl-kernel/csrc/activation/fused_add_rms_norm_kernel.cu",
-    "src/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu",
-    "src/sgl-kernel/csrc/allreduce/trt_reduce_kernel.cu",
-    "src/sgl-kernel/csrc/attention/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/gemm/cublas_grouped_gemm.cu",
-    "src/sgl-kernel/csrc/gemm/fp8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/gemm/fp8_blockwise_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/gemm/int8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/gemm/per_token_group_quant_fp8.cu",
-    "src/sgl-kernel/csrc/gemm/per_token_quant_fp8.cu",
-    "src/sgl-kernel/csrc/gemm/per_tensor_quant_fp8.cu",
-    "src/sgl-kernel/csrc/moe/moe_align_kernel.cu",
-    "src/sgl-kernel/csrc/speculative/eagle_utils.cu",
-    "src/sgl-kernel/csrc/speculative/speculative_sampling.cu",
+    "csrc/allreduce/trt_reduce_internal.cu",
+    "csrc/allreduce/trt_reduce_kernel.cu",
+    "csrc/attention/lightning_attention_decode_kernel.cu",
+    "csrc/elementwise/fused_add_rms_norm_kernel.cu",
+    "csrc/elementwise/rope.cu",
+    "csrc/gemm/bmm_fp8.cu",
+    "csrc/gemm/cublas_grouped_gemm.cu",
+    "csrc/gemm/fp8_gemm_kernel.cu",
+    "csrc/gemm/fp8_blockwise_gemm_kernel.cu",
+    "csrc/gemm/int8_gemm_kernel.cu",
+    "csrc/gemm/per_token_group_quant_fp8.cu",
+    "csrc/gemm/per_token_quant_fp8.cu",
+    "csrc/gemm/per_tensor_quant_fp8.cu",
+    "csrc/moe/moe_align_kernel.cu",
+    "csrc/speculative/eagle_utils.cu",
+    "csrc/speculative/speculative_sampling.cu",
+    "csrc/torch_extension.cc",
     "3rdparty/flashinfer/csrc/activation.cu",
-    "3rdparty/flashinfer/csrc/bmm_fp8.cu",
     "3rdparty/flashinfer/csrc/norm.cu",
-    "3rdparty/flashinfer/csrc/sampling.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
-    "3rdparty/flashinfer/csrc/rope.cu",
+    "3rdparty/flashinfer/csrc/sampling.cu",
 ]
 
 enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
@@ -158,7 +155,7 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linu
 
 ext_modules = [
     CUDAExtension(
-        name="sgl_kernel.ops._kernels",
+        name="sgl_kernel.common_ops",
         sources=sources,
         include_dirs=include_dirs,
         extra_compile_args={
@@ -174,8 +171,8 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=_get_version(),
-    packages=find_packages(),
-    package_dir={"": "src"},
+    packages=find_packages(where="python"),
+    package_dir={"": "python"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},

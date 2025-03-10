@@ -37,18 +37,6 @@ limitations under the License.
 using fptr_t = int64_t;
 
 /*
- * From csrc/activation
- */
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
-void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
-void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
-void gemma_fused_add_rmsnorm(
-    at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-
-/*
  * From csrc/allreduce
  */
 #ifdef USE_ROCM
@@ -89,6 +77,30 @@ void register_graph_buffers(
 #endif
 
 /*
+ * From csrc/attention
+ */
+void lightning_attention_decode(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& past_kv,
+    const torch::Tensor& slope,
+    torch::Tensor output,
+    torch::Tensor new_kv);
+
+/*
+ * From csrc/elementwise
+ */
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
+void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, int64_t cuda_stream);
+void gemma_fused_add_rmsnorm(
+    at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor int8_scaled_mm(
@@ -120,11 +132,21 @@ void sgl_per_token_group_quant_fp8(
     double fp8_min,
     double fp8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
+void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void cublas_grouped_gemm(
     const std::vector<torch::Tensor>& inputs,
     const std::vector<torch::Tensor>& weights,
     const std::vector<torch::Tensor>& outputs,
     const torch::Dtype& out_dtype,
+    int64_t cublas_handle,
+    int64_t cuda_stream);
+void bmm_fp8(
+    at::Tensor A,
+    at::Tensor B,
+    at::Tensor D,
+    at::Tensor A_scale,
+    at::Tensor B_scale,
+    at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream);
 
@@ -185,15 +207,6 @@ void build_tree_kernel(
 /*
  * From FlashInfer
  */
-void bmm_fp8(
-    at::Tensor A,
-    at::Tensor B,
-    at::Tensor D,
-    at::Tensor A_scale,
-    at::Tensor B_scale,
-    at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
 void min_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor uniform_samples,
@@ -254,18 +267,3 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     int64_t cuda_stream);
-
-/*
- * Other
- */
-void lightning_attention_decode(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& past_kv,
-    const torch::Tensor& slope,
-    torch::Tensor output,
-    torch::Tensor new_kv);
-
-// sgl_per_token_quant_fp8
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
