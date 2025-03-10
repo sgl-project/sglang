@@ -197,7 +197,6 @@ class LoRAManager:
         for module_name, module in self.base_model.named_modules():
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                # 从这里入手
                 self.lora_modules.append(
                     (module_name, self.set_lora_module(module_name, module))
                 )

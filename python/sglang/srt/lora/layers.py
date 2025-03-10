@@ -47,8 +47,6 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
-# 这是一个子类，继承自 BaseLayerWithLoRA，专门为 VocabParallelEmbedding 类型的嵌入层添加 LoRA 支持。
-# VocabParallelEmbedding 可能是一个并行化的嵌入层（例如在分布式训练中使用的词汇表并行嵌入）
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
@@ -334,7 +332,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             output_bias = self.base_layer.bias
         return output, output_bias
 
-    # 目前来讲，就是传输的量减少了
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         shard_size = self.base_layer.input_size_per_partition
         start_idx = tp_rank * shard_size

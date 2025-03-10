@@ -52,6 +52,7 @@ ALL_OTHER_LORA_MODELS = [
         base="meta-llama/Llama-2-7b-hf",
         adaptors=[LoRAAdaptor(name="winddude/wizardLM-LlaMA-LoRA-7B")],
         max_loras_per_batch=2,
+        tp_size=2,
     ),
 ]
 
