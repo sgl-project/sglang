@@ -12,6 +12,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
+
 
 # For test
 def native_per_token_group_quant_fp8(
@@ -209,9 +211,8 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(unittest.TestCase):
-    _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
-    if not _enable_jit_deepgemm:
+    if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]
         NKs = [
