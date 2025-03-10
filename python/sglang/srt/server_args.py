@@ -278,10 +278,10 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
+            self.disable_overlap_schedule = True
             logger.info(
-                "Overlap scheduler are disabled because of using "
+                "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
             # The token generated from the verify step is counted.
