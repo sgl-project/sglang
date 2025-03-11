@@ -7,7 +7,7 @@ from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.utils import (
-    ROW_PARALLELISM_LORA_NAMES,
+    ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
     get_stacked_multiply,
@@ -26,7 +26,7 @@ class LoRAMemoryPool:
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
-        lora_modules: List[Tuple[str, BaseLayerWithLoRA]],
+        lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]],
     ):
 
         self.base_hf_config: AutoConfig = base_hf_config
@@ -36,8 +36,7 @@ class LoRAMemoryPool:
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
-        self.lora_modules: List[Tuple[str, BaseLayerWithLoRA]] = lora_modules
-        self.num_modules_per_layer = divide(len(self.lora_modules), self.num_layer)
+        self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = lora_modules
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -63,8 +62,9 @@ class LoRAMemoryPool:
         """
         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        if self.tp_size > 1:
+            if module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                input_dim = divide(input_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
             self.max_lora_dim * c,
@@ -79,8 +79,9 @@ class LoRAMemoryPool:
         """
         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
+        if self.tp_size > 1:
+            if module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                output_dim = divide(output_dim, self.tp_size)
         return (
             c,
             self.max_loras_per_batch,
@@ -183,9 +184,8 @@ class LoRAMemoryPool:
                     temp_B_buffer[lora_weight_name] = weights
 
             if self.tp_size > 1:
-                for module_name, module in self.lora_modules[
-                    : self.num_modules_per_layer
-                ]:
+                cur_layer_modules = self.lora_modules[layer_id]
+                for module_name, module in cur_layer_modules:
                     if "qkv_proj" in module_name:
                         temp_A_buffer["qkv_proj"] = module.slice_lora_a_weights(
                             temp_A_buffer["qkv_proj"], self.tp_rank

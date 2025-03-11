@@ -144,4 +144,9 @@ def get_weight_name(
     )
 
 
-ROW_PARALLELISM_LORA_NAMES = ["o_proj", "down_proj"]
+# TODO: [PR #4274] For future use to simplify the mapping between HF module names and customized module names.
+VOCAB_PARALLELISM_EMBEDDING_NAMES = ["embeddings"]
+COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_proj", "up_proj"]
+MERGED_COLUMN_PARALLELISM_LINEAR_LORA_NAMES = ["gate_up_proj"]
+QKV_PARALLELISM_LINEAR_LORA_NAMES = ["qkv_proj"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]

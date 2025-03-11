@@ -161,22 +161,32 @@ class LoRAManager:
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules
-        for module_name, module in self.lora_modules:
-            layer_id = get_layer_id(module_name)
-            if "qkv_proj" in module_name:
-                module.set_lora_info(
-                    self.memory_pool.get_tensor("qkv_proj", layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor("q_proj", layer_id, LoRAType.LORA_B),
-                    self.memory_pool.get_tensor("kv_proj", layer_id, LoRAType.LORA_B),
-                )
-            else:
-                weight_name = get_weight_name(
-                    module_name, self.lora_weight_names, LoRAType.LORA_A
-                )
-                module.set_lora_info(
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_B),
-                )
+        for layer_id, modules in self.lora_modules.items():
+            for module_name, module in modules:
+                if "qkv_proj" in module_name:
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            "qkv_proj", layer_id, LoRAType.LORA_A
+                        ),
+                        self.memory_pool.get_tensor(
+                            "q_proj", layer_id, LoRAType.LORA_B
+                        ),
+                        self.memory_pool.get_tensor(
+                            "kv_proj", layer_id, LoRAType.LORA_B
+                        ),
+                    )
+                else:
+                    weight_name = get_weight_name(
+                        module_name, self.lora_weight_names, LoRAType.LORA_A
+                    )
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            weight_name, layer_id, LoRAType.LORA_A
+                        ),
+                        self.memory_pool.get_tensor(
+                            weight_name, layer_id, LoRAType.LORA_B
+                        ),
+                    )
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(
@@ -193,10 +203,13 @@ class LoRAManager:
         )
 
         # Monkey patch to use the LoRA version layers
-        self.lora_modules: List[Tuple[str, BaseLayerWithLoRA]] = []
+        self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = {
+            i: [] for i in range(self.base_hf_config.num_hidden_layers)
+        }
         for module_name, module in self.base_model.named_modules():
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                self.lora_modules.append(
+                layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id].append(
                     (module_name, self.set_lora_module(module_name, module))
                 )
