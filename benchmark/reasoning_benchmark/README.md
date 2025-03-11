@@ -56,15 +56,18 @@ This experiment aims to verify the reliability and stability of the model’s ou
 ## Results
 
 ### Evaluation Results
-| Dataset    | Num Tries | Accuracy | Reference |
-|------------|-----------|----------|-----------|
-| LIMO       | 8         | 47.7%    | ?         |
-| AIME 2024  | 64        | 33.2%    | 28.9%     |
-| AIME 2025 I| 64        | 29.9%    | 25.0%     |
+| Dataset    | Num Tries | Accuracy | Reference | Standard Error|
+|------------|-----------|----------|-----------|-----------|
+| LIMO       | 8         | 47.7%    | ?         |           |
+| AIME 2024  | 64        | 33.2%    | 28.9%     |0.0341     |
+| AIME 2025 I| 64        | 29.9%    | 25.0%     |           |
 
 ### Statistic Analysis Results
-- Experiment 1: In Experiment 1, the results show that all recorded accuracies lie within the CI based on the standard error. This indicates that, the **model's performance remains stable** across multiple independent runs.
+**Experiment 1**: The results show that all recorded accuracies lie within the CI based on the standard error. This indicates that our metric is appropriate as an upper bound for the deviation of reported accuracy.
+
 ![acc_hist](figure/Acc_histplot.png)
 
-- Experiment 2: In Experiment 2, we investigated the relationship between the number of attempts (num_tries) and the standard error (SE) by varying num_tries across multiple runs. The results reveal a clear trend: as num_tries increases, the SE consistently decreases.  Such a downward trend indicates that the more attempts are made on the same problem, the more stable the answer accuracy becomes.
+
+**Experiment 2**: We investigated the relationship between the number of num_tries and the standard error (SE) by varying num_tries across multiple runs.The results reveal that the more attempts are made on the same problem, the more stable the answer accuracy becomes.
+
 ![SE_num_tries](figure/SE_numtries.png)
