@@ -47,11 +47,11 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME
 ## Results
 
 ### Evaluation Results
-| Dataset    | Num Tries | Accuracy | Reference | Standard Error|
+| Dataset    | Num Tries | Accuracy | Reference | Standard Error |
 |------------|-----------|----------|-----------|-----------|
-| LIMO       | 8         | 47.7%    | ?         | ?          |
-| AIME 2024  | 64        | 33.2%    | 28.9%     |0.0341     |
-| AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?         |
+| LIMO       | 8         | 47.7%    | ?         | ?         |
+| AIME 2024  | 64        | 33.2%    | 28.9%     |3.4%       |
+| AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?        |
 
 ### Statistic Analysis Results
 **Experiment 1**: We fixed the number of attempts (num_tries) and conducted multiple runs to assess the consistency of the model's performance. The results show that all recorded accuracies lie within ± one standard error deviation from the mean. This suggests that **our metric serves as an effective upper bound for the deviation of reported accuracy**.
