@@ -33,7 +33,7 @@ __global__ void per_token_quant_fp8_kernel(
     vec_t input_vec;
     input_vec.cast_load(token_input + i * vec_size);
 
-    #pragma unroll
+#pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       max_value = fmaxf(max_value, fabsf(val));
@@ -57,7 +57,7 @@ __global__ void per_token_quant_fp8_kernel(
     input_vec.cast_load(token_input + i * vec_size);
 
     FP8_TYPE output_arr[vec_size];
-    #pragma unroll
+#pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_val, FP8_E4M3_MAX), -FP8_E4M3_MAX);
 #ifndef USE_ROCM
@@ -69,7 +69,7 @@ __global__ void per_token_quant_fp8_kernel(
 #endif
     }
 
-    #pragma unroll
+#pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       token_output[i * vec_size + j] = output_arr[j];
     }
@@ -85,8 +85,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const int64_t num_tokens = input_sizes[0];
   const int64_t hidden_dim = input_sizes[1];
 
-  TORCH_CHECK(hidden_dim % 8 == 0, 
-              "Hidden dimension must be divisible by 8, but got ", hidden_dim);
+  TORCH_CHECK(hidden_dim % 8 == 0, "Hidden dimension must be divisible by 8, but got ", hidden_dim);
 
   const int block_size = 256;
   const int num_blocks = num_tokens;
