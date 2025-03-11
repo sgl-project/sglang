@@ -163,7 +163,7 @@ class DeepseekV2MoE(nn.Module):
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
-            num_shared_experts=config.n_shared_experts,
+            num_shared_experts=config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -177,7 +177,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        if config.n_shared_experts is not None:
+        if config.n_shared_experts is not None and not get_bool_env_var("CK_MOE"):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -191,20 +191,17 @@ class DeepseekV2MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            if global_server_args_dict["enable_ep_moe"]:
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states, router_logits=router_logits
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+            if self.tp_size > 1:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
                 )
-                if self.tp_size > 1:
-                    final_hidden_states = tensor_model_parallel_all_reduce(
-                        final_hidden_states
-                    )
-                return final_hidden_states.view(num_tokens, hidden_dim)
+            return final_hidden_states.view(num_tokens, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         final_hidden_states = (
@@ -1055,8 +1052,7 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         if (
-            global_server_args_dict["enable_ep_moe"]
-            and is_hip_
+            is_hip_
             and get_bool_env_var("CK_MOE")
         ):
             model_dim = hidden_states.shape[-1]
@@ -1073,34 +1069,43 @@ class DeepseekV2Model(nn.Module):
                 # TODO need find a formal way
                 assert num_tokens <= (4096 * 128)
                 num_tokens = 4096 * 128
+                # if enable_ep_moe, need to add shared experts and one fake expert,
+                # otherwise, only add shared experts
+                if global_server_args_dict["enable_ep_moe"]:
+                    num_topK_pad_experts = num_shared_experts + 1
+                else:
+                    num_topK_pad_experts = num_shared_experts
                 # all layers resuse same buffer
                 self.total_topk_ids = torch.empty(
-                    (num_tokens, top_k + num_shared_experts +1),
+                    (num_tokens, top_k + num_topK_pad_experts),
                     dtype=torch.int32,
                     device="cuda",
                 )
                 self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split(
-                    [top_k, num_shared_experts + 1], dim=1
+                    [top_k, num_topK_pad_experts], dim=1
                 )
                 shared_expert_ids = [
-                    num_experts + i for i in range(num_shared_experts + 1)
+                    num_experts + i for i in range(num_topK_pad_experts)
                 ]
-                s_topk_ids_list = [
-                    [fake_expertid] * (num_shared_experts + 1)
-                ] * num_tokens
-                for i in range(tp_rank, num_tokens, tp_size):
-                    s_topk_ids_list[i] = shared_expert_ids
+                if global_server_args_dict["enable_ep_moe"]:
+                    s_topk_ids_list = [
+                        [fake_expertid] * (num_topK_pad_experts)
+                    ] * num_tokens
+                    for i in range(tp_rank, num_tokens, tp_size):
+                        s_topk_ids_list[i] = shared_expert_ids
+                else:
+                    s_topk_ids_list = [shared_expert_ids] * num_tokens
                 self.s_topk_ids[:] = torch.tensor(
                     s_topk_ids_list, dtype=torch.int32, device="cuda"
                 )
                 self.total_topk_weights = torch.empty(
-                    (num_tokens, top_k + num_shared_experts + 1),
+                    (num_tokens, top_k + num_topK_pad_experts),
                     dtype=torch.float32,
                     device="cuda",
                 )
                 self.ns_topk_weights, self.s_topk_weights = (
                     self.total_topk_weights.split(
-                        [top_k, num_shared_experts + 1], dim=1
+                        [top_k, num_topK_pad_experts], dim=1
                     )
                 )
                 shared_E_score = 1.0
@@ -1186,7 +1191,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
-            num_shared_experts=self.config.n_shared_experts,
+            num_shared_experts=self.config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0,
         )
 
         params_dict = dict(self.named_parameters())
@@ -1215,9 +1220,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                if global_server_args_dict["enable_ep_moe"] and (
-                    "mlp.shared_experts" in name
-                ):
+                if is_hip_ and get_bool_env_var("CK_MOE") and "mlp.shared_experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.

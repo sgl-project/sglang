@@ -456,10 +456,13 @@ class Fp8MoEMethod:
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        num_shared_experts: Optional[int] = 0,
         **extra_weight_attrs,
     ):
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            num_experts += num_shared_experts
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
+        
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = (
                 torch.int32
@@ -902,6 +905,11 @@ class Fp8MoEMethod:
             ), f"CK_MOE: FP8 and/or FP8 bloack_quant {activation=} will be supported later, unset CK_MOE"
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
+                token = x.shape[0]
+                layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
+                layer.ns_topk_ids[:token] = topk_ids
+                topk_ids = layer.total_topk_ids[:token]
+                topk_weights = layer.total_topk_weights[:token]
                 return asm_moe(
                     x,
                     layer.w13_weight,
