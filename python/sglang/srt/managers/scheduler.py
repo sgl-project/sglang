@@ -421,10 +421,10 @@ class Scheduler:
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
             self.think_start_id = self.tokenizer.encode(
-                parser.think_start_token, add_special_tokens=False
+                parser.detector.think_start_token, add_special_tokens=False
             )[0]
             self.think_end_id = self.tokenizer.encode(
-                parser.think_end_token, add_special_tokens=False
+                parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
     def init_memory_pool_and_cache(self):
