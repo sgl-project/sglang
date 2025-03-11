@@ -38,7 +38,7 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
-    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.60,
+    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.62,
 }
 
 
@@ -53,6 +53,8 @@ def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
             other_args.extend(["--kv-cache-dtype", "fp8_e5m2"])
         elif "Qwen2-72B-Instruct-FP8" in model:
             other_args.extend(["--quantization", "fp8"])
+        elif "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8" in model:
+            other_args.extend([])
         else:
             other_args.extend(["--quantization", "fp8", "--kv-cache-dtype", "fp8_e5m2"])
     if is_tp2:
