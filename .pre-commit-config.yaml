@@ -40,4 +40,4 @@ repos:
         entry: python docs/utils/check_doc_update_to_date.py
         language: system
         types: [python]
-        pass_filenames: false
+        pass_filenames: true
