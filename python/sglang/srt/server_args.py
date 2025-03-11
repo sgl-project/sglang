@@ -485,7 +485,7 @@ class ServerArgs:
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -510,7 +510,7 @@ class ServerArgs:
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading",
+            help="How many GBs of RAM to reserve for CPU offloading.",
         )
 
         # Other runtime options
