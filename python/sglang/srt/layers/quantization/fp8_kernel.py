@@ -34,6 +34,8 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
+
 
 @triton.jit
 def _per_token_group_quant_fp8(
@@ -725,7 +727,7 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if _is_cuda and C.dtype == torch.bfloat16:
+    if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
