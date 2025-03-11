@@ -125,3 +125,11 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8(input, output_q, output_s)
+
+
+def sgl_per_token_quant_int8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.sgl_per_token_quant_int8(input, output_q, output_s)

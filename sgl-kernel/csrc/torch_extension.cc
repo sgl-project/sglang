@@ -101,6 +101,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
+  m.def("sgl_per_token_quant_int8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
+  m.impl("sgl_per_token_quant_int8", torch::kCUDA, &sgl_per_token_quant_int8);
+
   m.def(
       "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
       " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
