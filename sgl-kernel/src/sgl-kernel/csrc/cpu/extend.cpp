@@ -152,7 +152,8 @@ void extend_attention_kernel_impl(
     int max_context_len,
     int max_total_num_tokens,
     int max_len_extend,
-    int buffer_size_per_thread) {
+    int buffer_size_per_thread,
+    bool is_prefix_skipped) {
 
   using Vec = at::vec::Vectorized<float>;
 
@@ -211,6 +212,11 @@ void extend_attention_kernel_impl(
       TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
       TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
+
+      if (is_prefix_skipped) {
+        TORCH_CHECK(seq_len_prefix == 0,
+            "extend attention: expect seq_len_prefix to be 0, got ", seq_len_prefix);
+      }
 
       // offset and size in MB
       int m = mb * BLOCK_N;
@@ -544,10 +550,10 @@ void extend_attention_cpu(
   CHECK_EQ(extend_seq_lens.size(0), num_seqs);
   CHECK_EQ(extend_start_loc.size(0), num_seqs);
   CHECK_EQ(v_extend.size(1), num_heads_kv);
-  CHECK_EQ(k_buffer.size(1), num_heads_kv);
-  CHECK_EQ(k_buffer.size(2), head_size);
-  CHECK_EQ(v_buffer.size(1), num_heads_kv);
-  CHECK_EQ(v_buffer.size(2), head_size_v);
+  CHECK_EQ(k_buffer.size(1), v_buffer.size(1));
+
+  // MLA will skip prefix part
+  const bool is_prefix_skipped = k_buffer.size(1) != num_heads_kv;
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
@@ -616,7 +622,8 @@ void extend_attention_cpu(
           max_context_len,
           max_total_num_tokens,
           max_len_extend,
-          size_per_thread);
+          size_per_thread,
+          is_prefix_skipped);
     });
   });
 }
