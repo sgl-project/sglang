@@ -57,7 +57,9 @@ if is_cuda:
             # the kernel being tested.
             finfo = torch.finfo(torch.float8_e4m3fn)
             scale = inv_scale.reciprocal()
-            qweight = (tensor.to(torch.float32) * scale).clamp(min=finfo.min, max=finfo.max)
+            qweight = (tensor.to(torch.float32) * scale).clamp(
+                min=finfo.min, max=finfo.max
+            )
             qweight = qweight.to(torch.float8_e4m3fn)
             return qweight
 

@@ -5,7 +5,8 @@ import torch
 from torch.nn import Module
 from vllm import _custom_ops as vllm_ops
 
-from sglang.srt.custom_op import CustomOp, scaled_fp8_quant as sgl_scaled_fp8_quant
+from sglang.srt.custom_op import CustomOp
+from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -26,7 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.utils import is_hip, set_weight_attrs, is_cuda
+from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 

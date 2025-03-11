@@ -1,12 +1,10 @@
 from typing import Optional
 
 import torch
-
 from torch import nn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 _is_rocm = torch.cuda.is_available() and torch.version.hip
-
 
 
 class CustomOp(nn.Module):
@@ -46,7 +44,7 @@ class CustomOp(nn.Module):
 
 if _is_cuda:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
-    
+
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
@@ -80,7 +78,9 @@ if _is_cuda:
         if scale is None:
             # Dynamic scaling
             if use_per_token_if_dynamic:
-                scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
                 sgl_per_token_quant_fp8(input, output, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
@@ -89,7 +89,9 @@ if _is_cuda:
                 )  # False for dynamic
         else:
             # Static scaling
-            assert scale.numel() == 1, f"Expected scalar scale, got numel={scale.numel()}"
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
             sgl_per_tensor_quant_fp8(
                 input, output, scale, is_static=True
             )  # True for static
