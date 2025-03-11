@@ -98,8 +98,6 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
-    reasoning_start_token: str = "<think>"
-    reasoning_end_token: str = "</think>"
     # If True, grammar restrictions will not be applied to tokens within reasoning sections
     # (between reasoning_start_token and reasoning_end_token)
     disable_grammar_in_reasoning: bool = False
