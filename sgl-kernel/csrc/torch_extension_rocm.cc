@@ -63,4 +63,4 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 }
 
-REGISTER_EXTENSION(_kernels)
+REGISTER_EXTENSION(common_ops)
