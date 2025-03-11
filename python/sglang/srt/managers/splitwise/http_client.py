@@ -15,6 +15,7 @@ import psutil
 
 from sglang.srt.managers.io_struct import (
     PrefillOnlyInput,
+    PrefillOnlyOutput,
     SamplingParams,
 )
 from sglang.srt.utils import (
@@ -34,7 +35,8 @@ class HTTPClientManager:
     def __init__(
         self,
         port_args: PortArgs,
-        max_workers=10
+        max_workers=10,
+        timeout=0.5, # timeout in secs
     ):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.response_queue = queue.Queue()
@@ -42,6 +44,9 @@ class HTTPClientManager:
 
         # status
         self.running = False
+
+        # client param
+        self.timeout = timeout
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -52,6 +57,7 @@ class HTTPClientManager:
         self._req_dispatcher = TypeBasedDispatcher(
             [
                 (PrefillOnlyInput, self._handle_prefill_request),
+                (PrefillOnlyOutput, self._handle_prefill_response),
             ]
         )
 
@@ -69,12 +75,30 @@ class HTTPClientManager:
             if not prefill_input.prefill_instance_ip_port or len(prefill_input.prefill_instance_ip_port) != 2:
                 return {"status": "error", "message": "Invalid prefill instance IP:port"}
             ip, port = prefill_input.prefill_instance_ip_port
-            url = f"http://{ip}:{port}/process_prefill_only"
+            url = f"http://{ip}:{port}/send_prefill_request"
             data = asdict(prefill_input)
             data['sampling_params'] = convert_sampling_params(data.get('sampling_params'))
 
             logger.info("!!!!!!!!!!!")
-            response = requests.post(url, json=data, timeout=0.5)
+            response = requests.post(url, json=data, timeout=self.timeout)
+            logger.info(response)
+            logger.info("!!!!!!!!!!!")
+            return {"status": "success", "status_code": response.status_code}
+        except Exception as e:
+            logger.error("!!!!!! error ", str(e))
+            return {"status": "error", "message": str(e)}
+
+
+    def _handle_prefill_response(self, prefill_output: PrefillOnlyOutput):
+        try:
+            if not prefill_output.prefill_instance_ip_port or len(prefill_output.prefill_instance_ip_port) != 2:
+                return {"status": "error", "message": "Invalid prefill instance IP:port"}
+            ip, port = prefill_output.decode_instance_ip_port
+            url = f"http://{ip}:{port}/return_prefill_result"
+            data = asdict(prefill_output)
+
+            logger.info("!!!!!!!!!!!")
+            response = requests.post(url, json=data, timeout=self.timeout)
             logger.info(response)
             logger.info("!!!!!!!!!!!")
             return {"status": "success", "status_code": response.status_code}

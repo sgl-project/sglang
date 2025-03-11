@@ -370,6 +370,15 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
 
     if server_args.server_role == "prefill":
         from sglang.srt.managers.splitwise.prefill_scheduler import run_scheduler_process
+        from sglang.srt.managers.splitwise.http_client import run_http_client_process
+        http_client_proc = mp.Process(
+            target=run_http_client_process,
+            args=(
+                server_args,
+                port_args,
+            ),
+        )
+        http_client_proc.start()
     elif server_args.server_role == "decode":
         from sglang.srt.managers.splitwise.decode_scheduler import run_scheduler_process
         from sglang.srt.managers.splitwise.http_client import run_http_client_process

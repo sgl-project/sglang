@@ -45,7 +45,6 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FunctionCallReqInput,
-    PrefillOnlyInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -54,6 +53,9 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    #####
+    PrefillOnlyInput,
+    PrefillOnlyOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -119,11 +121,18 @@ async def health() -> Response:
     return Response(status_code=200)
 
 
-@app.post("/process_prefill_only")
-async def process_prefill_only(obj: PrefillOnlyInput, request: Request) -> Response:
+@app.post("/send_prefill_request")
+async def send_prefill_request(obj: PrefillOnlyInput, request: Request) -> Response:
     """For Prefill Decode Disaggregation, process prefill request send from decode instance"""
     print("!!!!!!! recv request from decode !!!!!!!!")
     print(obj)
+    await _global_state.tokenizer_manager.pass_through_prefill_request(obj, request)
+    return Response(status_code=200)
+
+
+@app.post("/return_prefill_result")
+async def return_prefill_result(obj: PrefillOnlyOutput, request: Request) -> Response:
+    """For Prefill Decode Disaggregation, return prefill result back to decode instance"""
     await _global_state.tokenizer_manager.pass_through_prefill_request(obj, request)
     return Response(status_code=200)
 
@@ -528,15 +537,16 @@ def launch_server(
         enable_func_timer()
 
     # Send a warmup request
-    t = threading.Thread(
-        target=_wait_and_warmup,
-        args=(
-            server_args,
-            pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
-        ),
-    )
-    t.start()
+    if server_args.server_role != "prefill":
+        t = threading.Thread(
+            target=_wait_and_warmup,
+            args=(
+                server_args,
+                pipe_finish_writer,
+                _global_state.tokenizer_manager.image_token_id,
+            ),
+        )
+        t.start()
 
     try:
         # Update logging configs
@@ -552,7 +562,8 @@ def launch_server(
             loop="uvloop",
         )
     finally:
-        t.join()
+        if server_args.server_role != "prefill":    
+            t.join()
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):

@@ -236,7 +236,14 @@ class Req:
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
+        # TODO: need a better meta data for source and dest info
+        prefill_instance_ip_port: Optional[List[str]] = None,
+        decode_instance_ip_port: Optional[List[str]] = None,
     ):
+        # TODO:
+        self.prefill_instance_ip_port = prefill_instance_ip_port
+        self.decode_instance_ip_port = decode_instance_ip_port
+
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text

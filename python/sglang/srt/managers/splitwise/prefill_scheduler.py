@@ -64,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
     PrefillOnlyInput,
+    PrefillOnlyOutput,
     SamplingParams,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -101,6 +102,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.managers.splitwise.kv_cache_broker import KVCacheSender
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +176,9 @@ class PrefillScheduler:
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
+            self.out_bound_to_http_clients = get_zmq_socket(
+                context, zmq.PUSH, port_args.scheduler_out_bound_ipc_name, False                 
+            )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -189,6 +194,7 @@ class PrefillScheduler:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self.out_bound_to_http_clients = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -440,6 +446,12 @@ class PrefillScheduler:
             ]
         )
 
+        # TODO: need to remove hard coding value
+        if self.attn_tp_rank == 0:
+            self.kv_cache_sender = KVCacheSender(host="127.0.0.1", port=4000)
+        else:
+            self.kv_cache_sender = None
+
     # def watchdog_thread(self):
     #     """A watch dog thread that will try to kill the server itself if one batch takes too long."""
     #     self.watchdog_last_forward_ct = 0
@@ -602,7 +614,15 @@ class PrefillScheduler:
             input_embeds=None,
             custom_logit_processor=None,
             eos_token_ids=self.model_config.hf_eos_token_id,
+            # prefill_instance_ip_port=recv_req.prefill_instance_ip_port,
+            # decode_instance_ip_port=recv_req.decode_instance_ip_port
         )
+
+        if isinstance(recv_req, PrefillOnlyInput):
+            req.prefill_instance_ip_port = recv_req.prefill_instance_ip_port
+            req.decode_instance_ip_port = recv_req.decode_instance_ip_port
+
+
         req.tokenizer = self.tokenizer
 
         # Create a new request
@@ -989,6 +1009,7 @@ class PrefillScheduler:
             self.server_args.enable_custom_logit_processor,
             self.server_args.return_hidden_states,
         )
+        print("!!!!!!!!!!!!!!!!!!!!!! debug new batch: ", new_batch.req_to_token_pool)
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
@@ -1066,6 +1087,7 @@ class PrefillScheduler:
 
         # if self.is_generation:
             # if self.spec_algorithm.is_none():
+        print("???????????: ", batch.req_to_token_pool)
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
             model_worker_batch
@@ -1095,6 +1117,9 @@ class PrefillScheduler:
             # ret = EmbeddingBatchResult(
             #     embeddings=embeddings, bid=model_worker_batch.bid
             # )
+        
+        print("######## next_token_ids: ", next_token_ids)
+        print("???????????##########: ", batch.req_to_token_pool)
         return ret
 
     def process_batch_result(
@@ -1109,6 +1134,7 @@ class PrefillScheduler:
             if batch.is_empty():
                 self.running_batch = None
         elif batch.forward_mode.is_extend():
+            print("???????????!!!!!!!!: ", batch.req_to_token_pool)
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
@@ -1121,122 +1147,192 @@ class PrefillScheduler:
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: GenerationBatchResult
     ):
-        skip_stream_req = None
+        (
+            logits_output,
+            next_token_ids,
+            bid,
+        ) = (
+            result.logits_output,
+            result.next_token_ids,
+            result.bid,
+        )
 
-        if self.is_generation:
-            (
-                logits_output,
-                next_token_ids,
-                bid,
-            ) = (
-                result.logits_output,
-                result.next_token_ids,
-                result.bid,
-            )
+        if self.enable_overlap:
+            logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+            print("####### take a look at next_tokens: ", next_token_ids)
+        else:
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = next_token_ids.tolist()
 
-            if self.enable_overlap:
-                logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-            else:
-                # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.tolist()
-                    )
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            # if self.is_mixed_chunk and self.enable_overlap and req.finished():
+            #     # Free the one delayed token for the mixed decode batch
+            #     j = len(batch.out_cache_loc) - len(batch.reqs) + i
+            #     self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+            #     continue
 
-            hidden_state_offset = 0
+            # if req.is_being_chunked <= 0:
+            req.output_ids.append(next_token_id)
 
-            # Check finish conditions
-            logprob_pt = 0
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.is_retracted:
-                    continue
+        if self.attn_tp_rank == 0:
+            # kv cache sending
+            with self.kv_cache_sender.connect_lock:
 
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
-                    continue
+                # send new token back to decode
+                # notify decode to connect to socket if necessary
+                self.distribute_output(batch.reqs)
 
-                if req.is_being_chunked <= 0:
-                    req.output_ids.append(next_token_id)
+                remote_ip = "127.0.0.1" #TODO: remote hard coding value
+                remote_port = 4000
+                addr_key = (remote_ip, remote_port)
+                self.kv_cache_sender.wait_for_connect(remote_ip, remote_port)
+                lock = self.kv_cache_sender.connections_lock[addr_key]
+                lock.acquire()
 
-                    # force to finish, prefill is done
-                    # cache kv cache to device
-                    self.tree_cache.cache_finished_req(req)
+            try:
+                import ctypes
+                # print("11111 reqs: ", batch.reqs)
+                # print("22222 req_to_token_pool: ", batch.req_to_token_pool)
+                token_ids = (batch.reqs[0].origin_input_ids + batch.reqs[0].output_ids)[:-1]
+                device_indices = self.req_to_token_pool.req_to_token[batch.reqs[0].req_pool_idx, :len(token_ids)]
+                print("!!!!!!! device indices shape: ", device_indices.shape)
+                print("!!!!!!! device indices: ", device_indices)
+                kv_cache_device = self.token_to_kv_pool.get_flat_data(device_indices)
+                kv_cache_host = kv_cache_device.cpu().contiguous()
+                # kv_cache = b"a" * 1024  # 1KB test data, TODO: replace with real data
+                kv_cache_size = kv_cache_host.numel() * kv_cache_host.element_size()
+                print("kv cache shape: ", kv_cache_host.shape)
+                print(f"!!!!!! kv cache: {kv_cache_host}")
+                ctypes_buffer = (ctypes.c_byte * kv_cache_size).from_address(kv_cache_host.data_ptr())
+                buffer = memoryview(ctypes_buffer)
+                self.kv_cache_sender.send_kv_cache(buffer, remote_ip, remote_port, kv_cache_size)
+            finally:
+                lock.release()
+        
 
-                    # req.check_finished()
+    # def process_batch_result_prefill(
+    #     self,
+    #     batch: ScheduleBatch,
+    #     result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    # ):
+    #     skip_stream_req = None
 
-                    # if req.finished():
-                    #     self.tree_cache.cache_finished_req(req)
-                    # elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                    #     self.tree_cache.cache_unfinished_req(req)
+    #     if self.is_generation:
+    #         (
+    #             logits_output,
+    #             next_token_ids,
+    #             bid,
+    #         ) = (
+    #             result.logits_output,
+    #             result.next_token_ids,
+    #             result.bid,
+    #         )
 
-                    # if req.return_logprob:
-                    #     logprob_pt += self.add_logprob_return_values(
-                    #         i, req, logprob_pt, next_token_ids, logits_output
-                    #     )
+    #         if self.enable_overlap:
+    #             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
+    #             print("####### take a look at next_tokens: ", next_token_ids)
+    #         else:
+    #             # Move next_token_ids and logprobs to cpu
+    #             next_token_ids = next_token_ids.tolist()
+    #             if batch.return_logprob:
+    #                 logits_output.next_token_logprobs = (
+    #                     logits_output.next_token_logprobs.tolist()
+    #                 )
+    #                 logits_output.input_token_logprobs = (
+    #                     logits_output.input_token_logprobs.tolist()
+    #                 )
 
-                    # if (
-                    #     self.server_args.return_hidden_states
-                    #     and logits_output.hidden_states is not None
-                    # ):
-                    #     req.hidden_states.append(
-                    #         logits_output.hidden_states[
-                    #             hidden_state_offset : (
-                    #                 hidden_state_offset := hidden_state_offset
-                    #                 + len(req.origin_input_ids)
-                    #             )
-                    #         ]
-                    #         .cpu()
-                    #         .clone()
-                    #     )
+    #         hidden_state_offset = 0
 
-                    # if req.grammar is not None:
-                    #     req.grammar.accept_token(next_token_id)
-                    #     req.grammar.finished = req.finished()
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_being_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+    #         # Check finish conditions
+    #         logprob_pt = 0
+    #         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+    #             if req.is_retracted:
+    #                 continue
 
-            if batch.next_batch_sampling_info:
-                batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
-                batch.next_batch_sampling_info.sampling_info_done.set()
+    #             if self.is_mixed_chunk and self.enable_overlap and req.finished():
+    #                 # Free the one delayed token for the mixed decode batch
+    #                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
+    #                 self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
+    #                 continue
 
-        else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+    #             if req.is_being_chunked <= 0:
+    #                 req.output_ids.append(next_token_id)
 
-            # Check finish conditions
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
-                    continue
+    #                 # force to finish, prefill is done
+    #                 # cache kv cache to device
+    #                 self.tree_cache.cache_finished_req(req)
 
-                req.embedding = embeddings[i]
-                if req.is_being_chunked <= 0:
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.check_finished()
+    #                 # req.check_finished()
 
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    else:
-                        self.tree_cache.cache_unfinished_req(req)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_being_chunked -= 1
+    #                 # if req.finished():
+    #                 #     self.tree_cache.cache_finished_req(req)
+    #                 # elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+    #                 #     self.tree_cache.cache_unfinished_req(req)
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+    #                 # if req.return_logprob:
+    #                 #     logprob_pt += self.add_logprob_return_values(
+    #                 #         i, req, logprob_pt, next_token_ids, logits_output
+    #                 #     )
+
+    #                 # if (
+    #                 #     self.server_args.return_hidden_states
+    #                 #     and logits_output.hidden_states is not None
+    #                 # ):
+    #                 #     req.hidden_states.append(
+    #                 #         logits_output.hidden_states[
+    #                 #             hidden_state_offset : (
+    #                 #                 hidden_state_offset := hidden_state_offset
+    #                 #                 + len(req.origin_input_ids)
+    #                 #             )
+    #                 #         ]
+    #                 #         .cpu()
+    #                 #         .clone()
+    #                 #     )
+
+    #                 # if req.grammar is not None:
+    #                 #     req.grammar.accept_token(next_token_id)
+    #                 #     req.grammar.finished = req.finished()
+    #             else:
+    #                 # being chunked reqs' prefill is not finished
+    #                 req.is_being_chunked -= 1
+    #                 # There is only at most one request being currently chunked.
+    #                 # Because this request does not finish prefill,
+    #                 # we don't want to stream the request currently being chunked.
+    #                 skip_stream_req = req
+
+    #         if batch.next_batch_sampling_info:
+    #             batch.next_batch_sampling_info.update_regex_vocab_mask()
+    #             self.current_stream.synchronize()
+    #             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    #     else:  # embedding or reward model
+    #         # embeddings, bid = result.embeddings, result.bid
+    #         # embeddings = embeddings.tolist()
+
+    #         # # Check finish conditions
+    #         # for i, req in enumerate(batch.reqs):
+    #         #     if req.is_retracted:
+    #         #         continue
+
+    #         #     req.embedding = embeddings[i]
+    #         #     if req.is_being_chunked <= 0:
+    #         #         # Dummy output token for embedding models
+    #         #         req.output_ids.append(0)
+    #         #         req.check_finished()
+
+    #         #         if req.finished():
+    #         #             self.tree_cache.cache_finished_req(req)
+    #         #         else:
+    #         #             self.tree_cache.cache_unfinished_req(req)
+    #         #     else:
+    #         #         # being chunked reqs' prefill is not finished
+    #         #         req.is_being_chunked -= 1
+    #         pass
+
+    #     self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     # def process_batch_result_decode(
     #     self,
@@ -1398,6 +1494,22 @@ class PrefillScheduler:
 
     #     return num_input_logprobs
 
+    def distribute_output(
+        self, reqs: List[Req]
+    ):
+        """Distribute the output to decode"""
+        for req in reqs:
+            output = PrefillOnlyOutput(
+                input_text=req.origin_input_text,
+                input_ids=req.origin_input_ids,
+                rid=req.rid,
+                output_ids=req.output_ids,
+                prefill_instance_ip_port=req.prefill_instance_ip_port,
+                decode_instance_ip_port=req.decode_instance_ip_port
+            )
+            self.out_bound_to_http_clients.send_pyobj(output)
+
+
     def stream_output(
         self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
     ):
@@ -1440,6 +1552,10 @@ class PrefillScheduler:
             for req in reqs:
                 if req is skip_req:
                     continue
+                
+                print("###### see where dose the new token goes, req: ", req)
+                print("req stream? ", req.stream)
+                print("req finished? ", req.finished())
 
                 # TODO(lianmin): revisit this for overlap + retract + stream
                 if (

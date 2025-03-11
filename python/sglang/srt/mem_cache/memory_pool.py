@@ -166,6 +166,12 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
+    def get_flat_data(
+        self,
+        indices
+    ) -> torch.tensor: 
+        raise NotImplementedError()
+
 
 class MHATokenToKVPool(BaseTokenToKVPool):
 
@@ -354,6 +360,11 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
         else:
             self.kv_buffer[layer_id][loc] = cache_k
+
+    def get_flat_data(self, indices):
+        # prepare a large chunk of contiguous data for efficient transfer
+        flatten = torch.stack([self.kv_buffer[i][indices] for i in range(len(self.kv_buffer))])
+        return flatten
 
 
 class DoubleSparseTokenToKVPool(BaseTokenToKVPool):

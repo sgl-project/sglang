@@ -18,7 +18,8 @@ class KVCacheReceiver:
         future = self.kv_receiver_executor.submit(
             self._pull_kv, remote_ip, remote_port, kv_cache_size
         )
-        return future.result()
+        buffer = future.result()
+        return buffer
 
     def _pull_kv(self, remote_ip, remote_port, kv_cache_size):
         key = (remote_ip, remote_port)
@@ -30,21 +31,28 @@ class KVCacheReceiver:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setblocking(True)
                 try:
+                    print("!!!!! start connect !!!!!")
                     sock.connect((remote_ip, int(remote_port)))
                     self.connections[key] = sock
+                    print("!!!!! done connect !!!!!")
                 except Exception as e:
                     sock.close()
                     raise
 
         received = bytearray()
         try:
+            print("start recv, kv cache size: ", kv_cache_size)
             while len(received) < kv_cache_size:
+                print("recv a chunk now size: ", len(received))
                 chunk = sock.recv(4096)
                 if not chunk:
                     # Remote closed connection, remove and retry
                     raise ConnectionError("Connection closed by remote")
                 received.extend(chunk)
             # Return successfully if all data is received
+            # print("!!!!!!!!!!")
+            # print(received)
+            print("!!!!!!!!!!")
             return bytes(received)
         except (ConnectionError, OSError) as e:
             # Cleanup and retry on connection errors
@@ -83,29 +91,33 @@ class KVCacheSender:
         self.kv_sender_executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
         self.connections = {}  # Maps (remote_ip, remote_port) to active socket
-        self.connection_lock = Lock()
+        self.connections_lock = {} # Maps (remote_ip, remote_port): Lock
+        self.connect_lock = Lock()
 
+    def wait_for_connect(self, remote_ip: str, remote_port: int):
+        """wait until only one thread is doing the accept"""
+        addr_key = (remote_ip, remote_port)
+        if addr_key in self.connections:
+            return
+        else:
+            # TODO accept should have a timeout
+            client_sock, client_addr_key = self.sock.accept()
+            # <socket.socket fd=174, family=AddressFamily.AF_INET, type=SocketKind.SOCK_STREAM, proto=0, laddr=('127.0.0.1', 4000), raddr=('127.0.0.1', 46738)>
+            # print(f"!!!!! debug addr: {client_sock}, {addr_key}")
+            # assert client_addr_key == addr_key
+            client_sock.setblocking(True)
+            self.connections[addr_key] = client_sock
+            self.connections_lock[addr_key] = Lock()
 
     def send_kv_cache(self, buffer: bytes, remote_ip, remote_port, kv_cache_size) -> None:
         future = self.kv_sender_executor.submit(self._send_kv, buffer, remote_ip, remote_port, kv_cache_size)
         future.result()
         return
 
+    # TODO: send should have a timeout
     def _send_kv(self, buffer: bytes, remote_ip, remote_port, kv_cache_size) -> None:
-        key = (remote_ip, remote_port)
-
-        with self.connection_lock:
-            sock_client = self.connections.get(key)
-            if not sock_client:
-                # Create new connection if not exists
-                try:
-                    client_sock, _ = self.sock.accept()
-                    client_sock.setblocking(True)
-                    self.connections[key] = client_sock
-                except Exception as e:
-                    self.sock.close()
-                    raise
-
+        addr_key = (remote_ip, remote_port)
+        client_sock = self.connections[addr_key]
         sent = 0
         while sent < len(buffer):
             try:

@@ -50,7 +50,6 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FlushCacheReq,
-    PrefillOnlyInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -72,6 +71,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    ########
+    PrefillOnlyInput,
+    PrefillOnlyOutput,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -265,7 +267,7 @@ class TokenizerManager:
 
     async def pass_through_prefill_request(
         self,
-        obj: PrefillOnlyInput,
+        obj: Union[PrefillOnlyInput, PrefillOnlyOutput],
         request: Optional[fastapi.Request] = None,
     ):  
         print("!!!!! pass through req to scheduler")

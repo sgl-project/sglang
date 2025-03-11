@@ -57,13 +57,16 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    PrefillOnlyInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    #
+    PrefillOnlyInput,
+    PrefillOnlyOutput,
+    SamplingParams,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -101,6 +104,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.managers.splitwise.kv_cache_broker import KVCacheReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +439,7 @@ class DecodeScheduler:
             [
                 # (TokenizedGenerateReqInput, self.handle_generate_request),
                 # (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (PrefillOnlyOutput, self.process_prefill_result),
                 (TokenizedGenerateReqInput, self.distribute_to_prefill),
                 (FlushCacheReq, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
@@ -459,6 +464,12 @@ class DecodeScheduler:
                 ),
             ]
         )
+
+        # TODO: remove hard coding ip and port
+        if self.attn_tp_rank == 0:
+            self.kv_cache_receiver = KVCacheReceiver()
+        else:
+            self.kv_cache_receiver = None
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
@@ -601,6 +612,48 @@ class DecodeScheduler:
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
 
+    def process_prefill_result(
+        self,
+        recv_req: PrefillOnlyOutput
+    ):
+        # parse prefill result
+        sample_params = SamplingParams(temperature=0.7) # TODO: need to have a sample param parser
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            sample_params,
+            # return_logprob=recv_req.return_logprob,
+            # top_logprobs_num=recv_req.top_logprobs_num,
+            stream=True,
+            # lora_path=recv_req.lora_path,
+            # input_embeds=recv_req.input_embeds,
+            # custom_logit_processor=custom_logit_processor,
+            # eos_token_ids=self.model_config.hf_eos_token_id,
+            lora_path=None,
+            input_embeds=None,
+            custom_logit_processor=None,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            prefill_instance_ip_port=recv_req.prefill_instance_ip_port,
+            decode_instance_ip_port=recv_req.decode_instance_ip_port
+        )
+
+        # stream output
+        req.output_ids = recv_req.output_ids
+        self.stream_output([req], False)
+
+        # TODO: kick off kv cache pulling
+        # TODO: remove hard coding value here
+        if self.attn_tp_rank == 0:
+            remote_ip = "127.0.0.1"
+            remote_port = 4000
+            kv_cache_size = 27 * (len(req.origin_input_ids)) * 576 * 2
+            buffer = self.kv_cache_receiver.pull_kv_cache(remote_ip, remote_port, kv_cache_size)
+            shape = (27, len(req.origin_input_ids), 1, 576)
+            buffer_view = memoryview(buffer)
+            kv_cache = torch.frombuffer(buffer_view, dtype=torch.bfloat16).clone().reshape(shape)
+            print(kv_cache)
+
     def distribute_to_prefill(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -610,11 +663,13 @@ class DecodeScheduler:
 
         # TODO: need to have a load balance
         prefill_instance_ip_port = ["127.0.0.1", "30001"]
+        decode_instance_ip_port = ["127.0.0.1", "30000"]
 
         prefill_req = PrefillOnlyInput(
             input_ids=recv_req.input_ids,
             rid = recv_req.rid,
             prefill_instance_ip_port=prefill_instance_ip_port,
+            decode_instance_ip_port=decode_instance_ip_port,
             input_text=recv_req.input_text,
             sampling_params={
                 "temperature": recv_req.sampling_params.temperature,
@@ -1196,6 +1251,8 @@ class DecodeScheduler:
             if batch.is_empty():
                 self.running_batch = None
         elif batch.forward_mode.is_extend():
+            # should not run prefill at all
+            raise
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
