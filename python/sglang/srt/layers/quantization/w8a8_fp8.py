@@ -14,7 +14,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device_capability, is_hip
 
 _is_hip = is_hip()
 

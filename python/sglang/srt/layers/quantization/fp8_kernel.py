@@ -263,7 +263,7 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
-        if is_triton_:
+        if _is_triton:
             _per_token_group_quant_fp8[(M,)](
                 x,
                 x_q,
@@ -804,7 +804,7 @@ def w8a8_block_fp8_matmul(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    if is_triton_:  # pragma: no cover
+    if _is_triton:  # pragma: no cover
         assert len(block_size) == 2
         block_n, block_k = block_size[0], block_size[1]
 
