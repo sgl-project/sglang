@@ -154,6 +154,7 @@ class Scheduler:
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.stream_interval = server_args.stream_interval
+        self.metrics_flush_interval = server_args.metrics_flush_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -336,6 +337,7 @@ class Scheduler:
         self.watchdog_timeout = server_args.watchdog_timeout
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
+
         self.parent_process = psutil.Process().parent()
 
         # Init memory saver
@@ -471,6 +473,8 @@ class Scheduler:
                     "engine_type": engine_type,
                 },
             )
+            t = threading.Thread(target=self.metrics_stats_thread, daemon=True)
+            t.start()
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -805,6 +809,14 @@ class Scheduler:
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
 
+    def metrics_stats_thread(self):
+        while True:
+            if self.stats.last_stats_time + self.metrics_flush_interval < time.time():
+                self.stats.clear()
+            self.metrics_collector.log_stats(self.stats)
+
+            time.sleep(self.metrics_flush_interval)
+
     def log_prefill_stats(
         self,
         adder: PrefillAdder,
@@ -840,6 +852,7 @@ class Scheduler:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
             self.metrics_collector.log_stats(self.stats)
+            self.stats.last_stats_time = time.time()
 
     def log_decode_stats(self):
         gap_latency = time.time() - self.last_decode_stats_tic
@@ -896,6 +909,7 @@ class Scheduler:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
+            self.stats.last_stats_time = time.time()
 
     def check_memory(self):
         available_size = (

@@ -91,6 +91,7 @@ class ServerArgs:
     log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
+    metrics_flush_interval: int = 15
     decode_log_interval: int = 40
 
     # API related
@@ -604,6 +605,12 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--metrics_flush_interval",
+            type=int,
+            default=ServerArgs.metrics_flush_interval,
+            help="The interval(seconds) for writing stats data to Prometheus metrics..",
         )
         parser.add_argument(
             "--decode-log-interval",

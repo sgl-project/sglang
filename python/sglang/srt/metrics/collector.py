@@ -28,6 +28,17 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
     spec_accept_length: float = 0.0
 
+    last_stats_time: float = time.time()
+
+    def clear(self):
+        self.num_running_reqs = 0
+        self.num_used_tokens = 0
+        self.token_usage = 0
+        self.gen_throughput = 0
+        self.num_queue_reqs = 0
+        self.cache_hit_rate = 0
+        self.spec_accept_length = 0
+
 
 class SchedulerMetricsCollector:
 
