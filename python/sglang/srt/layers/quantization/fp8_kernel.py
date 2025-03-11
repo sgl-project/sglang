@@ -724,7 +724,8 @@ def w8a8_block_fp8_matmul(
         N, config["BLOCK_SIZE_N"]
     )
 
-    if _is_cuda:
+    # deepgemm only support bf16
+    if _is_cuda and C.dtype == torch.bfloat16:
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
