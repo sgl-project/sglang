@@ -48,6 +48,10 @@ void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// gemm
+void weight_packed_linear(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2,
+    std::optional<at::Tensor>& bias, bool is_vnni);
+
 // fused moe
 at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
     at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool is_vnni);
@@ -77,6 +81,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // weight prepack
   m.def("convert_weight_packed", &convert_weight_packed, "prepack weight to vnni format for intel AMX");
+
+  // gemm
+  m.def("weight_packed_linear", &weight_packed_linear, "weight packed linear for intel AMX");
 
   // moe
   m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");
