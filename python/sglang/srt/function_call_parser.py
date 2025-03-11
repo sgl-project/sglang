@@ -7,8 +7,11 @@ from json import JSONDecodeError, JSONDecoder
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import partial_json_parser
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +22,6 @@ TOOLS_TAG_LIST = [
     "<|python_tag|>",
     "[TOOL_CALLS]",
 ]
-
-
-class Function(BaseModel):
-    """Function Tool Template."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
-    parameters: Optional[object] = None
 
 
 class ToolCallItem(BaseModel):
@@ -107,26 +102,12 @@ class BaseFormatDetector(ABC):
         self.bot_token = ""
         self.eot_token = ""
 
-    def parse_base_json(self, action: Any, tools: List[Function]) -> List[ToolCallItem]:
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = {
             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
         }
         if not isinstance(action, list):
-            name = action.get("name")
-            if not name or name not in tool_indices:
-                logger.warning(f"Model attempted to call undefined function: {name}")
-                return []
-
-            return [
-                ToolCallItem(
-                    tool_index=tool_indices[name],
-                    name=name,
-                    parameters=json.dumps(
-                        action.get("parameters") or action.get("arguments", {}),
-                        ensure_ascii=False,
-                    ),
-                )
-            ]
+            action = [action]
 
         results = []
         for act in action:
@@ -142,11 +123,13 @@ class BaseFormatDetector(ABC):
                         ),
                     )
                 )
+            else:
+                logger.warning(f"Model attempted to call undefined function: {name}")
 
         return results
 
     @abstractmethod
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -155,7 +138,7 @@ class BaseFormatDetector(ABC):
         return self.parse_base_json(action, tools)
 
     def parse_streaming_increment(
-        self, new_text: str, tools: List[Function]
+        self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing with tool validation.
@@ -214,7 +197,7 @@ class BaseFormatDetector(ABC):
                         obj["arguments"] = obj["parameters"]
                     tool_call_arr.append(obj)
 
-            except partial_json_parser.core.exceptions.MalformedJSON:
+            except MalformedJSON:
                 return StreamingParseResult()
 
             if len(tool_call_arr) == 0:
@@ -340,7 +323,7 @@ class Qwen25Detector(BaseFormatDetector):
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -395,7 +378,7 @@ class MistralDetector(BaseFormatDetector):
         else:
             return ""
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -433,7 +416,7 @@ class Llama32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<|python_tag|>"
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text:
             return []
@@ -475,7 +458,7 @@ class MultiFormatParser:
         """
         self.detectors = detectors
 
-    def parse_once(self, text: str, tools: List[Function]):
+    def parse_once(self, text: str, tools: List[Tool]):
         """
         One-time parsing: Loop through detectors until there are no new matches or text is exhausted
         Return: (final_text, all_calls)
@@ -493,7 +476,7 @@ class MultiFormatParser:
         # leftover_text is the normal text not consumed by any Detector
         return final_normal_text, final_calls
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Function]):
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]):
         """
         Streaming incremental parsing: Feed new_text to each detector's parse_streaming_increment
         and merge their produced normal_text/calls to return.
@@ -530,7 +513,7 @@ class FunctionCallParser:
         "mistral": MistralDetector,
     }
 
-    def __init__(self, tools: List[Function], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str):
         detectors = []
         if tool_call_parser:
             detector_class = self.ToolCallParserEnum.get(tool_call_parser)
