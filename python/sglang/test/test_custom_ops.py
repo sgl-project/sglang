@@ -65,7 +65,7 @@ def test_scaled_fp8_quant_per_token_dynamic(dtype) -> None:
 
     # Note that we use a shape % 8 = 0,
     # because per_token_quant_fp8 is vectorized by 8 elements.
-    x = (torch.randn(size=(16, 11), device="cuda") * 13).to(dtype)
+    x = (torch.randn(size=(11, 16), device="cuda") * 13).to(dtype)
 
     # Test Per Tensor Dynamic quantization
     # scale = max(abs(x)) / FP8_E4M3_MAX
