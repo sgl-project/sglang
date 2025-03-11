@@ -173,7 +173,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # 是一样的，所以取index 0
+        # Since the outputs for both gate and up are identical, we use a random one.
         shard_size = self.base_layer.output_partition_sizes[0]
         start_idx = tp_rank * shard_size
         end_idx = (tp_rank + 1) * shard_size
