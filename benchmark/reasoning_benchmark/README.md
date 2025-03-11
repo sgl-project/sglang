@@ -44,30 +44,20 @@ Evaluate on [AIME 2025 I dataset](https://huggingface.co/datasets/opencompass/AI
 python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME2025 --question-key question --answer-key answer --num-tries 64
 ```
 
-## Further Statistic Analysis
-This experiment aims to verify the reliability and stability of the model’s output in statistic method following the evaluation above.
-
-### **Experiment 1: Fixed num_tries with Multiple Executions**
-- In this experiment, we set a fixed number of attempts (num_tries) and conduct multiple runs to evaluate the model's performance consistency. For each run, we measure accuracy and compute the standard error, then derive the 95% confidence interval (CI) for accuracy. If all accuracy values lie within this CI, the model's performance is deemed stable; otherwise, it suggests potential instability.
-
-### **Experiment 2: Varying num_tries with Single Executions**
-- Here, we adjust num_tries across a range (e.g., 8, 16, 32, ..., 256) and perform a single run for each value to examine how the standard error (SE) changes. We plot SE against num_tries and expect the SE to decrease.
-
 ## Results
 
 ### Evaluation Results
 | Dataset    | Num Tries | Accuracy | Reference | Standard Error|
 |------------|-----------|----------|-----------|-----------|
-| LIMO       | 8         | 47.7%    | ?         |           |
+| LIMO       | 8         | 47.7%    | ?         | ?          |
 | AIME 2024  | 64        | 33.2%    | 28.9%     |0.0341     |
-| AIME 2025 I| 64        | 29.9%    | 25.0%     |           |
+| AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?         |
 
 ### Statistic Analysis Results
-**Experiment 1**: The results show that all recorded accuracies lie within the CI based on the standard error. This indicates that our metric is appropriate as an upper bound for the deviation of reported accuracy.
-
+**Experiment 1**: We fixed the number of attempts (num_tries) and conducted multiple runs to assess the consistency of the model's performance. The results show that all recorded accuracies lie within ± one standard error deviation from the mean. This suggests that **our metric serves as an effective upper bound for the deviation of reported accuracy**.
 ![acc_hist](figure/Acc_histplot.png)
 
 
-**Experiment 2**: We investigated the relationship between the number of num_tries and the standard error (SE) by varying num_tries across multiple runs.The results reveal that the more attempts are made on the same problem, the more stable the answer accuracy becomes.
+**Experiment 2**: We explored the relationship between the number of attempts (num_tries) and the standard error (SE) by varying num_tries across a range (e.g., 8, 16, 32, ..., 256) and performing a single run for each value. The results demonstrate that as the number of attempts increases, the standard error decreases, leading to **greater stability in answer accuracy**.
 
 ![SE_num_tries](figure/SE_numtries.png)
