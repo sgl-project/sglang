@@ -1087,7 +1087,7 @@ class DeepseekV2Model(nn.Module):
                     [fake_expertid] * (num_shared_experts + 1)
                 ] * num_tokens
                 for i in range(tp_rank, num_tokens, tp_size):
-                    s_topk_ids_list[1] = shared_expert_ids
+                    s_topk_ids_list[i] = shared_expert_ids
                 self.s_topk_ids[:] = torch.tensor(
                     s_topk_ids_list, dtype=torch.int32, device="cuda"
                 )
@@ -1109,7 +1109,7 @@ class DeepseekV2Model(nn.Module):
                     mlp = self.layers[i].mlp
                     if not isinstance(mlp, DeepseekV2MoE):
                         continue
-                    mlp.experts.total_topk_weights = self.s_topk_weights
+                    mlp.experts.total_topk_weights = self.total_topk_weights
                     mlp.experts.total_topk_ids = self.total_topk_ids
                     mlp.experts.ns_topk_weights = self.ns_topk_weights
                     mlp.experts.ns_topk_ids = self.ns_topk_ids
