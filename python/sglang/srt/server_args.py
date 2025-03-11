@@ -643,18 +643,6 @@ class ServerArgs:
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
         parser.add_argument(
-            "--reasoning-start-token",
-            type=str,
-            default=ServerArgs.reasoning_start_token,
-            help="The start token for reasoning.",
-        )
-        parser.add_argument(
-            "--reasoning-end-token",
-            type=str,
-            default=ServerArgs.reasoning_end_token,
-            help="The end token for reasoning.",
-        )
-        parser.add_argument(
             "--disable-grammar-in-reasoning",
             action="store_true",
             help="Disable grammar restrictions within reasoning sections (between reasoning_start_token and reasoning_end_token). This is useful for reasoning models where you want to allow free-form reasoning within <think>...</think> sections.",
