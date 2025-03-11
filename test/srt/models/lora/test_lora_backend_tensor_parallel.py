@@ -32,6 +32,7 @@ CI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=1,
+        tp_size=2,
     ),
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
@@ -42,6 +43,7 @@ CI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=1,
+        tp_size=2,
     ),
 ]
 
@@ -50,6 +52,7 @@ ALL_OTHER_LORA_MODELS = [
         base="meta-llama/Llama-2-7b-hf",
         adaptors=[LoRAAdaptor(name="winddude/wizardLM-LlaMA-LoRA-7B")],
         max_loras_per_batch=2,
+        tp_size=2,
     ),
 ]
 
@@ -96,7 +99,7 @@ class TestLoRABackend(unittest.TestCase):
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.88,
-            disable_custom_all_reduce=False,
+            disable_custom_all_reduce=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 [prompt], max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
@@ -115,7 +118,7 @@ class TestLoRABackend(unittest.TestCase):
             model_type="generation",
             tp_size=model_case.tp_size,
             mem_fraction_static=0.88,
-            disable_custom_all_reduce=False,
+            disable_custom_all_reduce=True,
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
                 [prompt], max_new_tokens=max_new_tokens
