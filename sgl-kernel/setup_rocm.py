@@ -79,7 +79,7 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=_get_version(),
-    packages=find_packages(),
+    packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
