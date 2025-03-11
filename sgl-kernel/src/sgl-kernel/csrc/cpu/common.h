@@ -9,6 +9,19 @@
 
 namespace {
 
+// dispatcher
+#define AT_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)                                 \
+  [&] {                                                                          \
+    if (BOOL_V) {                                                                \
+      constexpr bool BOOL_NAME = true;                                           \
+      return __VA_ARGS__();                                                      \
+    } else {                                                                     \
+      constexpr bool BOOL_NAME = false;                                          \
+      return __VA_ARGS__();                                                      \
+    }                                                                            \
+  }()
+
+
 #define UNUSED(x) (void)(x)
 
 #define CHECK_CPU(x) TORCH_CHECK(x.device().type() == at::kCPU, #x " must be a CPU tensor")
