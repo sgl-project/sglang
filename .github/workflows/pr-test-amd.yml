@@ -47,11 +47,11 @@ jobs:
       - name: Install dependencies
         run: |
           docker exec ci_sglang pip install --upgrade pip
-          docker exec -w /sglang-checkout/sgl-kernel python3 -c "import sgl_kernel; print(f'[Debug-1] {sgl_kernel.__version__}')"
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 -c "import sgl_kernel; print(f'[Debug-1] {sgl_kernel.__version__}')"
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
-          docker exec -w /sglang-checkout/sgl-kernel python3 -c "import sgl_kernel; print(f'[Debug-2] {sgl_kernel.__version__}')"
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 -c "import sgl_kernel; print(f'[Debug-2] {sgl_kernel.__version__}')"
           docker exec ci_sglang pip install -e "python[dev_hip]"
-          docker exec -w /sglang-checkout/sgl-kernel python3 -c "import sgl_kernel; print(f'[Debug-2] {sgl_kernel.__version__}')"
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 -c "import sgl_kernel; print(f'[Debug-2] {sgl_kernel.__version__}')"
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
