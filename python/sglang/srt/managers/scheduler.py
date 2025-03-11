@@ -416,7 +416,7 @@ class Scheduler:
         self.think_start_id = None
         self.think_end_id = None
 
-        if getattr(self.server_args, "reasoning-parser"):
+        if getattr(self.server_args, "reasoning_parser"):
             parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
