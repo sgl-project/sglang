@@ -649,7 +649,6 @@ register_conv_template(
         sep_style=SeparatorStyle.QWEN2_VL_EMBED,
         stop_str="<|endoftext|>",
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
-
     )
 )
 

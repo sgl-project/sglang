@@ -249,7 +249,7 @@ class ModelRunner:
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
-            
+
             if self.model_config.hf_config.architectures == ["DeepseekVL2ForCausalLM"]:
                 # TODO: deepseek-vl2 does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
