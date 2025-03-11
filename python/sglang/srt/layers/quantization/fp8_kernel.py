@@ -29,9 +29,12 @@ fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 if _is_cuda:
+    import deep_gemm
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
 logger = logging.getLogger(__name__)
+
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
 
 @triton.jit
@@ -722,34 +725,39 @@ def w8a8_block_fp8_matmul(
     num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
         N, config["BLOCK_SIZE_N"]
     )
-    kernel = (
-        _w8a8_block_fp8_matmul_unrolledx4
-        if (is_hip_ == True and num_workgroups <= get_device_core_count())
-        else _w8a8_block_fp8_matmul
-    )
 
-    kernel[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        **config,
-    )
+    # deepgemm only support bf16
+    if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+        deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+    else:
+        kernel = (
+            _w8a8_block_fp8_matmul_unrolledx4
+            if (is_hip_ == True and num_workgroups <= get_device_core_count())
+            else _w8a8_block_fp8_matmul
+        )
+
+        kernel[grid](
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            **config,
+        )
 
     return C
