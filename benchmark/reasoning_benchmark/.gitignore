@@ -1,7 +1,0 @@
-# temp file for reasoning benchmark
-*.sh
-*.txt
-*.jsonl
-*.ipynb
-# pycache
-__pycache__/
