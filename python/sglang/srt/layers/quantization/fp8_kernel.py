@@ -18,7 +18,6 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import deep_gemm
 import torch
 import triton
 import triton.language as tl
@@ -30,6 +29,7 @@ fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 if _is_cuda:
+    import deep_gemm
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
 logger = logging.getLogger(__name__)
