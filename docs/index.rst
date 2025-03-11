@@ -40,6 +40,7 @@ The core features include:
    backend/separate_reasoning.ipynb
    backend/custom_chat_template.md
    backend/quantization.md
+   backend/disabling_grammar_restrictions_in_reasoning_sections.ipynb
 
 .. toctree::
    :maxdepth: 1
