@@ -253,7 +253,7 @@ class ServerArgs:
             self.disable_cuda_graph = True
 
         # Expert parallelism
-        if self.enable_ep_moe or self.enable_deepep_moe:
+        if self.enable_ep_moe:
             self.ep_size = self.tp_size
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
@@ -270,6 +270,12 @@ class ServerArgs:
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
             )
+            # DeepEP MoE
+            if self.enable_deepep_moe:
+                self.ep_size = self.dp_size
+                logger.info(
+                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
+                )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
