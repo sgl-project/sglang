@@ -278,10 +278,10 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
+            self.disable_overlap_schedule = True
             logger.info(
-                "Overlap scheduler are disabled because of using "
+                "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
             # The token generated from the verify step is counted.
@@ -405,6 +405,7 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "w8a8_int8",
+                "w8a8_fp8",
             ],
             help="The quantization method.",
         )
@@ -479,7 +480,7 @@ class ServerArgs:
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -504,7 +505,7 @@ class ServerArgs:
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading",
+            help="How many GBs of RAM to reserve for CPU offloading.",
         )
 
         # Other runtime options
