@@ -154,6 +154,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -269,6 +270,12 @@ class ServerArgs:
                 f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
             )
+            # DeepEP MoE
+            if self.enable_deepep_moe:
+                self.ep_size = self.dp_size
+                logger.info(
+                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
+                )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -976,6 +983,11 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="Enabling DeepEP MoE implementation for moe.",
         )
 
         # Server warmups
