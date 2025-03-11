@@ -13,7 +13,6 @@ import triton
 import triton.language as tl
 from vllm import _custom_ops as vllm_ops
 
-from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.int8_kernel import (
@@ -526,6 +525,8 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
+            from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             A, A_scale = sgl_scaled_fp8_quant(A, A_scale)

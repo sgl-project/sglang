@@ -6,7 +6,6 @@ from torch.nn import Module
 from vllm import _custom_ops as vllm_ops
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -719,6 +718,10 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 
             for expert in range(layer.num_experts_per_partition):
                 if is_cuda:
+                    from sglang.srt.custom_op import (
+                        scaled_fp8_quant as sgl_scaled_fp8_quant,
+                    )
+
                     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
                         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                     )
