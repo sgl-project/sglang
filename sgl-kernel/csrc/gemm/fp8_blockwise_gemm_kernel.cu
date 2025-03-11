@@ -156,10 +156,20 @@ void launch_sm90_fp8_blockwise_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
 }
 
-template <typename OutType, typename MmaTileShape, typename PerSmTileShape, typename EpilogueTileShape,
-          typename ScalesPerTile, int TileSizeM_ = 128, class ClusterShape = Shape<_1, _1, _1>>
-void launch_sm100_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                                          const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
+template <
+    typename OutType,
+    typename MmaTileShape,
+    typename PerSmTileShape,
+    typename EpilogueTileShape,
+    typename ScalesPerTile,
+    int TileSizeM_ = 128,
+    class ClusterShape = Shape<_1, _1, _1>>
+void launch_sm100_fp8_blockwise_scaled_mm(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b) {
   static constexpr int ScaleMsPerTile = size<0>(ScalesPerTile{});
   static constexpr int ScaleGranularityM = size<0>(MmaTileShape{}) / ScaleMsPerTile;
   static constexpr int ScaleGranularityN = size<1>(MmaTileShape{}) / size<1>(ScalesPerTile{});
@@ -175,9 +185,12 @@ void launch_sm100_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tenso
   using LayoutD = cutlass::layout::RowMajor;
   using LayoutC = LayoutD;
   // This means both SFA and SFB are column-major.
-  using ScaleConfig =
-      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
-                                                 cute::UMMA::Major::MN, cute::UMMA::Major::K>;
+  using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<
+      ScaleGranularityM,
+      ScaleGranularityN,
+      ScaleGranularityK,
+      cute::UMMA::Major::MN,
+      cute::UMMA::Major::K>;
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -193,19 +206,42 @@ void launch_sm100_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tenso
   using OperatorClass = cutlass::arch::OpClassTensorOp;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, cutlass::arch::OpClassTensorOp, PerSmTileShape, ClusterShape, EpilogueTileShape, ElementAccumulator,
-      ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
+      ArchTag,
+      cutlass::arch::OpClassTensorOp,
+      PerSmTileShape,
+      ClusterShape,
+      EpilogueTileShape,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      LayoutC,
+      AlignmentC,
+      ElementD,
+      LayoutD,
+      AlignmentD,
       cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass, ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB,
-      cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      cute::tuple<LayoutA, LayoutSFA>,
+      AlignmentA,
+      ElementB,
+      cute::tuple<LayoutB, LayoutSFB>,
+      AlignmentB,
+      ElementAccumulator,
+      MmaTileShape,
+      ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
-                                                          CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   Gemm gemm_op;
@@ -231,8 +267,8 @@ void launch_sm100_fp8_blockwise_scaled_mm(torch::Tensor& out, const torch::Tenso
   LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 
-  typename GemmKernel::MainloopArguments mainloop_args{a_ptr,        a_stride,   b_ptr,        b_stride,
-                                                       scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
+  typename GemmKernel::MainloopArguments mainloop_args{
+      a_ptr, a_stride, b_ptr, b_stride, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
 
   typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, c_stride, c_ptr, c_stride};
   epilogue_args.thread.alpha = 1.0f;
@@ -268,8 +304,12 @@ void sm90_fp8_blockwise_dispatch_shape(
 }
 
 template <typename OutType>
-void sm100_fp8_blockwise_dispatch_shape(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b,
-                                        const torch::Tensor& scales_a, const torch::Tensor& scales_b) {
+void sm100_fp8_blockwise_dispatch_shape(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b) {
   if (a.size(0) <= 128) {
     using MmaTileShape = Shape<_64, _128, _128>;
     using PerSmTileShape = Shape<_64, _128, _128>;
@@ -342,23 +382,21 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #endif
 #endif
 
-
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+#if defined CUDA_VERSION && CUDA_VERSION >= 12800
   if (sm_version == 100) {
     int64_t original_rows = mat_a.size(0);
 
-    torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
-    torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
-    torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
+    TORCH_CHECK(a.size(0) % 4 == 0, "A M must be a multiple of 4 for minimum alignment requirement.");
+    TORCH_CHECK(scales_a.size(0) % 4 == 0, "scales_a M must be also a multiple of 4 for minimum alignment requirement.");
 
     if (out_dtype == torch::kBFloat16) {
-      sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out_padded, mat_a_padded, mat_b, scales_a_padded,
+      sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a_padded,
                                                               scales_b);
     } else {
-      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a_padded, scales_b);
     }
-    return out_padded.slice(0, 0, original_rows);
+    return out;
   }
 #endif
 #endif

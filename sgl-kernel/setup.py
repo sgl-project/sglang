@@ -121,7 +121,6 @@ nvcc_flags = [
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_100,code=sm_100",
     "-std=c++17",
     "-DFLASHINFER_ENABLE_F16",
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
@@ -176,6 +175,7 @@ if torch.cuda.is_available():
     if cuda_version >= (12, 0) and sm_version >= 90:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if cuda_version >= (12, 8) and sm_version >= 100:
+        nvcc_flags.append("-gencode=arch=compute_100,code=sm_100")
         nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
