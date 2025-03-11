@@ -4,7 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import partial_json_parser
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -507,7 +507,7 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, type[BaseFormatDetector]] = {
+    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "llama3": Llama32Detector,
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
