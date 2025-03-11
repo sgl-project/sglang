@@ -121,9 +121,6 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        if self.server_args.enable_deepep_moe:
-            logger.info("DeepEP is turned on.")
-
         if server_args.disable_outlines_disk_cache:
             from outlines.caching import disable_cache
 
@@ -252,6 +249,9 @@ class ModelRunner:
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
+
+        if server_args.enable_deepep_moe:
+            logger.info("DeepEP is turned on.")
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

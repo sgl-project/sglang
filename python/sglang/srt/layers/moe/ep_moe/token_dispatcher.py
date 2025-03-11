@@ -205,9 +205,9 @@ class DeepEPManager:
                 "https://github.com/deepseek-ai/deepep."
             )
         self.buffer = get_buffer(self.group, self.hidden_size * self.params_bytes)
-        self.low_latency_buffer = get_low_latency_buffer(
-            self.group, 256, self.hidden_size * self.params_bytes, self.num_experts
-        )
+        # self.low_latency_buffer = get_low_latency_buffer(
+        #     self.group, 256, self.hidden_size * self.params_bytes, self.num_experts
+        # )
 
     def dispatch(
         self,
