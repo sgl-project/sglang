@@ -191,7 +191,7 @@ class Conversation:
 
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i//2 + round_add_n}]{self.sep}"
+                    ret += f"[Round {i // 2 + round_add_n}]{self.sep}"
 
                 if message:
                     ret += f"{role}：{message}{self.sep}"
@@ -453,7 +453,6 @@ def generate_chat_conv(
                     conv.system_message = getattr(message.content[0], "text", "")
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
-            role = conv.roles[0]
             if isinstance(message.content, str):
                 conv.append_message(conv.roles[0], message.content)
             else:
