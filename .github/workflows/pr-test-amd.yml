@@ -48,7 +48,7 @@ jobs:
         run: |
           docker exec ci_sglang pip install --upgrade pip
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 -c "import sgl_kernel; print(f'[Debug-1] {sgl_kernel.__version__}')"
-          docker exec -w /sglang-checkout/sgl-kernel ci_sglang pip uninstall sgl-kernel
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang pip uninstall sgl-kernel -y
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 -c "import sgl_kernel; print(f'[Debug-2] {sgl_kernel.__version__}')"
           docker exec ci_sglang pip install -e "python[dev_hip]"
