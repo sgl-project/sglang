@@ -81,7 +81,7 @@ class ModelConfig:
         if context_length is not None:
             if context_length > derived_context_len:
                 if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="False"
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
@@ -237,6 +237,7 @@ class ModelConfig:
             "compressed_tensors",
             "compressed-tensors",
             "fbgemm_fp8",
+            "w8a8_fp8",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -250,9 +251,11 @@ class ModelConfig:
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
+            "w8a8_fp8",
         ]
         compatible_quantization_methods = {
-            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
+            "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
