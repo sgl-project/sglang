@@ -42,6 +42,7 @@ sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/torch_extension_rocm.cc",
+    "csrc/speculative/eagle_utils.cu"
 ]
 
 cxx_flags = ["-O3"]

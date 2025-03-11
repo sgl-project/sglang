@@ -61,6 +61,20 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+  // build_tree_kernel_efficient
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+  
+  // build_tree_kernel
+  m.def(
+      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
+      "int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
 }
 
 REGISTER_EXTENSION(common_ops)
