@@ -994,7 +994,7 @@ class Fp8MoEMethod:
                     layer.w13_weight_scale1,
                     layer.w2_weight_scale1,
                 )
-        elif is_cuda_:
+        elif _is_cuda:
             # Expert fusion with FP8 quantization
             return fused_experts(
                 x,
