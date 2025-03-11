@@ -383,20 +383,21 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-#if defined CUDA_VERSION && CUDA_VERSION >= 12800
+#if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version == 100) {
     int64_t original_rows = mat_a.size(0);
 
-    TORCH_CHECK(a.size(0) % 4 == 0, "A M must be a multiple of 4 for minimum alignment requirement.");
-    TORCH_CHECK(scales_a.size(0) % 4 == 0, "scales_a M must be also a multiple of 4 for minimum alignment requirement.");
+    torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+    torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+    torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
 
     if (out_dtype == torch::kBFloat16) {
-      sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a_padded,
-                                                              scales_b);
+      sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
     } else {
-      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a_padded, scales_b);
+      sm100_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
     }
-    return out;
+    return out_padded.slice(0, 0, original_rows);
   }
 #endif
 #endif
