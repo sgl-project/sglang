@@ -39,6 +39,7 @@ from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -415,30 +416,16 @@ class Scheduler:
         self.think_start_id = None
         self.think_end_id = None
 
-        # Get reasoning tokens from server args or use defaults
-        think_start_token = getattr(
-            self.server_args, "reasoning_start_token", "<think>"
-        )
-        think_end_token = getattr(self.server_args, "reasoning_end_token", "</think>")
-
-        try:
+        if getattr(self.server_args, "reasoning-parser"):
+            parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
             self.think_start_id = self.tokenizer.encode(
-                think_start_token, add_special_tokens=False
+                parser.think_start_token, add_special_tokens=False
             )[0]
             self.think_end_id = self.tokenizer.encode(
-                think_end_token, add_special_tokens=False
+                parser.think_end_token, add_special_tokens=False
             )[0]
-            print(
-                f"Initialized reasoning tokens: start={think_start_token} (ID={self.think_start_id}), end={think_end_token} (ID={self.think_end_id})"
-            )
-            if getattr(self.server_args, "disable_grammar_in_reasoning", False):
-                print(
-                    f"Grammar restrictions will be disabled within reasoning sections ({think_start_token}...{think_end_token})"
-                )
-        except Exception as e:
-            # If we can't encode these tokens, leave them as None
-            print(f"Failed to encode reasoning tokens: {e}")
-            pass
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
