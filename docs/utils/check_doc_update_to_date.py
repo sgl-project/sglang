@@ -14,7 +14,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 EXCLUDE_MODELS = {
     "python.sglang.srt.models.registry",
-    "python.sglang.srt.models.torch_native_llama",
 }
 
 DOC = "docs/references/supported_models.md"

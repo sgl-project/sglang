@@ -521,4 +521,7 @@ class TorchNativePhi3ForCausalLM(TorchNativeLlamaForCausalLM):
     pass
 
 
-EntryClass = [TorchNativeLlamaForCausalLM, TorchNativePhi3ForCausalLM]
+EntryClass = [
+    (TorchNativeLlamaForCausalLM, "Llama"),
+    (TorchNativePhi3ForCausalLM, "Phi-3"),
+]
