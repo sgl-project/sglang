@@ -73,7 +73,7 @@ def benchmark(batch_size, provider):
             quantiles=quantiles,
         )
 
-    return ms, min_ms, max_ms
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":

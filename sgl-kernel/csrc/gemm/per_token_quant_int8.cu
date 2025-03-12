@@ -7,7 +7,7 @@
 #include "utils.h"
 
 // Function adapted from https://github.com/vllm-project/vllm/blob/53056731fdf8aa8f960cd3473b01a36d5cb0281d/csrc/quantization/compressed_tensors/int8_quant_kernels.cu#L15
-static inline __device__ int8_t float_to_int8_rn(float x) {
+static inline __device__ int8_t float_to_int8_rn(float src) {
 #ifdef USE_ROCM
   static constexpr auto i8_min =
       static_cast<float>(std::numeric_limits<int8_t>::min());
@@ -18,15 +18,12 @@ static inline __device__ int8_t float_to_int8_rn(float x) {
   // It uses the current rounding mode, which is always FE_TONEAREST on HIP.
   // If that changes in the future, we may need to set the rounding mode
   // explicitly, either at runtime or compile time.
-  float dst = std::nearbyint(x);
-
-  // saturate
+  float dst = std::nearbyint(src);
   dst = std::clamp(dst, i8_min, i8_max);
   return static_cast<int8_t>(dst);
 #else
-  // CUDA path
   uint32_t dst;
-  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(x));
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(src));
   return reinterpret_cast<const int8_t&>(dst);
 #endif
 }
@@ -67,14 +64,14 @@ __global__ void per_token_quant_int8_kernel(
 
   max_value = blockReduceMax(max_value);
 
-  __shared__ float block_max;
+  __shared__ float scale;
   if (tid == 0) {
-    block_max = max_value / 127.0f;
-    output_s[token_idx] = block_max;
+    scale = max_value / 127.0f;
+    output_s[token_idx] = scale;
   }
   __syncthreads();
 
-  const float scale_val = 1.0f / block_max;
+  const float scale_inv = 1.0f / scale;
 
   // Quantize using vectorized loads
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
@@ -84,7 +81,7 @@ __global__ void per_token_quant_int8_kernel(
     int8_t output_arr[vec_size];
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_val, 127.0f), -128.0f);
+      float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, 127.0f), -128.0f);
       output_arr[j] = float_to_int8_rn(val);
     }
 
@@ -106,7 +103,7 @@ void sgl_per_token_quant_int8(torch::Tensor input, torch::Tensor output_q, torch
 
   TORCH_CHECK(hidden_dim % 8 == 0, "Hidden dimension must be divisible by 8, but got ", hidden_dim);
 
-  const int block_size = 256;
+  int block_size = 1024;
   const int num_blocks = num_tokens;
 
   dim3 grid(num_blocks);
