@@ -47,7 +47,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -75,7 +75,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        assert "man" in text or "person" in text, text
+        assert "cab" in text or "taxi" in text or "SUV" in text, text
+        assert "iron" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -169,7 +171,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        print(text)
+        print(f"LLM response: {text}")
         assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
@@ -379,6 +381,8 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
+                "--chunked-prefill-size",
+                "10000",
             ],
         )
         cls.base_url += "/v1"
@@ -408,7 +412,7 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
+class TestVLMContextLengthIssue(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -433,7 +437,7 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         with self.assertRaises(openai.BadRequestError) as cm:
@@ -459,9 +463,11 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
                 temperature=0,
             )
 
-        self.assertIn(
-            "Multimodal prompt is too long after expanding multimodal tokens.",
-            str(cm.exception),
+        # context length is checked first, then max_req_input_len, which is calculated from the former
+        assert (
+            "Multimodal prompt is too long after expanding multimodal tokens."
+            in str(cm.exception)
+            or "is longer than the model's context length" in str(cm.exception)
         )
 
 
