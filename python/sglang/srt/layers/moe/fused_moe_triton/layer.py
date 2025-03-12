@@ -6,7 +6,12 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.cpu_utils import get_actual_shard_size, reset_param_data_if_needed
+from sglang.srt.cpu_utils import (
+    cpu_has_amx_support,
+    get_actual_shard_size,
+    prepack_weight_if_needed,
+    reset_param_data_if_needed,
+)
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -25,6 +30,9 @@ if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
+
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 import logging
 
@@ -114,6 +122,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+
+        # Pack weight for get better performance on CPU
+        layer.w13_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(layer.w13_weight.data),
+            requires_grad=False,
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(layer.w2_weight.data),
+            requires_grad=False,
+        )
+
         return
 
     def apply(
@@ -216,20 +235,50 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
         inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
-        return moe_forward_native(
-            layer,
-            x,
-            use_grouped_topk,
-            top_k,
-            router_logits,
-            renormalize,
-            topk_group,
-            num_expert_group,
-            custom_routing_function,
-            correction_bias,
-        )
+        assert activation == "silu", f"activation = {activation} is not supported."
+
+        if cpu_has_amx_support():
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                torch_native=True,
+            )
+
+            return sgl_kernel.cpu.fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                True,  # inplace
+            )
+        else:
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                inplace,
+                no_combine,
+            )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")

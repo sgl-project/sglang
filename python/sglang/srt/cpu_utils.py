@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
 DEFAULT_MOE_PADDING_SIZE = 32
+
+try:
+    from sgl_kernel.cpu import convert_weight_packed
+
+    is_intel_amx_backend_available = True
+except:
+    is_intel_amx_backend_available = False
 
 
 def update_config(model_config: ModelConfig, tp_size: int) -> ModelConfig:
@@ -49,3 +58,16 @@ def reset_param_data_if_needed(param_data, dim, start, length):
 
     param_data.narrow(dim, start, length).zero_()
     return
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return convert_weight_packed(weight)
