@@ -525,7 +525,7 @@ def synchronized(func):
     return wrapper
 
 
-class MLATokenToKVPoolHost:
+class MHATokenToKVPoolHost:
 
     def __init__(
         self,
