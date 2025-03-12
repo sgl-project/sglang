@@ -215,7 +215,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print("Triton expert_ids:", expert_ids_triton)
         print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
-    
+
     if torch.allclose(expert_ids_cuda, expert_ids_vllm) and torch.allclose(
         num_tokens_post_pad_cuda, num_tokens_post_pad_vllm
     ):
@@ -259,7 +259,7 @@ def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
 )
 def benchmark(num_tokens, num_experts, topk, provider):
     block_size = 128
-    
+
     if USE_RANDOM_PERM:
         topk_ids = get_topk_ids(num_tokens, num_experts, topk)
     else:
