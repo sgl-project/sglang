@@ -36,7 +36,7 @@ runtime_common = [
     "python-multipart",
     "pyzmq>=25.1.2",
     "torchao>=0.7.0",
-    "transformers==4.48.3",
+    "transformers @ git+https://github.com/huggingface/transformers.git@v4.49.0-AyaVision",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.15",
