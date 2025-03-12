@@ -330,8 +330,11 @@ class GemmaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        for name, param in self.named_modules():
+            print(f"1 gemma, name: {name}, param.shape: {param.shape}")
         loaded_params = set()
         for name, loaded_weight in weights:
+            print(f"2 gemma, name: {name}, loaded_weight.shape: {loaded_weight.shape}")
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue

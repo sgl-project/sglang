@@ -255,13 +255,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            elif "language_model" in name :
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            elif "language_model" in name:
+                self.language_model.load_weights([(name, loaded_weight)])
 
-        #load language model
-        self.language_model.load_weights(weights)
 
 EntryClass = PaliGemmaForConditionalGeneration
     
