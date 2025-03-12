@@ -83,7 +83,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_output_processor_mixin import (
-    SchedulerOutputProcessingMixin,
+    SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -132,7 +132,7 @@ class EmbeddingBatchResult:
     bid: int
 
 
-class Scheduler(SchedulerOutputProcessingMixin):
+class Scheduler(SchedulerOutputProcessorMixin):
     """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
