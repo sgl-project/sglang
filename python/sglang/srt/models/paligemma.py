@@ -243,11 +243,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
-        for name, param in params_dict.items():
-            print(f"1 name: {name} and param shape: {param.shape}")
         weights = list(weights) 
         for name, loaded_weight in weights:
-            print(f"2 name: {name} and weight shape: {loaded_weight.shape}")
             if "projector" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
@@ -257,7 +254,6 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
             elif "language_model" in name:
                 self.language_model.load_weights([(name, loaded_weight)])
-
 
 EntryClass = PaliGemmaForConditionalGeneration
     
