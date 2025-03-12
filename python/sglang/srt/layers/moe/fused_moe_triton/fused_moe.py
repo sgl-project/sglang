@@ -1139,7 +1139,7 @@ def fused_experts_impl(
 
         if no_combine:
             pass
-        elif _is_hip_:
+        elif _is_hip:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
