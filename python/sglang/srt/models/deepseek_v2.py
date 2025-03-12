@@ -63,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import get_bool_env_var, add_prefix, is_cuda_available, is_hip
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda_available, is_hip
 
 _is_hip = is_hip()
 
@@ -163,7 +163,9 @@ class DeepseekV2MoE(nn.Module):
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
-            num_shared_experts=config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0,
+            num_shared_experts=(
+                config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0
+            ),
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -571,12 +573,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     and forward_batch.extend_prefix_lens.sum() == 0
                 )
             # TODO ROCM prefill MHA
-            #elif is_hip_ and get_bool_env_var("CK_MOE"):
+            # elif is_hip_ and get_bool_env_var("CK_MOE"):
             #    return (
             #        forward_batch.forward_mode.is_extend()
             #        and not forward_batch.forward_mode.is_target_verify()
             #        and not forward_batch.forward_mode.is_draft_extend()
-            #    )                
+            #    )
             else:
                 # Triton: Use normal computation for prefill and use weight absorption for extend/decode
                 return (
@@ -1058,10 +1060,7 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        if (
-            is_hip_
-            and get_bool_env_var("CK_MOE")
-        ):
+        if is_hip_ and get_bool_env_var("CK_MOE"):
             model_dim = hidden_states.shape[-1]
             num_tokens = hidden_states.view(-1, model_dim).shape[0]
             if not self.aiter_init:
@@ -1111,9 +1110,7 @@ class DeepseekV2Model(nn.Module):
                     device="cuda",
                 )
                 self.ns_topk_weights, self.s_topk_weights = (
-                    self.total_topk_weights.split(
-                        [top_k, num_topK_pad_experts], dim=1
-                    )
+                    self.total_topk_weights.split([top_k, num_topK_pad_experts], dim=1)
                 )
                 shared_E_score = 1.0
                 self.s_topk_weights.fill_(shared_E_score)
@@ -1127,7 +1124,6 @@ class DeepseekV2Model(nn.Module):
                     mlp.experts.total_topk_ids = self.total_topk_ids
                     mlp.experts.ns_topk_weights = self.ns_topk_weights
                     mlp.experts.ns_topk_ids = self.ns_topk_ids
-
 
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -1198,7 +1194,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
-            num_shared_experts=self.config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0,
+            num_shared_experts=(
+                self.config.n_shared_experts
+                if get_bool_env_var("CK_MOE") and is_hip_
+                else 0
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1227,7 +1227,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                if is_hip_ and get_bool_env_var("CK_MOE") and "mlp.shared_experts" in name:
+                if (
+                    is_hip_
+                    and get_bool_env_var("CK_MOE")
+                    and "mlp.shared_experts" in name
+                ):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.

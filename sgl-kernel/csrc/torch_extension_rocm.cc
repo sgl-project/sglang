@@ -68,7 +68,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "Tensor! retrive_next_sibling, "
       "int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
-  
+
   // build_tree_kernel
   m.def(
       "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "

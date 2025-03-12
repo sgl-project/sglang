@@ -57,9 +57,9 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 _is_hip = is_hip()
 
 if _is_hip:
+    from aiter import biased_grouped_topk
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
-    from aiter import biased_grouped_topk
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +463,7 @@ class Fp8MoEMethod:
         if is_hip_ and get_bool_env_var("CK_MOE"):
             num_experts += num_shared_experts
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-        
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = (
                 torch.int32
@@ -876,14 +876,16 @@ class Fp8MoEMethod:
         # Expert selection
         if is_hip_ and get_bool_env_var("CK_MOE") and correction_bias is not None:
             token = x.shape[0]
-            biased_grouped_topk(router_logits,
-                                correction_bias,
-                                layer.ns_topk_weights[:token],
-                                layer.ns_topk_ids[:token],
-                                num_expert_group,
-                                topk_group,
-                                renormalize,
-                                layer.routed_scaling_factor)
+            biased_grouped_topk(
+                router_logits,
+                correction_bias,
+                layer.ns_topk_weights[:token],
+                layer.ns_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+                layer.routed_scaling_factor,
+            )
             topk_ids = layer.total_topk_ids[:token]
             topk_weights = layer.total_topk_weights[:token]
         else:

@@ -20,6 +20,12 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -42,12 +48,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-    tensor_model_parallel_all_reduce,
-)
 
 _is_hip = is_hip()
 
@@ -84,7 +84,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
+
         self.aiter_init = False
         self.num_experts_per_tok = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts

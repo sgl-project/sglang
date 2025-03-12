@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
 _is_cuda = is_cuda()
 
@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 if is_hip_:
+    from aiter import biased_grouped_topk
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
-    from aiter import biased_grouped_topk
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -420,7 +420,6 @@ class EPMoE(torch.nn.Module):
                 ("w1", ckpt_gate_proj_name),
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
-
             ]
         ] + [
             (
@@ -429,7 +428,11 @@ class EPMoE(torch.nn.Module):
                     if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
                     else "experts.w2_"
                 ),
-                f"shared_experts.{expert_id}.{weight_name}." if num_shared_experts >= 2 else f"shared_experts.{weight_name}.",
+                (
+                    f"shared_experts.{expert_id}.{weight_name}."
+                    if num_shared_experts >= 2
+                    else f"shared_experts.{weight_name}."
+                ),
                 -num_shared_experts + expert_id,
                 shard_id,
             )
@@ -440,7 +443,7 @@ class EPMoE(torch.nn.Module):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
-        
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -449,7 +452,9 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id >= 0 and (expert_id < self.start_expert_id or expert_id > self.end_expert_id):
+        if expert_id >= 0 and (
+            expert_id < self.start_expert_id or expert_id > self.end_expert_id
+        ):
             return
         if expert_id >= 0:
             expert_id = expert_id - self.start_expert_id
@@ -812,7 +817,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     torch.max(layer.w13_weight_scale, dim=1).values,
                     requires_grad=False,
                 )
-        
+
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if is_hip_:
@@ -863,15 +868,16 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
     ) -> torch.Tensor:
         if is_hip_ and get_bool_env_var("CK_MOE"):
             token = x.shape[0]
-            biased_grouped_topk(router_logits,
-                                layer.correction_bias,
-                                layer.ns_topk_weights[:token],
-                                layer.ns_topk_ids[:token],
-                                num_expert_group,
-                                topk_group,
-                                renormalize,
-                                layer.routed_scaling_factor
-                                )
+            biased_grouped_topk(
+                router_logits,
+                layer.correction_bias,
+                layer.ns_topk_weights[:token],
+                layer.ns_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+                layer.routed_scaling_factor,
+            )
             topk_ids = layer.total_topk_ids[:token]
             topk_weights = layer.total_topk_weights[:token]
 

@@ -656,15 +656,16 @@ def decode_attention_fwd(
         )
     elif is_hip_ and get_bool_env_var("CK_MOE"):
         from aiter.mla import mla_decode_fwd
+
         mla_decode_fwd(
-                q,
-                k_buffer.view(-1, 1, 1, q.shape[-1]),
-                o,
-                kv_indptr,
-                kv_indices,
-                attn_logits,
-                sm_scale,
-                logit_cap,
+            q,
+            k_buffer.view(-1, 1, 1, q.shape[-1]),
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            sm_scale,
+            logit_cap,
         )
         k_buffer = k_buffer.reshape(-1, 1, q.shape[-1])
     else:
