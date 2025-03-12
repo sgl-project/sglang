@@ -8,7 +8,6 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import deep_gemm
 import torch
 import triton
 import triton.language as tl
@@ -28,6 +27,7 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 _is_hip = is_hip()
 
 
@@ -37,10 +37,10 @@ padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
+    import deep_gemm
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
@@ -599,7 +599,7 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    if _is_cuda:
+    if _is_cuda and _enable_jit_deepgemm:
         invalid_ids = topk_ids.numel()
         M = num_tokens_post_padded[0]
         clipped_token_ids = torch.empty(
