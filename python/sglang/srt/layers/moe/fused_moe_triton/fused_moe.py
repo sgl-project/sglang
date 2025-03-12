@@ -598,27 +598,35 @@ def invoke_fused_moe_kernel(
 
     if _is_cuda:
         invalid_ids = topk_ids.numel()
-        clipped_token_ids = sorted_token_ids[: num_tokens_post_padded[0]]
+        M = num_tokens_post_padded[0]
+        clipped_token_ids = torch.empty(
+            M, device=sorted_token_ids.device, dtype=sorted_token_ids.dtype
+        )
+        clipped_token_ids.copy_(sorted_token_ids[:M])
 
         A_, idx_inverse = apply_token_ids(A, clipped_token_ids, top_k, invalid_ids)
         A_scale_, _ = apply_token_ids(A_scale, clipped_token_ids, top_k, invalid_ids)
 
-        expert_ids_ = torch.repeat_interleave(
-            expert_ids, config["BLOCK_SIZE_M"], dim=0
-        )[: num_tokens_post_padded[0]]
+        expert_ids_ = torch.empty(M, device=expert_ids.device, dtype=expert_ids.dtype)
+        expert_M = M // config["BLOCK_SIZE_M"]
+        expert_ids_.copy_(
+            torch.repeat_interleave(
+                expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
+            )
+        )
         expert_ids_[clipped_token_ids == invalid_ids] = -1
 
-        C_flatten = torch.empty(
-            (A_.shape[0], B.shape[1]),
+        C_2d = torch.empty(
+            (M, B.shape[1]),
             device=C.device,
             dtype=C.dtype,
         )
 
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (A_, A_scale_), (B, B_scale), C_flatten, expert_ids_
+            (A_, A_scale_), (B, B_scale), C_2d, expert_ids_
         )
 
-        C_ = C_flatten[clipped_token_ids != invalid_ids][idx_inverse].view(C.shape)
+        C_ = C_2d[clipped_token_ids != invalid_ids][idx_inverse].view(C.shape)
         if mul_routed_weight:
             C_ *= topk_weights[:, :, None]
         C.copy_(C_)
