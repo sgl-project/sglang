@@ -206,6 +206,8 @@ class MHATokenToKVPool(KVCache):
         self.layer_num = layer_num
         self._create_buffers()
 
+        self.layer_transfer_counter = None
+
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
             f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
@@ -267,12 +269,28 @@ class MHATokenToKVPool(KVCache):
             self.k_buffer[i][indices] = k_data[i]
             self.v_buffer[i][indices] = v_data[i]
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        k_data, v_data = flat_data[0], flat_data[1]
+        self.k_buffer[layer_id][indices] = k_data
+        self.v_buffer[layer_id][indices] = v_data
+
     def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id)
+
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id].view(self.dtype)
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id)
+
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id].view(self.dtype)
         return self.v_buffer[layer_id]
@@ -529,6 +547,9 @@ class MHATokenToKVPoolHost:
 
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[:, layer_id, indices]
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
