@@ -36,6 +36,7 @@ is_hip_ = is_hip()
 if is_hip_:
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter import biased_grouped_topk
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -846,22 +847,16 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
         if is_hip_ and get_bool_env_var("CK_MOE"):
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                use_grouped_topk=use_grouped_topk,
-                top_k=top_k,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                correction_bias=layer.correction_bias,
-            )
-
-            # TODO these can be removed when "select_experts" is inplaced op
             token = x.shape[0]
-            layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
-            layer.ns_topk_ids[:token] = topk_ids
+            biased_grouped_topk(router_logits,
+                                layer.correction_bias,
+                                layer.ns_topk_weights[:token],
+                                layer.ns_topk_ids[:token],
+                                num_expert_group,
+                                topk_group,
+                                renormalize,
+                                layer.routed_scaling_factor
+                                )
             topk_ids = layer.total_topk_ids[:token]
             topk_weights = layer.total_topk_weights[:token]
 

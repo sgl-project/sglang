@@ -59,6 +59,7 @@ is_hip_ = is_hip()
 if is_hip_:
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter import biased_grouped_topk
 
 logger = logging.getLogger(__name__)
 
@@ -873,17 +874,30 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-        )
+        if is_hip_ and get_bool_env_var("CK_MOE") and correction_bias is not None:
+            token = x.shape[0]
+            biased_grouped_topk(router_logits,
+                                correction_bias,
+                                layer.ns_topk_weights[:token],
+                                layer.ns_topk_ids[:token],
+                                num_expert_group,
+                                topk_group,
+                                renormalize,
+                                layer.routed_scaling_factor)
+            topk_ids = layer.total_topk_ids[:token]
+            topk_weights = layer.total_topk_weights[:token]
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+            )
 
         if is_hip_ and get_bool_env_var("USE_INT4_WEIGHT"):
             # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
@@ -905,11 +919,6 @@ class Fp8MoEMethod:
             ), f"CK_MOE: FP8 and/or FP8 bloack_quant {activation=} will be supported later, unset CK_MOE"
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                token = x.shape[0]
-                layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
-                layer.ns_topk_ids[:token] = topk_ids
-                topk_ids = layer.total_topk_ids[:token]
-                topk_weights = layer.total_topk_weights[:token]
                 return asm_moe(
                     x,
                     layer.w13_weight,
