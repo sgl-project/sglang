@@ -72,13 +72,17 @@ show_time_cost = False
 time_infos = {}
 
 
+# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
-    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
 
 
+def is_rocm() -> bool:
+    return torch.cuda.is_available() and torch.version.hip
+
+
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.version.cuda is not None
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_cuda_alike():
@@ -100,11 +104,11 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def is_cuda_available():
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def enable_show_time_cost():
