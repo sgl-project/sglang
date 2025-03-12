@@ -230,11 +230,10 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        vision_path = self.config.mm_vision_tower
-    
         self.vision_tower = SiglipVisionModel.from_pretrained(
-            vision_path, torch_dtype=torch.float16
-            ).cuda()
+            self.config._name_or_path, 
+            torch_dtype=torch.float16
+        ).to("cuda")
 
         self.vision_tower.eval()
 
@@ -243,9 +242,6 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             "model.mm_projector.0": "multi_modal_projector.linear",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
-
-        # self.vision_feature_layer = self.config.mm_vision_select_layer
-        # self.vision_feature_select_strategy = self.config.mm_vision_select_feature
 
         params_dict = dict(self.named_parameters())
         weights = list(weights)
