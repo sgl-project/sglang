@@ -38,12 +38,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
-    from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -51,9 +51,8 @@ if TYPE_CHECKING:
 
 
 class ForwardMode(IntEnum):
-    # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
-    PREFILL = auto()
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+    # It is also called "prefill" in common terminology.
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
@@ -153,11 +152,14 @@ class ForwardBatch:
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
+    # For logits and logprobs post processing
+    temp_scaled_logprobs: bool = False
+    temperature: torch.Tensor = None
+    top_p_normalized_logprobs: bool = False
+    top_p: torch.Tensor = None
+
     # Position information
     positions: torch.Tensor = None
-
-    # For decode
-    decode_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -189,7 +191,7 @@ class ForwardBatch:
 
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: BaseTokenToKVPool = None
+    token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
     # For DP attention
@@ -229,7 +231,6 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -382,8 +383,6 @@ def compute_position_triton(
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
-    has_prefix = extend_prefix_lens.shape[0] == batch_size
-
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
     )
@@ -397,7 +396,7 @@ def compute_position_triton(
         extend_start_loc,
         extend_prefix_lens,
         extend_seq_lens,
-        has_prefix,
+        next_power_of_2(batch_size),
     )
 
     return positions, extend_start_loc
@@ -409,18 +408,17 @@ def compute_position_kernel(
     extend_start_loc,
     extend_prefix_lens,
     extend_seq_lens,
-    has_prefix: tl.constexpr,
+    bs_upper: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(0).to(tl.int64)
 
-    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
+    prefix_len = tl.load(extend_prefix_lens + pid)
     seq_len = tl.load(extend_seq_lens + pid)
 
-    # TODO: optimize this?
-    cumsum_start = 0
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
+    load_offset = tl.arange(0, bs_upper)
+    cumsum_elems = tl.load(extend_seq_lens + load_offset, mask=load_offset < pid)
+    cumsum_start = tl.sum(cumsum_elems)
 
     num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
     for i in range(num_loop):

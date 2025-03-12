@@ -1,52 +1,65 @@
-from abc import ABC, abstractmethod
-from typing import Callable, List, Tuple
+from __future__ import annotations
+
+"""Cache for chunked prefill, used when RadixCache is disabled."""
+
+from typing import TYPE_CHECKING, Any, Callable, List, Tuple
+
+import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
-class BasePrefixCache(ABC):
-    """Cache can be indexed by either rid or key."""
+class ChunkCacheEntry:
+    def __init__(self, rid: str, value: torch.Tensor):
+        self.rid = rid
+        self.value = value
 
-    @abstractmethod
+
+class ChunkCache(BasePrefixCache):
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+    ):
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
     def reset(self):
         pass
 
-    @abstractmethod
-    def match_prefix(self, **kwargs) -> Tuple[List[int], int]:
-        pass
+    def match_prefix(self, **unused_kwargs) -> Tuple[List[int], int]:
+        return [], None
 
-    @abstractmethod
-    def insert(self, **kwargs):
-        pass
+    def cache_finished_req(self, req: Req):
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
+        ]
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.token_to_kv_pool_allocator.free(kv_indices)
 
-    @abstractmethod
-    def cache_finished_req(self, **kwargs):
-        pass
+    def cache_unfinished_req(self, req: Req):
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(req.fill_ids)
+        ]
 
-    @abstractmethod
-    def cache_unfinished_req(self, **kwargs):
-        pass
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        req.prefix_indices = kv_indices
 
-    @abstractmethod
-    def evict(self, num_tokens: int, evict_callback: Callable):
-        pass
-
-    @abstractmethod
-    def inc_lock_ref(self, node):
-        pass
-
-    @abstractmethod
-    def dec_lock_ref(self, node):
-        pass
-
-    @abstractmethod
-    def evictable_size(self):
-        pass
-
-    @abstractmethod
-    def protected_size(self):
+    def insert(self):
         raise NotImplementedError()
 
-    def total_size(self):
-        raise NotImplementedError()
+    def evict(self, num_tokens: int):
+        pass
+
+    def inc_lock_ref(self, node: Any):
+        return 0
+
+    def dec_lock_ref(self, node: Any):
+        return 0
 
     def pretty_print(self):
-        raise NotImplementedError()
+        return ""

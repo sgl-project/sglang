@@ -122,7 +122,7 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int, evict_callback=None):
+    def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
