@@ -243,11 +243,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
-        for name, param in params_dict.items():
-            print(f"1 name: {name}, param: {param.shape}")
         weights = list(weights) 
         for name, loaded_weight in weights:
-            print(f"2 name: {name}, loaded_weight: {loaded_weight.shape}")
             if "projector" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
