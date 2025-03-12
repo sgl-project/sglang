@@ -55,10 +55,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     device_loading_context,
-    get_model,
     get_model_loader,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -430,7 +430,7 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # Only support vllm DefaultModelLoader for now
+        # Only support the DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
