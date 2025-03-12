@@ -1175,6 +1175,17 @@ class PrefillScheduler:
 
             # if req.is_being_chunked <= 0:
             req.output_ids.append(next_token_id)
+            print("????? before output ids: ", req.output_ids)
+
+            # sync cache
+            self.tree_cache.cache_finished_req(req)
+            # print("????? after output ids: ", req.output_ids)
+
+            # request is finished at the prefill side
+            # if self.enable_overlap:
+            #     # Free the one delayed token
+            #     self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
+            #     continue
 
         if self.attn_tp_rank == 0:
             # kv cache sending
@@ -1195,10 +1206,12 @@ class PrefillScheduler:
                 import ctypes
                 # print("11111 reqs: ", batch.reqs)
                 # print("22222 req_to_token_pool: ", batch.req_to_token_pool)
-                token_ids = (batch.reqs[0].origin_input_ids + batch.reqs[0].output_ids)[:-1]
-                device_indices = self.req_to_token_pool.req_to_token[batch.reqs[0].req_pool_idx, :len(token_ids)]
+                token_ids = (batch.reqs[0].origin_input_ids + batch.reqs[0].output_ids)
+                print("input ids: ", batch.reqs[0].origin_input_ids)
+                print("output ids: ", batch.reqs[0].output_ids)
+                device_indices = self.req_to_token_pool.req_to_token[batch.reqs[0].req_pool_idx, :len(token_ids) - 1]
                 print("!!!!!!! device indices shape: ", device_indices.shape)
-                print("!!!!!!! device indices: ", device_indices)
+                print("!!!!!!! device indices + 1: ", device_indices)
                 kv_cache_device = self.token_to_kv_pool.get_flat_data(device_indices)
                 kv_cache_host = kv_cache_device.cpu().contiguous()
                 # kv_cache = b"a" * 1024  # 1KB test data, TODO: replace with real data
@@ -1210,6 +1223,8 @@ class PrefillScheduler:
                 self.kv_cache_sender.send_kv_cache(buffer, remote_ip, remote_port, kv_cache_size)
             finally:
                 lock.release()
+
+        self.token_to_kv_pool.free_group_end()
         
 
     # def process_batch_result_prefill(

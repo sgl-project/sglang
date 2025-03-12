@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import setproctitle
 import torch
+import torch.distributed as dist
 import zmq
 
 from sglang.global_config import global_config
@@ -348,6 +349,10 @@ class DecodeScheduler:
         # Session info
         self.sessions: Dict[str, Session] = {}
 
+        # TODO: to be removed
+        self.is_mixed_chunk = False
+        self.chunked_prefill_size = None
+
         # Init chunked prefill
         # self.chunked_prefill_size = server_args.chunked_prefill_size
         # if self.chunked_prefill_size <= 0:  # -1 means disable
@@ -617,7 +622,7 @@ class DecodeScheduler:
         recv_req: PrefillOnlyOutput
     ):
         # parse prefill result
-        sample_params = SamplingParams(temperature=0.7) # TODO: need to have a sample param parser
+        sample_params = SamplingParams(temperature=0.7, stop=[]) # TODO: need to have a sample param parser
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -637,6 +642,7 @@ class DecodeScheduler:
             prefill_instance_ip_port=recv_req.prefill_instance_ip_port,
             decode_instance_ip_port=recv_req.decode_instance_ip_port
         )
+        req.tokenizer = self.tokenizer
 
         # stream output
         req.output_ids = recv_req.output_ids
@@ -644,15 +650,36 @@ class DecodeScheduler:
 
         # TODO: kick off kv cache pulling
         # TODO: remove hard coding value here
+        token_ids = req.origin_input_ids + req.output_ids
+        context_length = len(token_ids) - 1
+        shape = (self.token_to_kv_pool.layer_num, context_length, 1, 576)
+
         if self.attn_tp_rank == 0:
             remote_ip = "127.0.0.1"
             remote_port = 4000
-            kv_cache_size = 27 * (len(req.origin_input_ids)) * 576 * 2
+            kv_cache_size = self.token_to_kv_pool.layer_num * (context_length) * 576 * 2
             buffer = self.kv_cache_receiver.pull_kv_cache(remote_ip, remote_port, kv_cache_size)
-            shape = (27, len(req.origin_input_ids), 1, 576)
+            shape = (self.token_to_kv_pool.layer_num, context_length, 1, 576)
             buffer_view = memoryview(buffer)
             kv_cache = torch.frombuffer(buffer_view, dtype=torch.bfloat16).clone().reshape(shape)
-            print(kv_cache)
+            # Move tensor to GPU for rank 0
+            kv_cache = kv_cache.to(f'cuda:{self.attn_tp_rank}')
+        else:
+            kv_cache = torch.empty(shape, dtype=torch.bfloat16, device=f'cuda:{self.attn_tp_rank}')
+
+        # Broadcast actual tensor data
+        dist.broadcast(kv_cache, src=0)
+        print(f"Rank {self.attn_tp_rank} received:", kv_cache)
+
+        # copy kv cache to managed kv pool, and let tree cache keep track of it
+        device_indices = self.token_to_kv_pool.alloc(context_length)
+        for i in range(self.token_to_kv_pool.layer_num):
+            self.token_to_kv_pool.kv_buffer[i][device_indices] = kv_cache[i]
+        
+        self.tree_cache.insert(token_ids, device_indices.clone())
+
+        # self.req_to_token_pool.req_to_token[req.req_pool_idx][:context_length] = device_indices
+        self.waiting_queue.append(req)
 
     def distribute_to_prefill(
         self,
@@ -959,43 +986,177 @@ class DecodeScheduler:
                 raise ValueError(msg)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        # Merge the prefill batch into the running batch
-        # if self.last_batch and self.last_batch.forward_mode.is_extend():
-        #     if self.being_chunked_req:
-        #         # Move the chunked request out of the batch
-        #         self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
-        #         self.tree_cache.cache_unfinished_req(self.being_chunked_req)
-        #         # being chunked request keeps its rid but will get a new req_pool_idx
-        #         self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
-        #         self.batch_is_full = False
+        # this doing excat same as get_new_batch_prefill
+        # but the req here already have all kv indices be precomputed.
+        new_decode_batch = self.get_new_batch_for_deocde()
 
-        #     if not self.last_batch.is_empty():
-        #         if self.running_batch is None:
-        #             self.running_batch = self.last_batch
-        #         else:
-        #             self.running_batch.merge_batch(self.last_batch)
-
-
-        # TODO: get new batch from finished prefill request
-        # new_batch = self.get_new_batch_prefill()
-        # if new_batch is not None:
-            # pass new batch to prefill instance
-            # call prefill
-            # pass
-
-
-        # Run decode
         if self.running_batch is None:
-            ret = None
+            self.running_batch = new_decode_batch
         else:
+            if new_decode_batch is not None:
+                self.running_batch.merge_batch(new_decode_batch)
+
+        if self.running_batch is not None:
             self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch
 
-        # Handle DP attention
-        # if self.server_args.enable_dp_attention:
-        #     ret = self.prepare_dp_attn_batch(ret)
-
+        ret = self.running_batch
         return ret
+    
+    def get_new_batch_for_deocde(self) -> Optional[ScheduleBatch]:
+        # Check if the grammar is ready in the grammar queue
+        # if self.grammar_queue:
+        #     self.move_ready_grammar_requests()
+
+        # Handle the cases where prefill is not allowed
+        # if (
+        #     self.batch_is_full or len(self.waiting_queue) == 0
+        # ) and self.being_chunked_req is None:
+        #     return None
+
+        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
+        if running_bs >= self.max_running_requests:
+            self.batch_is_full = True
+            return None
+
+        # Get priority queue
+        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+
+        # Prefill policy
+        adder = PrefillAdder(
+            self.tree_cache,
+            self.token_to_kv_pool,
+            self.running_batch,
+            self.new_token_ratio,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
+        )
+
+        # has_being_chunked = self.being_chunked_req is not None
+        # if has_being_chunked:
+        #     self.being_chunked_req.init_next_round_input()
+        #     self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
+
+        # if self.lora_paths:
+        #     lora_set = (
+        #         set([req.lora_path for req in self.running_batch.reqs])
+        #         if self.running_batch is not None
+        #         else set([])
+        #     )
+
+        # Get requests from the waiting queue to a new prefill batch
+        for req in self.waiting_queue:
+            # if (
+            #     self.lora_paths
+            #     and len(
+            #         lora_set
+            #         | set([req.lora_path for req in adder.can_run_list])
+            #         | set([req.lora_path])
+            #     )
+            #     > self.max_loras_per_batch
+            # ):
+            #     self.batch_is_full = True
+            #     break
+
+            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                self.batch_is_full = True
+                break
+
+            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            # print("!!!!!! debug req: ", req)
+            if self.enable_hierarchical_cache and req.last_node is not None:
+                if req.last_node.evicted:
+                    # loading KV cache for the request
+                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
+                        req.last_node,
+                        req.prefix_indices,
+                        adder.rem_total_tokens,
+                    )
+                    if req.last_node.loading:
+                        # to prevent frequent cache invalidation
+                        if req.rid in self.staging_reqs:
+                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                        self.tree_cache.inc_lock_ref(req.last_node)
+                        self.staging_reqs[req.rid] = req.last_node
+                        continue
+                elif req.last_node.loading:
+                    if not self.tree_cache.loading_complete(req.last_node):
+                        continue
+
+                if req.rid in self.staging_reqs:
+                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
+                    del self.staging_reqs[req.rid]
+
+            res = adder.add_one_req(req)
+            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if self.enable_hierarchical_cache:
+                        # Set batch_is_full after making sure there are requests that can be served
+                        self.batch_is_full = len(adder.can_run_list) > 0 or (
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
+                    else:
+                        self.batch_is_full = True
+                break
+            if self.server_args.prefill_only_one_req:
+                break
+
+        # Update waiting queue
+        can_run_list = adder.can_run_list
+        if len(can_run_list) == 0:
+            return None
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        # if adder.new_being_chunked_req is not None:
+        #     assert self.being_chunked_req is None
+        #     self.being_chunked_req = adder.new_being_chunked_req
+
+        # if self.being_chunked_req:
+        #     self.being_chunked_req.is_being_chunked += 1
+
+        # Print stats
+        # if self.attn_tp_rank == 0:
+            # self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
+            # self.log_prefill_stats(adder, can_run_list, running_bs, False)
+
+        # Create a new batch
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            self.server_args.enable_custom_logit_processor,
+            self.server_args.return_hidden_states,
+        )
+        new_batch.prepare_for_extend()
+
+        # convert list[int] to tensor, also assume output_id for each req is length = 1
+        new_batch.output_ids = torch.tensor([req.output_ids[0] for req in can_run_list]).to(f'cuda:{self.attn_tp_rank}')
+
+
+        # Mixed-style chunked prefill
+        # if (
+        #     self.is_mixed_chunk
+        #     and self.running_batch is not None
+        #     and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        # ):
+        #     # TODO (lianmin): support return_logprob + mixed chunked prefill
+        #     self.running_batch.filter_batch()
+        #     if not self.running_batch.is_empty():
+        #         self.running_batch.prepare_for_decode()
+        #         new_batch.mix_with_running(self.running_batch)
+        #         new_batch.decoding_reqs = self.running_batch.reqs
+        #     self.running_batch = None
+        # else:
+        #     new_batch.decoding_reqs = None
+
+        return new_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
@@ -1211,6 +1372,8 @@ class DecodeScheduler:
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+                if (self.attn_tp_rank == 0):
+                    print("!!!!!!! debug model_worker_batch: ", model_worker_batch)
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )

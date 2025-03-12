@@ -317,6 +317,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         super().__init__(size, dtype, device)
 
         self.kv_lora_rank = kv_lora_rank
+        self.layer_num = layer_num
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -330,7 +331,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     dtype=self.store_dtype,
                     device=device,
                 )
-                for _ in range(layer_num)
+                for _ in range(self.layer_num)
             ]
 
     def get_key_buffer(self, layer_id: int):
@@ -363,7 +364,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
-        flatten = torch.stack([self.kv_buffer[i][indices] for i in range(len(self.kv_buffer))])
+        flatten = torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
         return flatten
 
 
