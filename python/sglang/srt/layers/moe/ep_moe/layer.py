@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
-if is_hip_:
+if _is_hip:
     from aiter import biased_grouped_topk
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -185,7 +185,7 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             self.routed_scaling_factor = routed_scaling_factor
             self.expert_mask = torch.zeros(
                 (self.num_experts + self.num_shared_experts + 1),
@@ -210,7 +210,7 @@ class EPMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             # Matrix multiply.
             final_hidden_states = self.quant_method.apply(
                 layer=self,
@@ -820,7 +820,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip_:
+            if _is_hip:
                 # activation_scheme: dynamic
                 w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.w13_weight,
@@ -866,7 +866,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             token = x.shape[0]
             biased_grouped_topk(
                 router_logits,

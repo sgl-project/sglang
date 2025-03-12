@@ -654,7 +654,7 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap,
         )
-    elif is_hip_ and get_bool_env_var("CK_MOE"):
+    elif _is_hip and get_bool_env_var("CK_MOE"):
         from aiter.mla import mla_decode_fwd
 
         mla_decode_fwd(

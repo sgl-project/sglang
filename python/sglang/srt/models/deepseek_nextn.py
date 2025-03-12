@@ -102,7 +102,7 @@ class DeepseekModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             model_dim = hidden_states.shape[-1]
             num_tokens = hidden_states.view(-1, model_dim).shape[0]
             if not self.aiter_init:
@@ -257,7 +257,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             num_experts=self.config.n_routed_experts,
             num_shared_experts=(
                 self.config.n_shared_experts
-                if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1" and is_hip_
+                if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1" and _is_hip
                 else 0
             ),
         )
@@ -305,7 +305,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 if (
-                    is_hip_
+                    _is_hip
                     and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1"
                     and "mlp.shared_experts" in name
                 ):

@@ -164,7 +164,7 @@ class DeepseekV2MoE(nn.Module):
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
             num_shared_experts=(
-                config.n_shared_experts if get_bool_env_var("CK_MOE") and is_hip_ else 0
+                config.n_shared_experts if get_bool_env_var("CK_MOE") and _is_hip else 0
             ),
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -195,7 +195,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -573,7 +573,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     and forward_batch.extend_prefix_lens.sum() == 0
                 )
             # TODO ROCM prefill MHA
-            # elif is_hip_ and get_bool_env_var("CK_MOE"):
+            # elif _is_hip and get_bool_env_var("CK_MOE"):
             #    return (
             #        forward_batch.forward_mode.is_extend()
             #        and not forward_batch.forward_mode.is_target_verify()
@@ -1060,7 +1060,7 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             model_dim = hidden_states.shape[-1]
             num_tokens = hidden_states.view(-1, model_dim).shape[0]
             if not self.aiter_init:
@@ -1196,7 +1196,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts,
             num_shared_experts=(
                 self.config.n_shared_experts
-                if get_bool_env_var("CK_MOE") and is_hip_
+                if get_bool_env_var("CK_MOE") and _is_hip
                 else 0
             ),
         )
@@ -1228,7 +1228,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 if (
-                    is_hip_
+                    _is_hip
                     and get_bool_env_var("CK_MOE")
                     and "mlp.shared_experts" in name
                 ):

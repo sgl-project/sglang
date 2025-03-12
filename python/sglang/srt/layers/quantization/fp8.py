@@ -460,7 +460,7 @@ class Fp8MoEMethod:
         num_shared_experts: Optional[int] = 0,
         **extra_weight_attrs,
     ):
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             num_experts += num_shared_experts
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -874,7 +874,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        if is_hip_ and get_bool_env_var("CK_MOE") and correction_bias is not None:
+        if _is_hip and get_bool_env_var("CK_MOE") and correction_bias is not None:
             token = x.shape[0]
             biased_grouped_topk(
                 router_logits,
