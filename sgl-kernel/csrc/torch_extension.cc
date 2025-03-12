@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/core/dispatch/Dispatcher.h>
+#include <cuda_fp16.h>  // for __half
 #include <torch/library.h>
 
 #include "sgl_kernel_ops.h"
@@ -136,6 +137,18 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
       "int topk, int depth, int draft_token_num) -> ()");
   m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+
+  /*
+   * From csrc/kvcacheio
+   */
+  m.def(
+      "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int item_size) -> ()");
+  m.impl("transfer_kv_per_layer", torch::kCUDA, &transfer_kv_per_layer);
+  m.def(
+      "transfer_kv_all_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int item_size, int num_layers, int layer_offset) -> ()");
+  m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
 
   /*
    * From FlashInfer

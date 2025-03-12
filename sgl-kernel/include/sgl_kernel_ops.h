@@ -214,6 +214,29 @@ void build_tree_kernel(
     int64_t draft_token_num);
 
 /*
+ * From csrc/kvcacheio
+ */
+void transfer_kv_per_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size);
+
+void transfer_kv_all_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t layer_offset);
+
+/*
  * From FlashInfer
  */
 void min_p_sampling_from_probs(

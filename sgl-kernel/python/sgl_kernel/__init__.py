@@ -45,4 +45,5 @@ from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
     tree_speculative_sampling_target_only,
 )
+from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_all_layer
 from sgl_kernel.version import __version__
