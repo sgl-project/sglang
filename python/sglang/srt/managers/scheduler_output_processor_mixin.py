@@ -2,13 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from sglang.srt.disaggregation.metrics import update_disagg_metrics_in_scheduler_metrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
-    BatchMultimodalDecodeReq,
-    BatchTokenIDOut,
-)
+from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:

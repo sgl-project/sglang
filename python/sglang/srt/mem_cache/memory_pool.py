@@ -320,9 +320,17 @@ class MHATokenToKVPool(KVCache):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        if self.capture_mode:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                self.k_buffer[layer_id][loc] = cache_k
+            self.v_buffer[layer_id][loc] = cache_v
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v

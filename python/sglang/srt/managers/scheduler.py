@@ -1059,7 +1059,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.running_batch.batch_is_full = True
                 break
 
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
 
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
@@ -1459,6 +1462,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         for i, req in enumerate(self.waiting_queue):
             if req.rid.startswith(recv_req.rid):
                 to_del.append(i)
+                break
 
         # Sort in reverse order to avoid index issues when deleting
         for i in sorted(to_del, reverse=True):
