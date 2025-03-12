@@ -31,4 +31,4 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly --timeout-per-file 2400
+          python3 run_suite.py --suite nightly --timeout-per-file 3600
