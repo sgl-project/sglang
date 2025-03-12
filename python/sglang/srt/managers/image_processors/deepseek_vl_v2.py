@@ -20,13 +20,22 @@
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
+import asyncio
 
 import torch
+import contextlib
 import torchvision.transforms as T
 from PIL import Image, ImageOps
 from torch.nn.utils.rnn import pad_sequence
 from transformers import LlamaTokenizerFast
+from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
+
+from sglang.srt.managers.image_processor import BaseImageProcessor
+from sglang.srt.managers.image_processors.base_image_processor import (
+    get_global_processor,
+)
+from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
 def select_best_resolution(image_size, candidate_resolutions):
@@ -458,3 +467,83 @@ class DeepseekVLV2Processor(ProcessorMixin):
         ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
 
         return tokenized_str, images_list, images_seq_mask, images_spatial_crop
+
+
+class DeepseekVL2ImageProcessor(BaseImageProcessor):
+    def __init__(self, hf_config, server_args, _processor):
+        with contextlib.suppress(ValueError):
+            AutoProcessor.register("DeepseekVLV2Processor", DeepseekVLV2Processor)
+        super().__init__(hf_config, server_args, _processor)
+        self.IMAGE_TOKEN = "<image>"
+
+    @staticmethod
+    def _process_images_task(image, input_text, max_req_input_len):
+        return get_global_processor().__call__(
+            conversations=input_text, images=image, max_req_input_len=max_req_input_len
+        )
+
+    async def _process_images(
+        self, image_data, input_text, max_req_input_len
+    ):
+        if self.executor is not None:
+            loop = asyncio.get_event_loop()
+            image_inputs = await loop.run_in_executor(
+                self.executor,
+                DeepseekVL2ImageProcessor._process_images_task,
+                image_data,
+                input_text,
+                max_req_input_len,
+            )
+        else:
+            image_inputs = self._process_images_task(
+                image_data, input_text, max_req_input_len
+            )
+
+        return image_inputs
+
+    async def process_images_async(
+        self, image_data, input_ids, request_obj, max_req_input_len, *args, **kwargs
+    ):
+        if not image_data:
+            return None
+
+        if not isinstance(image_data, list):
+            image_data = [image_data]
+
+        images, image_hashes, image_sizes = [], [], []
+
+        # for image in image_data:
+        #     pil_image, _size = load_image(image)
+        #     pil_image = pil_image.convert("RGB")
+        #     images += [pil_image]
+        #     image_hashes += [hash(image)]
+        #     image_sizes += [_size]
+        image_token = self.IMAGE_TOKEN
+        base_output = self.load_images(
+            max_req_input_len, input_ids, image_data, image_token
+        )
+        base_output.all_frames = [img.convert("RGB") for img in base_output.all_frames]
+        res = await self._process_single_image(
+            base_output.all_frames, base_output.input_text, max_req_input_len
+        )
+        pixel_values = res["images"]
+        input_ids = res["input_ids"]
+        images_seq_mask = res["images_seq_mask"]
+        images_spatial_crop = res["images_spatial_crop"]
+        batched_images_spatial_crop = []
+        batched_images_spatial_crop.append(images_spatial_crop)
+        batched_images_spatial_crop = torch.stack(batched_images_spatial_crop, dim=0)
+
+        return {
+            "input_ids": input_ids.tolist(),
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "image_seq_mask": images_seq_mask,
+            "image_spatial_crop": batched_images_spatial_crop,
+            "modalities": request_obj.modalities or ["image"],
+        }
+
+ImageProcessorMapping = {
+    DeepseekVL2ForCausalLM: DeepseekVL2ImageProcessor,
+}
