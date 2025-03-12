@@ -441,28 +441,6 @@ class Req:
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
-    def get_next_inc_detokenization(self):
-        if self.tokenizer is None:
-            return False, ""
-        read_ids, read_offset = self.init_incremental_detokenize()
-        surr_ids = read_ids[:read_offset]
-
-        surr_text = self.tokenizer.decode(
-            surr_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-        new_text = self.tokenizer.decode(
-            read_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-
-        if len(new_text) > len(surr_text) and not new_text.endswith("�"):
-            return True, new_text[len(surr_text) :]
-
-        return False, ""
-
     def check_finished(self):
         if self.finished():
             return
