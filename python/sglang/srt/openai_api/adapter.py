@@ -876,7 +876,7 @@ def v1_chat_generate_request(
     lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
-
+    openai_compatible_messages_list = []
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -916,7 +916,7 @@ def v1_chat_generate_request(
                     openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
-
+                openai_compatible_messages_list.append(openai_compatible_messages)
                 try:
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
@@ -1006,10 +1006,15 @@ def v1_chat_generate_request(
         image_data_list.append(image_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
-        else:
+        if (
+            len(openai_compatible_messages_list) > 0
+            and len(openai_compatible_messages_list[0]) > 0
+        ):
+            prompt_kwargs = {"text": str(openai_compatible_messages_list[0])}
+        elif not isinstance(input_ids[0], str):
             prompt_kwargs = {"input_ids": input_ids[0]}
+        else:
+            prompt_kwargs = {"text": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         return_logprobs = return_logprobs[0]
