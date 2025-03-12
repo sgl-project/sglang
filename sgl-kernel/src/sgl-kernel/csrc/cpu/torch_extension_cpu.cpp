@@ -49,7 +49,7 @@ void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
 // gemm
-void weight_packed_linear(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2,
+at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
     std::optional<at::Tensor>& bias, bool is_vnni);
 
 // fused moe

@@ -341,14 +341,13 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 // mat1 : [M, K]
 // mat2 : [N, K]
 // bias : [N]
-// out  : [M, N] support non-contiguous tensor
+// out  : [M, N]
 //
-void weight_packed_linear(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2,
+at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
     std::optional<at::Tensor>& bias, bool is_vnni) {
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(out);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
 
@@ -356,8 +355,10 @@ void weight_packed_linear(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2,
   int N = mat2.size(0);
   int K = mat2.size(1);
   CHECK_EQ(mat1.size(1), K);
-  CHECK_EQ(out.size(0), M);
-  CHECK_EQ(out.size(1), N);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  auto out = at::empty({M, N}, mat1.options());
 
   // strides
   int mat1_strideM = mat1.stride(0);
@@ -382,4 +383,6 @@ void weight_packed_linear(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2,
         mat1_strideM,
         out_strideM);
   });
+
+  return out;
 }
