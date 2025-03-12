@@ -87,6 +87,7 @@ def set_seed(seed_value):
 
 
 def prepare_samples(eval_args: EvalArgs):
+    print("preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
 
@@ -110,6 +111,7 @@ def prepare_samples(eval_args: EvalArgs):
             eval_args.dataset_path, subject, split=eval_args.split
         )
         sub_dataset_list.append(sub_dataset)
+        # break
 
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
@@ -426,9 +428,26 @@ def calculate_ins_level_acc(results: Dict):
     return acc / ins_num
 
 
-def eval_result(output_path, answer_dict):
+def process_result(response, sample, answer_dict, out_samples):
+    if sample["question_type"] == "multiple-choice":
+        pred_ans = parse_multi_choice_response(
+            response, sample["all_choices"], sample["index2ans"]
+        )
+    else:  # open question
+        pred_ans = response
+
+    out_samples[sample["id"]] = pred_ans
+
+    # set ground truth answer
+    answer_dict[sample["id"]] = {
+        "question_type": sample["question_type"],
+        "ground_truth": sample["answer"],
+    }
+
+
+def eval_result(model_answer_path, answer_dict):
     print("Evaluating...")
-    output_dict = json.load(open(output_path))
+    output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
 
     # group by category
@@ -521,7 +540,7 @@ def eval_result(output_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
-    out = output_path
+    out = model_answer_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")
