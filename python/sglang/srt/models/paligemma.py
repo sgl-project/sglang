@@ -44,7 +44,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         
         super().__init__()
         self.config = config
-        self.languag_model = GemmaForCausalLM(
+        self.language_model = GemmaForCausalLM(
             config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
@@ -99,7 +99,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.last_hidden_state        
+        selected_image_feature = image_outputs.last_hidden_state #Note: from transformers     
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
 
@@ -239,14 +239,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         #load mm_projector
         projector_weights = {
-            "model.mm_projector.0": "multi_modal_projector.linear",
-            "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "multi_modal_projector.linear": "multi_model_projector.linear", 
         }
 
         params_dict = dict(self.named_parameters())
-        weights = list(weights)
+        for name, param in params_dict.items():
+            print(f"1 name: {name}, param: {param.shape}")
+        weights = list(weights) 
         for name, loaded_weight in weights:
-            if "projector" in name or "vision_tower" in name:
+            print(f"2 name: {name}, loaded_weight: {loaded_weight.shape}")
+            if "projector" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
