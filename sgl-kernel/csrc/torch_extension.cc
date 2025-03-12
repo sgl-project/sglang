@@ -147,7 +147,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("transfer_kv_per_layer", torch::kCUDA, &transfer_kv_per_layer);
   m.def(
       "transfer_kv_all_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
-      "dst_indices, int item_size, int num_layers, int layer_offset) -> ()");
+      "dst_indices, int item_size, int num_layers, int src_layer_offset, int dst_layer_offset) -> ()");
   m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
 
   /*

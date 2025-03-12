@@ -24,7 +24,8 @@ def transfer_kv_all_layer(
     dst_indices: torch.Tensor,
     cache_size: int,
     num_layers: int,
-    layer_offset: int,
+    src_layer_offset: int,
+    dst_layer_offset: int,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer(
         src_k,
@@ -35,5 +36,6 @@ def transfer_kv_all_layer(
         dst_indices,
         cache_size,
         num_layers,
-        layer_offset,
+        src_layer_offset,
+        dst_layer_offset,
     )
