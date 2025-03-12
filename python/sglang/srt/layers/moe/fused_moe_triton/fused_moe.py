@@ -42,6 +42,7 @@ _is_rocm = torch.cuda.is_available() and torch.version.hip
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
@@ -525,11 +526,12 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
-            A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            if _is_cuda:
+                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            else:
+                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2

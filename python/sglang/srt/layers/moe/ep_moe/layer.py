@@ -28,6 +28,12 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -717,11 +723,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
 
             for expert in range(layer.num_experts_per_partition):
-                if is_cuda:
-                    from sglang.srt.custom_op import (
-                        scaled_fp8_quant as sgl_scaled_fp8_quant,
-                    )
-
+                if _is_cuda:
                     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
                         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                     )
