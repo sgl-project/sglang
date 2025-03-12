@@ -230,6 +230,29 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="janus-pro",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "User": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+        image_token="<image_placeholder>\n",
+    )
+)
+
 # The difference between "llama-3-instruct-llava" and "llama-3-instruct" is that llava uses a different image_token.
 register_chat_template(
     ChatTemplate(
@@ -382,6 +405,12 @@ def match_deepseek(model_path: str):
         "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
     ) and "base" not in model_path.lower():
         return get_chat_template("deepseek-v3")
+
+
+@register_chat_template_matching_function
+def match_deepseek_janus_pro(model_path: str):
+    if "janus" in model_path.lower():
+        return get_chat_template("janus-pro")
 
 
 @register_chat_template_matching_function
