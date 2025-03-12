@@ -29,7 +29,7 @@ is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -330,7 +330,7 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_hip_:
+    if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
@@ -364,7 +364,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip_:
+    if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
@@ -403,7 +403,7 @@ def extend_attention_fwd(
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=is_hip_,
+        STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
