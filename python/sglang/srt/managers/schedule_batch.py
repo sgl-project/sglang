@@ -158,14 +158,18 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
-    # MiniCPMV related
+    # The id of the single-image placeholder token
+    im_token_id: Optional[torch.Tensor] = None
     # All the images in the batch should share the same special image
     # bound token ids.
-    im_start_id: Optional[torch.Tensor] = None
-    im_end_id: Optional[torch.Tensor] = None
-    slice_start_id: Optional[torch.Tensor] = None
-    slice_end_id: Optional[torch.Tensor] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
     tgt_sizes: Optional[list] = None
+
+    # denotes the number of valid image tokens in each image
+    images_emb_mask: Optional[torch.BoolTensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -186,11 +190,13 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:

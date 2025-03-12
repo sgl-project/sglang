@@ -23,10 +23,11 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cuda,
     is_hip,
 )
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,7 @@ enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
-_is_rocm = torch.cuda.is_available() and torch.version.hip
+_is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
@@ -46,7 +46,7 @@ if _is_cuda:
         sglang_per_token_group_quant_fp8,
     )
 
-if _is_cuda or _is_rocm:
+if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
@@ -679,7 +679,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 32,
                 "num_warps": 8,
-                "num_stages": 2 if is_hip_ else 4,
+                "num_stages": 2 if _is_hip else 4,
             }
             if M <= E:
                 config = {
@@ -688,7 +688,7 @@ def get_default_config(
                     "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 1,
                     "num_warps": 4,
-                    "num_stages": 2 if is_hip_ else 4,
+                    "num_stages": 2 if _is_hip else 4,
                 }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
@@ -698,7 +698,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": block_shape[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,
-                "num_stages": 2 if is_hip_ else 3,
+                "num_stages": 2 if _is_hip else 3,
             }
     else:
         config = {
@@ -976,7 +976,7 @@ def fused_experts_impl(
     if (
         not (use_fp8_w8a8 or use_int8_w8a8)
         or block_shape is not None
-        or (is_hip_ and get_bool_env_var("CK_MOE"))
+        or (_is_hip and get_bool_env_var("CK_MOE"))
     ):
         padded_size = 0
 
@@ -1131,7 +1131,7 @@ def fused_experts_impl(
 
         if no_combine:
             pass
-        elif is_hip_:
+        elif _is_hip:
             ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
