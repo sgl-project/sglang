@@ -197,23 +197,20 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         num_tokens_post_pad_triton,
     )
 
-    # Skip VLLM test for non-32 multiple experts
-    if num_experts % 32 == 0:
-        try:
-            ops.moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids_vllm,
-                expert_ids_vllm,
-                num_tokens_post_pad_vllm,
-            )
-            vllm_works = True
-        except RuntimeError as e:
-            print(f"❌ VLLM implementation failed: {e}")
-            vllm_works = False
-    else:
-        print(f"⚠️ Skipping VLLM test for {num_experts} experts (not divisible by 32)")
+    # Try VLLM implementation regardless of num_experts
+    try:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids_vllm,
+            expert_ids_vllm,
+            num_tokens_post_pad_vllm,
+        )
+        print(f"✅ VLLM implementation works with {num_experts} experts!")
+        vllm_works = True
+    except RuntimeError as e:
+        print(f"❌ VLLM implementation failed with {num_experts} experts: {e}")
         vllm_works = False
 
     if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
@@ -235,7 +232,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print("✅ SGL and VLLM implementations match")
     else:
         if not vllm_works:
-            print("⚠️ VLLM comparison skipped")
+            print("⚠️ VLLM comparison skipped due to failure")
         else:
             print("❌ SGL and VLLM implementations do not match")
             print("SGL expert_ids:", expert_ids_cuda)
@@ -333,11 +330,6 @@ def benchmark(num_tokens, num_experts, topk, provider):
             quantiles=quantiles,
         )
     else:  # vllm
-        # Skip VLLM test for non-multiple of 32 experts
-        if num_experts % 32 != 0:
-            # Return extreme values to show as missing data in the chart
-            return float("inf"), float("inf"), float("inf")
-
         try:
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: ops.moe_align_block_size(
@@ -350,8 +342,9 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 ),
                 quantiles=quantiles,
             )
-        except RuntimeError:
-            # If there's a CUDA error, return extreme values
+        except RuntimeError as e:
+            print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
+            # Return extreme values to indicate failure in the chart
             return float("inf"), float("inf"), float("inf")
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
