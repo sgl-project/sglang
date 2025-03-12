@@ -242,9 +242,9 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
             print("VLLM num_tokens_post_pad:", num_tokens_post_pad_vllm)
 
 
-# Add 8 experts to test range
+# Test range
 num_tokens_range = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-num_experts_range = [8, 32, 64, 128, 256]  # Added 8 experts
+num_experts_range = [8, 32, 64, 128, 256]
 topk_range = [2, 4, 8]
 
 configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
@@ -367,7 +367,7 @@ if __name__ == "__main__":
         "--num_experts",
         type=int,
         default=256,
-        choices=[8, 16, 32, 64, 128, 256],  # Added more options
+        choices=[8, 16, 32, 64, 128, 256],
         help="Number of experts for benchmark",
     )
     parser.add_argument(
@@ -387,14 +387,5 @@ if __name__ == "__main__":
     calculate_diff(num_tokens=1024, num_experts=args.num_experts, topk=args.topk)
     
     if not args.skip_full_benchmark:
-        # Install matplotlib if needed
-        try:
-            import matplotlib
-        except ImportError:
-            import sys
-            import subprocess
-            print("⚠️ matplotlib not found, attempting to install...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib"])
-        
         print(f"\n📊 Running performance benchmark for {args.num_experts} experts...")
         benchmark.run(print_data=True)
