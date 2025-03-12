@@ -311,9 +311,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.grammar_backend = None
 
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
-            self.schedule_policy, self.tree_cache, self.enable_hierarchical_cache
-        )
+        self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"

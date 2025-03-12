@@ -73,7 +73,11 @@ class CacheAgnosticPolicy(Enum):
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
-    def __init__(self, policy: str, tree_cache: BasePrefixCache):
+    def __init__(
+        self,
+        policy: str,
+        tree_cache: BasePrefixCache,
+    ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
 
