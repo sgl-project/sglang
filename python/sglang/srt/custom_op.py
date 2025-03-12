@@ -74,7 +74,7 @@ if _is_cuda:
         """
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
-        out_dtype = torch.float8_e4m3fnuz if _is_rocm else torch.float8_e4m3fn
+        out_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
         output = torch.empty(shape, device=input.device, dtype=out_dtype)
 
         if scale is None:
