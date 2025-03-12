@@ -45,6 +45,7 @@ class SeparatorStyle(IntEnum):
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
     QWEN2_VL_EMBED = auto()
+    PALIGEMMA = auto()
 
 
 @dataclasses.dataclass
@@ -623,6 +624,20 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="minicpmv",
+        system_message="You are a helpful assistant",
+        system_template="<|im_start|>system\n{system_message}.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
+    )
+)
+
+# Reference: https://huggingface.co/google/paligemma-3b-pt-224#usage
+register_conv_template(
+    Conversation(
+        name="paligemma",
         system_message="You are a helpful assistant",
         system_template="<|im_start|>system\n{system_message}.",
         roles=("<|im_start|>user", "<|im_start|>assistant"),

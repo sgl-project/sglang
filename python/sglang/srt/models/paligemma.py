@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from transformers import (
     PaliGemmaConfig,
-    SiglipVisionModel,
+    SiglipVisionModel
 )
 from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModalProjector
 
@@ -34,8 +34,7 @@ from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
 
 
-
-class PaliGemmaForConditionalGeneration(nn.module):
+class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: PaliGemmaConfig,
@@ -100,18 +99,7 @@ class PaliGemmaForConditionalGeneration(nn.module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-
-        image_outputs = image_outputs.hidden_states[self.vision_feature_layer]
-
-        if self.vision_feature_select_strategy in ["default", "patch"]:
-            selected_image_feature = selected_image_feature[:, 1:]
-        elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
-        else:
-            raise ValueError(
-                f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
-            )
-        
+        selected_image_feature = image_outputs.last_hidden_state        
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
 
@@ -256,8 +244,8 @@ class PaliGemmaForConditionalGeneration(nn.module):
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
 
-        self.vision_feature_layer = self.config.mm_vision_select_layer
-        self.vision_feature_select_strategy = self.config.mm_vision_select_feature
+        # self.vision_feature_layer = self.config.mm_vision_select_layer
+        # self.vision_feature_select_strategy = self.config.mm_vision_select_feature
 
         params_dict = dict(self.named_parameters())
         weights = list(weights)

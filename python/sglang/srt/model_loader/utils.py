@@ -33,7 +33,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
         and "MixtralForCausalLM" in architectures
     ):
         architectures = ["QuantMixtralForCausalLM"]
-
+    print(f"Model architectures: {architectures}")
     return ModelRegistry.resolve_model_cls(architectures)
 
 

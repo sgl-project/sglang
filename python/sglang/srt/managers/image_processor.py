@@ -459,11 +459,11 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.executor,
-                PaliGemmaImageProcessor._process_single_image_task
+                PaliGemmaImageProcessor._process_images_task,
                 image_data,
             )
         else:
-            return self._process_single_image_task(image_data)
+            return self._process_images_task(image_data)
 
     async def process_images_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs

@@ -20,7 +20,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, PaliGemmaConfig, GemmaConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -297,12 +297,15 @@ class GemmaForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
+        if isinstance(config, PaliGemmaConfig):
+            self.config = config.text_config
+        elif isinstance(config, GemmaConfig):
+            self.config = config
         self.quant_config = quant_config
         self.model = GemmaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            self.config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(self.config)
 
     @torch.no_grad()
     def forward(
