@@ -37,6 +37,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
+from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_all_layer
 
 logger = logging.getLogger(__name__)
 
@@ -217,22 +218,16 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            self.k_buffer = torch.empty(
+                (self.layer_num, self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.empty(
+                (self.layer_num, self.size + 1, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -271,6 +266,19 @@ class MHATokenToKVPool(KVCache):
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def transfer_per_layer_kernel(
+        self, host_pool, host_indices, device_indices, layer_id
+    ):
+        transfer_kv_per_layer(
+            host_pool.get_key_buffer(layer_id),
+            self.k_buffer[layer_id],
+            host_pool.get_value_buffer(layer_id),
+            self.v_buffer[layer_id],
+            host_indices,
+            device_indices,
+            self.head_num * self.head_dim,
+        )
 
     def transfer_per_layer(self, indices, flat_data, layer_id):
         # transfer prepared data from host to device
@@ -488,8 +496,8 @@ class MHATokenToKVPoolHost:
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 3.0,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_to_device_ratio: float = 4.0,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
         assert (
@@ -545,6 +553,12 @@ class MHATokenToKVPoolHost:
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
 
+    def get_key_buffer(self, layer_id):
+        return self.kv_buffer[0, layer_id]
+
+    def get_value_buffer(self, layer_id):
+        return self.kv_buffer[1, layer_id]
+
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
 
@@ -553,6 +567,20 @@ class MHATokenToKVPoolHost:
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
+
+    def transfer_all_layer_kernel(self, device_pool, src_indices, dst_indices):
+        transfer_kv_all_layer(
+            device_pool.k_buffer,
+            self.kv_buffer[0].pin_memory(),
+            device_pool.v_buffer,
+            self.kv_buffer[1].pin_memory(),
+            src_indices,
+            dst_indices,
+            self.head_num * self.head_dim,
+            self.layer_num,
+            self.head_num * self.head_dim * (device_pool.size + 1),
+            self.head_num * self.head_dim * self.size,
+        )
 
     @debug_timing
     def transfer(self, indices, flat_data):
