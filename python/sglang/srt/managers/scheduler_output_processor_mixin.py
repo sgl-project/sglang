@@ -2,13 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from sglang.srt.disaggregation.metrics import update_disagg_metrics_in_scheduler_metrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
-    BatchMultimodalDecodeReq,
-    BatchTokenIDOut,
-)
+from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -191,7 +186,6 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            assert batch.spec_algorithm.is_none()
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
@@ -441,7 +435,6 @@ class SchedulerOutputProcessorMixin:
     def stream_output_generation(
         self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
     ):
-        """Stream the output to detokenizer."""
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 
@@ -519,7 +512,6 @@ class SchedulerOutputProcessorMixin:
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
-
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
@@ -557,7 +549,7 @@ class SchedulerOutputProcessorMixin:
         # Send to detokenizer
         if rids:
             if self.model_config.is_multimodal_gen:
-                raise NotImplementedError()
+                return
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
