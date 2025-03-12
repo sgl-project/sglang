@@ -161,6 +161,9 @@ class ForwardBatch:
     # Position information
     positions: torch.Tensor = None
 
+    # For decode
+    decode_seq_lens_cpu: Optional[torch.Tensor] = None
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
