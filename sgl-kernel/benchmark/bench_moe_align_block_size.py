@@ -197,7 +197,6 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         num_tokens_post_pad_triton,
     )
 
-    # Try VLLM implementation regardless of num_experts
     try:
         ops.moe_align_block_size(
             topk_ids,
