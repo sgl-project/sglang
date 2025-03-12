@@ -40,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import add_prefix, is_hip
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -277,7 +277,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if is_hip_:
+                    if _is_hip:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=self_attn.kv_b_proj.weight_scale_inv,
@@ -301,7 +301,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 and self_attn.w_scale is None
             ):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if is_hip_:
+                if _is_hip:
                     self_attn.w_scale *= 2.0
 
 
