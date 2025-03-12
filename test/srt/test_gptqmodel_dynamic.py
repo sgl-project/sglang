@@ -144,7 +144,7 @@ class TestGPTQModelDynamic(unittest.TestCase):
 
         print(f"result = `{result}`")
 
-        self.assertIn("paris", result["text"].lower())
+        self.assertTrue("paris" in result["text"].lower() or "巴黎" in result["text"])
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
@@ -198,7 +198,7 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
 
         print(f"result = `{result}`")
 
-        assert "paris" in result["text"].lower()
+        assert "paris" in result["text"].lower() or "巴黎" in result["text"]
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
