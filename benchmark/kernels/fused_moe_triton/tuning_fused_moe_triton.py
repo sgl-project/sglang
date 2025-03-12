@@ -88,7 +88,12 @@ def benchmark_config(
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
     if use_fp8_w8a8 or use_int8_w8a8:
-        if block_shape is None:
+        if use_int8_w8a8 and block_shape is None:
+            w1_scale = torch.randn(
+                num_experts, shard_intermediate_size, dtype=torch.float32
+            )
+            w2_scale = torch.randn(num_experts, hidden_size, dtype=torch.float32)
+        elif block_shape is None:
             w1_scale = torch.randn(num_experts, dtype=torch.float32)
             w2_scale = torch.randn(num_experts, dtype=torch.float32)
             a1_scale = torch.randn(1, dtype=torch.float32)
@@ -394,6 +399,15 @@ def main(args: argparse.Namespace):
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         E = config.n_routed_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in [
+        "Grok1ForCausalLM",
+        "Grok1ImgGen",
+        "Grok1AForCausalLM",
+    ]:
+        E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size

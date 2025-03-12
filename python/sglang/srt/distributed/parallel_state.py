@@ -156,7 +156,7 @@ if supports_custom_op():
     direct_register_custom_op(
         op_name="reg_all_gather_into_tensor",
         op_func=reg_all_gather_into_tensor,
-        mutates_args=[],
+        mutates_args=["output"],
         fake_impl=reg_all_gather_into_tensor_fake,
     )
 

@@ -38,9 +38,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import add_prefix, is_hip
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -48,6 +48,7 @@ class DeepseekModelNextN(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -56,6 +57,7 @@ class DeepseekModelNextN(nn.Module):
             config.vocab_size,
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -64,7 +66,11 @@ class DeepseekModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.decoder = DeepseekV2DecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+            config,
+            0,
+            quant_config=quant_config,
+            is_nextn=True,
+            prefix=add_prefix("decoder", prefix),
         )
 
         self.shared_head = nn.Module()
@@ -108,25 +114,30 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
 
-        self.model = DeepseekModelNextN(config, quant_config)
+        self.model = DeepseekModelNextN(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
         if global_server_args_dict["enable_dp_attention"]:
-            self.model.shared_head.head = ReplicatedLinear(
+            self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                prefix=add_prefix("model.shared_head.head", prefix),
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
-            self.model.shared_head.head = ParallelLMHead(
+            self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
             )
             self.logits_processor = LogitsProcessor(config)
 
@@ -139,7 +150,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.model.shared_head.head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -168,10 +179,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
         nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
-            "shared_head.head",
             "shared_head.norm",
             "eh_proj",
-            "embed_tokens",
             "enorm",
             "hnorm",
         ]
@@ -180,17 +189,21 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         for name, loaded_weight in weights:
             if not name.startswith(nextn_layer_prefix):
                 continue
-            else:
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            # Use shared head and embed weights from target model
+            if "shared_head.head" in name or "embed_tokens" in name:
+                continue
+
+            is_decoder = True
+            # For nextn specific weights
+            for weight_name in nextn_spec_weight_names:
+                if weight_name in name:
+                    name = name.replace(nextn_layer_prefix, "model")
+                    is_decoder = False
+                    break
+            # For decoder layer weights
+            if is_decoder:
+                name = name.replace(nextn_layer_prefix, "model.decoder")
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -264,7 +277,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if is_hip_:
+                    if _is_hip:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=self_attn.kv_b_proj.weight_scale_inv,
@@ -288,7 +301,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 and self_attn.w_scale is None
             ):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if is_hip_:
+                if _is_hip:
                     self_attn.w_scale *= 2.0
 
 

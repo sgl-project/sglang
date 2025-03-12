@@ -149,9 +149,9 @@ def sglang_per_token_group_quant_fp8(
     "batch_size, seq_len, group_size",
     list(
         itertools.product(
-            [1, 2, 4, 8, 16],  # batch_size
+            [1, 2, 4, 8, 16, 32, 64, 128],  # batch_size
             [64, 128, 256, 512, 1024, 2048],  # seq_len
-            [64, 128, 256],  # group_size
+            [16, 32, 64, 128, 256],  # group_size
         )
     ),
 )

@@ -1,29 +1,33 @@
 from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
 class ChunkCacheEntry:
-    def __init__(self, rid, value):
+    def __init__(self, rid: str, value: torch.Tensor):
         self.rid = rid
         self.value = value
 
 
 class ChunkCache(BasePrefixCache):
     def __init__(
-        self, req_to_token_pool: ReqToTokenPool, token_to_kv_pool: BaseTokenToKVPool
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
     ):
         self.disable = True
         self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.entries: Dict[str, ChunkCacheEntry] = {}
 
         self.reset()
 
@@ -48,16 +52,13 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :token_id_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool.free(kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices)
 
         if req.rid in self.entries:
             del self.entries[req.rid]
 
-    def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        if token_ids is None:
-            token_id_len = len(req.fill_ids)
-        else:
-            token_id_len = len(token_ids)
+    def cache_unfinished_req(self, req: Req):
+        token_id_len = len(req.fill_ids)
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :token_id_len
@@ -86,5 +87,11 @@ class ChunkCache(BasePrefixCache):
     def evictable_size(self):
         return 0
 
+    def pretty_print(self):
+        return ""
+
     def protected_size(self):
         return 0
+
+    def pretty_print(self):
+        return ""

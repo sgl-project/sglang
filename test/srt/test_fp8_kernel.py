@@ -17,7 +17,7 @@ class TestFP8Base(unittest.TestCase):
         cls.K = 512
         cls.group_size = 128
         cls.quant_type = torch.float8_e4m3fn
-        cls.output_type = torch.float16
+        cls.output_type = torch.bfloat16
 
     @staticmethod
     def _make_A(M, K, group_size, out_dtype):

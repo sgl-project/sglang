@@ -38,6 +38,8 @@
 - Mistral embedding models
 - Qwen embedding models
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
+- Multi-modal embedding models
+  - `python -m sglang.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding --chat-template gme-qwen2-vl`
 
 ## Reward Models
 
@@ -83,7 +85,7 @@ You should test the new vLM locally against hf models. See [`mmmu`](https://gith
 For interactive debugging, you can compare the outputs of huggingface/transformers and SGLang.
 The following two commands should give the same text output and very similar prefill logits.
 
-- Get the reference output by `python3 scripts/playground/reference_hf.py --model [new model]`
+- Get the reference output by `python3 scripts/playground/reference_hf.py --model-path [new model] --model-type {text,vlm}`
 - Get the SGLang output by `python3 -m sglang.bench_one_batch --correct --model [new model]`
 
 #### Add the model to the test suite

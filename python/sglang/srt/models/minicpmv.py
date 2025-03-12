@@ -41,7 +41,6 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
@@ -51,11 +50,15 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.multi_modality_padding import (
+    MultiModalityDataPaddingPatternTokenPairs,
+)
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from sglang.srt.utils import add_prefix
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -158,14 +161,14 @@ class Idefics2VisionMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
+            prefix=add_prefix("fc2", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -185,24 +188,25 @@ class Idefics2EncoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
-
         self.num_heads = config.num_attention_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        num_heads_per_partition = divide(self.num_heads, tp_size)
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
-            num_heads=num_heads_per_partition,
+            num_heads=self.num_heads,
             projection_size=config.intermediate_size,
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=config.attention_dropout,
             use_context_forward=False,
-            use_full_precision_softmax=True,
+            softmax_in_single_precision=True,
             flatten_batch=False,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = Idefics2VisionMLP(config, quant_config=quant_config)
+        self.mlp = Idefics2VisionMLP(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
@@ -242,6 +246,7 @@ class Idefics2Encoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -251,8 +256,9 @@ class Idefics2Encoder(nn.Module):
                 Idefics2EncoderLayer(
                     config,
                     quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
-                for _ in range(config.num_hidden_layers)
+                for i in range(config.num_hidden_layers)
             ]
         )
 
@@ -379,13 +385,18 @@ class Idefics2VisionTransformer(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
         embed_dim = config.hidden_size
         self.config = config
         self.embeddings = Idefics2VisionEmbeddings(config)
-        self.encoder = Idefics2Encoder(config=config, quant_config=quant_config)
+        self.encoder = Idefics2Encoder(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
+        )
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     def get_input_embeddings(self):
@@ -503,7 +514,7 @@ class BaseResampler(nn.Module):
                 embed_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.kv_proj",
+                prefix=add_prefix("kv_proj", prefix),
             )
         else:
             # Maintain the same return value with ReplicatedLinear.forward
@@ -660,6 +671,7 @@ class MiniCPMVBaseModel(nn.Module):
         *,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         # All MiniCPM-V models disable `tie_word_embeddings` but
@@ -669,8 +681,12 @@ class MiniCPMVBaseModel(nn.Module):
         self.config = config
 
         self.version = get_version_by_config(self.config)
-        self.llm = self.init_llm(config=config, quant_config=quant_config)
-        self.vpm = self.init_vision_module(config, quant_config)
+        self.llm = self.init_llm(
+            config=config, quant_config=quant_config, prefix=add_prefix("llm", prefix)
+        )
+        self.vpm = self.init_vision_module(
+            config, quant_config, add_prefix("vpm", prefix)
+        )
         self.vision_dim = (
             self.vpm.embed_dim
             if self.version == (2, 0)
@@ -679,7 +695,10 @@ class MiniCPMVBaseModel(nn.Module):
         self.embed_dim = self.config.hidden_size
 
         self.resampler = self.init_resampler(
-            self.embed_dim, self.vision_dim, quant_config=quant_config
+            self.embed_dim,
+            self.vision_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("resampler", prefix),
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -688,21 +707,21 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         pad_values: List[int],
-        im_start_id: torch.Tensor,
-        im_end_id: torch.Tensor,
-        slice_start_id: Optional[torch.Tensor] = None,
-        slice_end_id: Optional[torch.Tensor] = None,
+        im_start_id: int,
+        im_end_id: int,
+        slice_start_id: Optional[int] = None,
+        slice_end_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Returns a tensor indicating the bounds (start and end token ids) of the images
         """
         # All the images in the batch should share the same special image
         # bound token ids.
-        start_cond = input_ids == im_start_id[0]
-        end_cond = input_ids == im_end_id[0]
+        start_cond = input_ids == im_start_id
+        end_cond = input_ids == im_end_id
         if slice_start_id is not None:
-            start_cond |= input_ids == slice_start_id[0]
-            end_cond |= input_ids == slice_end_id[0]
+            start_cond |= input_ids == slice_start_id
+            end_cond |= input_ids == slice_end_id
 
         (image_start_tokens,) = torch.where(start_cond)
         image_start_tokens += 1
@@ -713,6 +732,8 @@ class MiniCPMVBaseModel(nn.Module):
             if (
                 len(image_start_tokens) + 1 == len(image_end_tokens)
                 and input_ids[0] in pad_values
+                and len(image_start_tokens) != 0
+                and len(image_end_tokens) != 0
                 and image_end_tokens[0] < image_start_tokens[0]
             ):
                 image_start_tokens = torch.cat(
@@ -877,9 +898,12 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if forward_batch.image_inputs is not None and forward_batch.image_inputs != [
-            None
-        ]:
+        if (
+            forward_batch.image_inputs is not None
+            and len(forward_batch.image_inputs) > 0
+            and forward_batch.image_inputs[0] is not None
+        ):
+            # TODO: bath
             kwargs.update(
                 {
                     "pixel_values": (
@@ -937,6 +961,7 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -944,6 +969,7 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -952,6 +978,7 @@ class MiniCPMVBaseModel(nn.Module):
         embed_dim: int,
         vision_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -1011,24 +1038,27 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
-        super().__init__(config=config, quant_config=quant_config)
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         assert self.version == (2, 6)
 
     def init_llm(
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
-        return Qwen2ForCausalLM(config=config, quant_config=quant_config)
+        return Qwen2ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
 
     def init_vision_module(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
     ) -> nn.Module:
         model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
         )
         if self.config.drop_vision_last_layer:
             model.encoder.layers = model.encoder.layers[:-1]
@@ -1042,6 +1072,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         embed_dim: int,
         vision_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         with set_default_torch_dtype(torch.float16):
             # The resampler in 2.6 remains consistent with the one in 2.5.
@@ -1051,6 +1082,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
                 num_heads=embed_dim // 128,
                 kv_dim=vision_dim,
                 quant_config=quant_config,
+                prefix=prefix,
             )
 
         return resampler.to(device="cuda", dtype=torch.get_default_dtype())
@@ -1107,81 +1139,16 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         return self.resampler(vision_embedding, tgt_sizes)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        if not isinstance(image_inputs.im_start_id, list) or not isinstance(
-            image_inputs.im_end_id, list
-        ):
-            return input_ids
-
-        new_input_ids = []
-        last_idx = 0
-        image_idx = -1
-        image_inputs.image_offsets = []
-
         # Get all special token IDs
-        im_start_id = (
-            image_inputs.im_start_id[0].item()
-            if isinstance(image_inputs.im_start_id[0], torch.Tensor)
-            else image_inputs.im_start_id[0]
-        )
-        im_end_id = (
-            image_inputs.im_end_id[0].item()
-            if isinstance(image_inputs.im_end_id[0], torch.Tensor)
-            else image_inputs.im_end_id[0]
-        )
-        slice_start_id = (
-            image_inputs.slice_start_id[0].item()
-            if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
-            else image_inputs.slice_start_id[0]
-        )
-        slice_end_id = (
-            image_inputs.slice_end_id[0].item()
-            if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
-            else image_inputs.slice_end_id[0]
-        )
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
 
-        # Find all start and end positions for both types
-        start_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x == im_start_id or x == slice_start_id
-        ]
-        end_indices = [
-            i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
-        ]
+        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        if len(start_indices) != len(end_indices):
-            return input_ids
-        # Process each region (both image and slice)
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            # Add non-image tokens before this region
-            new_input_ids.extend(
-                input_ids[last_idx : start_idx + 1]
-            )  # include start token
-
-            is_image_start = input_ids[start_idx] == im_start_id
-
-            if is_image_start:
-                image_inputs.image_offsets += [start_idx]
-                image_idx += 1
-
-            num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
-
-            # Generate pad_ids
-            pad_values = [image_inputs.pad_values[image_idx]]
-
-            pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
-            pad_ids = pad_ids[:num_tokens]
-
-            # Add pad_ids
-            new_input_ids.extend(pad_ids)
-
-            # Update last_idx to after end token
-            last_idx = end_idx
-
-        # Add remaining tokens after last region
-        new_input_ids.extend(input_ids[last_idx:])
-        assert len(input_ids) == len(new_input_ids)
-        return new_input_ids
+        return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6}
@@ -1207,6 +1174,7 @@ class MiniCPMV:
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -1221,7 +1189,9 @@ class MiniCPMV:
             raise ValueError("Currently, MiniCPMV only supports versions 2.6")
 
         try:
-            minicpmv = instance_class(config=config, quant_config=quant_config)
+            minicpmv = instance_class(
+                config=config, quant_config=quant_config, prefix=prefix
+            )
             self.minicpmv = minicpmv
         except Exception as e:
             print(f"Failed to instantiate MiniCPMV: {e}")

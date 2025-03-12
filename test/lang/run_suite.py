@@ -1,11 +1,19 @@
 import argparse
 import glob
+from dataclasses import dataclass
 
 from sglang.test.test_utils import run_unittest_files
 
+
+@dataclass
+class TestFile:
+    name: str
+    estimated_time: float = 60
+
+
 suites = {
     "per-commit": [
-        "test_srt_backend.py",
+        TestFile("test_srt_backend.py"),
         # Skip this due to some OPENAI_API_KEY issues
         # "test_openai_backend.py",
     ],

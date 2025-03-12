@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
@@ -28,6 +29,8 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.utils import is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -180,7 +183,6 @@ class EPMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-        assert self.activation == "silu"
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
@@ -287,6 +289,17 @@ class EPMoE(torch.nn.Module):
 
         if self.activation == "silu":
             silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                self.w2_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        elif self.activation == "gelu":
+            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
                 gateup_output,
                 down_input,
                 gateup_output.shape[1],
@@ -692,7 +705,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         # If checkpoint is fp16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             # If rocm, use float8_e4m3fnuz as dtype
-            fp8_dtype = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+            fp8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 

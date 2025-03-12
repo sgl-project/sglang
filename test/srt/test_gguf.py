@@ -15,7 +15,7 @@ class TestGGUF(unittest.TestCase):
             filename="qwen2-1_5b-instruct-q4_k_m.gguf",
         )
 
-        engine = sgl.Engine(model_path=model_path, random_seed=42)
+        engine = sgl.Engine(model_path=model_path, random_seed=42, cuda_graph_max_bs=2)
         outputs = engine.generate(prompt, sampling_params)["text"]
         engine.shutdown()
 

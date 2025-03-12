@@ -26,6 +26,8 @@ class TestTritonAttnBackend(unittest.TestCase):
                 "--attention-backend",
                 "triton",
                 "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                16,
             ],
         )
 

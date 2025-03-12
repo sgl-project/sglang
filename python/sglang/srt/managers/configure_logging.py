@@ -28,6 +28,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", type=str, default="http://localhost:30000")
     parser.add_argument("--log-requests", action="store_true")
+    parser.add_argument("--log-requests-level", type=int, default=2)
     parser.add_argument(
         "--dump-requests-folder", type=str, default="/tmp/sglang_request_dump"
     )
@@ -38,7 +39,7 @@ if __name__ == "__main__":
         args.url + "/configure_logging",
         json={
             "log_requests": args.log_requests,
-            "log_requests_level": 1,  # Log full requests
+            "log_requests_level": args.log_requests_level,  # Log full requests
             "dump_requests_folder": args.dump_requests_folder,
             "dump_requests_threshold": args.dump_requests_threshold,
         },

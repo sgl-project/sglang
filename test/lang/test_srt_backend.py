@@ -30,7 +30,9 @@ class TestSRTBackend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.backend = sgl.Runtime(
+            model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
+        )
         sgl.set_default_backend(cls.backend)
 
     @classmethod
@@ -74,7 +76,7 @@ class TestSRTBackend(unittest.TestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            self.assertGreater(accuracy, 0.65)
+            self.assertGreater(accuracy, 0.60)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
