@@ -210,6 +210,7 @@ class MHATokenToKVPool(KVCache):
         self.layer_num = layer_num
         self._create_buffers()
 
+        self.layer_transfer_counter = None
         self.capture_mode = False
         self.alt_stream = torch.cuda.Stream()
 

@@ -7,13 +7,13 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolHost,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
 
 logger = logging.getLogger(__name__)
 
