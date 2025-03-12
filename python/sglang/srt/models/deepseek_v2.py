@@ -570,6 +570,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     and not forward_batch.forward_mode.is_draft_extend()
                     and forward_batch.extend_prefix_lens.sum() == 0
                 )
+            elif is_hip_ and get_bool_env_var("CK_MOE"):
+                return (
+                    forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and not forward_batch.forward_mode.is_draft_extend()
+                )                
             else:
                 # Triton: Use normal computation for prefill and use weight absorption for extend/decode
                 return (
