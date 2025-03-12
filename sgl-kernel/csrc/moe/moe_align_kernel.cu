@@ -109,17 +109,17 @@ void moe_align_block_size(
     torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  
+
   int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
-  
+
   int experts_per_warp = WARP_SIZE;
-  
+
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto align_kernel = moe_align_block_size_kernel<scalar_t>;
-    
+
     size_t num_warps = CEILDIV(padded_num_experts, WARP_SIZE);
     size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
-    
+
     align_kernel<<<1, 1024, shared_mem_size, stream>>>(
         topk_ids.data_ptr<scalar_t>(),
         sorted_token_ids.data_ptr<int32_t>(),

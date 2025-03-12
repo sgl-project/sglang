@@ -196,7 +196,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         expert_ids_triton,
         num_tokens_post_pad_triton,
     )
-    
+
     # Skip VLLM test for non-32 multiple experts
     if num_experts % 32 == 0:
         try:
@@ -227,8 +227,10 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
-    if vllm_works and torch.allclose(expert_ids_cuda, expert_ids_vllm) and torch.allclose(
-        num_tokens_post_pad_cuda, num_tokens_post_pad_vllm
+    if (
+        vllm_works
+        and torch.allclose(expert_ids_cuda, expert_ids_vllm)
+        and torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_vllm)
     ):
         print("✅ SGL and VLLM implementations match")
     else:
@@ -334,8 +336,8 @@ def benchmark(num_tokens, num_experts, topk, provider):
         # Skip VLLM test for non-multiple of 32 experts
         if num_experts % 32 != 0:
             # Return extreme values to show as missing data in the chart
-            return float('inf'), float('inf'), float('inf')
-            
+            return float("inf"), float("inf"), float("inf")
+
         try:
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: ops.moe_align_block_size(
@@ -350,7 +352,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             )
         except RuntimeError:
             # If there's a CUDA error, return extreme values
-            return float('inf'), float('inf'), float('inf')
+            return float("inf"), float("inf"), float("inf")
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
@@ -378,14 +380,14 @@ if __name__ == "__main__":
         help="Top-k value for benchmark",
     )
     parser.add_argument(
-        "--skip_full_benchmark", 
+        "--skip_full_benchmark",
         action="store_true",
-        help="Only run the calculate_diff function, skip full benchmarking"
+        help="Only run the calculate_diff function, skip full benchmarking",
     )
     args = parser.parse_args()
 
     calculate_diff(num_tokens=1024, num_experts=args.num_experts, topk=args.topk)
-    
+
     if not args.skip_full_benchmark:
         print(f"\n📊 Running performance benchmark for {args.num_experts} experts...")
         benchmark.run(print_data=True)
