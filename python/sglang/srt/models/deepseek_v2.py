@@ -297,9 +297,8 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = (
             self.experts(
                 hidden_states=recv_hidden_states,
-                topk_ids=recv_topk_ids,
-                topk_weights=recv_topk_weights,
                 tokens_per_expert=tokens_per_expert,
+                forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
         )
