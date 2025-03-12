@@ -16,6 +16,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import is_hip
 
+_is_hip = is_hip()
+
 
 class W8A8Fp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
@@ -71,7 +73,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
         weight_scale = layer.weight_scale.detach()
-        if is_hip():
+        if _is_hip:
             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 weight=weight, weight_scale=weight_scale
             )
