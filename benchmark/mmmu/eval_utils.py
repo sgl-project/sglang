@@ -120,13 +120,13 @@ def prepare_samples(eval_args: EvalArgs):
     samples = []
     skip_count = 0
     for i, sample in enumerate(dataset):
-        sample = process_single_sample(sample)
+        # sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
-        image = sample["image"]
-        width, height = image.size
-        if width * height >= eval_args.image_pixels_limit:
-            skip_count += 1
-            continue
+        # image = sample["image"]
+        # width, height = image.size
+        # if width * height >= eval_args.image_pixels_limit:
+        #     skip_count += 1
+        #     continue
         samples.append(sample)
 
     print(
