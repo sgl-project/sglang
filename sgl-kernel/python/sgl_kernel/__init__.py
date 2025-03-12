@@ -23,6 +23,7 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.gemm import (
+    awq_dequantize,
     bmm_fp8,
     cublas_grouped_gemm,
     fp8_blockwise_scaled_mm,
