@@ -14,17 +14,17 @@ import torch.distributed as dist
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-_buffer = None
-_low_latency_buffer = None
+_buffer_normal = None
+_buffer_low_latency = None
 
 
-def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
+def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     """
     Copy from DeepEP example usage in model inference prefilling.
     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-model-training-or-inference-prefilling
     """
 
-    global _buffer
+    global _buffer_normal
 
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
@@ -39,16 +39,16 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         )
 
     if (
-        _buffer is None
-        or _buffer.group != group
-        or _buffer.num_nvl_bytes < num_nvl_bytes
-        or _buffer.num_rdma_bytes < num_rdma_bytes
+        _buffer_normal is None
+        or _buffer_normal.group != group
+        or _buffer_normal.num_nvl_bytes < num_nvl_bytes
+        or _buffer_normal.num_rdma_bytes < num_rdma_bytes
     ):
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
-    return _buffer
+        _buffer_normal = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+    return _buffer_normal
 
 
-def get_low_latency_buffer(
+def get_buffer_low_latency(
     group: dist.ProcessGroup,
     num_max_dispatch_tokens_per_rank: int,
     hidden: int,
@@ -59,26 +59,26 @@ def get_low_latency_buffer(
     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
     """
 
-    global _low_latency_buffer
+    global _buffer_low_latency
     num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
         num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
     )
 
     if (
-        _low_latency_buffer is None
-        or _low_latency_buffer.group != group
-        or not _low_latency_buffer.low_latency_mode
-        or _low_latency_buffer.num_rdma_bytes < num_rdma_bytes
+        _buffer_low_latency is None
+        or _buffer_low_latency.group != group
+        or not _buffer_low_latency.low_latency_mode
+        or _buffer_low_latency.num_rdma_bytes < num_rdma_bytes
     ):
         assert num_experts % group.size() == 0
-        _low_latency_buffer = Buffer(
+        _buffer_low_latency = Buffer(
             group,
             0,
             num_rdma_bytes,
             low_latency_mode=True,
             num_qps_per_rank=num_experts // group.size(),
         )
-    return _low_latency_buffer
+    return _buffer_low_latency
 
 
 def permute(
@@ -199,14 +199,20 @@ class DeepEPManager:
         # Handle used for combine operation
         self.handle = None
 
+        self.num_max_dispatch_tokens_per_rank = 256
+        self.return_recv_hook = True
+        self.async_finish = not self.return_recv_hook
+
         if not use_deepep:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        self.buffer = get_buffer(self.group, self.hidden_size * self.params_bytes)
-        # self.low_latency_buffer = get_low_latency_buffer(
-        #     self.group, 256, self.hidden_size * self.params_bytes, self.num_experts
+        self.buffer_normal = get_buffer_normal(
+            self.group, self.hidden_size * self.params_bytes
+        )
+        # self.buffer_low_latency = get_buffer_low_latency(
+        #     self.group, self.num_max_dispatch_tokens_per_rank, self.hidden_size * self.params_bytes, self.num_experts
         # )
 
     def dispatch(
@@ -219,7 +225,7 @@ class DeepEPManager:
         previous_event=None,
         num_max_dispatch_tokens_per_rank: int = 256,
     ):
-        # Todo: for decode batch, use low_latency_dispatch
+        # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
             (
                 hidden_states,
@@ -228,7 +234,7 @@ class DeepEPManager:
                 num_recv_tokens_per_expert_list,
                 handle,
                 event,
-            ) = self.dispatch_forward(
+            ) = self.dispatch_normal(
                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
             )
             self.tokens_per_expert = torch.tensor(
@@ -238,7 +244,7 @@ class DeepEPManager:
             )
         else:
             hidden_states, recv_expert_count, handle, event, hook = (
-                self.low_latency_dispatch(
+                self.dispatch_low_latency(
                     hidden_states,
                     topk_idx,
                     num_max_dispatch_tokens_per_rank,
@@ -251,7 +257,7 @@ class DeepEPManager:
         self.topk_weights = topk_weights
         return hidden_states, topk_idx, topk_weights
 
-    def dispatch_forward(
+    def dispatch_normal(
         self,
         x: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -265,7 +271,7 @@ class DeepEPManager:
             num_tokens_per_expert,
             is_token_in_rank,
             previous_event,
-        ) = self.buffer.get_dispatch_layout(
+        ) = self.buffer_normal.get_dispatch_layout(
             topk_idx,
             num_experts,
             previous_event=previous_event,
@@ -280,7 +286,7 @@ class DeepEPManager:
             num_recv_tokens_per_expert_list,
             handle,
             event,
-        ) = self.buffer.dispatch(
+        ) = self.buffer_normal.dispatch(
             x,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -306,8 +312,41 @@ class DeepEPManager:
             event,
         )
 
-    def combine_forward(self, x: torch.Tensor, handle: Tuple, previous_event=None):
-        combined_x, _, event = self.buffer.combine(
+    def dispatch_low_latency(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+    ):
+        recv_hidden_states, recv_expert_count, handle, event, hook = (
+            self.buffer_low_latency.low_latency_dispatch(
+                hidden_states,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                async_finish=self.async_finish,
+                return_recv_hook=self.return_recv_hook,
+            )
+        )
+        hook() if self.return_recv_hook else event.current_stream_wait()
+        return recv_hidden_states, recv_expert_count, handle, event, hook
+
+    def combine(
+        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        # Todo: enable low latency combine
+        if True:  # not forward_mode.is_decode():
+            hidden_states, event = self.combine_normal(hidden_states, self.handle)
+        else:
+            hidden_states, event, hook = self.combine_low_latency(
+                hidden_states, self.topk_idx, self.topk_weights, self.handle
+            )
+        self.handle = None
+        return hidden_states
+
+    def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
+        combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
             async_finish=False,
@@ -316,26 +355,7 @@ class DeepEPManager:
         )
         return combined_x, event
 
-    def low_latency_dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-    ):
-        recv_hidden_states, recv_expert_count, handle, event, hook = (
-            self.low_latency_buffer.low_latency_dispatch(
-                hidden_states,
-                topk_idx,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                async_finish=False,
-                return_recv_hook=True,
-            )
-        )
-        return recv_hidden_states, recv_expert_count, handle, event, hook
-
-    def low_latency_combine(
+    def combine_low_latency(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -343,15 +363,16 @@ class DeepEPManager:
         handle: Tuple,
     ):
         combined_hidden_states, event_overlap, hook = (
-            self.low_latency_buffer.low_latency_combine(
+            self.buffer_low_latency.low_latency_combine(
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 handle,
-                async_finish=False,
-                return_recv_hook=True,
+                async_finish=self.async_finish,
+                return_recv_hook=self.return_recv_hook,
             )
         )
+        hook() if self.return_recv_hook else event_overlap.current_stream_wait()
         return combined_hidden_states, event_overlap, hook
 
     def _indices_to_multihot(self, indices, probs):
@@ -385,19 +406,6 @@ class DeepEPManager:
         Get the number of tokens per expert.
         """
         return self.tokens_per_expert
-
-    def combine(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
-    ) -> torch.Tensor:
-        # Todo: for decode batch, use low_latency_combine
-        if True:  # not forward_mode.is_decode():
-            hidden_states, event = self.combine_forward(hidden_states, self.handle)
-        else:
-            hidden_states, event, hook = self.low_latency_combine(
-                hidden_states, self.topk_idx, self.topk_weights, self.handle
-            )
-        self.handle = None
-        return hidden_states
 
     def get_permuted_hidden_states_by_experts(
         self, hidden_states: torch.Tensor

@@ -819,7 +819,7 @@ class DeepEPMoE(EPMoE):
         self,
         hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        forward_mode: Optional[ForwardMode],
+        forward_mode: ForwardMode,
     ):
         # Todo @sleepcoo: use m_grouped_gemm_fp8_fp8_bf16_nt_masked after low_latency dispatch (decode)
         if True:  # not forward_mode.is_decode():
