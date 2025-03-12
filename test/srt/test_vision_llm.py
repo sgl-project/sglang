@@ -9,7 +9,12 @@ import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
@@ -18,6 +23,7 @@ from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
 
 MiniCPMV = "openbmb/MiniCPM-V-2_6"
+QWEN25VL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 
 # Test the logits output between HF and SGLang
@@ -204,6 +210,60 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             )
 
         self.compare_outputs(sglang_output, hf_output)
+
+
+class TestQWEN25VLLogits(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = QWEN25VL
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.chat_template = "qwen2-vl"
+
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.model = AutoModelForImageTextToText.from_pretrained(
+            cls.model_path,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+            device_map=cls.device,
+            trust_remote_code=True,
+        ).eval()
+        cls.model.to(cls.device)
+        cls.max_new_tokens = 30
+        cls.temperature = 0.4
+        cls.top_k = 0
+        cls.top_p = 1.0
+
+    async def test_encode_output(self):
+        inputs = self.get_processor_output()
+
+        with torch.no_grad():
+            generated_outputs = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=True,
+                temperature=self.temperature,
+                top_k=self.top_k,  # Disable top-k filtering
+                top_p=self.top_p,  # Disable nucleus sampling
+            )
+            hf_output = generated_outputs.scores
+
+        with torch.no_grad():
+            model = self.get_sglang_model()
+            # TODO: SGLang logits output
+            # sglang_output =
+
+        # Move tensors to CPU for numpy operations
+        hf_output_np = hf_output.cpu().numpy()
+        # sglang_output_np = sglang_output.cpu().numpy()
+
+        np.testing.assert_allclose(hf_output_np, sglang_output_np)
 
 
 if __name__ == "__main__":
