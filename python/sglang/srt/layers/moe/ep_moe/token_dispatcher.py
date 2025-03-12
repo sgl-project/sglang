@@ -409,7 +409,7 @@ class DeepEPManager:
         hidden_states, self.reversed_mapping_for_combine = permute(
             hidden_states,
             self.dispatched_routing_map,
-            num_out_tokens=sum(self.tokens_per_expert),
+            num_out_tokens=self.tokens_per_expert.sum(),
             fused=self.permute_fusion,
         )
         return hidden_states

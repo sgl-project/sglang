@@ -833,11 +833,7 @@ class DeepEPMoE(EPMoE):
                 torch.cumsum(tokens_per_expert, dim=0),
             ]
         )
-        reorder_topk_ids = torch.tensor(
-            [idx for idx, count in enumerate(tokens_per_expert) for _ in range(count)],
-            device=tokens_per_expert.device,
-            dtype=torch.int32,
-        )
+        reorder_topk_ids = torch.repeat_interleave(tokens_per_expert)
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
                 torch.max(hidden_states)
