@@ -122,9 +122,7 @@ class TritonPythonModel:
                     add_generation_prompt=True,
                 )
             else:
-                text = pb_utils.get_input_tensor_by_name(request, "prompt").as_numpy()[
-                    0
-                ]
+                text = pb_utils.get_input_tensor_by_name(request, "prompt").as_numpy()[0]
                 if isinstance(text, bytes):
                     text = text.decode("utf-8")
                 prompt = text
@@ -146,52 +144,37 @@ class TritonPythonModel:
                 stream=stream,
             )
             if stream:
-                is_first = True
                 stream_buffer = ""
                 async for content in gen:
                     index = content.get("index", 0)
                     finish_reason = content["meta_info"]["finish_reason"]
-                    if is_first:
-                        # First chunk with role
-                        is_first = False
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(role="assistant", content=""),
-                            finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
-                            ),
-                            matched_stop=(
-                                finish_reason["matched"]
-                                if finish_reason and "matched" in finish_reason
-                                else None
-                            ),
+                    text = content["text"]
+                    prompt_tokens = content["meta_info"]["prompt_tokens"]
+                    completion_tokens = content["meta_info"]["completion_tokens"]
+                    delta = text[len(stream_buffer):]
+                    stream_buffer = stream_buffer + delta
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(role="assistant", content=delta),
+                        finish_reason=(
+                            finish_reason["type"] if finish_reason else ""
+                        ),
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
+                        ),
+                    )
+                    response = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        choices=[choice_data],
+                        model=self.triton_model_name,
+                        usage=UsageInfo(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=prompt_tokens + completion_tokens,
                         )
-                        response = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            choices=[choice_data],
-                            model=self.triton_model_name,
-                        ).model_dump_json()
-                    else:
-                        text = content["text"]
-                        delta = text[len(stream_buffer) :]
-                        stream_buffer = stream_buffer + delta
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(role="assistant", content=delta),
-                            finish_reason=(
-                                finish_reason["type"] if finish_reason else ""
-                            ),
-                            matched_stop=(
-                                finish_reason["matched"]
-                                if finish_reason and "matched" in finish_reason
-                                else None
-                            ),
-                        )
-                        response = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            choices=[choice_data],
-                            model=self.triton_model_name,
-                        ).model_dump_json()
+                    ).model_dump_json()
                     # for stream mode, send the partial response one by one
                     triton_output_tensor = pb_utils.Tensor(
                         "response", np.asarray(response, dtype=np.object_)
@@ -207,13 +190,14 @@ class TritonPythonModel:
                         response_sender.send(resp)
             else:
                 content = gen
+                index = content.get("index", 0)
                 outputs.append(content["text"])
                 prompt_tokens = content["meta_info"]["prompt_tokens"]
                 completion_tokens = content["meta_info"]["completion_tokens"]
                 finish_reason = content["meta_info"]["finish_reason"]
                 # for non-stream mode, send concatenated response at one time
                 choice = ChatCompletionResponseChoice(
-                    index=0,
+                    index=index,
                     message=ChatMessage(
                         role="assistant",
                         content="".join(outputs),

@@ -39,7 +39,7 @@ def process_result(que):
 
 
 if __name__ == "__main__":
-    model_name = "Qwen2-7B"
+    model_name = "sglang_model"
     prompts = json.dumps([{"role": "user", "content": "please introduce yourself"}])
     max_tokens = 512
     temperature = 1.0
