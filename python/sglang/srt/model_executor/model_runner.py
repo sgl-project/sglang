@@ -56,6 +56,12 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    device_loading_context,
+    get_model_loader,
+)
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -409,13 +415,6 @@ class ModelRunner:
         self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        from sglang.srt.model_loader.loader import (
-            DefaultModelLoader,
-            device_loading_context,
-            get_model_loader,
-        )
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -425,7 +424,7 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # Only support vllm DefaultModelLoader for now
+        # Only support the DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
