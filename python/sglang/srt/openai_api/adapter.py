@@ -1124,8 +1124,9 @@ def v1_chat_generate_response(
         if tool_choice != "none" and tools:
             parser = FunctionCallParser(tools, tool_call_parser)
             if parser.has_tool_call(text):
-                if finish_reason == "stop":
-                    finish_reason = "tool_calls"
+                if finish_reason["type"] == "stop":
+                    finish_reason["type"] = "tool_calls"
+                    finish_reason["matched"] = None
                 try:
                     full_normal_text, call_info_list = parser.parse_non_stream(text)
                     tool_calls = [
