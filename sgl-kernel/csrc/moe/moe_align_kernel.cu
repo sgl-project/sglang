@@ -57,7 +57,6 @@ __global__ void moe_align_block_size_kernel(
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int my_expert_start = warp_id * experts_per_warp;
 
-  // Initialize shared memory - only care about real experts, not padded ones
   for (int i = 0; i < experts_per_warp; ++i) {
     if (my_expert_start + i < padded_num_experts) {
       shared_counts[warp_id * experts_per_warp + i] = 0;
@@ -69,7 +68,6 @@ __global__ void moe_align_block_size_kernel(
   const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
   const size_t start_idx = threadIdx.x * tokens_per_thread;
 
-  // Count tokens per expert
   for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
     int expert_id = topk_ids[i];
     int warp_idx = expert_id / experts_per_warp;
@@ -79,7 +77,6 @@ __global__ void moe_align_block_size_kernel(
 
   __syncthreads();
 
-  // Calculate cumulative sums and token counts
   if (threadIdx.x == 0) {
     cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
@@ -88,7 +85,6 @@ __global__ void moe_align_block_size_kernel(
       int expert_offset = (i - 1) % experts_per_warp;
       expert_count = shared_counts[warp_idx * experts_per_warp + expert_offset];
 
-      // Calculate aligned size for this expert's tokens
       cumsum[i] = cumsum[i - 1] + CEILDIV(expert_count, block_size) * block_size;
     }
     *total_tokens_post_pad = cumsum[num_experts];
@@ -96,7 +92,6 @@ __global__ void moe_align_block_size_kernel(
 
   __syncthreads();
 
-  // Assign expert IDs to blocks - only the threads we need
   if (threadIdx.x < num_experts) {
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
@@ -117,24 +112,20 @@ void moe_align_block_size(
 
   int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
-  // Optimize for small expert counts
   int experts_per_warp;
   int threads;
 
   if (num_experts <= 8) {
-    // For small expert counts, use fewer threads and optimize memory access
     experts_per_warp = 8;
     threads = 256;
   } else if (num_experts <= 16) {
     experts_per_warp = 16;
     threads = 512;
   } else {
-    // Default case - use warp size
     experts_per_warp = WARP_SIZE;
     threads = 1024;
   }
 
-  // Ensure threads are a multiple of warp size
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
