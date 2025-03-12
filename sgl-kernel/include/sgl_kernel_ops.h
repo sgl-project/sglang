@@ -112,6 +112,7 @@ void apply_rope_pos_ids_cos_sin_cache(
 /*
  * From csrc/gemm
  */
+torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
