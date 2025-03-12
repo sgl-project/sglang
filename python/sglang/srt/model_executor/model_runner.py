@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -341,6 +342,8 @@ class ModelRunner:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
+        monkey_patch_isinstance_for_vllm_base_layer()
+
         with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
@@ -348,6 +351,7 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
+        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:

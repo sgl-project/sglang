@@ -65,7 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda_available, is_hip
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
@@ -571,7 +571,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if no_absorb():
             return self.forward_normal(positions, hidden_states, forward_batch)
         else:
-            if is_hip_:
+            if _is_hip:
                 if (
                     os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
                     and forward_batch.forward_mode.is_decode()
@@ -848,11 +848,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 def all_gather(
     input_tensor: torch.Tensor, forward_batch: ForwardBatch, rank, world_size, group
 ):
-    if world_size == 1:
-        return input_tensor
-
     all_lens = forward_batch.global_num_tokens_cpu
     max_len = max(forward_batch.global_num_tokens_cpu)
+
+    if world_size == 1:
+        return input_tensor, 0, all_lens[0]
 
     padded_tensor = torch.nn.functional.pad(
         input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
@@ -1190,7 +1190,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
                         assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        if is_hip_:
+                        if _is_hip:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                                 weight=w,
                                 weight_scale=self_attn.kv_b_proj.weight_scale_inv,
@@ -1230,7 +1230,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     and self_attn.w_scale is None
                 ):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                    if is_hip_:
+                    if _is_hip:
                         self_attn.w_scale *= 2.0
 
     def get_embed_and_head(self):
