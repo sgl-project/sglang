@@ -23,11 +23,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import (
+    direct_register_custom_op,
     get_device_core_count,
     get_device_name,
     is_cuda,
     is_hip,
     is_triton_available,
+    supports_custom_op,
 )
 
 _is_hip = is_hip()
@@ -43,6 +45,33 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
+
+if supports_custom_op():
+
+    def deep_gemm_fp8_fp8_bf16_nt(
+        A: torch.Tensor,
+        As: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+        C: torch.Tensor,
+    ) -> None:
+        deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+
+    def deep_gemm_fp8_fp8_bf16_nt_fake(
+        A: torch.Tensor,
+        As: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+        C: torch.Tensor,
+    ) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="deep_gemm_fp8_fp8_bf16_nt",
+        op_func=deep_gemm_fp8_fp8_bf16_nt,
+        mutates_args=["C"],
+        fake_impl=deep_gemm_fp8_fp8_bf16_nt_fake,
+    )
 
 
 @triton.jit
@@ -821,22 +850,13 @@ def w8a8_block_fp8_matmul(
         num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
             N, config["BLOCK_SIZE_N"]
         )
-        kernel = (
-            _w8a8_block_fp8_matmul_unrolledx4
-            if (_is_hip == True and num_workgroups <= get_device_core_count())
-            else _w8a8_block_fp8_matmul
-        )
-
-        # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
-        # Empirical testing shows the sweet spot lies when it's less than the # of
-        # compute units available on the device.
-        num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
-            N, config["BLOCK_SIZE_N"]
-        )
 
         # deepgemm only support bf16
         if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
-            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+            if supports_custom_op():
+                torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+            else:
+                deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
         else:
             kernel = (
                 _w8a8_block_fp8_matmul_unrolledx4
