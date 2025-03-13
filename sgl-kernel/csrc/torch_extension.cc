@@ -75,6 +75,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
+  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
+  m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
+
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
