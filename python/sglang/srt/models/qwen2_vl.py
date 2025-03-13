@@ -428,6 +428,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     # Use grid_t * grid_w * grid_h to pad tokens for each image
     # add replaced padding by unique image hash
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        print(f"Qwen2VLForConditionalGeneration::pad_input_ids, len(input_ids)={len(input_ids)}")
+        logger.info(f"1 Qwen2VLForConditionalGeneration::pad_input_ids, len(input_ids)={len(input_ids)}")
         image_grid_thws = image_inputs.image_grid_thws
         pad_values = image_inputs.pad_values
 
@@ -525,6 +527,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        print(f"Qwen2VLForConditionalGeneration::forward")
         if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
             positions = forward_batch.mrope_positions
 

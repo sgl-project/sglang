@@ -449,46 +449,121 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _image_processor):
         self.hf_config = hf_config
         self._image_processor = _image_processor
+        self.executor = concurrent.futures.ProcessPoolExecutor(
+            initializer=init_global_processor,
+            mp_context=mp.get_context("fork"),
+            initargs=(server_args,),
+            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
+        )
 
     @staticmethod
-    def _process_images_task(images, input_text):
-        return global_processor(images, input_text, return_tensors="pt")
+    def _process_single_image_task(
+        image_data: Union[str, bytes],
+        image_processor=None,
+    ):
+        image_processor = image_processor or global_processor.image_processor
+
+        try:
+            image, image_size = load_image(image_data)
+            if image_size is not None:
+                # It is a video with multiple images
+                image_hash = hash(image_data)
+                process_result = image_processor(image)
+                pixel_values, image_grid_thws = (
+                    process_result["pixel_values"],
+                    process_result["image_grid_thw"][0],
+                )
+                for _ in range(len(pixel_values)):
+                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                pixel_values = np.stack(pixel_values, axis=0)
+                image_grid_thws = np.stack(image_grid_thws, axis=0)
+                return pixel_values, image_hash, image_size, image_grid_thws
+            else:
+                # It is an image
+                image_hash = hash(image_data)
+                process_result = image_processor(image)
+                pixel_values, image_grid_thws = (
+                    process_result["pixel_values"],
+                    process_result["image_grid_thw"][0],
+                )
+                if isinstance(pixel_values, np.ndarray):
+                    pixel_values = pixel_values.astype(np.float16)
+
+                return pixel_values, image_hash, image.size, image_grid_thws
+        except Exception:
+            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
     async def _process_single_image(self, image_data: Union[bytes, str]):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.executor,
-                PaliGemmaImageProcessor._process_images_task,
+                PaliGemmaImageProcessor._process_single_image_task,
                 image_data,
             )
         else:
-            return self._process_images_task(image_data)
+            return self._process_single_image_task(image_data)
 
     async def process_images_async(
-        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
-    ):
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        *args,
+        **kwargs,
+    ):  
+        logger.info(f"1 Qwen2VLImageProcessor::process_images_async, image_data:{image_data} and input_text:{input_text}")
         if not image_data:
             return None
 
-        if isinstance(input_text, list):
-            assert len(input_text) and isinstance(input_text[0], int)
-            input_text = self._processor.tokenizer.decode(input_text)
+        if isinstance(image_data, list) and len(image_data) > 0:
+            # Multiple images
+            if len(image_data) > 1:
+                pixel_values, image_hashes, image_sizes, image_grid_thws = (
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                res = []
+                for img_data in image_data:
+                    res.append(self._process_single_image(img_data))
+                res = await asyncio.gather(*res)
+                for pixel_v, image_h, image_s, image_thw in res:
+                    pixel_values.append(pixel_v)
+                    image_hashes.append(image_h)
+                    image_sizes.append(image_s)
+                    image_grid_thws.append(image_thw)
 
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-
-        if len(image_data) > 0:
-            images = [load_image(image)[0] for image in image_data]
-
+                if isinstance(pixel_values[0], np.ndarray):
+                    pixel_values = np.concatenate(pixel_values, axis=0)
+            else:
+                # A single image
+                pixel_values, image_hash, image_size, image_grid_thw = (
+                    await self._process_single_image(image_data[0])
+                )
+                image_hashes = [image_hash]
+                image_sizes = [image_size]
+                image_grid_thws = [image_grid_thw]
+        elif isinstance(image_data, str) or isinstance(image_data, bytes):
+            # A single image
+            pixel_values, image_hash, image_size, image_grid_thw = (
+                await self._process_single_image(image_data)
+            )
+            image_hashes = [image_hash]
+            image_sizes = [image_size]
+            image_grid_thws = [image_grid_thw]
         else:
-            images = load_image(image_data[0])[0]
 
-        image_inputs = await self._process_single_image(images, input_text)
-        image_inputs["image_hashes"] = [hash(str(image_data))]
-        image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
+            raise ValueError(f"Invalid image data: {image_data}")
 
-        return image_inputs
+        return {
+            "pixel_values": pixel_values,
+            "image_hashes": image_hashes,
+            "image_sizes": image_sizes,
+            "modalities": request_obj.modalities or ["image"],
+            "image_grid_thws": image_grid_thws,
+        }
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
@@ -507,6 +582,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         image_data: Union[str, bytes],
         image_processor=None,
     ):
+        logger.info(f"1 Qwen2VLImageProcessor::_process_single_image_task, image_data:{image_data} and image_processor:{image_processor}")
         image_processor = image_processor or global_processor.image_processor
 
         try:
@@ -557,7 +633,8 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         request_obj,
         *args,
         **kwargs,
-    ):
+    ):  
+        logger.info(f"1 Qwen2VLImageProcessor::process_images_async, image_data:{image_data} and input_text:{input_text}")
         if not image_data:
             return None
 
@@ -689,7 +766,7 @@ def get_image_processor(
         return MiniCPMVImageProcessor(hf_config, server_args, processor)
 
     elif "PalieGemma" in hf_config.architectures:
-        return PaliGemmaImageProcessor(hf_config, server_args, processor)
+        return PaliGemmaImageProcessor(hf_config, server_args, processor.image_processor)
     else:
         return LlavaImageProcessor(hf_config, server_args, processor.image_processor)
 

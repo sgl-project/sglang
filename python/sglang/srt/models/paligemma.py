@@ -16,6 +16,7 @@
 import math
 import re
 from typing import Iterable, List, Optional, Tuple
+import logging
 
 import numpy as np
 import torch
@@ -31,7 +32,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
+from sglang.srt.mm_utils import (
+    get_anyres_image_grid_shape,
+    unpad_image,
+    unpad_image_shape,
+)
 
+logger = logging.getLogger(__name__)
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(
@@ -51,6 +58,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        logger.info(f"1 paligemma::pad_input_ids, len(input_ids)={len(input_ids)}")
         new_input_ids = []
         last_idx = 0
         image_idx = -1
@@ -101,7 +109,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         selected_image_feature = (
             image_outputs.last_hidden_state
         )  # Note: from transformers
-        image_features = self.multi_modal_projector(selected_image_feature)
+        image_features = self.multi_model_projector(selected_image_feature)
         return image_features
 
     @torch.no_grad()
@@ -112,7 +120,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
-
+        logger.info("1 paligemma::forward")
         if forward_batch.forward_mode.is_extend():
             bs = forward_batch.batch_size
 
@@ -235,6 +243,11 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         ).to("cuda")
 
         self.vision_tower.eval()
+
+        self.image_size = self.vision_tower.config.image_size
+        self.patch_size = self.vision_tower.config.patch_size
+
+        self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
 
         # load mm_projector
         projector_weights = {

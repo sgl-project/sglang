@@ -275,6 +275,7 @@ class Qwen2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        print(f"1 Qwen2Model::forward")
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:

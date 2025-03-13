@@ -17,6 +17,7 @@
 """Inference-only Gemma model compatible with HuggingFace weights."""
 
 from typing import Iterable, Optional, Tuple
+import logging
 
 import torch
 from torch import nn
@@ -39,6 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
+logger = logging.getLogger(__name__)
 
 class GemmaMLP(nn.Module):
     def __init__(
@@ -317,6 +319,7 @@ class GemmaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        logger.info("1 Gemma::forward")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
