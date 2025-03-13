@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include <flashinfer/pytorch_extension_utils.h>
+ #include "pytorch_extension_utils.h"
 
 #include <flashinfer/quantization.cuh>
 
