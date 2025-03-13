@@ -35,7 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.utils import is_hip
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -119,7 +119,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         else:
             capture_bs = list(range(1, 33))
 
-    if is_hip_:
+    if _is_hip:
         capture_bs += [i * 8 for i in range(21, 33)]
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
@@ -264,11 +264,15 @@ class CudaGraphRunner:
     def model_capture_mode(self):
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = True
+        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
+            self.model_runner.token_to_kv_pool.capture_mode = True
 
         yield
 
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = False
+        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
+            self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention:
