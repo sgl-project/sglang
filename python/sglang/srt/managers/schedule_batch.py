@@ -814,9 +814,11 @@ class ScheduleBatch:
         input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        prefix_lens_tensor = torch.tensor(
-            prefix_lens, dtype=torch.int64, device=self.device
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
         )
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
 
@@ -943,7 +945,6 @@ class ScheduleBatch:
                 seq_lens_tensor,
                 extend_lens_tensor,
                 out_cache_loc,
-                next_power_of_2(bs),
                 self.req_to_token_pool.req_to_token.shape[1],
             )
         else:
@@ -1425,7 +1426,6 @@ def write_req_to_token_pool_triton(
     seq_lens,
     extend_lens,
     out_cache_loc,
-    bs_upper: tl.constexpr,
     req_to_token_ptr_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
@@ -1435,9 +1435,9 @@ def write_req_to_token_pool_triton(
     pre_len = tl.load(pre_lens + pid)
     seq_len = tl.load(seq_lens + pid)
 
-    load_offset = tl.arange(0, bs_upper)
-    cumsum_elems = tl.load(extend_lens + load_offset, mask=load_offset < pid)
-    cumsum_start = tl.sum(cumsum_elems)
+    cumsum_start = 0
+    for i in range(pid):
+        cumsum_start += tl.load(extend_lens + i)
 
     num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
     for i in range(num_loop):

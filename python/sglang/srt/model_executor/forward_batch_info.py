@@ -386,6 +386,8 @@ def compute_position_triton(
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
+    has_prefix = extend_prefix_lens.shape[0] == batch_size
+
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
     )
@@ -399,7 +401,7 @@ def compute_position_triton(
         extend_start_loc,
         extend_prefix_lens,
         extend_seq_lens,
-        next_power_of_2(batch_size),
+        has_prefix,
     )
 
     return positions, extend_start_loc
@@ -411,17 +413,18 @@ def compute_position_kernel(
     extend_start_loc,
     extend_prefix_lens,
     extend_seq_lens,
-    bs_upper: tl.constexpr,
+    has_prefix: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(0).to(tl.int64)
 
-    prefix_len = tl.load(extend_prefix_lens + pid)
+    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
-    load_offset = tl.arange(0, bs_upper)
-    cumsum_elems = tl.load(extend_seq_lens + load_offset, mask=load_offset < pid)
-    cumsum_start = tl.sum(cumsum_elems)
+    # TODO: optimize this?
+    cumsum_start = 0
+    for i in range(pid):
+        cumsum_start += tl.load(extend_seq_lens + i)
 
     num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
     for i in range(num_loop):
