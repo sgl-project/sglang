@@ -326,7 +326,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.capture_mode:
+        if self.capture_mode and cache_k.shape[0] < 4:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.alt_stream):
                 self.k_buffer[layer_id][loc] = cache_k
@@ -590,6 +590,9 @@ class MHATokenToKVPoolHost:
 
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[:, layer_id, indices]
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
