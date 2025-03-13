@@ -3,6 +3,7 @@ import itertools
 import pytest
 import torch
 from sgl_kernel import sgl_per_token_group_quant_int8
+
 from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
 

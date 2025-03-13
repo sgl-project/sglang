@@ -77,9 +77,7 @@ __global__ void per_token_group_quant_int8_kernel(
       dst = std::clamp(dst, int8_min, int8_max);
       group_output[i * vec_size + j] = static_cast<int8_t>(dst);
 #else
-      uint32_t dst;
-      asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(q_val));
-      group_output[i * vec_size + j] = reinterpret_cast<const int8_t&>(dst);
+      group_output[i * vec_size + j] = int8_t(q_val);
 #endif
     }
   }
@@ -117,18 +115,18 @@ void sgl_per_token_group_quant_int8(
     groups_per_block = 2;
   }
 
-#define LAUNCH_KERNEL(T, GPB)                                                          \
-  do {                                                                                 \
-    constexpr int GROUPS_PER_BLOCK = GPB;                                              \
-    dim3 grid((num_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK);                 \
-    dim3 block(GROUPS_PER_BLOCK* THREADS_PER_GROUP);                                   \
+#define LAUNCH_KERNEL(T, GPB)                                                           \
+  do {                                                                                  \
+    constexpr int GROUPS_PER_BLOCK = GPB;                                               \
+    dim3 grid((num_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK);                  \
+    dim3 block(GROUPS_PER_BLOCK* THREADS_PER_GROUP);                                    \
     per_token_group_quant_int8_kernel<T, GROUPS_PER_BLOCK><<<grid, block, 0, stream>>>( \
-        static_cast<T*>(input.data_ptr()),                                             \
-        output_q.data_ptr(),                                                           \
-        static_cast<float*>(output_s.data_ptr()),                                      \
-        group_size,                                                                    \
-        num_groups,                                                                    \
-        (float)eps,                                                                    \
+        static_cast<T*>(input.data_ptr()),                                              \
+        output_q.data_ptr(),                                                            \
+        static_cast<float*>(output_s.data_ptr()),                                       \
+        group_size,                                                                     \
+        num_groups,                                                                     \
+        (float)eps,                                                                     \
         (float)int8_min,                                                                \
         (float)int8_max);                                                               \
   } while (0)
