@@ -16,7 +16,6 @@
 import math
 import re
 from typing import Iterable, List, Optional, Tuple
-from functools import lru_cache
 import logging
 
 import numpy as np
@@ -27,17 +26,20 @@ from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaMultiModalProjector,
 )
 
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
-from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.mm_utils import (
+    get_anyres_image_grid_shape,
+    unpad_image,
+    unpad_image_shape,
+)
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(
@@ -56,98 +58,150 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         )
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
     
-    def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
-        processor = cached_get_processor(self.config._name_or_path)
-        grid_t, grid_h, grid_w = image_grid_thw
-        num_image_tokens = (
-            grid_t
-            * grid_h
-            * grid_w
-            // processor.image_processor.merge_size
-            // processor.image_processor.merge_size
-        )
-        return num_image_tokens
-
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        if not isinstance(image_inputs.im_start_id, list) or not isinstance(
-            image_inputs.im_end_id, list
+        image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
+
+        # hardcode for spatial_unpad + anyres
+        if image_inputs.modalities is not None and (
+            "multi-images" in image_inputs.modalities
+            or "video" in image_inputs.modalities
         ):
-            return input_ids
+            image_aspect_ratio = "pad"
+        else:
+            image_aspect_ratio = "anyres"
+        offset_list = []
+        image_inputs.image_pad_len = []
+        for image_idx, image_s in enumerate(image_sizes):
+            if len(image_sizes) > 16:
+                # 2x2 pooling with stride 2
+                new_image_feature_len = (
+                    math.ceil(self.image_size / self.patch_size / 2) ** 2
+                )
+            else:
+                new_image_feature_len = self.image_feature_len  # multiimage
 
-        new_input_ids = []
-        last_idx = 0
-        image_idx = -1
-        image_inputs.image_offsets = []
+            height = width = self.num_patches_per_side
+            if "anyres" in image_aspect_ratio:
+                num_patch_width, num_patch_height = get_anyres_image_grid_shape(
+                    image_s,
+                    self.image_grid_pinpoints,
+                    self.vision_tower.config.image_size,
+                )
+                h = num_patch_height * height
+                w = num_patch_width * width
+                new_h, new_w = unpad_image_shape(h, w, image_s)
 
-        # Get all special token IDs
-        im_start_id = (
-            image_inputs.im_start_id[0].item()
-            if isinstance(image_inputs.im_start_id[0], torch.Tensor)
-            else image_inputs.im_start_id[0]
-        )
-        im_end_id = (
-            image_inputs.im_end_id[0].item()
-            if isinstance(image_inputs.im_end_id[0], torch.Tensor)
-            else image_inputs.im_end_id[0]
-        )
-        slice_start_id = (
-            image_inputs.slice_start_id[0].item()
-            if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
-            else image_inputs.slice_start_id[0]
-        )
-        slice_end_id = (
-            image_inputs.slice_end_id[0].item()
-            if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
-            else image_inputs.slice_end_id[0]
-        )
+                if "anyres_max" in self.config.image_aspect_ratio:
+                    matched_anyres_max_num_patches = re.match(
+                        r"anyres_max_(\d+)", self.config.image_aspect_ratio
+                    )
+                    if matched_anyres_max_num_patches:
+                        max_num_patches = int(matched_anyres_max_num_patches.group(1))
+                    # times = math.sqrt(h * w / (max_num_patches * unit**2))
+                    times = math.sqrt(
+                        new_h * new_w / (max_num_patches * self.image_feature_len)
+                    )
+                    if times > 1.1:
+                        new_h = int(new_h // times)
+                        new_w = int(new_w // times)
+                new_image_feature_len += new_h * (new_w + 1)
 
-        # Find all start and end positions for both types
-        start_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x == im_start_id or x == slice_start_id
-        ]
-        end_indices = [
-            i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
-        ]
+            try:
+                offset = input_ids.index(self.config.image_token_index)
+            except ValueError:
+                offset = 0
+            # old_len + pad_len - 1, because we need to remove image_token_id
+            input_ids = (
+                input_ids[:offset]
+                + [pad_values[image_idx]] * new_image_feature_len
+                + input_ids[offset + 1 :]
+            )
+            offset_list.append(offset)
+            image_inputs.image_pad_len.append(new_image_feature_len)
 
-        if len(start_indices) != len(end_indices):
-            return input_ids
-        # Process each region (both image and slice)
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            # Add non-image tokens before this region
-            new_input_ids.extend(
-                input_ids[last_idx : start_idx + 1]
-            )  # include start token
+        image_inputs.image_offsets = offset_list
+        return input_ids
 
-            is_image_start = input_ids[start_idx] == im_start_id
+    # def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    #     if not isinstance(image_inputs.im_start_id, list) or not isinstance(
+    #         image_inputs.im_end_id, list
+    #     ):
+    #         return input_ids
 
-            if is_image_start:
-                image_inputs.image_offsets += [start_idx]
-                image_idx += 1
+    #     new_input_ids = []
+    #     last_idx = 0
+    #     image_idx = -1
+    #     image_inputs.image_offsets = []
 
-            num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
+    #     # Get all special token IDs
+    #     im_start_id = (
+    #         image_inputs.im_start_id[0].item()
+    #         if isinstance(image_inputs.im_start_id[0], torch.Tensor)
+    #         else image_inputs.im_start_id[0]
+    #     )
+    #     im_end_id = (
+    #         image_inputs.im_end_id[0].item()
+    #         if isinstance(image_inputs.im_end_id[0], torch.Tensor)
+    #         else image_inputs.im_end_id[0]
+    #     )
+    #     slice_start_id = (
+    #         image_inputs.slice_start_id[0].item()
+    #         if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
+    #         else image_inputs.slice_start_id[0]
+    #     )
+    #     slice_end_id = (
+    #         image_inputs.slice_end_id[0].item()
+    #         if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
+    #         else image_inputs.slice_end_id[0]
+    #     )
 
-            # Generate pad_ids
-            pad_values = [image_inputs.pad_values[image_idx]]
+    #     # Find all start and end positions for both types
+    #     start_indices = [
+    #         i
+    #         for i, x in enumerate(input_ids)
+    #         if x == im_start_id or x == slice_start_id
+    #     ]
+    #     end_indices = [
+    #         i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
+    #     ]
 
-            pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
-            pad_ids = pad_ids[:num_tokens]
+    #     if len(start_indices) != len(end_indices):
+    #         return input_ids
+    #     # Process each region (both image and slice)
+    #     for start_idx, end_idx in zip(start_indices, end_indices):
+    #         # Add non-image tokens before this region
+    #         new_input_ids.extend(
+    #             input_ids[last_idx : start_idx + 1]
+    #         )  # include start token
 
-            # Add pad_ids
-            new_input_ids.extend(pad_ids)
+    #         is_image_start = input_ids[start_idx] == im_start_id
 
-            # Update last_idx to after end token
-            last_idx = end_idx
+    #         if is_image_start:
+    #             image_inputs.image_offsets += [start_idx]
+    #             image_idx += 1
 
-        # Add remaining tokens after last region
-        new_input_ids.extend(input_ids[last_idx:])
-        assert len(input_ids) == len(new_input_ids)
-        return new_input_ids
+    #         num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
+
+    #         # Generate pad_ids
+    #         pad_values = [image_inputs.pad_values[image_idx]]
+
+    #         pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
+    #         pad_ids = pad_ids[:num_tokens]
+
+    #         # Add pad_ids
+    #         new_input_ids.extend(pad_ids)
+
+    #         # Update last_idx to after end token
+    #         last_idx = end_idx
+
+    #     # Add remaining tokens after last region
+    #     new_input_ids.extend(input_ids[last_idx:])
+    #     assert len(input_ids) == len(new_input_ids)
+    #     return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature =image_outputs.last_hidden_state  # Note: from transformers
+        selected_image_feature =image_outputs.last_hidden_state # Note: from transformers
         image_features = self.multi_model_projector(selected_image_feature)
         return image_features
 
@@ -159,60 +213,55 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
-        logger.info("1 paligemma::forward")
-        if forward_batch.forward_mode.is_extend():
-            bs = forward_batch.batch_size
 
-            # Clamp input ids. See llava.py for more details
-            input_ids.clamp_(0, self.config._vocab_size - 1)
+        if forward_batch.forward_mode.is_extend():
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            input_ids.clamp_(min=0, max=self.config._vocab_size - 1)
 
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            image_inputs = [
-                img for img in forward_batch.image_inputs if img is not None
-            ]
-
-            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-
-            # Whether the requests need vision inputs
+            # Got List[List[str]] extend it to List[str]
+            # The length of the List should be equal to batch size
+            modalities_list = []
             max_image_offset = []
             for im in image_inputs:
+                if im and im.modalities is not None:
+                    modalities_list.extend(im.modalities)
                 if im and im.image_offsets:
-                    max_image_offset.append(max(im.image_offsets))
+                    max_image_offset.append(
+                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
+                    )
                 else:
                     max_image_offset.append(-1)
+
             start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
             need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
+                bs = forward_batch.batch_size
                 pixel_values = [
                     image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
                 ]
-                image_offsets = [
-                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+                image_sizes = [
+                    image_inputs[i].image_sizes for i in range(bs) if need_vision[i]
                 ]
 
                 ########## Encode Image ########
 
                 if pixel_values[0].ndim == 4:
-                    # : BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
+                    # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
                     np.concatenate(pixel_values, axis=0)
                     # ndim=4
                     concat_images = torch.tensor(
                         np.concatenate(pixel_values, axis=0),
                         device=self.vision_tower.device,
                     )
-                    # image_features = self.encode_images(concat_images)
-                    # split_sizes = [image.shape[0] for image in pixel_values]
-                    # image_features = torch.split(image_features, split_sizes, dim=0)
-                    image_features = self.encode_images(
-                        concat_images
-                    )  # , prompts)#, image_counts, long_video=long_video)
+                    image_features = self.encode_images(concat_images)
                     split_sizes = [image.shape[0] for image in pixel_values]
                     image_features = torch.split(image_features, split_sizes, dim=0)
-
                     # hd image_features: BS, num_patch, 576, 4096
                 else:
                     # normal pixel: BS, C=3, H=336, W=336
@@ -220,11 +269,167 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                         np.array(pixel_values), device=self.vision_tower.device
                     )
                     image_features = self.encode_images(pixel_values)
+                    # image_features: BS, 576, 4096
 
-                new_image_features = []
-                for image_idx, image_feature in enumerate(image_features):
-                    new_image_features.append(image_feature.flatten(0, 1))
-                image_features = new_image_features
+                if self.mm_patch_merge_type.startswith("spatial"):
+                    new_image_features = []
+                    height = width = self.num_patches_per_side
+                    for image_idx, image_feature in enumerate(image_features):
+                        if modalities_list[image_idx] == "image":
+                            image_aspect_ratio = (
+                                self.config.image_aspect_ratio
+                            )  # single image
+                        elif (
+                            modalities_list[image_idx] == "multi-images"
+                            or modalities_list[image_idx] == "video"
+                        ):
+                            image_aspect_ratio = "pad"  # multi image
+                        # image_aspect_ratio = (
+                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
+                        # )
+                        if (
+                            image_feature.shape[0] > 1
+                            and "anyres" in image_aspect_ratio
+                            and modalities_list[image_idx] == "image"
+                        ):
+                            base_image_feature = image_feature[0]
+                            image_feature = image_feature[1:]
+                            assert height * width == base_image_feature.shape[0]
+
+                            if "anyres_max" in image_aspect_ratio:
+                                matched_anyres_max_num_patches = re.match(
+                                    r"anyres_max_(\d+)", image_aspect_ratio
+                                )
+                                if matched_anyres_max_num_patches:
+                                    max_num_patches = int(
+                                        matched_anyres_max_num_patches.group(1)
+                                    )
+
+                            if (
+                                image_aspect_ratio == "anyres"
+                                or "anyres_max" in image_aspect_ratio
+                            ):
+                                vision_tower_image_size = self.image_size
+                                try:
+                                    num_patch_width, num_patch_height = (
+                                        get_anyres_image_grid_shape(
+                                            image_sizes[image_idx][0],
+                                            self.config.image_grid_pinpoints,
+                                            vision_tower_image_size,
+                                        )
+                                    )
+                                except Exception as e:
+                                    print(f"Error: {e}")
+                                    num_patch_width, num_patch_height = 2, 2
+                                image_feature = image_feature.view(
+                                    num_patch_height, num_patch_width, height, width, -1
+                                )
+                            else:
+                                image_feature = image_feature.view(
+                                    2, 2, height, width, -1
+                                )
+
+                            # (
+                            #     num_patch_width,
+                            #     num_patch_height,
+                            # ) = get_anyres_image_grid_shape(
+                            #     image_sizes[image_idx][0],
+                            #     self.image_grid_pinpoints,
+                            #     self.vision_tower.config.image_size,
+                            # )
+
+                            # image_feature = image_feature.view(
+                            #     num_patch_height, num_patch_width, height, width, -1
+                            # )
+
+                            if "unpad" in self.mm_patch_merge_type:
+                                unit = image_feature.shape[2]
+                                image_feature = image_feature.permute(
+                                    4, 0, 2, 1, 3
+                                ).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(
+                                    2, 3
+                                )
+                                image_feature = unpad_image(
+                                    image_feature, image_sizes[image_idx][0]
+                                )
+                                if (
+                                    "anyres_max" in image_aspect_ratio
+                                    and matched_anyres_max_num_patches
+                                ):
+                                    c, h, w = image_feature.shape
+                                    times = math.sqrt(
+                                        h * w / (max_num_patches * unit**2)
+                                    )
+                                    if times > 1.1:
+                                        image_feature = image_feature[None]
+                                        image_feature = nn.functional.interpolate(
+                                            image_feature,
+                                            [int(h // times), int(w // times)],
+                                            mode="bilinear",
+                                        )[0]
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        self.language_model.model.image_newline[
+                                            :, None, None
+                                        ].expand(*image_feature.shape[:-1], 1),
+                                    ),
+                                    dim=-1,
+                                )
+                                image_feature = image_feature.flatten(1, 2).transpose(
+                                    0, 1
+                                )
+                            else:
+                                image_feature = image_feature.permute(
+                                    0, 2, 1, 3, 4
+                                ).contiguous()
+                                image_feature = image_feature.flatten(0, 3)
+                            image_feature = torch.cat(
+                                (base_image_feature, image_feature), dim=0
+                            )
+                            image_feature = image_feature.unsqueeze(0)
+                        else:
+                            if modalities_list[image_idx] == "video":  # video
+                                # 2x2 pooling
+                                num_of_frames = image_feature.shape[0]
+                                image_feature = image_feature.view(
+                                    num_of_frames, height, width, -1
+                                )
+                                image_feature = image_feature.permute(
+                                    0, 3, 1, 2
+                                ).contiguous()  # N, C, H, W
+                                height, weight = image_feature.shape[2:]
+                                scaled_shape = [
+                                    math.ceil(height / 2),
+                                    math.ceil(weight / 2),
+                                ]
+                                image_feature = nn.functional.interpolate(
+                                    image_feature, size=scaled_shape, mode="bilinear"
+                                )
+                                image_feature = (
+                                    image_feature.flatten(2)
+                                    .transpose(1, 2)
+                                    .contiguous()
+                                )  # N, C, H*W
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        # Expand to (bs, 1, hidden_dim) and concat at the end of the image tokens
+                                        self.language_model.model.image_newline[
+                                            None, None
+                                        ].expand(
+                                            image_feature.shape[0],
+                                            1,
+                                            image_feature.shape[-1],
+                                        ),
+                                    ),
+                                    dim=1,
+                                )
+
+                        new_image_features.append(image_feature)
+                    image_features = new_image_features
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
@@ -240,11 +445,18 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                     prefix_len = prefix_lens_cpu[i]
 
                     # Multiple images
-                    for image_offset in image_offsets[i]:
-                        if image_offset < prefix_len:
+                    for image_idx, image_offset in enumerate(
+                        image_inputs[i].image_offsets
+                    ):
+                        if (
+                            image_offset + image_inputs[i].image_pad_len[image_idx]
+                            <= prefix_len
+                        ):
                             continue
+                        if image_offset >= prefix_len + seq_len:
+                            break
 
-                        tmp_image_feature = image_features[pt]
+                        tmp_image_feature = image_features[pt][image_idx]
                         pad_len = tmp_image_feature.shape[0]
 
                         input_offset = image_offset - prefix_len
@@ -267,13 +479,131 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                             print(
                                 f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
                             )
-                        pt += 1
+                    pt += 1
 
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
+        # image_inputs = forward_batch.image_inputs
+        # logger.info(f"1 paligemma::forward and inputs_ids.shape:{input_ids.shape}")
+        # if forward_batch.forward_mode.is_extend():
+        #     bs = forward_batch.batch_size
+
+        #     # Clamp input ids. See llava.py for more details
+        #     input_ids.clamp_(0, self.config._vocab_size - 1)
+
+        #     # Embed text inputs
+        #     input_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        #     image_inputs = [
+        #         img for img in forward_batch.image_inputs if img is not None
+        #     ]
+
+        #     extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+        #     prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+
+        #     # Whether the requests need vision inputs
+        #     max_image_offset = []
+        #     for im in image_inputs:
+        #         if im and im.image_offsets:
+        #             max_image_offset.append(max(im.image_offsets))
+        #         else:
+        #             max_image_offset.append(-1)
+        #     start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
+        #     need_vision = start_positions <= np.array(max_image_offset)
+
+        #     if need_vision.any():
+        #         pixel_values = [
+        #             image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
+        #         ]
+        #         image_offsets = [
+        #             image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+        #         ]
+
+        #         ########## Encode Image ########
+
+        #         if pixel_values[0].ndim == 4:
+        #             # : BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
+        #             np.concatenate(pixel_values, axis=0)
+        #             # ndim=4
+        #             concat_images = torch.tensor(
+        #                 np.concatenate(pixel_values, axis=0),
+        #                 device=self.vision_tower.device,
+        #             )
+        #             # image_features = self.encode_images(concat_images)
+        #             # split_sizes = [image.shape[0] for image in pixel_values]
+        #             # image_features = torch.split(image_features, split_sizes, dim=0)
+        #             image_features = self.encode_images(
+        #                 concat_images
+        #             )  # , prompts)#, image_counts, long_video=long_video)
+        #             split_sizes = [image.shape[0] for image in pixel_values]
+        #             image_features = torch.split(image_features, split_sizes, dim=0)
+
+        #             # hd image_features: BS, num_patch, 576, 4096
+        #         else:
+        #             # normal pixel: BS, C=3, H=336, W=336
+        #             pixel_values = torch.tensor(
+        #                 np.array(pixel_values), device=self.vision_tower.device
+        #             )
+        #             image_features = self.encode_images(pixel_values)
+
+        #         new_image_features = []
+        #         for image_idx, image_feature in enumerate(image_features):
+        #             new_image_features.append(image_feature.flatten(0, 1))
+        #         image_features = new_image_features
+
+        #         # Fill in the placeholder for the image
+        #         extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+        #         extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
+        #         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        #         pt = 0
+        #         for i in range(bs):
+        #             if not need_vision[i]:
+        #                 continue
+
+        #             start_idx = extend_start_loc_cpu[i]
+        #             seq_len = extend_seq_lens[i]
+        #             prefix_len = prefix_lens_cpu[i]
+
+        #             # Multiple images
+        #             for image_offset in image_offsets[i]:
+        #                 if image_offset < prefix_len:
+        #                     continue
+
+        #                 tmp_image_feature = image_features[pt]
+        #                 pad_len = tmp_image_feature.shape[0]
+
+        #                 input_offset = image_offset - prefix_len
+        #                 left_idx = start_idx + input_offset
+        #                 right_idx = left_idx + pad_len
+        #                 assert right_idx > start_idx
+        #                 if input_offset < 0:
+        #                     left_idx = start_idx
+        #                     tmp_image_feature = tmp_image_feature[-input_offset:]
+        #                 if right_idx > start_idx + seq_len:
+        #                     tmp_image_feature = tmp_image_feature[
+        #                         : start_idx + seq_len - right_idx
+        #                     ]
+        #                     right_idx = start_idx + seq_len
+        #                 try:
+        #                     input_embeds[left_idx:right_idx] = tmp_image_feature
+        #                 except RuntimeError as e:
+        #                     print(f"RuntimeError in image encoding: {e}")
+        #                     print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
+        #                     print(
+        #                         f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
+        #                     )
+        #                 pt += 1
+
+        #     return self.language_model(
+        #         input_ids, positions, forward_batch, input_embeds=input_embeds
+        #     )
+        # elif forward_batch.forward_mode.is_decode():
+        #     if image_inputs is  None or len(image_inputs) == 0:
+        #         input_embds = self.language_model.model.embed_tokens(input_ids)
+        #     return self.language_model(input_ids, positions, forward_batch, input_embeds=input_embds)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.vision_tower = SiglipVisionModel.from_pretrained(
