@@ -31,10 +31,8 @@ class KVCacheReceiver:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setblocking(True)
                 try:
-                    print("!!!!! start connect !!!!!")
                     sock.connect((remote_ip, int(remote_port)))
-                    self.connections[key] = sock
-                    print("!!!!! done connect !!!!!")
+                    # self.connections[key] = sock
                 except Exception as e:
                     sock.close()
                     raise
@@ -43,16 +41,11 @@ class KVCacheReceiver:
         try:
             print("start recv, kv cache size: ", kv_cache_size)
             while len(received) < kv_cache_size:
-                print("recv a chunk now size: ", len(received))
-                chunk = sock.recv(4096)
+                chunk = sock.recv(64*1024)
                 if not chunk:
                     # Remote closed connection, remove and retry
                     raise ConnectionError("Connection closed by remote")
                 received.extend(chunk)
-            # Return successfully if all data is received
-            # print("!!!!!!!!!!")
-            # print(received)
-            print("!!!!!!!!!!")
             return bytes(received)
         except (ConnectionError, OSError) as e:
             # Cleanup and retry on connection errors
@@ -98,12 +91,14 @@ class KVCacheSender:
         """wait until only one thread is doing the accept"""
         addr_key = (remote_ip, remote_port)
         if addr_key in self.connections:
+            print("??? here")
             return
         else:
+            print("addr_key: ", addr_key)
             # TODO accept should have a timeout
             client_sock, client_addr_key = self.sock.accept()
             # <socket.socket fd=174, family=AddressFamily.AF_INET, type=SocketKind.SOCK_STREAM, proto=0, laddr=('127.0.0.1', 4000), raddr=('127.0.0.1', 46738)>
-            # print(f"!!!!! debug addr: {client_sock}, {addr_key}")
+            print(f"!!!!! debug addr: {client_sock}, {addr_key}")
             # assert client_addr_key == addr_key
             client_sock.setblocking(True)
             self.connections[addr_key] = client_sock
@@ -130,6 +125,7 @@ class KVCacheSender:
         
         # if sent == len(buffer):
         client_sock.close()
+        self.connections.pop(addr_key)
         return 
 
 if __name__ == "__main__":

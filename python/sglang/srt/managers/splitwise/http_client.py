@@ -3,7 +3,7 @@ import sys
 import zmq
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+# from concurrent.futures import ThreadPoolExecutor
 import queue
 import requests
 from dataclasses import asdict
@@ -38,7 +38,7 @@ class HTTPClientManager:
         max_workers=10,
         timeout=0.5, # timeout in secs
     ):
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.response_queue = queue.Queue()
         self.asyncio_tasks = set()
 
@@ -64,17 +64,15 @@ class HTTPClientManager:
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            logger.info("============== start recv obj ================")
             recv_obj = self.recv_from_scheduler.recv_pyobj()
-            logger.info("============== finally recv obj ================")
             print(recv_obj)
             self._req_dispatcher(recv_obj)
 
     def _handle_prefill_request(self, prefill_input: PrefillOnlyInput):
         try:
-            if not prefill_input.prefill_instance_ip_port or len(prefill_input.prefill_instance_ip_port) != 2:
-                return {"status": "error", "message": "Invalid prefill instance IP:port"}
-            ip, port = prefill_input.prefill_instance_ip_port
+            # if not prefill_input.prefill_instance_ip_port or len(prefill_input.prefill_instance_ip_port) != 2:
+            #     return {"status": "error", "message": "Invalid prefill instance IP:port"}
+            ip, port = prefill_input.prefill_instance_host, prefill_input.prefill_instance_port
             url = f"http://{ip}:{port}/send_prefill_request"
             data = asdict(prefill_input)
             data['sampling_params'] = convert_sampling_params(data.get('sampling_params'))
@@ -91,9 +89,9 @@ class HTTPClientManager:
 
     def _handle_prefill_response(self, prefill_output: PrefillOnlyOutput):
         try:
-            if not prefill_output.prefill_instance_ip_port or len(prefill_output.prefill_instance_ip_port) != 2:
-                return {"status": "error", "message": "Invalid prefill instance IP:port"}
-            ip, port = prefill_output.decode_instance_ip_port
+            # if not prefill_output.prefill_instance_ip_port or len(prefill_output.prefill_instance_ip_port) != 2:
+            #     return {"status": "error", "message": "Invalid prefill instance IP:port"}
+            ip, port = prefill_output.decode_instance_host, prefill_output.decode_instance_port
             url = f"http://{ip}:{port}/return_prefill_result"
             data = asdict(prefill_output)
 

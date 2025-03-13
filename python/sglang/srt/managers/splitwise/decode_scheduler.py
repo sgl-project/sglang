@@ -20,12 +20,15 @@ import signal
 import threading
 import time
 import warnings
+import math
+import queue
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor
 
 import psutil
 import setproctitle
@@ -35,7 +38,7 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
+# from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -64,7 +67,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    #
     PrefillOnlyInput,
     PrefillOnlyOutput,
     SamplingParams,
@@ -470,11 +472,15 @@ class DecodeScheduler:
             ]
         )
 
-        # TODO: remove hard coding ip and port
         if self.attn_tp_rank == 0:
             self.kv_cache_receiver = KVCacheReceiver()
         else:
             self.kv_cache_receiver = None
+
+        self.kv_transfer_stream = torch.cuda.Stream()
+        self.kv_cache_transfer_queue = queue.Queue()
+        kv_transfer_thread = threading.Thread(target=self.kv_cache_pulling_loop, daemon=True)
+        kv_transfer_thread.start()
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one batch takes too long."""
@@ -611,8 +617,6 @@ class DecodeScheduler:
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            print("!!!!!!!!! recv warmup req !!!!!!!!!!")
-            print(recv_req)
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
@@ -622,7 +626,9 @@ class DecodeScheduler:
         recv_req: PrefillOnlyOutput
     ):
         # parse prefill result
-        sample_params = SamplingParams(temperature=0.7, stop=[]) # TODO: need to have a sample param parser
+        # TODO: need to have a sample param parser
+        sample_params = SamplingParams(temperature=0.7, stop=[]) 
+        
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -639,8 +645,6 @@ class DecodeScheduler:
             input_embeds=None,
             custom_logit_processor=None,
             eos_token_ids=self.model_config.hf_eos_token_id,
-            prefill_instance_ip_port=recv_req.prefill_instance_ip_port,
-            decode_instance_ip_port=recv_req.decode_instance_ip_port
         )
         req.tokenizer = self.tokenizer
 
@@ -648,38 +652,54 @@ class DecodeScheduler:
         req.output_ids = recv_req.output_ids
         self.stream_output([req], False)
 
-        # TODO: kick off kv cache pulling
-        # TODO: remove hard coding value here
+        # do kv transfer in a seperate thread
+        self.kv_cache_transfer_queue.put((req, recv_req))
+
+    def kv_cache_pulling_loop(self):
+        while True:
+            req, recv_req = self.kv_cache_transfer_queue.get()
+            self._pull_kv_cache(req, recv_req)
+
+    @torch.no_grad()
+    def _pull_kv_cache(
+        self,
+        req: Req,
+        recv_req: PrefillOnlyOutput,
+    ):
         token_ids = req.origin_input_ids + req.output_ids
         context_length = len(token_ids) - 1
-        shape = (self.token_to_kv_pool.layer_num, context_length, 1, 576)
 
-        if self.attn_tp_rank == 0:
-            remote_ip = "127.0.0.1"
-            remote_port = 4000
-            kv_cache_size = self.token_to_kv_pool.layer_num * (context_length) * 576 * 2
-            buffer = self.kv_cache_receiver.pull_kv_cache(remote_ip, remote_port, kv_cache_size)
-            shape = (self.token_to_kv_pool.layer_num, context_length, 1, 576)
-            buffer_view = memoryview(buffer)
-            kv_cache = torch.frombuffer(buffer_view, dtype=torch.bfloat16).clone().reshape(shape)
-            # Move tensor to GPU for rank 0
-            kv_cache = kv_cache.to(f'cuda:{self.attn_tp_rank}')
-        else:
-            kv_cache = torch.empty(shape, dtype=torch.bfloat16, device=f'cuda:{self.attn_tp_rank}')
+        # TODO: this shape is for MLA model, need to have a utility function for this
+        shape = (self.token_to_kv_pool.layer_num, context_length, 1, self.token_to_kv_pool.kv_buffer[0].shape[-1])
 
-        # Broadcast actual tensor data
-        dist.broadcast(kv_cache, src=0)
-        print(f"Rank {self.attn_tp_rank} received:", kv_cache)
+        with torch.cuda.stream(self.kv_transfer_stream):
+            if self.attn_tp_rank == 0:
+                remote_ip = recv_req.kv_transfer_host
+                remote_port = recv_req.kv_transfer_port
 
-        # copy kv cache to managed kv pool, and let tree cache keep track of it
-        device_indices = self.token_to_kv_pool.alloc(context_length)
-        for i in range(self.token_to_kv_pool.layer_num):
-            self.token_to_kv_pool.kv_buffer[i][device_indices] = kv_cache[i]
+                # TODO: remove hard coding dtype, now use dtype as bfloat16
+                kv_cache_size = math.prod(shape) * 2
+                buffer = self.kv_cache_receiver.pull_kv_cache(remote_ip, remote_port, kv_cache_size)
+                buffer_view = memoryview(buffer)
+                kv_cache = torch.frombuffer(buffer_view, dtype=torch.bfloat16).clone().reshape(shape)
+                # Move tensor to GPU for rank 0
+                kv_cache = kv_cache.to(f'cuda:{self.attn_tp_rank}')
+            else:
+                kv_cache = torch.empty(shape, dtype=torch.bfloat16, device=f'cuda:{self.attn_tp_rank}')
+
+            # Broadcast actual tensor data
+            dist.broadcast(kv_cache, src=0)
+            print(f"Rank {self.attn_tp_rank} received:", kv_cache)
+
+            # copy kv cache to managed kv pool, and let tree cache keep track of it
+            device_indices = self.token_to_kv_pool.alloc(context_length)
+            for i in range(self.token_to_kv_pool.layer_num):
+                self.token_to_kv_pool.kv_buffer[i][device_indices] = kv_cache[i]
         
-        self.tree_cache.insert(token_ids, device_indices.clone())
+            self.tree_cache.insert(token_ids, device_indices.clone())
 
         # self.req_to_token_pool.req_to_token[req.req_pool_idx][:context_length] = device_indices
-        self.waiting_queue.append(req)
+        self.waiting_queue.append(req)        
 
     def distribute_to_prefill(
         self,
@@ -688,16 +708,22 @@ class DecodeScheduler:
         # create prefill only req
         # TODO: need to figure out session_params stuff
 
-        # TODO: need to have a load balance
-        prefill_instance_ip_port = ["127.0.0.1", "30001"]
-        decode_instance_ip_port = ["127.0.0.1", "30000"]
+        ## TODO need a way to get private network ip
+        decode_instance_host = "127.0.0.1"
+        decode_instance_port = self.server_args.port
+
+        # TODO: implement a load balance + service discovery
+        # prefill_instance_host, prefill_instance_port = self.prefill_selector.select()
+        prefill_instance_host, prefill_instance_port = "127.0.0.1", 30001
 
         prefill_req = PrefillOnlyInput(
             input_ids=recv_req.input_ids,
             rid = recv_req.rid,
-            prefill_instance_ip_port=prefill_instance_ip_port,
-            decode_instance_ip_port=decode_instance_ip_port,
             input_text=recv_req.input_text,
+            prefill_instance_host=prefill_instance_host,
+            prefill_instance_port=prefill_instance_port,
+            decode_instance_host=decode_instance_host,
+            decode_instance_port=decode_instance_port,
             sampling_params={
                 "temperature": recv_req.sampling_params.temperature,
                 "top_p": recv_req.sampling_params.top_p,
@@ -705,9 +731,7 @@ class DecodeScheduler:
             },
         )
 
-        print("!!!!!!!!!! distribute to prefill !!!!!!!!!!")
         self.out_bound_to_http_clients.send_pyobj(prefill_req)
-        print("!!!!!!!!!! done send !!!!!!!!!!!!")
 
     def handle_generate_request(
         self,
@@ -845,70 +869,6 @@ class DecodeScheduler:
             self.grammar_queue.append(req)
         else:
             self.waiting_queue.append(req)
-
-    # def handle_embedding_request(
-    #     self,
-    #     recv_req: TokenizedEmbeddingReqInput,
-    # ):
-    #     req = Req(
-    #         recv_req.rid,
-    #         recv_req.input_text,
-    #         recv_req.input_ids,
-    #         recv_req.sampling_params,
-    #     )
-    #     req.tokenizer = self.tokenizer
-
-    #     # Validate prompts length
-    #     error_msg = validate_input_length(
-    #         req,
-    #         self.max_req_input_len,
-    #         self.server_args.allow_auto_truncate,
-    #     )
-    #     if error_msg:
-    #         self.waiting_queue.append(req)
-    #         return
-
-    #     # Copy more attributes
-    #     req.logprob_start_len = len(req.origin_input_ids) - 1
-    #     self.waiting_queue.append(req)
-
-    # def log_prefill_stats(
-    #     self,
-    #     adder: PrefillAdder,
-    #     can_run_list: List[Req],
-    #     running_bs: ScheduleBatch,
-    #     has_being_chunked: bool,
-    # ):
-    #     self.tree_cache_metrics["total"] += (
-    #         adder.log_input_tokens + adder.log_hit_tokens
-    #     ) / 10**9
-    #     self.tree_cache_metrics["hit"] += (adder.log_hit_tokens) / 10**9
-    #     tree_cache_hit_rate = (
-    #         self.tree_cache_metrics["hit"] / self.tree_cache_metrics["total"]
-    #     )
-
-    #     num_used = self.max_total_num_tokens - (
-    #         self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
-    #     )
-
-    #     logger.info(
-    #         f"Prefill batch. "
-    #         f"#new-seq: {len(can_run_list)}, "
-    #         f"#new-token: {adder.log_input_tokens}, "
-    #         f"#cached-token: {adder.log_hit_tokens}, "
-    #         f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
-    #         f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-    #         f"#running-req: {running_bs}, "
-    #         f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
-    #     )
-
-    #     if self.enable_metrics:
-    #         self.stats.num_running_reqs = running_bs
-    #         self.stats.num_used_tokens = num_used
-    #         self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
-    #         self.stats.num_queue_reqs = len(self.waiting_queue) + has_being_chunked
-    #         self.stats.cache_hit_rate = tree_cache_hit_rate
-    #         self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
         num_used = self.max_total_num_tokens - (
@@ -1063,7 +1023,6 @@ class DecodeScheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
-            # print("!!!!!! debug req: ", req)
             if self.enable_hierarchical_cache and req.last_node is not None:
                 if req.last_node.evicted:
                     # loading KV cache for the request
@@ -1117,11 +1076,6 @@ class DecodeScheduler:
         # if self.being_chunked_req:
         #     self.being_chunked_req.is_being_chunked += 1
 
-        # Print stats
-        # if self.attn_tp_rank == 0:
-            # self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
-            # self.log_prefill_stats(adder, can_run_list, running_bs, False)
-
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -1157,162 +1111,6 @@ class DecodeScheduler:
         #     new_batch.decoding_reqs = None
 
         return new_batch
-
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
-        # if self.grammar_queue:
-        #     self.move_ready_grammar_requests()
-
-        # Handle the cases where prefill is not allowed
-        if (
-            self.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.being_chunked_req is None:
-            return None
-
-        running_bs = len(self.running_batch.reqs) if self.running_batch else 0
-        if running_bs >= self.max_running_requests:
-            self.batch_is_full = True
-            return None
-
-        # Get priority queue
-        # prefix_computed = self.policy.calc_priority(self.waiting_queue)
-
-        # Prefill policy
-        adder = PrefillAdder(
-            self.tree_cache,
-            self.token_to_kv_pool,
-            self.running_batch,
-            self.new_token_ratio,
-            self.max_prefill_tokens,
-            self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-        )
-
-        # has_being_chunked = self.being_chunked_req is not None
-        # if has_being_chunked:
-        #     self.being_chunked_req.init_next_round_input()
-        #     self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
-
-        # if self.lora_paths:
-        #     lora_set = (
-        #         set([req.lora_path for req in self.running_batch.reqs])
-        #         if self.running_batch is not None
-        #         else set([])
-        #     )
-
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
-            # send req to prefill
-            pass
-
-
-            # if (
-            #     self.lora_paths
-            #     and len(
-            #         lora_set
-            #         | set([req.lora_path for req in adder.can_run_list])
-            #         | set([req.lora_path])
-            #     )
-            #     > self.max_loras_per_batch
-            # ):
-            #     self.batch_is_full = True
-            #     break
-
-            # if running_bs + len(adder.can_run_list) >= self.max_running_requests:
-            #     self.batch_is_full = True
-            #     break
-
-            # req.init_next_round_input(None if prefix_computed else self.tree_cache)
-
-            # if self.enable_hierarchical_cache and req.last_node is not None:
-            #     if req.last_node.evicted:
-            #         # loading KV cache for the request
-            #         req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-            #             req.last_node,
-            #             req.prefix_indices,
-            #             adder.rem_total_tokens,
-            #         )
-            #         if req.last_node.loading:
-            #             # to prevent frequent cache invalidation
-            #             if req.rid in self.staging_reqs:
-            #                 self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-            #             self.tree_cache.inc_lock_ref(req.last_node)
-            #             self.staging_reqs[req.rid] = req.last_node
-            #             continue
-            #     elif req.last_node.loading:
-            #         if not self.tree_cache.loading_complete(req.last_node):
-            #             continue
-
-            #     if req.rid in self.staging_reqs:
-            #         self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-            #         del self.staging_reqs[req.rid]
-
-            # res = adder.add_one_req(req)
-            # if res != AddReqResult.CONTINUE:
-            #     if res == AddReqResult.NO_TOKEN:
-            #         if self.enable_hierarchical_cache:
-            #             # Set batch_is_full after making sure there are requests that can be served
-            #             self.batch_is_full = len(adder.can_run_list) > 0 or (
-            #                 self.running_batch is not None
-            #                 and not self.running_batch.is_empty()
-            #             )
-            #         else:
-            #             self.batch_is_full = True
-            #     break
-            # if self.server_args.prefill_only_one_req:
-            #     break
-
-        # Update waiting queue
-        can_run_list = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
-
-        # if adder.new_being_chunked_req is not None:
-        #     assert self.being_chunked_req is None
-        #     self.being_chunked_req = adder.new_being_chunked_req
-
-        # if self.being_chunked_req:
-        #     self.being_chunked_req.is_being_chunked += 1
-
-        # Print stats
-        # if self.attn_tp_rank == 0:
-        #     self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
-
-        # Create a new batch
-        # new_batch = ScheduleBatch.init_new(
-        #     can_run_list,
-        #     self.req_to_token_pool,
-        #     self.token_to_kv_pool,
-        #     self.tree_cache,
-        #     self.model_config,
-        #     self.enable_overlap,
-        #     self.spec_algorithm,
-        #     self.server_args.enable_custom_logit_processor,
-        #     self.server_args.return_hidden_states,
-        # )
-        # new_batch.prepare_for_extend()
-
-        # Mixed-style chunked prefill
-        # if (
-        #     self.is_mixed_chunk
-        #     and self.running_batch is not None
-        #     and not (new_batch.return_logprob or self.running_batch.return_logprob)
-        # ):
-        #     # TODO (lianmin): support return_logprob + mixed chunked prefill
-        #     self.running_batch.filter_batch()
-        #     if not self.running_batch.is_empty():
-        #         self.running_batch.prepare_for_decode()
-        #         new_batch.mix_with_running(self.running_batch)
-        #         new_batch.decoding_reqs = self.running_batch.reqs
-        #     self.running_batch = None
-        # else:
-        #     new_batch.decoding_reqs = None
-
-        # return new_batch
-        return None
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

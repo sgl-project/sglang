@@ -20,8 +20,11 @@ import signal
 import threading
 import time
 import warnings
+import math
+import queue
 from collections import deque
 from concurrent import futures
+import ctypes
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -146,14 +149,6 @@ class PrefillScheduler:
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.spec_algorithm = SpeculativeAlgorithm.NONE
-        # self.spec_algorithm = SpeculativeAlgorithm.from_string(
-        #     server_args.speculative_algorithm
-        # )
-        # self.decode_mem_cache_buf_multiplier = (
-        #     self.server_args.speculative_num_draft_tokens
-        #     if not self.spec_algorithm.is_none()
-        #     else 1
-        # )
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
 
         # Distributed rank info
@@ -375,9 +370,9 @@ class PrefillScheduler:
         self.batch_is_full = False
 
         # Init watchdog thread
-        # self.watchdog_timeout = server_args.watchdog_timeout
-        # t = threading.Thread(target=self.watchdog_thread, daemon=True)
-        # t.start()
+        self.watchdog_timeout = server_args.watchdog_timeout
+        t = threading.Thread(target=self.watchdog_thread, daemon=True)
+        t.start()
         self.parent_process = psutil.Process().parent()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -446,31 +441,38 @@ class PrefillScheduler:
             ]
         )
 
-        # TODO: need to remove hard coding value
         if self.attn_tp_rank == 0:
-            self.kv_cache_sender = KVCacheSender(host="127.0.0.1", port=4000)
+            self.kv_cache_sender = KVCacheSender(
+                host=server_args.kv_transfer_tcp_host, 
+                port=server_args.kv_transfer_tcp_port,
+            )
         else:
             self.kv_cache_sender = None
 
-    # def watchdog_thread(self):
-    #     """A watch dog thread that will try to kill the server itself if one batch takes too long."""
-    #     self.watchdog_last_forward_ct = 0
-    #     self.watchdog_last_time = time.time()
+        self.kv_transfer_stream = torch.cuda.Stream()
+        self.kv_cache_transfer_queue = queue.Queue()
+        kv_transfer_thread = threading.Thread(target=self.kv_cache_sending_loop, daemon=True)
+        kv_transfer_thread.start()
 
-    #     while True:
-    #         current = time.time()
-    #         if self.cur_batch is not None:
-    #             if self.watchdog_last_forward_ct == self.forward_ct:
-    #                 if current > self.watchdog_last_time + self.watchdog_timeout:
-    #                     logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
-    #                     break
-    #             else:
-    #                 self.watchdog_last_forward_ct = self.forward_ct
-    #                 self.watchdog_last_time = current
-    #         time.sleep(self.watchdog_timeout // 2)
-    #     # Wait sometimes so that the parent process can print the error.
-    #     time.sleep(5)
-    #     self.parent_process.send_signal(signal.SIGQUIT)
+    def watchdog_thread(self):
+        """A watch dog thread that will try to kill the server itself if one batch takes too long."""
+        self.watchdog_last_forward_ct = 0
+        self.watchdog_last_time = time.time()
+
+        while True:
+            current = time.time()
+            if self.cur_batch is not None:
+                if self.watchdog_last_forward_ct == self.forward_ct:
+                    if current > self.watchdog_last_time + self.watchdog_timeout:
+                        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+                        break
+                else:
+                    self.watchdog_last_forward_ct = self.forward_ct
+                    self.watchdog_last_time = current
+            time.sleep(self.watchdog_timeout // 2)
+        # Wait sometimes so that the parent process can print the error.
+        time.sleep(5)
+        self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def event_loop_normal(self):
@@ -589,8 +591,6 @@ class PrefillScheduler:
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            print("!!!!!!!! receive new req !!!!!!!!!!")
-            print(recv_req)
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
@@ -614,14 +614,13 @@ class PrefillScheduler:
             input_embeds=None,
             custom_logit_processor=None,
             eos_token_ids=self.model_config.hf_eos_token_id,
-            # prefill_instance_ip_port=recv_req.prefill_instance_ip_port,
-            # decode_instance_ip_port=recv_req.decode_instance_ip_port
         )
 
         if isinstance(recv_req, PrefillOnlyInput):
-            req.prefill_instance_ip_port = recv_req.prefill_instance_ip_port
-            req.decode_instance_ip_port = recv_req.decode_instance_ip_port
-
+            req.prefill_instance_host = recv_req.prefill_instance_host
+            req.prefill_instance_port = recv_req.prefill_instance_port
+            req.decode_instance_host = recv_req.decode_instance_host
+            req.decode_instance_port = recv_req.decode_instance_port
 
         req.tokenizer = self.tokenizer
 
@@ -756,34 +755,7 @@ class PrefillScheduler:
         # if add_to_grammar_queue:
         #     self.grammar_queue.append(req)
         # else:
-        print("!!!!!!!! put req into waiting_queue !!!!!!!!!!")
         self.waiting_queue.append(req)
-
-    # def handle_embedding_request(
-    #     self,
-    #     recv_req: TokenizedEmbeddingReqInput,
-    # ):
-    #     req = Req(
-    #         recv_req.rid,
-    #         recv_req.input_text,
-    #         recv_req.input_ids,
-    #         recv_req.sampling_params,
-    #     )
-    #     req.tokenizer = self.tokenizer
-
-    #     # Validate prompts length
-    #     error_msg = validate_input_length(
-    #         req,
-    #         self.max_req_input_len,
-    #         self.server_args.allow_auto_truncate,
-    #     )
-    #     if error_msg:
-    #         self.waiting_queue.append(req)
-    #         return
-
-    #     # Copy more attributes
-    #     req.logprob_start_len = len(req.origin_input_ids) - 1
-    #     self.waiting_queue.append(req)
 
     def log_prefill_stats(
         self,
@@ -870,26 +842,11 @@ class PrefillScheduler:
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        # print("!!!!!!!! new batch: ", new_batch)
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
         else: 
-            # skip decode
-            pass
-
-            # TODO swap out kv cache and put into kv cache send queue
-            pass
-
             ret = None
-
-
-            # Run decode
-            # if self.running_batch is None:
-            #     ret = None
-            # else:
-            #     self.running_batch = self.update_running_batch(self.running_batch)
-            #     ret = self.running_batch
 
         # Handle DP attention
         # if self.server_args.enable_dp_attention:
@@ -961,7 +918,6 @@ class PrefillScheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
-            print("!!!!!!!! add one req")
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1009,7 +965,6 @@ class PrefillScheduler:
             self.server_args.enable_custom_logit_processor,
             self.server_args.return_hidden_states,
         )
-        print("!!!!!!!!!!!!!!!!!!!!!! debug new batch: ", new_batch.req_to_token_pool)
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
@@ -1030,80 +985,16 @@ class PrefillScheduler:
 
         return new_batch
 
-    # def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-    #     """Update the current running decoding batch."""
-    #     global test_retract
-
-    #     initial_bs = batch.batch_size()
-
-    #     batch.filter_batch()
-    #     if batch.is_empty():
-    #         self.batch_is_full = False
-    #         return None
-
-    #     # Check if decode out of memory
-    #     if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
-    #         test_retract and batch.batch_size() > 10
-    #     ):
-    #         old_ratio = self.new_token_ratio
-
-    #         retracted_reqs, new_token_ratio = batch.retract_decode()
-    #         self.new_token_ratio = new_token_ratio
-    #         if self.draft_worker:
-    #             self.draft_worker.finish_request(retracted_reqs)
-
-    #         logger.info(
-    #             "Decode out of memory happened. "
-    #             f"#retracted_reqs: {len(retracted_reqs)}, "
-    #             f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
-    #         )
-    #         self.waiting_queue.extend(retracted_reqs)
-    #     else:
-    #         self.new_token_ratio = max(
-    #             self.new_token_ratio - self.new_token_ratio_decay,
-    #             self.min_new_token_ratio,
-    #         )
-
-    #     # Check for jump-forward
-    #     if not self.disable_jump_forward and batch.has_grammar:
-    #         jump_forward_reqs = batch.check_for_jump_forward(self.pad_input_ids_func)
-    #         self.waiting_queue.extend(jump_forward_reqs)
-    #         if batch.is_empty():
-    #             self.batch_is_full = False
-    #             return None
-
-    #     if batch.batch_size() < initial_bs:
-    #         self.batch_is_full = False
-
-    #     # Update batch tensors
-    #     batch.prepare_for_decode()
-    #     return batch
-
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
 
-        # if self.is_generation:
-            # if self.spec_algorithm.is_none():
-        print("???????????: ", batch.req_to_token_pool)
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
             model_worker_batch
         )
-            # else:
-            #     (
-            #         logits_output,
-            #         next_token_ids,
-            #         model_worker_batch,
-            #         num_accepted_tokens,
-            #     ) = self.draft_worker.forward_batch_speculative_generation(batch)
-            #     self.spec_num_total_accepted_tokens += (
-            #         num_accepted_tokens + batch.batch_size()
-            #     )
-            #     self.spec_num_total_forward_ct += batch.batch_size()
-            #     self.num_generated_tokens += num_accepted_tokens
         batch.output_ids = next_token_ids
 
         ret = GenerationBatchResult(
@@ -1111,15 +1002,7 @@ class PrefillScheduler:
             next_token_ids=next_token_ids,
             bid=model_worker_batch.bid,
         )
-        # else:  # embedding or reward model
-            # model_worker_batch = batch.get_model_worker_batch()
-            # embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            # ret = EmbeddingBatchResult(
-            #     embeddings=embeddings, bid=model_worker_batch.bid
-            # )
         
-        print("######## next_token_ids: ", next_token_ids)
-        print("???????????##########: ", batch.req_to_token_pool)
         return ret
 
     def process_batch_result(
@@ -1134,7 +1017,6 @@ class PrefillScheduler:
             if batch.is_empty():
                 self.running_batch = None
         elif batch.forward_mode.is_extend():
-            print("???????????!!!!!!!!: ", batch.req_to_token_pool)
             self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
@@ -1161,7 +1043,6 @@ class PrefillScheduler:
 
         if self.enable_overlap:
             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-            print("####### take a look at next_tokens: ", next_token_ids)
         else:
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -1175,355 +1056,73 @@ class PrefillScheduler:
 
             # if req.is_being_chunked <= 0:
             req.output_ids.append(next_token_id)
-            print("????? before output ids: ", req.output_ids)
 
             # sync cache
             self.tree_cache.cache_finished_req(req)
-            # print("????? after output ids: ", req.output_ids)
 
-            # request is finished at the prefill side
-            # if self.enable_overlap:
-            #     # Free the one delayed token
-            #     self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
-            #     continue
+            self.kv_cache_transfer_queue.put(req)
+        
 
+    def kv_cache_sending_loop(self):
+        while True:
+            req = self.kv_cache_transfer_queue.get()
+            start_time = time.perf_counter()
+            self._send_kv_cache(req)
+            end_time = time.perf_counter()
+
+            # Calculate and print the elapsed time
+            elapsed_time = end_time - start_time
+            print(f"rank {self.attn_tp_rank} Wall time: {elapsed_time:.4f} seconds")
+
+    def _send_kv_cache(
+        self,
+        req: Req,
+    ):
         if self.attn_tp_rank == 0:
             # kv cache sending
             with self.kv_cache_sender.connect_lock:
 
-                # send new token back to decode
                 # notify decode to connect to socket if necessary
-                self.distribute_output(batch.reqs)
+                self.distribute_output(req)
 
-                remote_ip = "127.0.0.1" #TODO: remote hard coding value
-                remote_port = 4000
-                addr_key = (remote_ip, remote_port)
-                self.kv_cache_sender.wait_for_connect(remote_ip, remote_port)
+                decode_ip = req.decode_instance_host
+                decode_port = req.decode_instance_port
+                addr_key = (decode_ip, decode_port)
+                self.kv_cache_sender.wait_for_connect(decode_ip, decode_port)
                 lock = self.kv_cache_sender.connections_lock[addr_key]
                 lock.acquire()
 
             try:
-                import ctypes
-                # print("11111 reqs: ", batch.reqs)
-                # print("22222 req_to_token_pool: ", batch.req_to_token_pool)
-                token_ids = (batch.reqs[0].origin_input_ids + batch.reqs[0].output_ids)
-                print("input ids: ", batch.reqs[0].origin_input_ids)
-                print("output ids: ", batch.reqs[0].output_ids)
-                device_indices = self.req_to_token_pool.req_to_token[batch.reqs[0].req_pool_idx, :len(token_ids) - 1]
-                print("!!!!!!! device indices shape: ", device_indices.shape)
-                print("!!!!!!! device indices + 1: ", device_indices)
+                token_ids = (req.origin_input_ids + req.output_ids)
+                device_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :len(token_ids) - 1]
                 kv_cache_device = self.token_to_kv_pool.get_flat_data(device_indices)
                 kv_cache_host = kv_cache_device.cpu().contiguous()
-                # kv_cache = b"a" * 1024  # 1KB test data, TODO: replace with real data
                 kv_cache_size = kv_cache_host.numel() * kv_cache_host.element_size()
-                print("kv cache shape: ", kv_cache_host.shape)
-                print(f"!!!!!! kv cache: {kv_cache_host}")
                 ctypes_buffer = (ctypes.c_byte * kv_cache_size).from_address(kv_cache_host.data_ptr())
                 buffer = memoryview(ctypes_buffer)
-                self.kv_cache_sender.send_kv_cache(buffer, remote_ip, remote_port, kv_cache_size)
+                self.kv_cache_sender.send_kv_cache(buffer, decode_ip, decode_port, kv_cache_size)
             finally:
                 lock.release()
 
         self.token_to_kv_pool.free_group_end()
         
-
-    # def process_batch_result_prefill(
-    #     self,
-    #     batch: ScheduleBatch,
-    #     result: Union[GenerationBatchResult, EmbeddingBatchResult],
-    # ):
-    #     skip_stream_req = None
-
-    #     if self.is_generation:
-    #         (
-    #             logits_output,
-    #             next_token_ids,
-    #             bid,
-    #         ) = (
-    #             result.logits_output,
-    #             result.next_token_ids,
-    #             result.bid,
-    #         )
-
-    #         if self.enable_overlap:
-    #             logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-    #             print("####### take a look at next_tokens: ", next_token_ids)
-    #         else:
-    #             # Move next_token_ids and logprobs to cpu
-    #             next_token_ids = next_token_ids.tolist()
-    #             if batch.return_logprob:
-    #                 logits_output.next_token_logprobs = (
-    #                     logits_output.next_token_logprobs.tolist()
-    #                 )
-    #                 logits_output.input_token_logprobs = (
-    #                     logits_output.input_token_logprobs.tolist()
-    #                 )
-
-    #         hidden_state_offset = 0
-
-    #         # Check finish conditions
-    #         logprob_pt = 0
-    #         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-    #             if req.is_retracted:
-    #                 continue
-
-    #             if self.is_mixed_chunk and self.enable_overlap and req.finished():
-    #                 # Free the one delayed token for the mixed decode batch
-    #                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
-    #                 self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
-    #                 continue
-
-    #             if req.is_being_chunked <= 0:
-    #                 req.output_ids.append(next_token_id)
-
-    #                 # force to finish, prefill is done
-    #                 # cache kv cache to device
-    #                 self.tree_cache.cache_finished_req(req)
-
-    #                 # req.check_finished()
-
-    #                 # if req.finished():
-    #                 #     self.tree_cache.cache_finished_req(req)
-    #                 # elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-    #                 #     self.tree_cache.cache_unfinished_req(req)
-
-    #                 # if req.return_logprob:
-    #                 #     logprob_pt += self.add_logprob_return_values(
-    #                 #         i, req, logprob_pt, next_token_ids, logits_output
-    #                 #     )
-
-    #                 # if (
-    #                 #     self.server_args.return_hidden_states
-    #                 #     and logits_output.hidden_states is not None
-    #                 # ):
-    #                 #     req.hidden_states.append(
-    #                 #         logits_output.hidden_states[
-    #                 #             hidden_state_offset : (
-    #                 #                 hidden_state_offset := hidden_state_offset
-    #                 #                 + len(req.origin_input_ids)
-    #                 #             )
-    #                 #         ]
-    #                 #         .cpu()
-    #                 #         .clone()
-    #                 #     )
-
-    #                 # if req.grammar is not None:
-    #                 #     req.grammar.accept_token(next_token_id)
-    #                 #     req.grammar.finished = req.finished()
-    #             else:
-    #                 # being chunked reqs' prefill is not finished
-    #                 req.is_being_chunked -= 1
-    #                 # There is only at most one request being currently chunked.
-    #                 # Because this request does not finish prefill,
-    #                 # we don't want to stream the request currently being chunked.
-    #                 skip_stream_req = req
-
-    #         if batch.next_batch_sampling_info:
-    #             batch.next_batch_sampling_info.update_regex_vocab_mask()
-    #             self.current_stream.synchronize()
-    #             batch.next_batch_sampling_info.sampling_info_done.set()
-
-    #     else:  # embedding or reward model
-    #         # embeddings, bid = result.embeddings, result.bid
-    #         # embeddings = embeddings.tolist()
-
-    #         # # Check finish conditions
-    #         # for i, req in enumerate(batch.reqs):
-    #         #     if req.is_retracted:
-    #         #         continue
-
-    #         #     req.embedding = embeddings[i]
-    #         #     if req.is_being_chunked <= 0:
-    #         #         # Dummy output token for embedding models
-    #         #         req.output_ids.append(0)
-    #         #         req.check_finished()
-
-    #         #         if req.finished():
-    #         #             self.tree_cache.cache_finished_req(req)
-    #         #         else:
-    #         #             self.tree_cache.cache_unfinished_req(req)
-    #         #     else:
-    #         #         # being chunked reqs' prefill is not finished
-    #         #         req.is_being_chunked -= 1
-    #         pass
-
-    #     self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
-
-    # def process_batch_result_decode(
-    #     self,
-    #     batch: ScheduleBatch,
-    #     result: GenerationBatchResult,
-    # ):
-    #     logits_output, next_token_ids, bid = (
-    #         result.logits_output,
-    #         result.next_token_ids,
-    #         result.bid,
-    #     )
-    #     self.num_generated_tokens += len(batch.reqs)
-
-    #     if self.enable_overlap:
-    #         logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-    #         next_token_logprobs = logits_output.next_token_logprobs
-    #     else:
-    #         next_token_ids = next_token_ids.tolist()
-    #         if batch.return_logprob:
-    #             next_token_logprobs = logits_output.next_token_logprobs.tolist()
-
-    #     self.token_to_kv_pool.free_group_begin()
-
-    #     # Check finish condition
-    #     for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-    #         if req.is_retracted:
-    #             continue
-
-    #         if self.enable_overlap and req.finished():
-    #             # Free the one delayed token
-    #             self.token_to_kv_pool.free(batch.out_cache_loc[i : i + 1])
-    #             continue
-
-    #         if batch.spec_algorithm.is_none():
-    #             # speculative worker will solve the output_ids in speculative decoding
-    #             req.output_ids.append(next_token_id)
-
-    #         req.check_finished()
-
-    #         if req.finished():
-    #             self.tree_cache.cache_finished_req(req)
-
-    #         if req.return_logprob:
-    #             req.output_token_logprobs_val.append(next_token_logprobs[i])
-    #             req.output_token_logprobs_idx.append(next_token_id)
-    #             if req.top_logprobs_num > 0:
-    #                 req.output_top_logprobs_val.append(
-    #                     logits_output.next_token_top_logprobs_val[i]
-    #                 )
-    #                 req.output_top_logprobs_idx.append(
-    #                     logits_output.next_token_top_logprobs_idx[i]
-    #                 )
-
-    #         if (
-    #             self.server_args.return_hidden_states
-    #             and logits_output.hidden_states is not None
-    #         ):
-    #             req.hidden_states.append(logits_output.hidden_states[i].cpu().clone())
-
-    #         if req.grammar is not None:
-    #             req.grammar.accept_token(next_token_id)
-    #             req.grammar.finished = req.finished()
-
-    #     if batch.next_batch_sampling_info:
-    #         batch.next_batch_sampling_info.update_regex_vocab_mask()
-    #         self.current_stream.synchronize()
-    #         batch.next_batch_sampling_info.sampling_info_done.set()
-
-    #     self.stream_output(batch.reqs, batch.return_logprob)
-
-    #     self.token_to_kv_pool.free_group_end()
-
-    #     self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-    #     if (
-    #         self.attn_tp_rank == 0
-    #         and self.forward_ct_decode % self.server_args.decode_log_interval == 0
-    #     ):
-    #         self.log_decode_stats()
-
-    # def add_logprob_return_values(
-    #     self,
-    #     i: int,
-    #     req: Req,
-    #     pt: int,
-    #     next_token_ids: List[int],
-    #     output: LogitsProcessorOutput,
-    # ):
-    #     """Attach logprobs to the return values."""
-    #     req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-    #     req.output_token_logprobs_idx.append(next_token_ids[i])
-
-    #     # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-    #     num_input_logprobs = req.extend_input_len - req.extend_logprob_start_len
-
-    #     if req.input_token_logprobs_val is None:
-    #         input_token_logprobs_val = output.input_token_logprobs[
-    #             pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
-    #         ]
-
-    #         input_token_logprobs_idx = req.fill_ids[
-    #             len(req.fill_ids)
-    #             - num_input_logprobs
-    #             + 1 : len(req.fill_ids)
-    #             - req.last_update_decode_tokens
-    #         ]
-    #         # Clip the padded hash values from image tokens.
-    #         # Otherwise, it will lead to detokenization errors.
-    #         input_token_logprobs_idx = [
-    #             x if x < self.model_config.vocab_size - 1 else 0
-    #             for x in input_token_logprobs_idx
-    #         ]
-
-    #         if (
-    #             req.logprob_start_len == 0
-    #         ):  # The first token does not have logprob, pad it.
-    #             input_token_logprobs_val = [None] + input_token_logprobs_val
-    #             input_token_logprobs_idx = [req.fill_ids[0]] + input_token_logprobs_idx
-
-    #         req.input_token_logprobs_val = input_token_logprobs_val
-    #         req.input_token_logprobs_idx = input_token_logprobs_idx
-
-    #     if req.last_update_decode_tokens != 0:
-    #         # Some decode tokens are re-computed in an extend batch
-    #         req.output_token_logprobs_val.extend(
-    #             output.input_token_logprobs[
-    #                 pt
-    #                 + num_input_logprobs
-    #                 - 1
-    #                 - req.last_update_decode_tokens : pt
-    #                 + num_input_logprobs
-    #                 - 1
-    #             ],
-    #         )
-    #         req.output_token_logprobs_idx.extend(
-    #             req.fill_ids[
-    #                 len(req.fill_ids)
-    #                 - req.last_update_decode_tokens : len(req.fill_ids)
-    #             ]
-    #         )
-
-    #     if req.top_logprobs_num > 0:
-    #         if req.input_top_logprobs_val is None:
-    #             req.input_top_logprobs_val = output.input_top_logprobs_val[i]
-    #             req.input_top_logprobs_idx = output.input_top_logprobs_idx[i]
-    #             if req.logprob_start_len == 0:
-    #                 req.input_top_logprobs_val = [None] + req.input_top_logprobs_val
-    #                 req.input_top_logprobs_idx = [None] + req.input_top_logprobs_idx
-
-    #         if req.last_update_decode_tokens != 0:
-    #             req.output_top_logprobs_val.extend(
-    #                 output.input_top_logprobs_val[i][-req.last_update_decode_tokens :]
-    #             )
-    #             req.output_top_logprobs_idx.extend(
-    #                 output.input_top_logprobs_idx[i][-req.last_update_decode_tokens :]
-    #             )
-
-    #         req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-    #         req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
-
-    #     return num_input_logprobs
-
     def distribute_output(
-        self, reqs: List[Req]
+        self, req: Req
     ):
         """Distribute the output to decode"""
-        for req in reqs:
-            output = PrefillOnlyOutput(
-                input_text=req.origin_input_text,
-                input_ids=req.origin_input_ids,
-                rid=req.rid,
-                output_ids=req.output_ids,
-                prefill_instance_ip_port=req.prefill_instance_ip_port,
-                decode_instance_ip_port=req.decode_instance_ip_port
-            )
-            self.out_bound_to_http_clients.send_pyobj(output)
-
+        output = PrefillOnlyOutput(
+            input_text=req.origin_input_text,
+            input_ids=req.origin_input_ids,
+            rid=req.rid,
+            output_ids=req.output_ids,
+            prefill_instance_host=req.prefill_instance_host,
+            prefill_instance_port=req.prefill_instance_port,
+            decode_instance_host=req.decode_instance_host,
+            decode_instance_port=req.decode_instance_port,
+            kv_transfer_host=self.server_args.kv_transfer_tcp_host,
+            kv_transfer_port=self.server_args.kv_transfer_tcp_port
+        )
+        self.out_bound_to_http_clients.send_pyobj(output)
 
     def stream_output(
         self, reqs: List[Req], return_logprob: bool, skip_req: Optional[Req] = None
@@ -1567,10 +1166,6 @@ class PrefillScheduler:
             for req in reqs:
                 if req is skip_req:
                     continue
-                
-                print("###### see where dose the new token goes, req: ", req)
-                print("req stream? ", req.stream)
-                print("req finished? ", req.finished())
 
                 # TODO(lianmin): revisit this for overlap + retract + stream
                 if (
@@ -1661,44 +1256,6 @@ class PrefillScheduler:
                 BatchEmbeddingOut(rids, finished_reasons, embeddings, prompt_tokens)
             )
 
-    # def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
-    #     # Check if other DP workers have running batches
-    #     if local_batch is None:
-    #         num_tokens = 0
-    #     elif local_batch.forward_mode.is_decode():
-    #         num_tokens = local_batch.batch_size()
-    #     else:
-    #         num_tokens = local_batch.extend_num_tokens
-
-    #     local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
-    #     global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
-    #     torch.distributed.all_gather_into_tensor(
-    #         global_num_tokens,
-    #         local_num_tokens,
-    #         group=self.tp_cpu_group,
-    #     )
-
-    #     if local_batch is None and global_num_tokens.max().item() > 0:
-    #         local_batch = self.get_idle_batch()
-
-    #     if local_batch is not None:
-    #         local_batch.global_num_tokens = global_num_tokens.tolist()
-
-    #         # Check forward mode for cuda graph
-    #         if not self.server_args.disable_cuda_graph:
-    #             forward_mode_state = torch.tensor(
-    #                 (1 if local_batch.forward_mode.is_decode_or_idle() else 0),
-    #                 dtype=torch.int32,
-    #             )
-    #             torch.distributed.all_reduce(
-    #                 forward_mode_state,
-    #                 op=torch.distributed.ReduceOp.MIN,
-    #                 group=self.tp_cpu_group,
-    #             )
-    #             local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
-
-    #     return local_batch
-
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
             [],
@@ -1714,30 +1271,6 @@ class PrefillScheduler:
         idle_batch.prepare_for_idle()
         return idle_batch
 
-    # def move_ready_grammar_requests(self):
-    #     """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
-    #     num_ready_reqs = 0
-    #     for req in self.grammar_queue:
-    #         try:
-    #             req.grammar = req.grammar.result(timeout=0.05)
-    #             num_ready_reqs += 1
-    #         except futures._base.TimeoutError:
-    #             break
-
-    #     if self.tp_size > 1:
-    #         # Sync across TP ranks to make sure they have the same number of ready requests
-    #         tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
-    #         torch.distributed.all_reduce(
-    #             tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-    #         )
-    #         num_ready_reqs_max = tensor.item()
-    #         for i in range(num_ready_reqs, num_ready_reqs_max):
-    #             self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
-    #         num_ready_reqs = num_ready_reqs_max
-
-    #     self.waiting_queue.extend(self.grammar_queue[:num_ready_reqs])
-    #     self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-
     def flush_cache_wrapped(self, recv_req: FlushCacheReq):
         self.flush_cache()
 
@@ -1752,10 +1285,6 @@ class PrefillScheduler:
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool.clear()
-
-            # if not self.spec_algorithm.is_none():
-            #     self.draft_worker.model_runner.req_to_token_pool.clear()
-            #     self.draft_worker.model_runner.token_to_kv_pool.clear()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0

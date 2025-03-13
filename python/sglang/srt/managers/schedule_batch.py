@@ -237,12 +237,16 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
         # TODO: need a better meta data for source and dest info
-        prefill_instance_ip_port: Optional[List[str]] = None,
-        decode_instance_ip_port: Optional[List[str]] = None,
+        prefill_instance_host: Optional[str] = None,
+        prefill_instance_port: Optional[int] = None,
+        decode_instance_host: Optional[str] = None,
+        decode_instance_port: Optional[int] = None,
     ):
-        # TODO:
-        self.prefill_instance_ip_port = prefill_instance_ip_port
-        self.decode_instance_ip_port = decode_instance_ip_port
+        self.prefill_instance_host = prefill_instance_host
+        self.prefill_instance_port = prefill_instance_port
+
+        self.decode_instance_host = decode_instance_host
+        self.decode_instance_port = decode_instance_port
 
         # Input and output info
         self.rid = rid

@@ -46,9 +46,15 @@ class PrefillOnlyInput:
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
     # Origin decode instance info
-    decode_instance_ip_port: Optional[List[str]] = None
+    decode_instance_host: Optional[str] = None
+    decode_instance_port: Optional[int] = None
     # target prefill instance info
-    prefill_instance_ip_port: Optional[List[str]] = None
+    prefill_instance_host: Optional[str] = None
+    prefill_instance_port: Optional[int] = None
+    # kv transfer info
+    kv_transfer_host: Optional[str] = None
+    kv_transfer_port: Optional[int] = None
+
 
 @dataclass
 class PrefillOnlyOutput:
@@ -61,9 +67,14 @@ class PrefillOnlyOutput:
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
     # Origin decode instance info
-    decode_instance_ip_port: Optional[List[str]] = None
+    decode_instance_host: Optional[str] = None
+    decode_instance_port: Optional[int] = None
     # target prefill instance info
-    prefill_instance_ip_port: Optional[List[str]] = None
+    prefill_instance_host: Optional[str] = None
+    prefill_instance_port: Optional[int] = None
+    # kv transfer info
+    kv_transfer_host: Optional[str] = None
+    kv_transfer_port: Optional[int] = None
     #
     output_ids: Optional[List[int]] = None
 

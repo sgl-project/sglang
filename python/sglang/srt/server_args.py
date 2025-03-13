@@ -170,6 +170,8 @@ class ServerArgs:
 
     # prefill/decode disaggregation; it has three options: mixed, prefill, decode
     server_role: str = "mixed" 
+    kv_transfer_tcp_port: int = 4000
+    kv_transfer_tcp_host: str = "127.0.0.1"
 
     def __post_init__(self):
         # Set missing default values
@@ -944,6 +946,18 @@ class ServerArgs:
             choices=["mixed", "prefill", "decode"],
             default=ServerArgs.server_role,
             help="Enable hierarchical cache",
+        )
+
+        parser.add_argument(
+            "--kv-transfer-tcp-port",
+            type=int, 
+            default=ServerArgs.kv_transfer_tcp_port, help="The port of the kv cacher transfer tcp socket."
+        )
+
+        parser.add_argument(
+            "--kv-transfer-tcp-host",
+            type=str, 
+            default=ServerArgs.kv_transfer_tcp_host, help="The port of the kv cache transfer tcp socket."
         )
 
     @classmethod
