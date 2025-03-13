@@ -1,1 +1,0 @@
-python offline_batch_inference_vlm.py --model-path /home/xiaoxiang/paligemma-3b-pt-224 --chat-template=paligemma > pali.log 2>&1 
