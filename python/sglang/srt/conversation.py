@@ -632,7 +632,6 @@ register_conv_template(
         sep_style=SeparatorStyle.DeepSeekVL2,
         sep="\n\n",
         sep2="<｜end▁of▁sentence｜>",
-        stop_token_ids=[100001],
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
     )
 )

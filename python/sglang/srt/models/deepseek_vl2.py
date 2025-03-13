@@ -1000,8 +1000,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
     ):
         super().__init__()
 
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-
         # ----------- vision encoder ------------
         vision_config = config.vision_config
         self.vision = DeepseekVL2VisionTransformer(
