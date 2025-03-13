@@ -30,6 +30,10 @@ class HiRadixCache(RadixCache):
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
     ):
+        if page_size != 1:
+            raise ValueError(
+                "Page size larger than 1 is not yet supported in HiRadixCache."
+            )
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(self.kv_cache)
