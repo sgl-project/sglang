@@ -1677,9 +1677,16 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+
+    # Generate the prefix
+    if dp_rank is None:
+        prefix = f" TP{tp_rank}"
+    else:
+        prefix = f" DP{dp_rank} TP{tp_rank}"
+
     # Config the process
     # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
-    setproctitle.setproctitle(f"sglang::scheduler_{dp_rank}")
+    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
 
@@ -1688,10 +1695,6 @@ def run_scheduler_process(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
     # Configure the logger
-    if dp_rank is None:
-        prefix = f" TP{tp_rank}"
-    else:
-        prefix = f" DP{dp_rank} TP{tp_rank}"
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
