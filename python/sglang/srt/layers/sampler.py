@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist

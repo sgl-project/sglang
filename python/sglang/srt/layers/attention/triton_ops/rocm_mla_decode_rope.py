@@ -32,7 +32,7 @@ def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -333,7 +333,7 @@ def _decode_grouped_att_m_fwd_rope(
     BLOCK = 32
 
     # # [TODO] work around shmem limit on MI3xx
-    # if is_hip_ and kv_lora_rank >= 576:
+    # if _is_hip and kv_lora_rank >= 576:
     #     BLOCK = 16
 
     qk_rope_head_dim = k_buffer.shape[-1] - kv_lora_rank
@@ -353,7 +353,7 @@ def _decode_grouped_att_m_fwd_rope(
 
     extra_kargs = {}
     num_stages = 2
-    if is_hip_:
+    if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
