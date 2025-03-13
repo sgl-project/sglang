@@ -791,7 +791,6 @@ class DeepseekVL2VisionTransformer(nn.Module):
             else nn.Identity()
         )
 
-        # 初始化权重
         if weight_init != "skip":
             self.init_weights(weight_init)
 
