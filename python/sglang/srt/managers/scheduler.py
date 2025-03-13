@@ -477,7 +477,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 },
             )
 
-    @torch.no_grad()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -497,7 +496,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             self.last_batch = batch
 
-    @torch.no_grad()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
@@ -957,6 +955,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.metrics_collector.log_stats(self.stats)
 
+    @torch.no_grad()
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1175,6 +1174,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         batch.prepare_for_decode()
         return batch
 
+    @torch.inference_mode()
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -1237,6 +1237,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             )
         return ret
 
+    @torch.no_grad()
     def process_batch_result(
         self,
         batch: ScheduleBatch,
