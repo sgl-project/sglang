@@ -86,30 +86,6 @@ def build_tree_kernel_efficient(
     )
 
 
-def build_tree_kernel(
-    parent_list: torch.Tensor,
-    selected_index: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    tree_mask: torch.Tensor,
-    positions: torch.Tensor,
-    retrive_index: torch.Tensor,
-    topk: int,
-    depth: int,
-    draft_token_num: int,
-) -> None:
-    torch.ops.sgl_kernel.build_tree_kernel(
-        parent_list,
-        selected_index,
-        verified_seq_len,
-        tree_mask,
-        positions,
-        retrive_index,
-        topk,
-        depth,
-        draft_token_num,
-    )
-
-
 def segment_packbits(
     x: torch.Tensor,
     input_indptr: torch.Tensor,
