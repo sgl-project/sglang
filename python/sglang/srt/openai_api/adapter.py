@@ -37,7 +37,7 @@ from sglang.srt.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
-    generate_completion_prompt,
+    generate_completion_prompt_from_request,
     register_completion_template,
 )
 from sglang.srt.conversation import (
@@ -555,7 +555,9 @@ def v1_generate_request(
         if completion_template_name is None:
             prompts.append(request.prompt)
         else:
-            prompt = generate_completion_prompt(request, completion_template_name)
+            prompt = generate_completion_prompt_from_request(
+                request, completion_template_name
+            )
             prompts.append(prompt)
 
         lora_paths.append(request.lora_path)

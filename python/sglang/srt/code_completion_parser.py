@@ -68,11 +68,15 @@ def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
 
 
-def generate_completion_prompt(
+def generate_completion_prompt_from_request(
     request: ChatCompletionRequest, template_name: str
 ) -> str:
-    if (request.suffix is None) or (request.suffix == ""):
-        return request.prompt
+    return generate_completion_prompt(request.prompt, request.suffix, template_name)
+
+
+def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> str:
+    if (suffix is None) or (suffix == ""):
+        return prompt
 
     completion_template = completion_templates[template_name]
     fim_begin_token = completion_template.fim_begin_token
@@ -81,9 +85,9 @@ def generate_completion_prompt(
     fim_position = completion_template.fim_position
 
     if fim_position == FimPosition.MIDDLE:
-        prompt = f"{fim_begin_token}{request.prompt}{fim_middle_token}{request.suffix}{fim_end_token}"
+        prompt = f"{fim_begin_token}{prompt}{fim_middle_token}{suffix}{fim_end_token}"
     elif fim_position == FimPosition.END:
-        prompt = f"{fim_begin_token}{request.prompt}{fim_end_token}{request.suffix}{fim_middle_token}"
+        prompt = f"{fim_begin_token}{prompt}{fim_end_token}{suffix}{fim_middle_token}"
 
     return prompt
 
@@ -111,7 +115,7 @@ register_completion_template(
 
 register_completion_template(
     CompletionTemplate(
-        name="qwen2.5_coder",
+        name="qwen_coder",
         fim_begin_token="<|fim_prefix|>",
         fim_middle_token="<|fim_middle|>",
         fim_end_token="<|fim_suffix|>",
