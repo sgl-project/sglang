@@ -1563,6 +1563,13 @@ def set_cuda_arch():
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+setattr(triton, "next_power_of_2", next_power_of_2)
+
+
 def add_prefix(name: str, prefix: str) -> str:
     """Add a weight path prefix to a module name.
 
