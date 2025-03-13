@@ -117,7 +117,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             bs = forward_batch.batch_size
 
             # Clamp input ids. See llava.py for more details
-            input_ids.clamp__(0, self.config.vocab_size - 1)
+            input_ids.clamp_(0, self.config._vocab_size - 1)
 
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
