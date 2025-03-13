@@ -21,6 +21,7 @@ import asyncio
 import math
 from typing import List, Union
 
+import torch
 from PIL import Image, ImageOps
 
 from sglang.srt.managers.image_processor import BaseImageProcessor
@@ -72,18 +73,12 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
 
         images, image_hashes, image_sizes = [], [], []
 
-        # for image in image_data:
-        #     pil_image, _size = load_image(image)
-        #     pil_image = pil_image.convert("RGB")
-        #     images += [pil_image]
-        #     image_hashes += [hash(image)]
-        #     image_sizes += [_size]
         image_token = self.IMAGE_TOKEN
         base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, image_token
+            input_ids, image_data, image_token, max_req_input_len
         )
         base_output.all_frames = [img.convert("RGB") for img in base_output.all_frames]
-        res = await self._process_single_image(
+        res = await self._process_images(
             base_output.all_frames, base_output.input_text, max_req_input_len
         )
         pixel_values = res["images"]
