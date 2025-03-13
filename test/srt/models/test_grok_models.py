@@ -23,7 +23,7 @@ class TestGrok(unittest.TestCase):
                 "--load-format",
                 "dummy",
                 "--json-model-override-args",
-                '{"num_hidden_layers": 1}',
+                '{"num_hidden_layers": 2}',
             ],
         )
 
@@ -45,7 +45,7 @@ class TestGrok(unittest.TestCase):
         print(f"{metrics=}")
 
         # It is dummy weights so we only assert the output throughput instead of accuracy.
-        self.assertGreater(metrics["output_throughput"], 100)
+        self.assertGreater(metrics["output_throughput"], 1000)
 
 
 if __name__ == "__main__":
