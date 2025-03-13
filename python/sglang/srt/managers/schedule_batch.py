@@ -33,6 +33,7 @@ import copy
 import dataclasses
 import logging
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from enum import IntEnum
 
 import numpy as np
 import torch
@@ -228,6 +229,11 @@ class ImageInputs:
             if getattr(self, arg, None) is not None:
                 setattr(self, arg, getattr(self, arg) + getattr(other, arg))
 
+class PDStep(IntEnum):
+    PREFILL = 0
+    DISPATCHING = 1
+    DECODE = 2
+
 
 class Req:
     """The input and output status of a request."""
@@ -325,6 +331,10 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # Whether or not if it is prefilled.
+        # Only used for pd disaggregation.
+        self.pd_step: PDStep = PDStep.PREFILL
+
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
@@ -388,7 +398,7 @@ class Req:
 
     def finished(self) -> bool:
         # Whether request reached finished condition
-        return self.finished_reason is not None
+        return self.finished_reason is not None or self.pd_step == PDStep.DISPATCHING
 
     def init_next_round_input(
         self,

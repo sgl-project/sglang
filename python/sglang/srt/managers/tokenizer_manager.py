@@ -74,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PrefilledReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -303,6 +304,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    PrefilledReqInput,
+                    self.handle_prefilled_req_input,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -956,6 +961,9 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+    
+    def handle_prefilled_req_input(self, recv_obj: PrefilledReqInput):
+        self.send_to_scheduler.send_pyobj(recv_obj)
 
     def convert_logprob_style(
         self,

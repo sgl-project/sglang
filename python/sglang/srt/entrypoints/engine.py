@@ -53,6 +53,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.managers.pd_disaggregation_controller import PDAggregationController
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -501,6 +502,12 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
+
+    # Launch PD disaggregation controller
+    if server_args.kv_transfer_config is not None:
+        pd_disaggregation_controller = PDAggregationController(server_args, port_args)
+        t = threading.Thread(target=pd_disaggregation_controller.event_loop)
+        t.start()
 
     # Wait for the model to finish loading
     scheduler_infos = []

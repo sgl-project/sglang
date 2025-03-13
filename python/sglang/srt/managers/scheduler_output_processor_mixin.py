@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import PDStep
+from sglang.srt.managers.io_struct import PrefilledReqInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -64,6 +66,10 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.is_retracted:
                     continue
+
+                if req.pd_step == PDStep.PREFILL:
+                    req.pd_step = PDStep.DISPATCHING
+                    self.kv_transfer_agent.set_kv_buffer(req)
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
@@ -482,6 +488,10 @@ class SchedulerOutputProcessorMixin:
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
             if self.model_config.is_multimodal_gen and req.to_abort:
+                continue
+
+            if req.pd_step == PDStep.DISPATCHING:
+                self.send_to_decode.send_pyobj(PrefilledReqInput(req.rid, self.kv_transfer_agent.addr, req.kv_cache_length))
                 continue
 
             if (

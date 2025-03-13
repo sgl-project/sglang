@@ -19,6 +19,7 @@ import logging
 import random
 import tempfile
 from typing import List, Optional
+from pydantic import BaseModel
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -36,6 +37,16 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+class KVTransferConfig(BaseModel):
+    role: str = "prefill" # "prefill" or "decode"
+    
+    decode_dist_init_host: str = None
+    prefill_dist_init_host: str = None
+
+    @classmethod
+    def from_cli(cls, cli_value: str) -> "KVTransferConfig":
+        """Parse the CLI value for the kv cache transfer config."""
+        return KVTransferConfig.model_validate_json(cli_value)
 
 @dataclasses.dataclass
 class ServerArgs:
@@ -173,6 +184,9 @@ class ServerArgs:
     enable_flashinfer_mla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+
+    # KV cache transfer
+    kv_transfer_config: KVTransferConfig = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -993,6 +1007,13 @@ class ServerArgs:
             "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
         )
 
+        # KV cache transfer
+        parser.add_argument('--kv-transfer-config',
+                            type=KVTransferConfig.from_cli,
+                            default=None,
+                            help='The configurations for distributed KV cache '
+                            'transfer. Should be a JSON string.')
+
         # Debug tensor dumps
         parser.add_argument(
             "--debug-tensor-dump-output-folder",
@@ -1126,7 +1147,7 @@ class PortArgs:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                tokenizer_ipc_name=tokenizer_ipc_name,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,

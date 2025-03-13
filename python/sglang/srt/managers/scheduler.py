@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    PrefilledReqInput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -85,6 +86,8 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sglang.srt.managers.kv_transfer_agent import KVTransferAgent
+from sglang.srt.managers.pd_disaggregation_controller import PD_DISAGGREGATION_PORT
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
@@ -338,6 +341,19 @@ class Scheduler(SchedulerOutputProcessorMixin):
         t.start()
         self.parent_process = psutil.Process().parent()
 
+        if server_args.kv_transfer_config:
+            # Init kv transfer agent
+            self.kv_transfer_agent = KVTransferAgent(
+                server_args.kv_transfer_config,
+                self.device,
+                self.tp_rank
+            )
+            t = threading.Thread(target=self.kv_transfer_agent.event_loop, daemon=True)
+            t.start()
+
+            if server_args.kv_transfer_config.role == "prefill":
+                self.send_to_decode = get_zmq_socket(context, zmq.PUSH, f"tcp://{server_args.kv_transfer_config.decode_dist_init_host}:{PD_DISAGGREGATION_PORT}", False)
+
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
@@ -357,6 +373,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (PrefilledReqInput, self.handle_prefilled_request),
                 (FlushCacheReq, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -749,6 +766,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
+    
+    def handle_prefilled_request(self, req: PrefilledReqInput):
+        # TODO: convert to Req
+        self.waiting_queue.append(req)
 
     def _add_request_to_queue(self, req: Req):
         self.waiting_queue.append(req)
@@ -973,24 +994,26 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        if new_batch is not None:
-            # Run prefill first if possible
-            ret = new_batch
-        else:
-            # Run decode
-            if self.running_batch is None:
-                ret = None
-            else:
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch
+        if new_batch is None:
+            new_batch = self.get_new_batch_decode()
 
         # Handle DP attention
         if self.server_args.enable_dp_attention:
-            ret = self.prepare_dp_attn_batch(ret)
+            new_batch = self.prepare_dp_attn_batch(new_batch)
 
-        return ret
+        return new_batch
+    
+    def get_new_batch_decode(self) -> Optional[ScheduleBatch]:
+        if self.running_batch is None:
+            return None
+
+        self.running_batch = self.update_running_batch(self.running_batch)
+        return self.running_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        # if self.server_args.kv_transfer_config is not None and self.server_args.kv_transfer_config.role == "decode":
+        #     return None
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1134,6 +1157,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
         batch.filter_batch()
         if batch.is_empty():
             self.batch_is_full = False
+            return None
+        
+        if self.server_args.kv_transfer_config is not None and self.server_args.kv_transfer_config.role == "prefill":
+            for req in batch.reqs:
+                self.dispatch_to_decode(req)
             return None
 
         # Check if decode out of memory
@@ -1307,6 +1335,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
         )
         idle_batch.prepare_for_idle()
         return idle_batch
+    
+    def dispatch_to_decode(self, req: Req):
+        pass
 
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""

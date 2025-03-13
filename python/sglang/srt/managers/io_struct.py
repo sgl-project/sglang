@@ -660,6 +660,24 @@ class ProfileReqOutput:
 
 
 @dataclass
+class PrefilledReqInput(TokenizedGenerateReqInput):
+    kv_transfer_agent_addr: str
+    kv_cache_length: int
+
+
+@dataclass
+class KVTransferReqInput:
+    rid: str
+    kv_transfer_agent_addr: str
+    dst_ptr: int
+
+
+@dataclass
+class KVTransferReqOutput:
+    code: int # 0: success, 1: failed
+
+
+@dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
