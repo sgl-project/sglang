@@ -130,8 +130,8 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        if self.disable:
-            return [], self.root_node
+        if self.disable or len(key) == 0:
+            return torch.empty((0,), dtype=torch.int32), self.root_node
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
