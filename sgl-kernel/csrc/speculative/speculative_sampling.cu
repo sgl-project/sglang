@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include <flashinfer/pytorch_extension_utils.h>
+
 #include "speculative_sampling.cuh"
 
 using namespace flashinfer;

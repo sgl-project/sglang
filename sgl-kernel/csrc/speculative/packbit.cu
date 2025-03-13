@@ -17,6 +17,7 @@
  */
 
 #include <flashinfer/pytorch_extension_utils.h>
+
 #include <flashinfer/quantization.cuh>
 
 using namespace flashinfer;
