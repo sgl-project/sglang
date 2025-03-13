@@ -8,7 +8,7 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](./native_api.ipynb).
 
-* `prompt: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
+* `text: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
 * `input_ids: Optional[Union[List[List[int]], List[int]]] = None` Alternative to `text`. Specify the input as token IDs instead of text.
 * `sampling_params: Optional[Union[List[Dict], Dict]] = None` The sampling parameters as described in the sections below.
 * `return_logprob: Optional[Union[List[bool], bool]] = None` Whether to return log probabilities for tokens.
