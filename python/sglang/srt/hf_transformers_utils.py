@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     DbrxConfig,
     DeepseekVL2Config,
     ExaoneConfig,
+    MultiModalityConfig,
     Qwen2_5_VLConfig,
 )
 
@@ -44,6 +45,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
+    MultiModalityConfig.model_type: MultiModalityConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -73,6 +75,13 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+
+    # FIXME: Pour contents of janus-pro's langauge_config to first-level
+    if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):
+        assert hasattr(config, "language_config")
+        for key, val in config.language_config.__dict__.items():
+            setattr(config, key, val)
+        setattr(config, "architectures", ["MultiModalityCausalLM"])
 
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]

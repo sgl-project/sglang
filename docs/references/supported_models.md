@@ -31,7 +31,9 @@
 - Phi-3 / Phi-4
 - Phi-3-Small
 - IBM Granite 3
+- Janus-Pro-1B / Janus-Pro-7B
 - Deepseek-VL2 / Deepseek-VL2-small
+
 
 ## Embedding Models
 
