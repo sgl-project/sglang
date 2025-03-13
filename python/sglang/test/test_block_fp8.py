@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
 
 # For test
@@ -332,8 +333,7 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
 
 
 class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
-    _is_cuda = torch.cuda.is_available() and torch.version.cuda
-    if not _is_cuda:
+    if not (_is_cuda and _enable_jit_deepgemm):
         DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 33, 64, 222, 1024 * 128]
         N = [128, 1024, 2048]
