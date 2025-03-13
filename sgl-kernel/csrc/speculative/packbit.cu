@@ -16,8 +16,8 @@
  * limitations under the License.
  */
 
-#include "flashinfer/pytorch_extension_utils.h"
-#include "flashinfer/quantization.cuh"
+#include <flashinfer/pytorch_extension_utils.h>
+#include <flashinfer/quantization.cuh>
 
 using namespace flashinfer;
 
