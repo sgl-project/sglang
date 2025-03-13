@@ -113,7 +113,9 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
-            if policy == CacheAgnosticPolicy.LOF:
+            if self.policy == CacheAgnosticPolicy.FCFS:
+                pass
+            elif policy == CacheAgnosticPolicy.LOF:
                 SchedulePolicy._sort_by_longest_output(waiting_queue)
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
