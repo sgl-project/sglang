@@ -677,7 +677,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fnuz or not is_cuda_available():
+        if self.w_vc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),

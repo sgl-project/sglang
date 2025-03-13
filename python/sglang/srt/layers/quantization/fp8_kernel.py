@@ -28,8 +28,8 @@ from sglang.srt.utils import (
     get_device_name,
     is_cuda,
     is_hip,
-    supports_custom_op,
     is_triton_available,
+    supports_custom_op,
 )
 
 _is_hip = is_hip()
