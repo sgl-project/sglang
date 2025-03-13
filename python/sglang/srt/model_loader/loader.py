@@ -11,7 +11,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Type, cast
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import gguf
 import huggingface_hub
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoModelForCausalLM, PretrainedConfig
+from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.device_config import DeviceConfig
@@ -48,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_device_capability,
     is_pin_memory_available,
     set_weight_attrs,
@@ -197,7 +198,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
-        if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.

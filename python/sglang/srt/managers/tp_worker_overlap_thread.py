@@ -100,8 +100,11 @@ class TpModelWorkerClient:
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
-            self.worker.model_runner.token_to_kv_pool,
+            self.worker.model_runner.token_to_kv_pool_allocator,
         )
+
+    def get_kv_cache(self):
+        return self.worker.model_runner.token_to_kv_pool
 
     def forward_thread_func(self):
         try:
@@ -203,7 +206,7 @@ class TpModelWorkerClient:
             -(self.future_token_ids_ct + 1),
             -(self.future_token_ids_ct + 1 + bs),
             -1,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.future_token_ids_ct = (

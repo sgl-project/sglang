@@ -11,19 +11,23 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from vllm import _custom_ops as ops
+from vllm import _custom_ops as vllm_ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
+from sglang.srt.layers.quantization.int8_kernel import (
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+)
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_bool_env_var,
     get_device_name,
-    is_cuda_available,
+    is_cuda,
     is_hip,
 )
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 logger = logging.getLogger(__name__)
@@ -33,17 +37,17 @@ enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
-_is_rocm = torch.cuda.is_available() and torch.version.hip
+_is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
-if _is_cuda or _is_rocm:
+if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
@@ -116,6 +120,7 @@ def fused_moe_kernel(
     - expert_ids: A tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
         each block in A.
+
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
     `sorted_token_ids` by expert index and padding ensures divisibility by
@@ -166,16 +171,37 @@ def fused_moe_kernel(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_fp8_w8a8:
+        # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
             offs_bsn = offs_bn // group_n
             b_scale_ptrs = (
                 b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
             )
+        # tensor-wise
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+
+    if use_int8_w8a8:
+        # block-wise
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
+        # channel-wise
+        else:
+            # Load per-column scale for weights
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # Load per-token scale for activations
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -216,7 +242,11 @@ def fused_moe_kernel(
 
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
-                accumulator = tl.dot(a, b, acc=accumulator)
+                # fix out of shared memory issue
+                if use_fp8_w8a8:
+                    accumulator = tl.dot(a, b, acc=accumulator)
+                else:
+                    accumulator += tl.dot(a, b)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -457,7 +487,7 @@ def moe_align_block_size(
                 cumsum_buffer,
             )
     else:
-        ops.moe_align_block_size(
+        vllm_ops.moe_align_block_size(
             topk_ids,
             num_experts,
             block_size,
@@ -496,9 +526,14 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
+            # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
-            A, A_scale = ops.scaled_fp8_quant(A, A_scale)
+            if _is_cuda:
+                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            else:
+                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
         else:
+            # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             if _is_cuda:
@@ -511,9 +546,10 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            padded_size = padding_size
-            A, A_scale = ops.scaled_int8_quant(A, A_scale)
+            # activation channel-wise int8 quantization
+            A, A_scale = per_token_quant_int8(A)
         else:
+            # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             A, A_scale = per_token_group_quant_int8(A, block_k)
@@ -647,7 +683,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 32,
                 "num_warps": 8,
-                "num_stages": 2 if is_hip_ else 4,
+                "num_stages": 2 if _is_hip else 4,
             }
             if M <= E:
                 config = {
@@ -656,7 +692,7 @@ def get_default_config(
                     "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 1,
                     "num_warps": 4,
-                    "num_stages": 2 if is_hip_ else 4,
+                    "num_stages": 2 if _is_hip else 4,
                 }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisable by block_shape[1]
@@ -666,7 +702,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": block_shape[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,
-                "num_stages": 2 if is_hip_ else 3,
+                "num_stages": 2 if _is_hip else 3,
             }
     else:
         config = {
@@ -941,7 +977,11 @@ def fused_experts_impl(
     no_combine: bool = False,
 ):
     padded_size = padding_size
-    if not use_fp8_w8a8 or not use_int8_w8a8 or block_shape is not None:
+    if (
+        not (use_fp8_w8a8 or use_int8_w8a8)
+        or block_shape is not None
+        or (_is_hip and get_bool_env_var("CK_MOE"))
+    ):
         padded_size = 0
 
     # Check constraints.
@@ -1024,7 +1064,9 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
+            intermediate_cache2 = intermediate_cache2[
+                : tokens_in_chunk * topk_ids.shape[1]
+            ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
@@ -1055,17 +1097,20 @@ def fused_experts_impl(
             use_int8_w8a16=use_int8_w8a16,
             block_shape=block_shape,
         )
-
         if activation == "silu":
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                vllm_ops.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
         elif activation == "gelu":
             if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                ops.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+                vllm_ops.gelu_and_mul(
+                    intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
@@ -1096,8 +1141,8 @@ def fused_experts_impl(
 
         if no_combine:
             pass
-        elif is_hip_:
-            ops.moe_sum(
+        elif _is_hip:
+            vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )

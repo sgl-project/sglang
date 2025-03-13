@@ -39,6 +39,7 @@ from transformers import (
 )
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+ASSISTANT_SUFFIX = "Assistant:"
 
 global args
 
@@ -219,7 +220,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = data.get("usage", {}).get(
+                                output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
@@ -635,7 +636,11 @@ def sample_sharegpt_requests(
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
         if prompt_suffix:
-            prompt = prompt
+            prompt = (
+                remove_suffix(prompt, ASSISTANT_SUFFIX)
+                + prompt_suffix
+                + ASSISTANT_SUFFIX
+            )
 
         if apply_chat_template:
             prompt = tokenizer.apply_chat_template(
@@ -1001,7 +1006,7 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
 

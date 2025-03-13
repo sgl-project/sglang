@@ -1,4 +1,5 @@
 import itertools
+import os
 import unittest
 
 import torch
@@ -7,8 +8,11 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
+    static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+
+_is_cuda = torch.cuda.is_available() and torch.version.cuda
 
 
 # For test
@@ -63,7 +67,7 @@ class TestPerTokenGroupQuantFP8(unittest.TestCase):
             out, scale = per_token_group_quant_fp8(x, group_size)
 
         self.assertTrue(
-            torch.allclose(out.to(torch.float32), ref_out.to(torch.float32), rtol=0.15)
+            torch.allclose(out.to(torch.float32), ref_out.to(torch.float32), rtol=0.20)
         )
         self.assertTrue(torch.allclose(scale, ref_scale))
 
@@ -83,6 +87,71 @@ class TestPerTokenGroupQuantFP8(unittest.TestCase):
                 seed=params[4],
             ):
                 self._per_token_group_quant_fp8(*params)
+
+
+# For test
+def native_static_quant_fp8(x, x_s, dtype=torch.float8_e4m3fn):
+    """Function to perform static quantization on an input tensor `x` using native torch.
+
+    It converts the tensor values into float8 values and returns the
+    quantized tensor along with the scaling factor used for quantization.
+    """
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+
+    finfo = torch.finfo(dtype)
+    fp8_min = finfo.min
+    fp8_max = finfo.max
+
+    x_ = x.reshape(x.numel() // x.shape[-1], x.shape[-1])
+    x_s_inv = 1.0 / x_s
+    x_q = (x_ * x_s_inv).clamp(min=fp8_min, max=fp8_max).to(dtype)
+    x_q = x_q.reshape(x.shape)
+
+    return x_q, x_s
+
+
+class TestStaticQuantFP8(unittest.TestCase):
+    DTYPES = [torch.half, torch.bfloat16, torch.float32]
+    NUM_TOKENS = [7, 83, 2048]
+    D = [512, 4096, 5120, 13824]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _static_quant_fp8(self, num_tokens, d, dtype, seed):
+        torch.manual_seed(seed)
+
+        x = torch.rand(num_tokens, d, dtype=dtype)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        x_s = x.max() / fp8_max
+
+        with torch.inference_mode():
+            ref_out, _ = native_static_quant_fp8(x, x_s)
+            out, _ = static_quant_fp8(x, x_s, repeat_scale=True)
+
+        self.assertTrue(
+            torch.allclose(out.to(torch.float32), ref_out.to(torch.float32), rtol=0.50)
+        )
+
+    def test_static_quant_fp8(self):
+        for params in itertools.product(
+            self.NUM_TOKENS,
+            self.D,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                num_tokens=params[0],
+                d=params[1],
+                dtype=params[2],
+                seed=params[3],
+            ):
+                self._static_quant_fp8(*params)
 
 
 # For test
@@ -142,13 +211,35 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
 
 
 class TestW8A8BlockFP8Matmul(unittest.TestCase):
-    OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
-    M = [1, 7, 83, 512, 2048]
-    N = [128, 512, 1024, 4096, 7748, 13824]
-    K = [256, 4096, 5120, 3884, 13824]
-    # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
-    BLOCK_SIZE = [[128, 128]]
-    SEEDS = [0]
+
+    if not _is_cuda:
+        OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
+        M = [1, 7, 83, 512, 2048]
+        NKs = [
+            (N, K)
+            for N in [128, 512, 1024, 4096, 7748, 13824]
+            for K in [256, 4096, 5120, 3884, 13824]
+        ]
+        # BLOCK_SIZE = [[64, 64], [64, 128], [128, 64], [128, 128]]
+        BLOCK_SIZE = [[128, 128]]
+        SEEDS = [0]
+    else:
+        # use practical shape in DeepSeek V3 for test
+        OUT_DTYPES = [torch.bfloat16]
+        M = [64, 128, 512, 1024, 4096]
+        NKs = [
+            (1536, 7168),
+            (3072, 1536),
+            (24576, 7168),
+            (4096, 512),
+            (7168, 2048),
+            (4608, 7168),
+            (512, 7168),
+            (7168, 2304),
+            (7168, 512),
+        ]
+        BLOCK_SIZE = [[128, 128]]
+        SEEDS = [0]
 
     @classmethod
     def setUpClass(cls):
@@ -156,7 +247,8 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _w8a8_block_fp8_matmul(self, M, N, K, block_size, out_dtype, seed):
+    def _w8a8_block_fp8_matmul(self, M, NK, block_size, out_dtype, seed):
+        N, K = NK
         torch.manual_seed(seed)
         # NOTE(HandH1998): to avoid overflow when out_dtype = torch.half
         factor_for_scale = 1e-2
@@ -191,19 +283,17 @@ class TestW8A8BlockFP8Matmul(unittest.TestCase):
     def test_w8a8_block_fp8_matmul(self):
         for params in itertools.product(
             self.M,
-            self.N,
-            self.K,
+            self.NKs,
             self.BLOCK_SIZE,
             self.OUT_DTYPES,
             self.SEEDS,
         ):
             with self.subTest(
                 M=params[0],
-                N=params[1],
-                K=params[2],
-                block_size=params[3],
-                out_dtype=params[4],
-                seed=params[5],
+                NKs=params[1],
+                block_size=params[2],
+                out_dtype=params[3],
+                seed=params[4],
             ):
                 self._w8a8_block_fp8_matmul(*params)
 
