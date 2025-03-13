@@ -416,7 +416,7 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, False)
+    tree = RadixCache(None, None, page_size=1, disable=False)
 
     tree.insert("Hello")
     tree.insert("Hello")
