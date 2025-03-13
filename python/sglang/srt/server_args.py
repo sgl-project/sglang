@@ -20,14 +20,13 @@ import random
 import tempfile
 from typing import List, Optional
 
-import torch
-
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -71,6 +70,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
+    page_size: int = 1
 
     # Other runtime options
     tp_size: int = 1
@@ -190,10 +190,10 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif torch.cuda.is_available():
+        if is_cuda():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
         elif self.device == "hpu":
             gpu_mem = get_hpu_memory_capacity()
         else:
@@ -258,7 +258,7 @@ class ServerArgs:
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        # Others
+        # Data parallelism attention
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             assert self.tp_size % self.dp_size == 0
@@ -278,10 +278,10 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
+            self.disable_overlap_schedule = True
             logger.info(
-                "Overlap scheduler are disabled because of using "
+                "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
             # The token generated from the verify step is counted.
@@ -405,6 +405,7 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "w8a8_int8",
+                "w8a8_fp8",
             ],
             help="The quantization method.",
         )
@@ -479,7 +480,7 @@ class ServerArgs:
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -504,7 +505,13 @@ class ServerArgs:
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading",
+            help="How many GBs of RAM to reserve for CPU offloading.",
+        )
+        parser.add_argument(
+            "--page-size",
+            type=int,
+            default=ServerArgs.page_size,
+            help="The number of tokens in a page.",
         )
 
         # Other runtime options
@@ -764,7 +771,6 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="The number of tokens sampled from the draft model in eagle2 each step.",
-            choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

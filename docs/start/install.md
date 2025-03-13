@@ -98,7 +98,21 @@ drun v0.4.3.post4-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --in
 2. Execute the command `docker compose up -d` in your terminal.
 </details>
 
-## Method 5: Run on Kubernetes or Clouds with SkyPilot
+## Method 5: Using Kubernetes
+
+<details>
+<summary>More</summary>
+
+1. Option 1: For single node serving (typically when the model size fits into GPUs on one node)
+   Execute command `kubectl apply -f docker/k8s-sglang-service.yaml`, to create k8s deployment and service, with llama-31-8b as example.
+
+2. Option 2: For multi-node serving (usually when a large model requires more than one GPU node, such as `DeepSeek-R1`)
+   Modify the LLM model path and arguments as necessary, then execute command `kubectl apply -f docker/k8s-sglang-distributed-sts.yaml`, to create two nodes k8s statefulset and serving service.
+</details>
+
+
+
+## Method 6: Run on Kubernetes or Clouds with SkyPilot
 
 <details>
 <summary>More</summary>
@@ -143,4 +157,4 @@ sky status --endpoint 30000 sglang
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - If you only need to use OpenAI models with the frontend language, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 - The language frontend operates independently of the backend runtime. You can install the frontend locally without needing a GPU, while the backend can be set up on a GPU-enabled machine. To install the frontend, run `pip install sglang`, and for the backend, use `pip install sglang[srt]`. `srt` is the abbreviation of SGLang runtime.
-- To reinstall flashinfer locally, use the following command: `pip install "flashinfer-python>=0.2.2.post1" -i https://flashinfer.ai/whl/cu124/torch2.5 --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
+- To reinstall flashinfer locally, use the following command: `pip install "flashinfer-python>=0.2.3" -i https://flashinfer.ai/whl/cu124/torch2.5 --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
