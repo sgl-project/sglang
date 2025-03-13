@@ -31,6 +31,7 @@ from sgl_kernel.gemm import (
     int8_scaled_mm,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.moe import moe_align_block_size, topk_softmax

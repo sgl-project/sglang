@@ -154,6 +154,7 @@ sources = [
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu",
     "csrc/gemm/int8_gemm_kernel.cu",
     "csrc/gemm/per_token_group_quant_fp8.cu",
+    "csrc/gemm/per_token_group_quant_int8.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/gemm/per_tensor_quant_fp8.cu",
     "csrc/moe/moe_align_kernel.cu",
