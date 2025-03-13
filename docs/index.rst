@@ -40,6 +40,7 @@ The core features include:
    backend/function_calling.ipynb
    backend/separate_reasoning.ipynb
    backend/custom_chat_template.md
+   backend/code_completion_parser.ipynb
    backend/quantization.md
 
 .. toctree::
