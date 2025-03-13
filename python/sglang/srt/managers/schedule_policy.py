@@ -77,9 +77,11 @@ class SchedulePolicy:
         self,
         policy: str,
         tree_cache: BasePrefixCache,
+        enable_hierarchical_cache: bool,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
+        self.enable_hierarchical_cache = enable_hierarchical_cache
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(

@@ -137,16 +137,12 @@ class RadixCache(BasePrefixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value = []
-        last_node = [self.root_node]
-        self._match_prefix_helper(self.root_node, key, value, last_node)
+        value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.concat(value)
         else:
-            value = torch.empty(
-                (0,), dtype=torch.int32, device=self.token_to_kv_pool_allocator.device
-            )
-        return value, last_node[0]
+            value = torch.empty((0,), dtype=torch.int32)
+        return value, last_node
 
     def insert(self, key: List, value=None):
         if self.disable:
@@ -239,7 +235,7 @@ class RadixCache(BasePrefixCache):
         print(f"#tokens: {self.total_size()}")
 
     def total_size(self):
-        return self._total_size_helper(self.root_node)
+        return self._total_size_helper()
 
     def evict(self, num_tokens: int):
         if self.disable:
@@ -312,26 +308,30 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(
-        self, node: TreeNode, key: List, value, last_node: TreeNode
-    ):
+    def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
-        if len(key) == 0:
-            return
 
         child_key = self.get_child_key_fn(key)
 
-        if child_key in node.children.keys():
+        value = []
+        while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            child.last_access_time = time.time()
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
-                last_node[0] = new_node
+                node = new_node
+                break
             else:
                 value.append(child.value)
-                last_node[0] = child
-                self._match_prefix_helper(child, key[prefix_len:], value, last_node)
+                node = child
+                key = key[prefix_len:]
+
+                if len(key):
+                    child_key = self.get_child_key_fn(key)
+
+        return value, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
@@ -354,22 +354,21 @@ class RadixCache(BasePrefixCache):
 
         child_key = self.get_child_key_fn(key)
 
-        if child_key in node.children.keys():
-            child = node.children[child_key]
-            prefix_len = self.key_match_fn(child.key, key)
+        total_prefix_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.time()
+            prefix_len = self.key_match_fn(node.key, key)
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
 
-            if prefix_len == len(child.key):
-                if prefix_len == len(key):
-                    return prefix_len
-                else:
-                    key = key[prefix_len:]
-                    value = value[prefix_len:]
-                    return prefix_len + self._insert_helper(child, key, value)
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
 
-            new_node = self._split_node(child.key, child, prefix_len)
-            return prefix_len + self._insert_helper(
-                new_node, key[prefix_len:], value[prefix_len:]
-            )
+            if len(key):
+                child_key = self.get_child_key_fn(key)
 
         if len(key):
             new_node = TreeNode()
@@ -378,15 +377,25 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
-        return 0
+        return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
-        for key, child in node.children.items():
-            print(" " * indent, len(child.key), child.key[:10], f"r={child.lock_ref}")
-            self._print_helper(child, indent=indent + 2)
-            assert key == self.get_child_key_fn(
-                child.key
-            ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+        """Prints the radix tree in a human-readable format."""
+        stack = [(node, indent)]
+        while stack:
+            current_node, current_indent = stack.pop()
+            print(
+                " " * current_indent,
+                len(current_node.key),
+                current_node.key[:10],
+                f"r={current_node.lock_ref}",
+            )
+            for key, child in current_node.children.items():
+                stack.append((child, current_indent + 2))
+
+                assert key == self.get_child_key_fn(
+                    child.key
+                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
         for k, v in node.parent.children.items():
@@ -395,13 +404,17 @@ class RadixCache(BasePrefixCache):
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
 
-    def _total_size_helper(self, node: TreeNode):
-        if node.evicted:
-            return 0
-        x = len(node.value)
-        for child in node.children.values():
-            x += self._total_size_helper(child)
-        return x
+    def _total_size_helper(self):
+        total_size = 0
+        stack = [self.root_node]
+        while stack:
+            current_node = stack.pop()
+            total_size += len(current_node.value)
+            for child in current_node.children.values():
+                if child.evicted:
+                    continue
+                stack.append(child)
+        return total_size
 
     def _collect_leaves(self):
         ret_list = []
