@@ -193,10 +193,10 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 **{
                     "pixel_values": [inputs["pixel_values"]],
                     "tgt_sizes": [inputs["tgt_sizes"]],
-                    "im_start_id": [self.tokenizer.im_start_id],
-                    "im_end_id": [self.tokenizer.im_end_id],
-                    "slice_start_id": [self.tokenizer.slice_start_id],
-                    "slice_end_id": [self.tokenizer.slice_end_id],
+                    "im_start_id": self.tokenizer.im_start_id,
+                    "im_end_id": self.tokenizer.im_end_id,
+                    "slice_start_id": self.tokenizer.slice_start_id,
+                    "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
             (sglang_output, _) = model.get_embedding(

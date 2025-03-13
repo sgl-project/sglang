@@ -35,17 +35,13 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -57,9 +53,16 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    device_loading_context,
+    get_model_loader,
+)
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -77,10 +80,8 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
@@ -118,6 +119,7 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
@@ -160,6 +162,11 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        # If it is a draft model tp_group can be different.
+        self.initialize(min_per_gpu_memory)
+
+    def initialize(self, min_per_gpu_memory: float):
+        server_args = self.server_args
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -299,15 +306,16 @@ class ModelRunner:
         min_per_gpu_memory = get_available_gpu_memory(
             self.device, self.gpu_id, distributed=self.tp_size > 1
         )
-        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.tp_group = get_tp_group()
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
+        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if self.tp_size > 1:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
-                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
+                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                    f"{min_per_gpu_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
                 )
 
         logger.info(
@@ -347,6 +355,8 @@ class ModelRunner:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
+        monkey_patch_isinstance_for_vllm_base_layer()
+
         with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
@@ -354,6 +364,7 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
+        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -411,13 +422,6 @@ class ModelRunner:
         self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        from sglang.srt.model_loader.loader import (
-            DefaultModelLoader,
-            device_loading_context,
-            get_model_loader,
-        )
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -427,7 +431,7 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # Only support vllm DefaultModelLoader for now
+        # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
@@ -701,6 +705,12 @@ class ModelRunner:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
+        self.max_total_num_tokens = (
+            self.max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
+
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
@@ -723,6 +733,7 @@ class ModelRunner:
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
+                page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -733,6 +744,7 @@ class ModelRunner:
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
+                page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
@@ -744,6 +756,7 @@ class ModelRunner:
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
+                page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
@@ -753,12 +766,21 @@ class ModelRunner:
             )
 
         if self.token_to_kv_pool_allocator is None:
-            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                self.max_total_num_tokens,
-                dtype=self.kv_cache_dtype,
-                device=self.device,
-                kvcache=self.token_to_kv_pool,
-            )
+            if self.page_size == 1:
+                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                )
+            else:
+                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=self.token_to_kv_pool,
+                )
         else:
             assert self.is_draft_worker
 
@@ -779,10 +801,13 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
             # Init streams
             if self.server_args.speculative_algorithm == "EAGLE":
                 self.plan_stream_for_flashinfer = torch.cuda.Stream()
-
             self.attn_backend = FlashInferAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
@@ -794,12 +819,26 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             if self.server_args.enable_double_sparsity:
+                from sglang.srt.layers.attention.double_sparsity_backend import (
+                    DoubleSparseAttnBackend,
+                )
+
                 self.attn_backend = DoubleSparseAttnBackend(self)
             else:
+                from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
                 self.attn_backend = TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
+            from sglang.srt.layers.attention.torch_native_backend import (
+                TorchNativeAttnBackend,
+            )
+
             self.attn_backend = TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "flashinfer_mla":
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAAttnBackend,
+            )
+
             self.attn_backend = FlashInferMLAAttnBackend(self)
         else:
             raise ValueError(
