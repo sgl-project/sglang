@@ -25,6 +25,8 @@ class TestDPAttention(unittest.TestCase):
                 "--tp",
                 "2",
                 "--enable-dp-attention",
+                "--dp",
+                "2",
             ],
         )
 
@@ -42,7 +44,8 @@ class TestDPAttention(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.5
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -54,7 +57,8 @@ class TestDPAttention(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.8
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.8)
 
 
 if __name__ == "__main__":

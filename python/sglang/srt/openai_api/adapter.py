@@ -284,11 +284,11 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         file_request_list = []
         all_requests = []
         request_ids = []
-        for line in lines:
+        for line_id, line in enumerate(lines):
             request_data = json.loads(line)
             file_request_list.append(request_data)
             body = request_data["body"]
-            request_ids.append(request_data["custom_id"])
+            request_ids.append(f"{batch_id}-req_{line_id}")
 
             # Although streaming is supported for standalone completions, it is not supported in
             # batch mode (multiple completions in single request).
@@ -438,15 +438,9 @@ async def cancel_batch(tokenizer_manager, batch_id: str, input_file_id: str):
         with open(input_file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        file_request_list = []
-        request_ids = []
-        for line in lines:
-            request_data = json.loads(line)
-            file_request_list.append(request_data)
-            request_ids.append(request_data["custom_id"])
-
         # Cancel requests by request_ids
-        for rid in request_ids:
+        for line_id in range(len(lines)):
+            rid = f"{batch_id}-req_{line_id}"
             tokenizer_manager.abort_request(rid=rid)
 
         retrieve_batch = batch_storage[batch_id]
@@ -826,13 +820,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
-                        id=str(uuid.uuid4().hex),
+                        id=content["meta_info"]["id"],
                         choices=[],
                         model=request.model,
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
@@ -1155,7 +1149,7 @@ def v1_chat_generate_response(
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text,
                 },
-                "logprobs": choice_logprobs,
+                "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
                     finish_reason["matched"]
@@ -1503,13 +1497,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = ChatCompletionStreamResponse(
-                        id=str(uuid.uuid4().hex),
+                        id=content["meta_info"]["id"],
                         choices=[],
                         model=request.model,
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
