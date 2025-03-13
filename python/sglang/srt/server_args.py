@@ -122,7 +122,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
+    grammar_backend: Optional[str] = "xgrammar"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
