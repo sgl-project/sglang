@@ -72,13 +72,7 @@ __global__ void per_token_group_quant_int8_kernel(
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val / y_s, int8_min), int8_max);
-#ifdef USE_ROCM
-      float dst = std::nearbyint(q_val);
-      dst = std::clamp(dst, int8_min, int8_max);
-      group_output[i * vec_size + j] = static_cast<int8_t>(dst);
-#else
       group_output[i * vec_size + j] = int8_t(q_val);
-#endif
     }
   }
 }
