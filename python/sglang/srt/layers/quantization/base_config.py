@@ -54,18 +54,8 @@ class QuantizationConfig(ABC):
         """Minimum GPU capability to support the quantization method.
 
         E.g., 70 for Volta, 75 for Turing, 80 for Ampere.
-        This requirement is due to the custom kernels used by the
-        quantization method or the stock pytorch capability.
-        """
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def get_availability(cls) -> bool:
-        """Whether the quantization config is available on current device.
-
-        This requirement is due to the custom kernels used by the
-        quantization method or the stock pytorch capability.
+        This requirement is due to the custom CUDA kernels used by the
+        quantization method.
         """
         raise NotImplementedError
 
