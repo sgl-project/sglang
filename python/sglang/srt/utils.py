@@ -1425,7 +1425,7 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
-def configure_ipv6(server_args):
+def configure_ipv6(dist_init_addr):
     addr = server_args.dist_init_addr
     end = addr.find("]")
     if end == -1:
