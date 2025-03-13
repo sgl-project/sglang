@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
@@ -105,6 +106,8 @@ class Engine:
         tokenizer_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args
         )
+
+        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -213,13 +216,13 @@ class Engine:
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
         """
-
-        obj = EmbeddingReqInput(text=prompt)
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
@@ -302,6 +305,27 @@ class Engine:
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: Optional[str] = None,
+    ):
+        """Update the weights from disk inplace without re-launching the engine.
+
+        This method allows updating the model weights from disk without restarting
+        the engine. It can be used to load a different model or update weights with
+        new training.
+        """
+        obj = UpdateWeightFromDiskReqInput(
+            model_path=model_path,
+            load_format=load_format,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_disk(obj, None)
+        )
+
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
@@ -352,7 +376,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.2.post1",
+            "0.2.3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
