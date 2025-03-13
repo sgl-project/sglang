@@ -1435,6 +1435,7 @@ def write_req_to_token_pool_triton(
     pre_len = tl.load(pre_lens + pid)
     seq_len = tl.load(seq_lens + pid)
 
+    # NOTE: This can be slow for large bs
     cumsum_start = tl.cast(0, tl.int64)
     for i in range(pid):
         cumsum_start += tl.load(extend_lens + i)
