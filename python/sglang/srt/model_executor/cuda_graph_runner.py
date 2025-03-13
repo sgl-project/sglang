@@ -264,11 +264,15 @@ class CudaGraphRunner:
     def model_capture_mode(self):
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = True
+        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
+            self.model_runner.token_to_kv_pool.capture_mode = True
 
         yield
 
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = False
+        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
+            self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention:

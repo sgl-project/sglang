@@ -26,6 +26,7 @@ class EvalArgs:
     backend: str = "engine"
     seed: int = 42
     split: str = "validation"
+    # Default setting to make the benchmark available on A100 for most 7B models
     image_pixels_limit: int = 4300000
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
@@ -38,6 +39,7 @@ class EvalArgs:
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )
+
         parser.add_argument(
             "--image-pixels-limit", type=int, default=EvalArgs.image_pixels_limit
         )
