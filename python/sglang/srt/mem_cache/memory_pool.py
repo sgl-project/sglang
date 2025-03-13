@@ -591,6 +591,9 @@ class MHATokenToKVPoolHost:
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
 
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[:, layer_id, indices]
+
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
 
