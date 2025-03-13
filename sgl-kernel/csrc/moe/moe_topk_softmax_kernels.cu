@@ -49,52 +49,6 @@ template <int TPB>
 __launch_bounds__(TPB) __global__
     void moeSoftmax(const float* input, const bool* finished, float* output, const int num_cols)
 {
-    // __shared__ float normalizing_factor;
-    // __shared__ float float_max;
-
-    // const int thread_row_offset = blockIdx.x * num_cols;
-
-    // // Don't touch finished rows.
-    // if ((finished != nullptr) && finished[blockIdx.x])
-    // {
-    //     return;
-    // }
-    // float thread_max_value(-FLT_MAX);
-    // for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
-    // {
-    //     const int idx = thread_row_offset + ii;
-    //     thread_max_value = fmaxf(thread_max_value, static_cast<float>(input[idx]));
-    // }
-    // const float max_value = blockReduceMax(thread_max_value);
-
-    // if (threadIdx.x == 0)
-    // {
-    //     float_max = max_value;
-    // }
-    // __syncthreads();
-
-    // float thread_exp_sum_value = 0;
-    // for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
-    // {
-    //     const int idx = thread_row_offset + ii;
-    //     thread_exp_sum_value += exp((static_cast<float>(input[idx]) - float_max));
-    // }
-    // const auto Z = blockReduceSum(thread_exp_sum_value);
-
-    // if (threadIdx.x == 0)
-    // {
-    //     normalizing_factor = 1.f / Z;
-    // }
-    // __syncthreads();
-
-    // for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
-    // {
-    //     const int idx = thread_row_offset + ii;
-    //     const float val = exp((static_cast<float>(input[idx]) - float_max)) * normalizing_factor;
-    //     output[idx] = val;
-    // }
-
-
     using BlockReduce = cub::BlockReduce<float, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
 
@@ -120,13 +74,6 @@ __launch_bounds__(TPB) __global__
 
     const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
 
-    // for (int ii = threadIdx.x; ii < num_cols; ii += TPB)
-    // {
-    //     const int idx = thread_row_offset + ii;
-    //     threadData = fmaxf(threadData, static_cast<float>(input[idx]));
-    // }
-    // const float maxElem = blockReduceMax(threadData);
-
     if (threadIdx.x == 0)
     {
         float_max = maxElem;
@@ -142,7 +89,6 @@ __launch_bounds__(TPB) __global__
     }
 
     const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
-    // const auto Z = blockReduceSum(threadData);
 
     if (threadIdx.x == 0)
     {
@@ -318,14 +264,12 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
         thread_max = max(thread_max, row_chunk[ii]);
     }
 
-// // Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
-// #pragma unroll
-//     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-//     {
-//         thread_max = max(thread_max, SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, thread_max, mask, THREADS_PER_ROW));
-//     }
-
-    thread_max = warpReduceMax(thread_max);
+// Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
+#pragma unroll
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+    {
+        thread_max = max(thread_max, SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, thread_max, mask, THREADS_PER_ROW));
+    }
 
     // From this point, thread max in all the threads have the max within the row.
     // Now, we subtract the max from each element in the thread and take the exp. We also compute the thread local sum.
@@ -337,13 +281,12 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
         row_sum += row_chunk[ii];
     }
 
-// // Now, we perform the sum reduce within each thread group. Similar to the max reduce, we use a bufferfly pattern.
-// #pragma unroll
-//     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-//     {
-//         row_sum += SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, row_sum, mask, THREADS_PER_ROW);
-//     }
-    row_sum = warpReduceSum(row_sum);
+// Now, we perform the sum reduce within each thread group. Similar to the max reduce, we use a bufferfly pattern.
+#pragma unroll
+    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+    {
+        row_sum += SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, row_sum, mask, THREADS_PER_ROW);
+    }
 
     // From this point, all threads have the max and the sum for their rows in the thread_max and thread_sum variables
     // respectively. Finally, we can scale the rows for the softmax. Technically, for top-k gating we don't need to
