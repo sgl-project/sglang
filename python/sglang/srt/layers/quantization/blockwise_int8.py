@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -20,7 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import set_weight_attrs
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -72,20 +71,7 @@ class BlockInt8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return 80
-
-        # Vendors can update
-        return sys.maxsize
-
-    @classmethod
-    def get_availability(cls) -> bool:
-        major, minor = get_device_capability()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 80
-
-        # Vendors can update
-        return False
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
