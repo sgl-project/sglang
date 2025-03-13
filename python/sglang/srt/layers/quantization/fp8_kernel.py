@@ -28,13 +28,10 @@ from sglang.srt.utils import (
     get_device_name,
     is_cuda,
     is_hip,
-    is_triton_available,
     supports_custom_op,
 )
 
 _is_hip = is_hip()
-_is_cuda = is_cuda()
-_is_triton = is_triton_available()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 _is_cuda = is_cuda()
@@ -165,34 +162,6 @@ def _per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptr, y_s)
 
 
-def native_per_token_group_quant_fp8(
-    x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn
-):
-    """Function to perform per-token-group quantization on an input tensor `x` using native torch.
-
-    It converts the tensor values into float8 values and returns the
-    quantized tensor along with the scaling factor used for quantization.
-    Note that only `torch.float8_e4m3fn` is supported for now.
-    """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
-
-    finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
-    fp8_max = finfo.max
-
-    x_ = x.reshape(x.numel() // group_size, group_size)
-    amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)
-    x_s = amax / fp8_max
-    x_q = (x_ / x_s).clamp(min=fp8_min, max=fp8_max).to(dtype)
-    x_q = x_q.reshape(x.shape)
-    x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
-
-    return x_q, x_s
-
-
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -263,22 +232,19 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
-        if _is_triton:
-            _per_token_group_quant_fp8[(M,)](
-                x,
-                x_q,
-                x_s,
-                group_size,
-                N,
-                eps,
-                fp8_min=fp8_min,
-                fp8_max=fp8_max,
-                BLOCK=BLOCK,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-        else:
-            x_q, x_s = native_per_token_group_quant_fp8(x, group_size)
+        _per_token_group_quant_fp8[(M,)](
+            x,
+            x_q,
+            x_s,
+            group_size,
+            N,
+            eps,
+            fp8_min=fp8_min,
+            fp8_max=fp8_max,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
 
     return x_q, x_s
 
@@ -725,61 +691,6 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
-def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.float16):
-    """This function performs matrix multiplication with block-wise quantization using native torch.
-
-    It takes two input tensors `A` and `B` with scales `As` and `Bs`.
-    The output is returned in the specified `output_dtype`.
-    """
-
-    A = A.to(torch.float32)
-    B = B.to(torch.float32)
-    assert A.shape[-1] == B.shape[-1]
-    assert B.ndim == 2 and B.is_contiguous() and Bs.ndim == 2
-    assert len(block_size) == 2
-    block_n, block_k = block_size[0], block_size[1]
-    assert (A.shape[-1] + block_k - 1) // block_k == As.shape[-1]
-    assert A.shape[:-1] == As.shape[:-1]
-
-    M = A.numel() // A.shape[-1]
-    N, K = B.shape
-    origin_C_shape = A.shape[:-1] + (N,)
-    A = A.reshape(M, A.shape[-1])
-    As = As.reshape(M, As.shape[-1])
-    n_tiles = (N + block_n - 1) // block_n
-    k_tiles = (K + block_k - 1) // block_k
-    assert n_tiles == Bs.shape[0]
-    assert k_tiles == Bs.shape[1]
-
-    C_shape = (M, N)
-    C = torch.zeros(C_shape, dtype=torch.float32, device=A.device)
-
-    A_tiles = [A[:, i * block_k : min((i + 1) * block_k, K)] for i in range(k_tiles)]
-    B_tiles = [
-        [
-            B[
-                j * block_n : min((j + 1) * block_n, N),
-                i * block_k : min((i + 1) * block_k, K),
-            ]
-            for i in range(k_tiles)
-        ]
-        for j in range(n_tiles)
-    ]
-    C_tiles = [C[:, j * block_n : min((j + 1) * block_n, N)] for j in range(n_tiles)]
-    As_tiles = [As[:, i : i + 1] for i in range(k_tiles)]
-
-    for i in range(k_tiles):
-        for j in range(n_tiles):
-            a = A_tiles[i]
-            b = B_tiles[j][i]
-            c = C_tiles[j]
-            s = As_tiles[i] * Bs[j][i]
-            c[:, :] += torch.matmul(a, b.t()) * s
-
-    C = C.reshape(origin_C_shape).to(output_dtype)
-    return C
-
-
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -804,90 +715,86 @@ def w8a8_block_fp8_matmul(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    if _is_triton:  # pragma: no cover
-        assert len(block_size) == 2
-        block_n, block_k = block_size[0], block_size[1]
+    assert len(block_size) == 2
+    block_n, block_k = block_size[0], block_size[1]
 
-        assert A.shape[-1] == B.shape[-1]
-        assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
-        M = A.numel() // A.shape[-1]
+    assert A.shape[-1] == B.shape[-1]
+    assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    M = A.numel() // A.shape[-1]
 
-        assert B.ndim == 2 and B.is_contiguous() and Bs.ndim == 2
-        N, K = B.shape
-        assert triton.cdiv(N, block_n) == Bs.shape[0]
-        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    assert B.ndim == 2 and B.is_contiguous() and Bs.ndim == 2
+    N, K = B.shape
+    assert triton.cdiv(N, block_n) == Bs.shape[0]
+    assert triton.cdiv(K, block_k) == Bs.shape[1]
 
-        C_shape = A.shape[:-1] + (N,)
-        C = A.new_empty(C_shape, dtype=output_dtype)
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=output_dtype)
 
-        configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-        if configs:
-            # If an optimal configuration map has been found, look up the
-            # optimal config
-            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-        else:
-            # Default config
-            # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
-            config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_size[0],
-                "BLOCK_SIZE_K": block_size[1],
-                "GROUP_SIZE_M": 32,
-                "num_warps": 4,
-                "num_stages": 3,
-            }
+    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    if configs:
+        # If an optimal configuration map has been found, look up the
+        # optimal config
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        # Default config
+        # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": block_size[0],
+            "BLOCK_SIZE_K": block_size[1],
+            "GROUP_SIZE_M": 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
 
-        def grid(META):
-            return (
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            )
-
-        # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
-        # Empirical testing shows the sweet spot lies when it's less than the # of
-        # compute units available on the device.
-        num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
-            N, config["BLOCK_SIZE_N"]
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-        # deepgemm only support bf16
-        if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
-            if supports_custom_op():
-                torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-            else:
-                deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
-        else:
-            kernel = (
-                _w8a8_block_fp8_matmul_unrolledx4
-                if (_is_hip == True and num_workgroups <= get_device_core_count())
-                else _w8a8_block_fp8_matmul
-            )
+    # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
+    # Empirical testing shows the sweet spot lies when it's less than the # of
+    # compute units available on the device.
+    num_workgroups = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
+        N, config["BLOCK_SIZE_N"]
+    )
 
-            kernel[grid](
-                A,
-                B,
-                C,
-                As,
-                Bs,
-                M,
-                N,
-                K,
-                block_n,
-                block_k,
-                A.stride(-2),
-                A.stride(-1),
-                B.stride(1),
-                B.stride(0),
-                C.stride(-2),
-                C.stride(-1),
-                As.stride(-2),
-                As.stride(-1),
-                Bs.stride(1),
-                Bs.stride(0),
-                **config,
-            )
+    # deepgemm only support bf16
+    if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+        if supports_custom_op():
+            torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+        else:
+            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
-        C = native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype)
+        kernel = (
+            _w8a8_block_fp8_matmul_unrolledx4
+            if (_is_hip == True and num_workgroups <= get_device_core_count())
+            else _w8a8_block_fp8_matmul
+        )
+
+        kernel[grid](
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            **config,
+        )
 
     return C
