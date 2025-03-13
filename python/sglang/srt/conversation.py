@@ -71,9 +71,12 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
+    audio_token: str = "<audio>"
 
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
+
+    audio_data: Optional[List[str]] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -300,6 +303,10 @@ class Conversation:
         """Append a new message."""
         self.image_data.append(image)
 
+    def append_audio(self, audio: str):
+        """Append a new message."""
+        self.audio_data.append(audio)
+
     def update_last_message(self, message: str):
         """Update the last output.
 
@@ -346,6 +353,7 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             image_token=self.image_token,
+            audio_token=self.audio_token,
         )
 
     def dict(self):
@@ -432,8 +440,10 @@ def generate_chat_conv(
         sep2=conv.sep2,
         stop_str=conv.stop_str,
         image_data=[],
+        audio_data=[],
         modalities=[],
         image_token=conv.image_token,
+        audio_token=conv.audio_token,
     )
 
     if isinstance(request.messages, str):
@@ -471,6 +481,7 @@ def generate_chat_conv(
                         if conv.name != "qwen2-vl"
                         else conv.image_token
                     )
+                audio_token = conv.audio_token
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -480,6 +491,10 @@ def generate_chat_conv(
                         # NOTE: Only works for llava
                         real_content += image_token
                         conv.append_image(content.image_url.url)
+                    elif content.type == "audio_url":
+                        real_content += audio_token
+                        conv.append_audio(content.audio_url.url)
+
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -644,5 +659,20 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
         image_token="<image_placeholder>",
+    )
+)
+
+# Reference: https://huggingface.co/openbmb/MiniCPM-o-2_6#usage
+register_conv_template(
+    Conversation(
+        name="minicpmo",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant",
+        system_template="<|im_start|>system\n{system_message}.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
+        audio_token="(<audio>./</audio>)",
     )
 )

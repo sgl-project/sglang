@@ -16,7 +16,6 @@
 import asyncio
 import copy
 import dataclasses
-import json
 import logging
 import os
 import pickle
@@ -47,13 +46,10 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+import sglang
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -91,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.multimodal_processor import get_dummy_processor
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -169,7 +166,7 @@ class TokenizerManager:
         self.image_token_id = self.model_config.image_token_id
 
         # Create image processor placeholder
-        self.image_processor = get_dummy_image_processor()
+        self.image_processor = get_dummy_processor()
 
         # Create tokenizer
         if server_args.skip_tokenizer_init:
@@ -186,8 +183,10 @@ class TokenizerManager:
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
                 # We want to parallelize the image pre-processing so we create an executor for it
-                self.image_processor = get_image_processor(
-                    self.model_config.hf_config, server_args, self.processor
+                self.image_processor = (
+                    sglang.srt.managers.multimodal_processor.get_processor(
+                        self.model_config.hf_config, server_args, self.processor
+                    )
                 )
             else:
                 self.tokenizer = get_tokenizer(
@@ -372,7 +371,7 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Dict = await self.image_processor.process_images_async(
+        image_inputs: Dict = await self.image_processor.process_data_async(
             obj.image_data, input_text or input_ids, obj, self.max_req_input_len
         )
         if image_inputs and "input_ids" in image_inputs:

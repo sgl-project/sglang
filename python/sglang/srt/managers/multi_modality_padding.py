@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultiModalInputs
 from sglang.utils import logger
 
 
@@ -14,7 +14,7 @@ class MultiModalityDataPaddingPattern:
 
     @abstractmethod
     def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
+        self, input_ids: List[int], image_inputs: MultiModalInputs
     ) -> List[int]:
         """
         Pad the input ids sequence containing data tokens, and replace them with pad_values
@@ -22,7 +22,7 @@ class MultiModalityDataPaddingPattern:
         pass
 
 
-class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern):
+class MultiModalDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be enclosed by special token pairs (e.g. <image>...</image>, data_token_pairs)
 
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
@@ -32,7 +32,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         self.data_token_id_pairs = data_token_pairs
 
     def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
+        self, input_ids: List[int], image_inputs: MultiModalInputs
     ) -> List[int]:
         """
         This function will replace the data-tokens inbetween with pad_values accordingly
@@ -95,7 +95,7 @@ class MultModalityDataPaddingPatternSingleToken(MultiModalityDataPaddingPattern)
         self.num_data_token_calc_func = num_data_token_calc_func
 
     def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
+        self, input_ids: List[int], image_inputs: MultiModalInputs
     ) -> List[int]:
         """
         This function will follow the procedure of:
