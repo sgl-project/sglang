@@ -32,6 +32,7 @@ from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.layers.attention.vision import VisionAttention
 
 
 def _no_grad_tunc_normal_(tensor, mean, std, a, b):
@@ -436,64 +437,6 @@ class DropPath(nn.Module):
     def extra_repr(self):
         return f"drop_prob={round(self.drop_prob, 3):0.3f}"
 
-
-# Modified for https://github.com/deepseek-ai/DeepSeek-VL2/blob/a698c36a4cfbd3ca700e79e936f7bc16b6fd5957/deepseek_vl2/models/siglip_vit.py#L106C1-L174C17
-# Removed qk_norm option for simplicity
-class DeepseekVL2Attention(nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        qk_norm: bool = False,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        norm_layer: nn.Module = nn.LayerNorm,
-        deterministic: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, "dim should be divisible by num_heads"
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.qk_norm = qk_norm
-        self.deterministic = deterministic
-
-        self.qkv = ColumnParallelLinear(
-            dim, dim * 3, bias=qkv_bias, quant_config=quant_config
-        )
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = RowParallelLinear(dim, dim, quant_config=quant_config)
-        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x)[0].reshape(B, N, 3, self.num_heads, self.head_dim)
-
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        with torch.backends.cuda.sdp_kernel(
-            enable_math=False, enable_mem_efficient=False
-        ):
-            x = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)[0]
-        x = self.proj_drop(x)
-        return x
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -514,16 +457,14 @@ class Block(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = DeepseekVL2Attention(
-            dim=dim,
+        self.attn = VisionAttention(
+            embed_dim=dim,
             num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            norm_layer=norm_layer,
-            deterministic=deterministic,
-            quant_config=quant_config,
+            projection_size=dim,
+            use_qkv_parallel=True,
+            use_context_forward=False,
+            softmax_in_single_precision=False,
+            dropout=attn_drop,
         )
         self.ls1 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
