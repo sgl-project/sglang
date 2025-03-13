@@ -2003,7 +2003,7 @@ class MiniCPMO(MiniCPMVBaseModel):
         # There values are useless because their embeddings will be replaced by vision embeddings anyway.
         input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-        vllm_embeddings = self.get_vllm_embedding(
+        vllm_embeddings = self.get_vlm_embedding(
             input_ids, image_inputs, forward_batch.forward_mode
         )
 

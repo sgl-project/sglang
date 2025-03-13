@@ -59,14 +59,16 @@ class JanusProProcessor(BaseProcessor):
             image_data = [image_data]
 
         base_out = self.load_multimodal_data(
-            input_ids,
+            input_ids=input_ids,
             image_data=image_data,
             multimodal_tokens=MultiModalEmbedTokens(image_token="<image_placeholder>"),
             max_req_input_len=max_req_input_len,
         )
         images = base_out.images
         res = await self._process_images(images=images, input_text=base_out.input_text)
-
+        print(res)
+        print(base_out)
+        print("", res["images_emb_mask"].shape)
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": res["pixel_values"],

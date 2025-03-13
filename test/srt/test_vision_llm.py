@@ -216,7 +216,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            (hf_output, _) = self.hf_model.get_vllm_embedding(
+            (hf_output, _) = self.hf_model.get_vlm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)
@@ -235,7 +235,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                     "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
-            (sglang_output, _) = model.get_vllm_embedding(
+            (sglang_output, _) = model.get_vlm_embedding(
                 input_ids=input_ids, image_inputs=image_inputs
             )
 
@@ -274,7 +274,7 @@ class TestMiniCPMOLogits(VisionLLMLogitsBase):
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            (hf_output, _) = self.hf_model.get_vllm_embedding(
+            (hf_output, _) = self.hf_model.get_vlm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)
@@ -293,7 +293,7 @@ class TestMiniCPMOLogits(VisionLLMLogitsBase):
                     "slice_end_id": self.tokenizer.slice_end_id,
                 },
             )
-            (sglang_output, _) = model.get_vllm_embedding(
+            (sglang_output, _) = model.get_vlm_embedding(
                 input_ids=input_ids, image_inputs=image_inputs
             )
 

@@ -635,8 +635,6 @@ class TestJanusProServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "janus-pro",
-                "--chunked-prefill-size",
-                "-1",
                 "--mem-fraction-static",
                 "0.4",
             ],

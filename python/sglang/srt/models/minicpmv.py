@@ -694,7 +694,7 @@ class MiniCPMVBaseModel(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
-    def get_vllm_embedding(
+    def get_vlm_embedding(
         self,
         input_ids: torch.Tensor,
         image_inputs: Optional[MiniCPMVImageInputs],
@@ -890,7 +890,7 @@ class MiniCPMVBaseModel(nn.Module):
         # There values are useless because their embeddings will be replaced by vision embeddings anyway.
         input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
-        vlm_embeddings = self.get_vllm_embedding(
+        vlm_embeddings = self.get_vlm_embedding(
             input_ids, image_inputs, forward_batch.forward_mode
         )
 
