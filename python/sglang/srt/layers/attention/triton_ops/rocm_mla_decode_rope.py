@@ -20,26 +20,19 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-import argparse
-import logging
-import sys
-
-import pytest
-import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _decode_softmax_reducev_fwd,
 )
-from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
 
 
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -230,7 +223,7 @@ def _fwd_grouped_kernel_stage1_rope(
                 other=0.0,
             )  # positional embedding part of keys
 
-            if USE_ROPE and start_n >= cur_batch_seq_len - BLOCK_N:
+            if (USE_ROPE and LAST_SPLIT) and start_n >= cur_batch_seq_len - BLOCK_N:
                 k_pe = tl.where(
                     offs_n[None, :] != (split_kv_end - 1),
                     k_pe,
@@ -340,7 +333,7 @@ def _decode_grouped_att_m_fwd_rope(
     BLOCK = 32
 
     # # [TODO] work around shmem limit on MI3xx
-    # if is_hip_ and kv_lora_rank >= 576:
+    # if _is_hip and kv_lora_rank >= 576:
     #     BLOCK = 16
 
     qk_rope_head_dim = k_buffer.shape[-1] - kv_lora_rank
@@ -360,7 +353,7 @@ def _decode_grouped_att_m_fwd_rope(
 
     extra_kargs = {}
     num_stages = 2
-    if is_hip_:
+    if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}

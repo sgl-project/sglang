@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-kernel/src/sgl-kernel/version.py
+      - sgl-kernel/python/sgl_kernel/version.py
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build-wheels:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
+    runs-on: sgl-kernel-build-node
     strategy:
       matrix:
         python-version: ['3.9']

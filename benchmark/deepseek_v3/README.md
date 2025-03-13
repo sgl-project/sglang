@@ -6,14 +6,6 @@ Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model
 
 For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/references/deepseek.html).
 
-## Hardware Recommendation
-
-- 8 x NVIDIA H200 GPUs
-
-If you do not have GPUs with large enough memory, please try multi-node tensor parallelism. There is an example serving with [2 H20 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) below.
-
-For running on AMD MI300X, use this as a reference. [Running DeepSeek-R1 on a single NDv5 MI300X VM](https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/running-deepseek-r1-on-a-single-ndv5-mi300x-vm/4372726)
-
 ## Installation & Launch
 
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded.
@@ -182,6 +174,49 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
+
+
+### Example: Serving with 8 A100/A800 with AWQ Quantization
+
+AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+
+```bash
+python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
+```
+
+
+### Example: Serving with 16 A100/A800 with int8 Quantization
+
+There are block-wise and per-channel quantization methods, and the quantization parameters have already been uploaded to Huggingface. One example is as follows:
+
+- [meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
+```bash
+#master
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+#cluster
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+```
+
+> **Note that the launch command here enables `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+
+Then on the **master node**, supposing the ShareGPT data is located at `/path/to/ShareGPT_V3_unfiltered_cleaned_split.json`, you can run the following commands to benchmark the launched server:
+
+```bash
+# bench accuracy
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+
+# bench serving
+python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
+```
+
+> **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
 
 ### Example: Serving on any cloud or Kubernetes with SkyPilot
 
