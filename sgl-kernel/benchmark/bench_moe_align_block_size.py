@@ -196,14 +196,21 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         expert_ids_triton,
         num_tokens_post_pad_triton,
     )
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids_vllm,
-        expert_ids_vllm,
-        num_tokens_post_pad_vllm,
-    )
+
+    try:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids_vllm,
+            expert_ids_vllm,
+            num_tokens_post_pad_vllm,
+        )
+        print(f"✅ VLLM implementation works with {num_experts} experts!")
+        vllm_works = True
+    except RuntimeError as e:
+        print(f"❌ VLLM implementation failed with {num_experts} experts: {e}")
+        vllm_works = False
 
     if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
         num_tokens_post_pad_cuda, num_tokens_post_pad_triton
@@ -216,20 +223,26 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
-    if torch.allclose(expert_ids_cuda, expert_ids_vllm) and torch.allclose(
-        num_tokens_post_pad_cuda, num_tokens_post_pad_vllm
+    if (
+        vllm_works
+        and torch.allclose(expert_ids_cuda, expert_ids_vllm)
+        and torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_vllm)
     ):
         print("✅ SGL and VLLM implementations match")
     else:
-        print("❌ SGL and VLLM implementations do not match")
-        print("SGL expert_ids:", expert_ids_cuda)
-        print("VLLM expert_ids:", expert_ids_vllm)
-        print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
-        print("VLLM num_tokens_post_pad:", num_tokens_post_pad_vllm)
+        if not vllm_works:
+            print("⚠️ VLLM comparison skipped due to failure")
+        else:
+            print("❌ SGL and VLLM implementations do not match")
+            print("SGL expert_ids:", expert_ids_cuda)
+            print("VLLM expert_ids:", expert_ids_vllm)
+            print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
+            print("VLLM num_tokens_post_pad:", num_tokens_post_pad_vllm)
 
 
+# Test range
 num_tokens_range = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-num_experts_range = [32, 64, 128, 256]
+num_experts_range = [8, 32, 64, 128, 256]
 topk_range = [2, 4, 8]
 
 configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
@@ -316,17 +329,22 @@ def benchmark(num_tokens, num_experts, topk, provider):
             quantiles=quantiles,
         )
     else:  # vllm
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: ops.moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids.clone(),
-                expert_ids.clone(),
-                num_tokens_post_pad.clone(),
-            ),
-            quantiles=quantiles,
-        )
+        try:
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: ops.moe_align_block_size(
+                    topk_ids,
+                    num_experts,
+                    block_size,
+                    sorted_ids.clone(),
+                    expert_ids.clone(),
+                    num_tokens_post_pad.clone(),
+                ),
+                quantiles=quantiles,
+            )
+        except RuntimeError as e:
+            print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
+            # Return extreme values to indicate failure in the chart
+            return float("inf"), float("inf"), float("inf")
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
@@ -343,7 +361,7 @@ if __name__ == "__main__":
         "--num_experts",
         type=int,
         default=256,
-        choices=[8, 64, 128, 256],
+        choices=[8, 16, 32, 64, 128, 256],
         help="Number of experts for benchmark",
     )
     parser.add_argument(
@@ -353,8 +371,15 @@ if __name__ == "__main__":
         choices=[2, 4, 8],
         help="Top-k value for benchmark",
     )
+    parser.add_argument(
+        "--skip_full_benchmark",
+        action="store_true",
+        help="Only run the calculate_diff function, skip full benchmarking",
+    )
     args = parser.parse_args()
 
     calculate_diff(num_tokens=1024, num_experts=args.num_experts, topk=args.topk)
 
-    benchmark.run(print_data=True)
+    if not args.skip_full_benchmark:
+        print(f"\n📊 Running performance benchmark for {args.num_experts} experts...")
+        benchmark.run(print_data=True)
