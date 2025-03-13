@@ -301,6 +301,8 @@ class GemmaForCausalLM(nn.Module):
             self.config = config.text_config
         elif isinstance(config, GemmaConfig):
             self.config = config
+        else:
+            self.config = config
         self.quant_config = quant_config
         self.model = GemmaModel(
             self.config, quant_config=quant_config, prefix=add_prefix("model", prefix)
