@@ -45,5 +45,6 @@ from sgl_kernel.speculative import (
     build_tree_kernel,
     build_tree_kernel_efficient,
     tree_speculative_sampling_target_only,
+    verify_tree_greedy,
 )
 from sgl_kernel.version import __version__

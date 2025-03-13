@@ -83,7 +83,6 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         last_accepted_retrive_idx = draft_index;
         break;
       } else {
-        // FIXME: leverage draft probs
         draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
       }
@@ -156,8 +155,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 template <typename DType, typename IdType>
 cudaError_t TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,
-    IdType* output_token_ids,
-    IdType* output_accepted_token_num,  // mutable
+    IdType* accept_index,
+    IdType* accept_token_num,  // mutable
     IdType* candidates,
     IdType* retrive_index,
     IdType* retrive_next_token,
@@ -179,8 +178,8 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
   dim3 nthrs(BLOCK_THREADS);
   void* args[] = {
       &predicts,
-      &output_token_ids,
-      &output_accepted_token_num,
+      &accept_index,
+      &accept_token_num,
       &candidates,
       &retrive_index,
       &retrive_next_token,
