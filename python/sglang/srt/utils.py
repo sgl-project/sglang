@@ -52,11 +52,13 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
+from packaging.version import Version, parse
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -70,13 +72,17 @@ show_time_cost = False
 time_infos = {}
 
 
+# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
-    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
 
 
+def is_rocm() -> bool:
+    return torch.cuda.is_available() and torch.version.hip
+
+
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.version.cuda is not None
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_cuda_alike():
@@ -98,11 +104,11 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def is_cuda_available():
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def enable_show_time_cost():
@@ -313,7 +319,7 @@ def make_layers(
     """Make a list of layers with the given layer function"""
     modules = torch.nn.ModuleList(
         [
-            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=f"{prefix}.{idx}"))
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
             for idx in range(num_hidden_layers)
         ]
     )
@@ -739,13 +745,6 @@ def pytorch_profile(name, func, *args, data_size=-1):
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
-
-
-def first_rank_print(*args, **kwargs):
-    if torch.cuda.current_device() == 0:
-        print(*args, **kwargs)
-    else:
-        pass
 
 
 def get_zmq_socket(
@@ -1177,6 +1176,11 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
+@lru_cache(maxsize=2)
+def disable_request_logging() -> bool:
+    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+
+
 @lru_cache(maxsize=8)
 def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
@@ -1271,7 +1275,8 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
         x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
     else:
-        return x_
+        # return x_
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
 
     x_ = x_.permute(0, 1, 3, 4, 2, 5)
     x_ = x_.contiguous()
@@ -1432,6 +1437,12 @@ def rank0_print(msg: str):
         print(msg, flush=True)
 
 
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
+
+
 def launch_dummy_health_check_server(host, port):
     import uvicorn
     from fastapi import FastAPI, Response
@@ -1466,3 +1477,16 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"

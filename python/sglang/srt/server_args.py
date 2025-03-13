@@ -20,14 +20,13 @@ import random
 import tempfile
 from typing import List, Optional
 
-import torch
-
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -71,7 +70,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-    prefill_only_one_req: bool = False
+    page_size: int = 1
 
     # Other runtime options
     tp_size: int = 1
@@ -191,10 +190,10 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif torch.cuda.is_available():
+        if is_cuda():
             gpu_mem = get_nvgpu_memory_capacity()
+        elif is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
         elif self.device == "hpu":
             gpu_mem = get_hpu_memory_capacity()
         else:
@@ -259,7 +258,7 @@ class ServerArgs:
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        # Others
+        # Data parallelism attention
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
             assert self.tp_size % self.dp_size == 0
@@ -277,14 +276,17 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm == "EAGLE":
-            self.disable_overlap_schedule = True
-            self.prefill_only_one_req = True
+            if self.max_running_requests is None:
+                self.max_running_requests = 32
             self.disable_cuda_graph_padding = True
-            self.disable_radix_cache = True
-            self.chunked_prefill_size = -1
+            self.disable_overlap_schedule = True
             logger.info(
-                f"The radix cache, chunked prefill, and overlap scheduler are disabled because of using {self.speculative_algorithm} speculative decoding."
+                "Overlap scheduler is disabled because of using "
+                "eagle speculative decoding."
             )
+            # The token generated from the verify step is counted.
+            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
         if (
@@ -403,6 +405,7 @@ class ServerArgs:
                 "gguf",
                 "modelopt",
                 "w8a8_int8",
+                "w8a8_fp8",
             ],
             help="The quantization method.",
         )
@@ -477,7 +480,7 @@ class ServerArgs:
             "--chunked-prefill-size",
             type=int,
             default=ServerArgs.chunked_prefill_size,
-            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill",
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -502,13 +505,13 @@ class ServerArgs:
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
-            help="How many GBs of RAM to reserve for CPU offloading",
+            help="How many GBs of RAM to reserve for CPU offloading.",
         )
         parser.add_argument(
-            "--prefill-only-one-req",
-            type=bool,
-            help="If true, we only prefill one request at one prefill batch",
-            default=ServerArgs.prefill_only_one_req,
+            "--page-size",
+            type=int,
+            default=ServerArgs.page_size,
+            help="The number of tokens in a page.",
         )
 
         # Other runtime options
