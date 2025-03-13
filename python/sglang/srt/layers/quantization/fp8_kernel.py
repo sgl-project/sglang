@@ -750,8 +750,10 @@ def w8a8_block_fp8_matmul(
 
     # deepgemm only support bf16
     if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
-        # deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
-        torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+        if supports_custom_op():
+            torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+        else:
+            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4
