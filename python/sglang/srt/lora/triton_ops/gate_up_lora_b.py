@@ -22,17 +22,18 @@ def _gate_up_lora_b_kernel(
     w_stride_2,
     output_stride_0,
     output_stride_1,
-    # Information on sequence lengths and weight id
+    # Information on sequence lengths,ranks and weight id
     seg_lens,
     seg_indptr,
     weight_indices,
+    lora_ranks,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     # For fused output scaling and adding
     fuse_scaling_add,
-    scaling,
+    scalings,
 ):
     # This kernel packs 2 sgemms (gate/up) into a single kernel.
 
@@ -51,6 +52,11 @@ def _gate_up_lora_b_kernel(
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = gate_up_id * output_dim  # offset on output dim
+    rank = tl.load(lora_ranks + w_index)
+    scaling = tl.load(scalings + w_index)
+
+    # Adjust K (rank) according to the specific LoRA adapter
+    K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(output_dim, BLOCK_N)
@@ -109,7 +115,6 @@ def gate_up_lora_b_fwd(
     batch_info: LoRABatchInfo,
     output_dim: int,
     base_output: torch.Tensor = None,
-    scaling: float = 1.0,
 ) -> torch.Tensor:
 
     # x: (s, 2 * r)
@@ -160,11 +165,12 @@ def gate_up_lora_b_fwd(
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
+        batch_info.lora_ranks,
         BLOCK_S,
         BLOCK_OUT,
         BLOCK_R,
         fuse_scaling_add,
-        scaling,
+        batch_info.scalings,
     )
 
     return output

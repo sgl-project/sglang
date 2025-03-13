@@ -134,6 +134,7 @@ class LoRAMemoryPool:
             return
 
         assert lora_adapter is not None
+        lora_rank = lora_adapter.config.hf_config["r"]
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             for name, weights in layer_weights.items():
@@ -141,8 +142,9 @@ class LoRAMemoryPool:
                     lora_weight_name = get_weight_name(
                         name, self.lora_weight_names, LoRAType.LORA_A
                     )
+                    c = get_stacked_multiply(lora_weight_name)
                     if lora_weight_name:
-                        self.A_buffer[lora_weight_name][layer_id][buffer_id].copy_(
+                        self.A_buffer[lora_weight_name][layer_id][buffer_id][:lora_rank * c, :].copy_(
                             weights
                         )
                 else:
@@ -155,11 +157,11 @@ class LoRAMemoryPool:
                             for stacked_id in range(c):
                                 self.B_buffer[lora_weight_name][layer_id][stacked_id][
                                     buffer_id
-                                ].copy_(weights[stacked_id])
+                                ][:,:lora_rank].copy_(weights[stacked_id])
                         else:
                             self.B_buffer[lora_weight_name][layer_id][0][
                                 buffer_id
-                            ].copy_(weights)
+                            ][:,:lora_rank].copy_(weights)
 
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType

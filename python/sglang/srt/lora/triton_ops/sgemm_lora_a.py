@@ -22,10 +22,11 @@ def _sgemm_lora_a_kernel(
     w_stride_2,
     output_stride_0,
     output_stride_1,
-    # Information on sequence lengths and weight id
+    # Information on sequence lengths,ranks and weight id
     seg_lens,
     seg_indptr,
     weight_indices,
+    lora_ranks,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -43,6 +44,10 @@ def _sgemm_lora_a_kernel(
     seg_len = tl.load(seg_lens + batch_id)
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # Adjust K (rank) according to the specific LoRA adapter
+    K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -136,6 +141,7 @@ def sgemm_lora_a_fwd(
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
+        batch_info.lora_ranks,
         BLOCK_S,
         BLOCK_R,
         BLOCK_K,
