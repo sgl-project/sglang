@@ -126,6 +126,14 @@ def is_cuda_available():
     return is_cuda()
 
 
+def is_triton_available():
+    if is_cuda() or is_xpu() or is_hip():
+        return get_bool_env_var("TRITON_AVAILABLE", default="true")
+    else:
+        # update once CPU/HPU supports triton
+        return False
+
+
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
@@ -1136,6 +1144,7 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
+        assert 0 <= minor < 10
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
@@ -1552,6 +1561,13 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 def add_prefix(name: str, prefix: str) -> str:

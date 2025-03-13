@@ -129,6 +129,7 @@ class TokenToKVPoolAllocator:
         self.size = size
         self.dtype = dtype
         self.device = device
+        self.page_size = 1
 
         self.free_slots = None
         self.is_not_in_free_group = True
@@ -149,15 +150,14 @@ class TokenToKVPoolAllocator:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
-        return select_index.to(self.device, non_blocking=True)
+        return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+            self.free_slots = torch.concat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -172,7 +172,9 @@ class TokenToKVPoolAllocator:
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
         self.is_in_free_group = False
         self.free_group = []
 
@@ -182,6 +184,7 @@ class MHATokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -190,6 +193,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -207,6 +211,8 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.layer_transfer_counter = None
+        self.capture_mode = False
+        self.alt_stream = torch.cuda.Stream()
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -218,16 +224,16 @@ class MHATokenToKVPool(KVCache):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
             ]
             self.v_buffer = [
-                torch.empty(
-                    (self.size + 1, self.head_num, self.head_dim),
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
@@ -315,12 +321,42 @@ class MHATokenToKVPool(KVCache):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        if self.capture_mode:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                self.k_buffer[layer_id][loc] = cache_k
+            self.v_buffer[layer_id][loc] = cache_v
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
+
+
+@torch.compile
+def fused_downcast(
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    dtype: torch.dtype,
+    store_dtype: torch.dtype,
+    max_fp8: float,
+    min_fp8: float,
+):
+    cache_k = cache_k / k_scale
+    cache_k = torch.clamp(cache_k, min_fp8, max_fp8)
+    cache_v = cache_v / v_scale
+    cache_v = torch.clamp(cache_v, min_fp8, max_fp8)
+    cache_k = cache_k.to(dtype)
+    cache_v = cache_v.to(dtype)
+    cache_k = cache_k.view(store_dtype)
+    cache_v = cache_v.view(store_dtype)
+    return cache_k, cache_v
 
 
 # This compiled version is slower in the unit test
@@ -335,6 +371,7 @@ class MLATokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -359,8 +396,8 @@ class MLATokenToKVPool(KVCache):
         with memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
-                torch.empty(
-                    (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
+                torch.zeros(
+                    (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
                     dtype=self.store_dtype,
                     device=device,
                 )
@@ -400,6 +437,7 @@ class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -409,6 +447,7 @@ class DoubleSparseTokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -423,17 +462,21 @@ class DoubleSparseTokenToKVPool(KVCache):
         with memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.zeros(
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
             self.v_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.zeros(
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
 
             # [size, head_num, heavy_channel_num] for each layer
             self.label_buffer = [
-                torch.empty(
+                torch.zeros(
                     (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
                 )
                 for _ in range(layer_num)
@@ -528,7 +571,7 @@ class MHATokenToKVPoolHost:
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
-        self.kv_buffer = torch.empty(
+        self.kv_buffer = torch.zeros(
             (2, self.layer_num, self.size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
@@ -547,9 +590,6 @@ class MHATokenToKVPoolHost:
 
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
-
-    def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[:, layer_id, indices]
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
