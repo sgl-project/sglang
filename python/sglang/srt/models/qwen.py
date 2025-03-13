@@ -273,7 +273,7 @@ class QWenLMHeadModel(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,

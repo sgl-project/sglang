@@ -42,7 +42,7 @@ class InternLM2ForRewardModel(nn.Module):
         self.v_head = nn.Linear(config.hidden_size, 1, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,

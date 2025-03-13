@@ -115,7 +115,7 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGQUIT)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2

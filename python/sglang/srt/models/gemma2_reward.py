@@ -44,7 +44,7 @@ class Gemma2ForSequenceClassification(nn.Module):
 
         self.eos_token_id = config.eos_token_id
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,

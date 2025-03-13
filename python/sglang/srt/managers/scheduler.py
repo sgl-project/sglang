@@ -477,7 +477,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 },
             )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -497,7 +497,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             self.last_batch = batch
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
