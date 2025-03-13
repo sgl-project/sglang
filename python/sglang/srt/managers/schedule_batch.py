@@ -44,17 +44,15 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -160,14 +158,18 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
-    # MiniCPMV related
+    # The id of the single-image placeholder token
+    im_token_id: Optional[torch.Tensor] = None
     # All the images in the batch should share the same special image
     # bound token ids.
-    im_start_id: Optional[torch.Tensor] = None
-    im_end_id: Optional[torch.Tensor] = None
-    slice_start_id: Optional[torch.Tensor] = None
-    slice_end_id: Optional[torch.Tensor] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
     tgt_sizes: Optional[list] = None
+
+    # denotes the number of valid image tokens in each image
+    images_emb_mask: Optional[torch.BoolTensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -188,11 +190,13 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -311,6 +315,7 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         self.last_node = None
+        self.last_node_global = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -385,13 +390,24 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        enable_hierarchical_cache=False,
+    ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             # tree cache is None if the prefix is not computed with tree cache.
-            self.prefix_indices, self.last_node = tree_cache.match_prefix(
-                rid=self.rid, key=self.adjust_max_prefix_ids()
-            )
+            if enable_hierarchical_cache:
+                self.prefix_indices, self.last_node, self.last_node_global = (
+                    tree_cache.match_prefix(
+                        key=self.adjust_max_prefix_ids(), include_evicted=True
+                    )
+                )
+            else:
+                self.prefix_indices, self.last_node = tree_cache.match_prefix(
+                    rid=self.rid, key=self.adjust_max_prefix_ids()
+                )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -424,28 +440,6 @@ class Req:
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
-
-    def get_next_inc_detokenization(self):
-        if self.tokenizer is None:
-            return False, ""
-        read_ids, read_offset = self.init_incremental_detokenize()
-        surr_ids = read_ids[:read_offset]
-
-        surr_text = self.tokenizer.decode(
-            surr_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-        new_text = self.tokenizer.decode(
-            read_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-
-        if len(new_text) > len(surr_text) and not new_text.endswith("�"):
-            return True, new_text[len(surr_text) :]
-
-        return False, ""
 
     def check_finished(self):
         if self.finished():
@@ -523,7 +517,7 @@ class ScheduleBatch:
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: BaseTokenToKVPool = None
+    token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -596,7 +590,7 @@ class ScheduleBatch:
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
@@ -606,7 +600,7 @@ class ScheduleBatch:
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
@@ -637,19 +631,19 @@ class ScheduleBatch:
         return req_pool_indices
 
     def alloc_token_slots(self, num_tokens: int):
-        out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
 
         if out_cache_loc is None:
             if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
-                out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+                self.tree_cache.evict(num_tokens, self.token_to_kv_pool_allocator.free)
+                out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
 
             if out_cache_loc is None:
                 phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
                 logger.error(
                     f"{phase_str} out of memory. Try to lower your batch size.\n"
                     f"Try to allocate {num_tokens} tokens.\n"
-                    f"Avaliable tokens: {self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()}\n"
+                    f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 )
                 if self.tree_cache is not None:
                     self.tree_cache.pretty_print()
@@ -917,12 +911,12 @@ class ScheduleBatch:
 
     def check_decode_mem(self, buf_multiplier=1):
         bs = len(self.reqs) * buf_multiplier
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool_allocator.available_size() >= bs:
             return True
 
-        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
+        self.tree_cache.evict(bs, self.token_to_kv_pool_allocator.free)
 
-        if self.token_to_kv_pool.available_size() >= bs:
+        if self.token_to_kv_pool_allocator.available_size() >= bs:
             return True
 
         return False
@@ -945,6 +939,10 @@ class ScheduleBatch:
                 reverse=True,
             )
 
+        retracted_reqs = []
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        first_iter = True
+
         def get_required_tokens(num_reqs: int):
             headroom_for_spec_decode = 0
             if server_args.speculative_algorithm:
@@ -958,18 +956,15 @@ class ScheduleBatch:
                 num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
 
-        retracted_reqs = []
-        seq_lens_cpu = self.seq_lens.cpu().numpy()
-        first_iter = True
         while (
-            self.token_to_kv_pool.available_size()
+            self.token_to_kv_pool_allocator.available_size()
             < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
-                    self.token_to_kv_pool.available_size() > 0
+                    self.token_to_kv_pool_allocator.available_size() > 0
                 ), "No space left for only one request"
                 break
 
@@ -983,7 +978,7 @@ class ScheduleBatch:
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : seq_lens_cpu[idx]
                 ]
-                self.token_to_kv_pool.free(token_indices)
+                self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
                 del self.tree_cache.entries[req.rid]
             else:
@@ -992,7 +987,7 @@ class ScheduleBatch:
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
-                self.token_to_kv_pool.free(token_indices)
+                self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
@@ -1001,10 +996,13 @@ class ScheduleBatch:
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool.available_size()
+                    - self.token_to_kv_pool_allocator.available_size()
                 )
                 residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+                self.tree_cache.evict(
+                    residual_size, self.token_to_kv_pool_allocator.free
+                )
+
             req.reset_for_retract()
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1183,10 +1181,15 @@ class ScheduleBatch:
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(self):
+    def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
+            if global_server_args_dict["enable_flashinfer_mla"]:
+                decode_seq_lens = self.seq_lens.cpu()
+            else:
+                decode_seq_lens = None
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
+            decode_seq_lens = None
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
@@ -1213,6 +1216,7 @@ class ScheduleBatch:
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            decode_seq_lens=decode_seq_lens,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1273,7 +1277,7 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool
+    # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
     # The sum of all sequence lengths
@@ -1288,6 +1292,9 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     can_run_dp_cuda_graph: bool
+
+    # For decode
+    decode_seq_lens: Optional[torch.Tensor]
 
     # For extend
     extend_num_tokens: Optional[int]

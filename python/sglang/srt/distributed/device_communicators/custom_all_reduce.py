@@ -22,15 +22,16 @@ from sglang.srt.utils import cuda_device_count_stateless, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
-is_hip_ = is_hip()
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
-if is_cuda():
+if _is_cuda:
     try:
         import pynvml
     except ImportError as e:
         logger.warning("Failed to import pynvml with %r", e)
 
-if is_hip_:
+if _is_hip:
     try:
         from amdsmi import (
             AmdSmiException,
@@ -43,7 +44,7 @@ if is_hip_:
         logger.warning("Failed to import amdsmi with %r", e)
 
 try:
-    if ops.use_vllm_custom_allreduce and not is_hip_:
+    if ops.use_vllm_custom_allreduce and not _is_hip:
         # Use vLLM custom allreduce
         ops.meta_size()
     else:
@@ -63,7 +64,7 @@ _R = TypeVar("_R")
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        if is_hip_:
+        if _is_hip:
             try:
                 amdsmi_init()
                 return fn(*args, **kwargs)
@@ -81,7 +82,7 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @with_nvml_context
 def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
-    if is_hip_:
+    if _is_hip:
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
         """
@@ -145,7 +146,7 @@ def is_weak_contiguous(inp: torch.Tensor):
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
-    if is_hip_:
+    if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
 
@@ -229,7 +230,7 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        if is_cuda() or is_hip_:
+        if _is_cuda or _is_hip:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
@@ -243,7 +244,7 @@ class CustomAllreduce:
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if not is_hip_ and not _can_p2p(rank, world_size):
+        if not _is_hip and not _can_p2p(rank, world_size):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
@@ -256,7 +257,7 @@ class CustomAllreduce:
         self.world_size = world_size
         self.full_nvlink = full_nvlink
 
-        if ops.use_vllm_custom_allreduce and not is_hip_:
+        if ops.use_vllm_custom_allreduce and not _is_hip:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
@@ -279,7 +280,7 @@ class CustomAllreduce:
             )
             ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
-            if is_hip_:
+            if _is_hip:
                 # meta data buffers need to be "uncached" for signal on MI200
                 self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
                 self.buffer = torch.empty(
@@ -418,7 +419,7 @@ class CustomAllreduce:
         ops.register_buffer(self._ptr, inp, handles, offsets)
 
     def register_graph_buffers(self):
-        if is_hip_:
+        if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
             logger.info("Registering %d cuda graph addresses", len(offset))
@@ -454,12 +455,12 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if ops.use_vllm_custom_allreduce and not is_hip_:
+        if ops.use_vllm_custom_allreduce and not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size < self.max_size
             return False
 
-        if is_hip_:
+        if _is_hip:
             if self.full_nvlink:
                 if self.world_size == 8:
                     if self.MSCCL:
@@ -532,7 +533,7 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                if is_hip_:
+                if _is_hip:
                     return self.all_reduce_reg(input)
                 else:
                     return self.all_reduce(input, registered=True)
@@ -541,7 +542,7 @@ class CustomAllreduce:
                 # allreduce is out-of-place.
                 return torch.empty_like(input)
         else:
-            if is_hip_:
+            if _is_hip:
                 # note: outside of cuda graph context,
                 # custom allreduce incurs a cost of cudaMemcpy, which should
                 # be small(<=1% of overall latency) compared to the performance
@@ -556,7 +557,7 @@ class CustomAllreduce:
             if ops.use_vllm_custom_allreduce:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
-            elif is_cuda():
+            elif _is_cuda:
                 self.free_shared_buffer(self.buffer_ptrs)
                 self.free_shared_buffer(self.tmp_result_buffer_ptrs)
                 self.free_shared_buffer(self.barrier_in_ptrs)
