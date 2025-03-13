@@ -817,8 +817,8 @@ class ScheduleBatch:
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.int64).to(
-            self.device, non_blocking=True
+        prefix_lens_tensor = torch.tensor(
+            prefix_lens, dtype=torch.int64, device=self.device
         )
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
 
