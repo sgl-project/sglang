@@ -23,6 +23,7 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
