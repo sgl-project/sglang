@@ -262,14 +262,14 @@ class ServerArgs:
 
         # Data parallelism attention
         if self.enable_dp_attention:
-            self.dp_size = self.tp_size
-            assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // 2
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            assert (
+                self.dp_size > 1
+            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
+            assert self.tp_size % self.dp_size == 0
+            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-                f"The schedule conservativeness is adjusted to {self.schedule_conservativeness}. "
-                "Data parallel size is adjusted to be the same as tensor parallel size. "
             )
 
         # Speculative Decoding
