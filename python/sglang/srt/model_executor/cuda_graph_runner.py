@@ -464,7 +464,7 @@ class CudaGraphRunner:
                 self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
             )
         else:
-            index = bisect.bisect_left(self.capture_bs, self.raw_bs)
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
