@@ -284,11 +284,11 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         file_request_list = []
         all_requests = []
         request_ids = []
-        for line in lines:
+        for line_id, line in enumerate(lines):
             request_data = json.loads(line)
             file_request_list.append(request_data)
             body = request_data["body"]
-            request_ids.append(request_data["custom_id"])
+            request_ids.append(f"{batch_id}-req_{line_id}")
 
             # Although streaming is supported for standalone completions, it is not supported in
             # batch mode (multiple completions in single request).
@@ -438,15 +438,9 @@ async def cancel_batch(tokenizer_manager, batch_id: str, input_file_id: str):
         with open(input_file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        file_request_list = []
-        request_ids = []
-        for line in lines:
-            request_data = json.loads(line)
-            file_request_list.append(request_data)
-            request_ids.append(request_data["custom_id"])
-
         # Cancel requests by request_ids
-        for rid in request_ids:
+        for line_id in range(len(lines)):
+            rid = f"{batch_id}-req_{line_id}"
             tokenizer_manager.abort_request(rid=rid)
 
         retrieve_batch = batch_storage[batch_id]
