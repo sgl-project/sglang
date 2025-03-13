@@ -422,7 +422,7 @@ def compute_position_kernel(
     seq_len = tl.load(extend_seq_lens + pid)
 
     # TODO: optimize this?
-    cumsum_start = 0
+    cumsum_start = tl.cast(0, tl.int64)
     for i in range(pid):
         cumsum_start += tl.load(extend_seq_lens + i)
 
