@@ -771,7 +771,6 @@ class ServerArgs:
             "--speculative-eagle-topk",
             type=int,
             help="The number of tokens sampled from the draft model in eagle2 each step.",
-            choices=[1, 2, 4, 8],
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
