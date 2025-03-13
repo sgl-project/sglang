@@ -34,11 +34,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.elementwise import (
-    Softcap,
-    fused_dual_residual_rmsnorm,
-    fused_rmsnorm,
-)
+from sglang.srt.layers.elementwise import fused_dual_residual_rmsnorm, fused_rmsnorm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -135,8 +131,6 @@ class Grok1MoE(nn.Module):
             activation="gelu",
             **kwargs,
         )
-
-        self.softcap = Softcap(self.router_logit_softcapping)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # need to assert self.gate.quant_method is unquantized
