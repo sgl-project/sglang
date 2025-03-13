@@ -36,7 +36,7 @@ class TestGrok(unittest.TestCase):
             num_shots=5,
             data_path=None,
             num_questions=64,
-            max_new_tokens=512,
+            max_new_tokens=256,
             parallel=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
