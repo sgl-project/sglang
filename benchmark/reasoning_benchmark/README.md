@@ -11,7 +11,6 @@ for `parse_latex` which we use for symbolic equality check.
 ## Benchmark sglang
 
 1. Launch the Server
-
 ```bash
 python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000
 ```
@@ -20,6 +19,11 @@ Note that depending on the GPU this benchmark will take quiet some time. To empl
 
 ```bash
 python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 4
+```
+
+In statistic analysis, we use `--dp-size 8` to launch the server:
+```bash
+python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 8
 ```
 
 2. Benchmarking
@@ -50,7 +54,7 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME
 | Dataset    | Num Tries | Accuracy | Reference | Standard Error |
 |------------|-----------|----------|-----------|-----------|
 | LIMO       | 8         | 47.7%    | ?         | ?         |
-| AIME 2024  | 64        | 33.2%    | 28.9%     |3.4%       |
+| AIME 2024  | 64        | 33.2%    | 28.9%     | 3.4%       |
 | AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?        |
 
 ### Statistic Analysis Results
