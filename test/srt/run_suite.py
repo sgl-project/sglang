@@ -18,6 +18,7 @@ suites = {
         TestFile("models/lora/test_multi_lora_backend.py", 1),
         TestFile("models/test_embedding_models.py", 119),
         TestFile("models/test_generation_models.py", 103),
+        TestFile("models/test_grok_models.py", 60),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
