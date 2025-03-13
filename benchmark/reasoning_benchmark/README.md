@@ -21,10 +21,6 @@ Note that depending on the GPU this benchmark will take quiet some time. To empl
 python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 4
 ```
 
-In statistic analysis, we use `--dp-size 8` to launch the server:
-```bash
-python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 8
-```
 
 2. Benchmarking
 
@@ -47,7 +43,6 @@ Evaluate on [AIME 2025 I dataset](https://huggingface.co/datasets/opencompass/AI
 ```bash
 python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME2025 --question-key question --answer-key answer --num-tries 64
 ```
-
 ## Results
 
 ### Evaluation Results
@@ -58,10 +53,25 @@ python3 bench_sglang.py --parallel 256 --port 30000 --data-path opencompass/AIME
 | AIME 2025 I| 64        | 29.9%    | 25.0%     |  ?        |
 
 ### Statistic Analysis Results
-**Experiment 1**: We fixed the number of attempts (num_tries) and conducted multiple runs to assess the consistency of the model's performance. The results show that all recorded accuracies lie within ± one standard error deviation from the mean. This suggests that **our metric serves as an effective upper bound for the deviation of reported accuracy**.
+Set up SGLang engine for statistic analysis, for high efficiency we use `--dp-size 8` for data parallelism:
+```bash
+python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 8
+```
+**Experiment 1**: 
+We fixed the number of attempts (num_tries) and conducted multiple runs to assess the consistency of the model's performance. The results show that all recorded accuracies lie within ± one standard error deviation from the mean. This suggests that **our metric serves as an effective upper bound for the deviation of reported accuracy**.
+
+To collect the accuracy, run the following command 30 times:
+```bash
+python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries 64
+```
+
 ![acc_hist](figure/Acc_histplot.png)
 
 
 **Experiment 2**: We explored the relationship between the number of attempts (num_tries) and the standard error (SE) by varying num_tries across a range (e.g., 8, 16, 32, ..., 256) and performing a single run for each value. The results demonstrate that as the number of attempts increases, the standard error decreases, leading to **greater stability in answer accuracy**.
 
+To reveal the relationship, run the command 6 times and adjust the parameter `--num-tries` for each run:
+```bash
+python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries <num_tries>
+```
 ![SE_num_tries](figure/SE_numtries.png)
