@@ -20,11 +20,10 @@ from typing import Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import (
-    PaliGemmaConfig,
-    SiglipVisionModel
+from transformers import PaliGemmaConfig, SiglipVisionModel
+from transformers.models.paligemma.modeling_paligemma import (
+    PaliGemmaMultiModalProjector,
 )
-from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -39,9 +38,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self,
         config: PaliGemmaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str ="",
+        prefix: str = "",
     ) -> None:
-        
+
         super().__init__()
         self.config = config
         self.language_model = GemmaForCausalLM(
@@ -50,7 +49,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
-    
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         new_input_ids = []
         last_idx = 0
@@ -99,11 +98,12 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.last_hidden_state #Note: from transformers     
+        selected_image_feature = (
+            image_outputs.last_hidden_state
+        )  # Note: from transformers
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
 
-    
     @torch.no_grad()
     def forward(
         self,
@@ -119,11 +119,13 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             # Clamp input ids. See llava.py for more details
             input_ids.clamp__(0, self.config.vocab_size - 1)
 
-            #Embed text inputs 
+            # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
-        
-            #TODO(xiao)
-            image_inputs = [ img for img in forward_batch.image_inputs if img is not None]
+
+            # TODO(xiao)
+            image_inputs = [
+                img for img in forward_batch.image_inputs if img is not None
+            ]
 
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
@@ -177,7 +179,6 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 for image_idx, image_feature in enumerate(image_features):
                     new_image_features.append(image_feature.flatten(0, 1))
                 image_features = new_image_features
-            
 
                 # Fill in the placeholder for the image
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
@@ -200,7 +201,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                         tmp_image_feature = image_features[pt]
                         pad_len = tmp_image_feature.shape[0]
 
-                        input_offset  = image_offset - prefix_len
+                        input_offset = image_offset - prefix_len
                         left_idx = start_idx + input_offset
                         right_idx = left_idx + pad_len
                         assert right_idx > start_idx
@@ -228,22 +229,20 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
 
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.vision_tower = SiglipVisionModel.from_pretrained(
-            self.config._name_or_path, 
-            torch_dtype=torch.float16
+            self.config._name_or_path, torch_dtype=torch.float16
         ).to("cuda")
 
         self.vision_tower.eval()
 
-        #load mm_projector
+        # load mm_projector
         projector_weights = {
-            "multi_modal_projector.linear": "multi_model_projector.linear", 
+            "multi_modal_projector.linear": "multi_model_projector.linear",
         }
 
         params_dict = dict(self.named_parameters())
-        weights = list(weights) 
+        weights = list(weights)
         for name, loaded_weight in weights:
             if "projector" in name:
                 for weight_name, param_name in projector_weights.items():
@@ -253,9 +252,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             elif "language_model" in name:
-                if "language_model." in name: #load model weight from Paligemma
+                if "language_model." in name:  # load model weight from Paligemma
                     name = name.replace("language_model.", "")
                 self.language_model.load_weights([(name, loaded_weight)])
 
+
 EntryClass = PaliGemmaForConditionalGeneration
-    
