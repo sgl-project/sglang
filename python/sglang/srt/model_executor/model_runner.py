@@ -369,7 +369,8 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError("MLA optimization not supported on CPU.")
+                if server_args.attention_backend != "intel_amx":
+                    raise ValueError("MLA optimization not supported on CPU except for intel_amx backend.")
 
         if (
             server_args.attention_backend == "fa3"
@@ -1071,6 +1072,9 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "intel_amx":
+            from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+            return IntelAMXAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
