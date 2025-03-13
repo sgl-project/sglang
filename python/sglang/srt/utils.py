@@ -1348,7 +1348,7 @@ def kill_itself_when_parent_died():
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
     else:
-        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
 def set_uvicorn_logging_configs():

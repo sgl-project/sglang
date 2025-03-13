@@ -117,6 +117,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `log_level`: Global log verbosity.
 * `log_level_http`: Separate verbosity level for the HTTP server logs (if unset, defaults to `log_level`).
 * `log_requests`: Logs the inputs and outputs of all requests for debugging.
+* `log_requests_level`: Ranges from 0 to 2: level 0 only shows some basic metadata in requests, level 1 and 2 show request details (e.g., text, images), and level 1 limits output to 2048 characters (if unset, defaults to `0`).
 * `show_time_cost`: Prints or logs detailed timing info for internal operations (helpful for performance tuning).
 * `enable_metrics`: Exports Prometheus-like metrics for request usage and performance.
 * `decode_log_interval`: How often (in tokens) to log decode progress.
