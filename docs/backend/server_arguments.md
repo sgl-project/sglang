@@ -179,7 +179,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 * `enable_mixed_chunk`: Enables mixing prefill and decode, see [this discussion](https://github.com/sgl-project/sglang/discussions/1163).
 * `enable_dp_attention`: Enable [Data Parallelism Attention](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models) for Deepseek models. Note that you need to choose `dp_size = tp_size` for this.
-* `enable_torch_compile`: Torch compile the model. This is an experimental feature, 
+* `enable_torch_compile`: Torch compile the model. This is an experimental feature.
 * `torch_compile_max_bs`: The maximum batch size when using `torch_compile`.
 * `cuda_graph_max_bs`: Adjust the maximum batchsize when using cuda graph. By default this is chosen for you based on GPU specifics.
 * `cuda_graph_bs`: The batch sizes to capture by `CudaGraphRunner`. By default this is done for you.
