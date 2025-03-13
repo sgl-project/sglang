@@ -143,7 +143,9 @@ class RadixCache(BasePrefixCache):
         if value:
             value = torch.concat(value)
         else:
-            value = torch.empty((0,), dtype=torch.int32)
+            value = torch.empty(
+                (0,), dtype=torch.int32, device=self.token_to_kv_pool_allocator.device
+            )
         return value, last_node[0]
 
     def insert(self, key: List, value=None):
