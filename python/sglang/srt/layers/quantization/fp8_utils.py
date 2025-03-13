@@ -17,8 +17,8 @@ from sglang.srt.utils import (
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
-is_hip_ = is_hip()
-if is_hip_ and get_bool_env_var("CK_MOE"):
+_is_hip = is_hip()
+if _is_hip and get_bool_env_var("CK_MOE"):
     from aiter import gemm_a8w8_blockscale
 
 _is_cuda = is_cuda()
@@ -111,7 +111,7 @@ def apply_w8a8_block_fp8_linear(
         output = fp8_blockwise_scaled_mm(
             q_input, weight.T, x_scale, weight_scale.T, out_dtype=input.dtype
         )
-    elif is_hip_ and get_bool_env_var("CK_MOE"):
+    elif _is_hip and get_bool_env_var("CK_MOE"):
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
@@ -142,7 +142,7 @@ def input_to_float8(
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     fp8_max = finfo.max
-    if is_hip_:
+    if _is_hip:
         fp8_max = 224.0
     scale = fp8_max / amax
     x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)

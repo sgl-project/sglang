@@ -158,14 +158,18 @@ class ImageInputs:
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
-    # MiniCPMV related
+    # The id of the single-image placeholder token
+    im_token_id: Optional[torch.Tensor] = None
     # All the images in the batch should share the same special image
     # bound token ids.
-    im_start_id: Optional[torch.Tensor] = None
-    im_end_id: Optional[torch.Tensor] = None
-    slice_start_id: Optional[torch.Tensor] = None
-    slice_end_id: Optional[torch.Tensor] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
     tgt_sizes: Optional[list] = None
+
+    # denotes the number of valid image tokens in each image
+    images_emb_mask: Optional[torch.BoolTensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -186,11 +190,13 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -309,6 +315,7 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         self.last_node = None
+        self.last_node_global = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -383,13 +390,24 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        enable_hierarchical_cache=False,
+    ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             # tree cache is None if the prefix is not computed with tree cache.
-            self.prefix_indices, self.last_node = tree_cache.match_prefix(
-                rid=self.rid, key=self.adjust_max_prefix_ids()
-            )
+            if enable_hierarchical_cache:
+                self.prefix_indices, self.last_node, self.last_node_global = (
+                    tree_cache.match_prefix(
+                        key=self.adjust_max_prefix_ids(), include_evicted=True
+                    )
+                )
+            else:
+                self.prefix_indices, self.last_node = tree_cache.match_prefix(
+                    rid=self.rid, key=self.adjust_max_prefix_ids()
+                )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -422,28 +440,6 @@ class Req:
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
-
-    def get_next_inc_detokenization(self):
-        if self.tokenizer is None:
-            return False, ""
-        read_ids, read_offset = self.init_incremental_detokenize()
-        surr_ids = read_ids[:read_offset]
-
-        surr_text = self.tokenizer.decode(
-            surr_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-        new_text = self.tokenizer.decode(
-            read_ids,
-            skip_special_tokens=self.sampling_params.skip_special_tokens,
-            spaces_between_special_tokens=self.sampling_params.spaces_between_special_tokens,
-        )
-
-        if len(new_text) > len(surr_text) and not new_text.endswith("�"):
-            return True, new_text[len(surr_text) :]
-
-        return False, ""
 
     def check_finished(self):
         if self.finished():

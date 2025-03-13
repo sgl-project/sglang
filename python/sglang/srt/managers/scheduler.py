@@ -41,8 +41,6 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
     GetInternalStateReq,
@@ -74,7 +72,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    BaseFinishReason,
     ImageInputs,
     Req,
     ScheduleBatch,
@@ -84,6 +81,9 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+)
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -132,7 +132,7 @@ class EmbeddingBatchResult:
     bid: int
 
 
-class Scheduler:
+class Scheduler(SchedulerOutputProcessorMixin):
     """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
@@ -265,12 +265,10 @@ class Scheduler:
             f"context_len={self.model_config.context_len}"
         )
 
-        # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
         # Init running status
         self.waiting_queue: List[Req] = []
-        self.staging_reqs = {}
         # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
@@ -308,7 +306,9 @@ class Scheduler:
             self.grammar_backend = None
 
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(self.schedule_policy, self.tree_cache)
+        self.policy = SchedulePolicy(
+            self.schedule_policy, self.tree_cache, self.enable_hierarchical_cache
+        )
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
@@ -431,6 +431,7 @@ class Scheduler:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tp_cache_group=self.tp_worker.get_tp_cpu_group(),
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1005,6 +1006,11 @@ class Scheduler:
             self.batch_is_full = True
             return None
 
+        if self.enable_hierarchical_cache:
+            # check for completion of hierarchical cache activities to release memory
+            self.tree_cache.writing_check()
+            self.tree_cache.loading_check()
+
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
@@ -1048,32 +1054,14 @@ class Scheduler:
                 self.batch_is_full = True
                 break
 
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
+            req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                self.enable_hierarchical_cache,
+            )
 
-            if self.enable_hierarchical_cache and req.last_node is not None:
-                if req.last_node.evicted:
-                    # loading KV cache for the request
-                    req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                        req.last_node,
-                        req.prefix_indices,
-                        adder.rem_total_tokens,
-                    )
-                    if req.last_node.loading:
-                        # to prevent frequent cache invalidation
-                        if req.rid in self.staging_reqs:
-                            self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                        self.tree_cache.inc_lock_ref(req.last_node)
-                        self.staging_reqs[req.rid] = req.last_node
-                        continue
-                elif req.last_node.loading:
-                    if not self.tree_cache.loading_complete(req.last_node):
-                        continue
-
-                if req.rid in self.staging_reqs:
-                    self.tree_cache.dec_lock_ref(self.staging_reqs[req.rid])
-                    del self.staging_reqs[req.rid]
-
-            res = adder.add_one_req(req, self.chunked_req)
+            res = adder.add_one_req(
+                req, self.chunked_req, self.enable_hierarchical_cache
+            )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -1093,6 +1081,9 @@ class Scheduler:
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+
+        if self.enable_hierarchical_cache:
+            self.tree_cache.read_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -2261,9 +2252,16 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+
+    # Generate the prefix
+    if dp_rank is None:
+        prefix = f" TP{tp_rank}"
+    else:
+        prefix = f" DP{dp_rank} TP{tp_rank}"
+
     # Config the process
     # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
-    setproctitle.setproctitle(f"sglang::scheduler_{dp_rank}")
+    setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
 
@@ -2272,10 +2270,6 @@ def run_scheduler_process(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
     # Configure the logger
-    if dp_rank is None:
-        prefix = f" TP{tp_rank}"
-    else:
-        prefix = f" DP{dp_rank} TP{tp_rank}"
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 

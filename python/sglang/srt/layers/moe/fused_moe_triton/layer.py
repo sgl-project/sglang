@@ -27,9 +27,9 @@ else:
 
 import logging
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
-if is_hip_:
+if _is_hip:
     from aiter import ck_moe
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             layer.w13_weight = torch.nn.Parameter(
                 permute_weight(layer.w13_weight.data),
                 requires_grad=False,
@@ -175,7 +175,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             correction_bias=correction_bias,
         )
 
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             assert not no_combine, "unsupported"
             return ck_moe(
                 x,
@@ -514,7 +514,7 @@ class FusedMoE(torch.nn.Module):
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust input_scale for e4m3fnuz (AMD)
-            if is_hip_ and get_bool_env_var("USE_INT4_WEIGHT"):
+            if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
                 loaded_weight = loaded_weight * 2.0
 
             # this is needed for compressed-tensors only
@@ -556,7 +556,7 @@ class FusedMoE(torch.nn.Module):
             quant_method = getattr(param, "quant_method", None)
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust INT4 column-wise scaling number to e4m3fnuz (AMD)
-                if is_hip_ and get_bool_env_var("USE_INT4_WEIGHT"):
+                if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
                     loaded_weight = loaded_weight * 0.5
 
                 self._load_per_channel_weight_scale(
@@ -579,7 +579,7 @@ class FusedMoE(torch.nn.Module):
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
-                if is_hip_ and get_bool_env_var("USE_INT4_WEIGHT"):
+                if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
                     loaded_weight = loaded_weight * 2.0
 
                 self._load_per_tensor_weight_scale(
