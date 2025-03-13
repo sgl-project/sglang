@@ -42,6 +42,9 @@ from sgl_kernel.sampling import (
     top_p_sampling_from_probs,
 )
 from sgl_kernel.speculative import (
+    build_tree_kernel,  # TODO(ying): remove this after we release a new version
+)
+from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
     segment_packbits,
     tree_speculative_sampling_target_only,
