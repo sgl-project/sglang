@@ -1147,7 +1147,7 @@ def v1_chat_generate_response(
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text,
                 },
-                "logprobs": choice_logprobs,
+                "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
                     finish_reason["matched"]
