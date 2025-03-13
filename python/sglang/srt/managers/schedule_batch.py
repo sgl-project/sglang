@@ -850,7 +850,10 @@ class ScheduleBatch:
         extend_lens = torch.tensor(self.extend_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if not global_server_args_dict["attention_backend"] in [
+            "torch_native",
+            "intel_amx",
+        ]:
             write_req_to_token_pool_triton[(bs,)](
                 self.req_to_token_pool.req_to_token,
                 self.req_pool_indices,

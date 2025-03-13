@@ -236,6 +236,11 @@ class ServerArgs:
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                self.attention_backend = "intel_amx"
+            self.sampling_backend = "pytorch"
+
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"
@@ -720,7 +725,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native"],
+            choices=["flashinfer", "triton", "torch_native", "intel_amx"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
