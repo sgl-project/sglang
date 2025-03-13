@@ -446,123 +446,79 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
 
 
 class PaliGemmaImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _image_processor):
-        self.hf_config = hf_config
-        self._image_processor = _image_processor
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            initializer=init_global_processor,
-            mp_context=mp.get_context("fork"),
-            initargs=(server_args,),
-            max_workers=int(os.environ.get("SGLANG_CPU_COUNT", os.cpu_count())),
-        )
+    def __init__(self, hf_config, server_args, _processor):
+        super().__init__(hf_config, server_args, _processor)
 
     @staticmethod
-    def _process_single_image_task(
-        image_data: Union[str, bytes],
-        image_processor=None,
-    ):
-        image_processor = image_processor or global_processor.image_processor
+    def _process_images_task(images, input_text):
+        result = global_processor.__call__(
+            text=input_text, images=images, return_tensors="pt"
+        )
+        return {
+            "input_ids": result.input_ids,
+            "pixel_values": result.pixel_values,
+            "tgt_sizes": result.tgt_sizes,
+        }
 
-        try:
-            image, image_size = load_image(image_data)
-            if image_size is not None:
-                # It is a video with multiple images
-                image_hash = hash(image_data)
-                process_result = image_processor(image)
-                pixel_values, image_grid_thws = (
-                    process_result["pixel_values"],
-                    process_result["image_grid_thw"][0],
-                )
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
-                pixel_values = np.stack(pixel_values, axis=0)
-                image_grid_thws = np.stack(image_grid_thws, axis=0)
-                return pixel_values, image_hash, image_size, image_grid_thws
-            else:
-                # It is an image
-                image_hash = hash(image_data)
-                process_result = image_processor(image)
-                pixel_values, image_grid_thws = (
-                    process_result["pixel_values"],
-                    process_result["image_grid_thw"][0],
-                )
-                if isinstance(pixel_values, np.ndarray):
-                    pixel_values = pixel_values.astype(np.float16)
-
-                return pixel_values, image_hash, image.size, image_grid_thws
-        except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
-
-    async def _process_single_image(self, image_data: Union[bytes, str]):
+    async def _process_images(self, images, input_text):
+        logger.info(f"1 PaliGemmaImageProcessor::_process_images, images:{images} and input_text:{input_text}")
+        print(f"1 PaliGemmaImageProcessor::_process_images, images:{images} and input_text:{input_text}")
         if self.executor is not None:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
+            image_inputs = await loop.run_in_executor(
                 self.executor,
-                PaliGemmaImageProcessor._process_single_image_task,
-                image_data,
+                MiniCPMVImageProcessor._process_images_task,
+                images,
+                input_text,
             )
         else:
-            return self._process_single_image_task(image_data)
+            image_inputs = self._processor(
+                images=images, text=input_text, return_tensors="pt"
+            )
+
+        return image_inputs
 
     async def process_images_async(
         self,
         image_data: List[Union[str, bytes]],
-        input_text,
+        input_ids,
         request_obj,
-        *args,
-        **kwargs,
-    ):  
-        logger.info(f"1 Qwen2VLImageProcessor::process_images_async, image_data:{image_data} and input_text:{input_text}")
+        max_req_input_len,
+    ):
         if not image_data:
             return None
+        if not isinstance(image_data, list):
+            image_data = [image_data]
 
-        if isinstance(image_data, list) and len(image_data) > 0:
-            # Multiple images
-            if len(image_data) > 1:
-                pixel_values, image_hashes, image_sizes, image_grid_thws = (
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                res = []
-                for img_data in image_data:
-                    res.append(self._process_single_image(img_data))
-                res = await asyncio.gather(*res)
-                for pixel_v, image_h, image_s, image_thw in res:
-                    pixel_values.append(pixel_v)
-                    image_hashes.append(image_h)
-                    image_sizes.append(image_s)
-                    image_grid_thws.append(image_thw)
+        base_output = self.load_images(
+            max_req_input_len, input_ids, image_data, self.IMAGE_TOKEN
+        )
+        if base_output is None:
+            return None
 
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.concatenate(pixel_values, axis=0)
-            else:
-                # A single image
-                pixel_values, image_hash, image_size, image_grid_thw = (
-                    await self._process_single_image(image_data[0])
-                )
-                image_hashes = [image_hash]
-                image_sizes = [image_size]
-                image_grid_thws = [image_grid_thw]
-        elif isinstance(image_data, str) or isinstance(image_data, bytes):
-            # A single image
-            pixel_values, image_hash, image_size, image_grid_thw = (
-                await self._process_single_image(image_data)
-            )
-            image_hashes = [image_hash]
-            image_sizes = [image_size]
-            image_grid_thws = [image_grid_thw]
-        else:
+        if len(base_output.all_frames) == 0:
+            return None
+        res = await self._process_images(
+            images=base_output.all_frames, input_text=base_output.input_text
+        )
 
-            raise ValueError(f"Invalid image data: {image_data}")
-
+        # Collect special token ids
+        tokenizer = self._processor.tokenizer
+        im_start_id = [tokenizer.im_start_id]
+        im_end_id = [tokenizer.im_end_id]
+        if tokenizer.slice_start_id:
+            slice_start_id = [tokenizer.slice_start_id]
+            slice_end_id = [tokenizer.slice_end_id]
         return {
-            "pixel_values": pixel_values,
-            "image_hashes": image_hashes,
-            "image_sizes": image_sizes,
+            "input_ids": res["input_ids"].flatten().tolist(),
+            "pixel_values": res["pixel_values"],
+            "tgt_sizes": res["tgt_sizes"],
+            "image_hashes": base_output.image_hashes,
             "modalities": request_obj.modalities or ["image"],
-            "image_grid_thws": image_grid_thws,
+            "im_start_id": im_start_id,
+            "im_end_id": im_end_id,
+            "slice_start_id": slice_start_id,
+            "slice_end_id": slice_end_id,
         }
 
 

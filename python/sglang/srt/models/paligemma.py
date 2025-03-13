@@ -16,6 +16,7 @@
 import math
 import re
 from typing import Iterable, List, Optional, Tuple
+from functools import lru_cache
 import logging
 
 import numpy as np
@@ -32,13 +33,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
-from sglang.srt.mm_utils import (
-    get_anyres_image_grid_shape,
-    unpad_image,
-    unpad_image_shape,
-)
+from sglang.srt.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+cached_get_processor = lru_cache(get_processor)
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(
@@ -56,28 +55,70 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
+    
+    def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
+        processor = cached_get_processor(self.config._name_or_path)
+        grid_t, grid_h, grid_w = image_grid_thw
+        num_image_tokens = (
+            grid_t
+            * grid_h
+            * grid_w
+            // processor.image_processor.merge_size
+            // processor.image_processor.merge_size
+        )
+        return num_image_tokens
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        logger.info(f"1 paligemma::pad_input_ids, len(input_ids)={len(input_ids)}")
+        if not isinstance(image_inputs.im_start_id, list) or not isinstance(
+            image_inputs.im_end_id, list
+        ):
+            return input_ids
+
         new_input_ids = []
         last_idx = 0
         image_idx = -1
         image_inputs.image_offsets = []
 
         # Get all special token IDs
-        im_start_id = image_inputs.im_start_id
-        im_end_id = image_inputs.im_end_id
+        im_start_id = (
+            image_inputs.im_start_id[0].item()
+            if isinstance(image_inputs.im_start_id[0], torch.Tensor)
+            else image_inputs.im_start_id[0]
+        )
+        im_end_id = (
+            image_inputs.im_end_id[0].item()
+            if isinstance(image_inputs.im_end_id[0], torch.Tensor)
+            else image_inputs.im_end_id[0]
+        )
+        slice_start_id = (
+            image_inputs.slice_start_id[0].item()
+            if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
+            else image_inputs.slice_start_id[0]
+        )
+        slice_end_id = (
+            image_inputs.slice_end_id[0].item()
+            if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
+            else image_inputs.slice_end_id[0]
+        )
 
         # Find all start and end positions for both types
-        start_indices = [i for i, x in enumerate(input_ids) if x == im_start_id]
-        end_indices = [i for i, x in enumerate(input_ids) if x == im_end_id]
+        start_indices = [
+            i
+            for i, x in enumerate(input_ids)
+            if x == im_start_id or x == slice_start_id
+        ]
+        end_indices = [
+            i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
+        ]
 
         if len(start_indices) != len(end_indices):
             return input_ids
         # Process each region (both image and slice)
         for start_idx, end_idx in zip(start_indices, end_indices):
             # Add non-image tokens before this region
-            new_input_ids.extend(input_ids[last_idx : start_idx + 1])
+            new_input_ids.extend(
+                input_ids[last_idx : start_idx + 1]
+            )  # include start token
 
             is_image_start = input_ids[start_idx] == im_start_id
 
@@ -106,9 +147,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = (
-            image_outputs.last_hidden_state
-        )  # Note: from transformers
+        selected_image_feature =image_outputs.last_hidden_state  # Note: from transformers
         image_features = self.multi_model_projector(selected_image_feature)
         return image_features
 
@@ -130,7 +169,6 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # TODO(xiao)
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
