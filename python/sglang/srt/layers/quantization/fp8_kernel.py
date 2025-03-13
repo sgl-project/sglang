@@ -22,10 +22,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_core_count, get_device_name, is_cuda, is_hip
-
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_device_core_count,
+    get_device_name,
+    is_cuda,
+    is_hip,
     supports_custom_op,
 )
 
@@ -44,11 +46,21 @@ _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 if supports_custom_op():
 
     def deep_gemm_fp8_fp8_bf16_nt(
-        A: torch.Tensor, As: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.Tensor) -> None:
+        A: torch.Tensor,
+        As: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+        C: torch.Tensor,
+    ) -> None:
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
-        A: torch.Tensor, As: torch.Tensor, B: torch.Tensor, Bs: torch.Tensor, C: torch.Tensor) -> None:
+        A: torch.Tensor,
+        As: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+        C: torch.Tensor,
+    ) -> None:
         return
 
     direct_register_custom_op(
