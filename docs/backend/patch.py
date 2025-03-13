@@ -1,4 +1,3 @@
-import os
 import weakref
 
 from sglang.utils import execute_shell_command, reserve_port

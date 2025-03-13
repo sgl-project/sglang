@@ -1,5 +1,4 @@
 import argparse
-import copy
 import itertools
 
 import torch

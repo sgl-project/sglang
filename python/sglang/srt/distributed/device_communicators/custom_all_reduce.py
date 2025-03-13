@@ -49,7 +49,7 @@ try:
         ops.meta_size()
     else:
         # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
-        import sgl_kernel
+        pass
     custom_ar = True
 except Exception:
     # For CPUs

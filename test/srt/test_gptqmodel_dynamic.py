@@ -15,17 +15,15 @@ from sglang.test.test_utils import (
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed import (
-        get_tp_group,
         init_distributed_environment,
         initialize_model_parallel,
-        set_custom_all_reduce,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
     from sglang.srt.layers.quantization import get_dynamic_override
     from sglang.srt.model_loader import get_model
-    from sglang.srt.server_args import PortArgs, ServerArgs
+    from sglang.srt.server_args import ServerArgs
 
     try:
         init_distributed_environment(

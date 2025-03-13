@@ -1,6 +1,6 @@
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict
 
 
 class Node:
