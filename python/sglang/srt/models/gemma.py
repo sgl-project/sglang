@@ -333,8 +333,6 @@ class GemmaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
         for name, loaded_weight in weights:
-            if "language_model." in name: #load model weight from Paligemma
-                name = name.replace("language_model.", "")
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
