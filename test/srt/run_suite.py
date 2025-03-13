@@ -45,6 +45,7 @@ suites = {
         TestFile("test_no_overlap_scheduler.py", 262),
         TestFile("test_openai_server.py", 124),
         TestFile("test_penalty.py", 41),
+        TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),
