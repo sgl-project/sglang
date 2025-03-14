@@ -333,7 +333,7 @@ class Req:
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
-        
+
         # Latency Breakdown
         self.queue_time_start = None
         self.queue_time_end = None
