@@ -87,7 +87,7 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        
+
         self.avg_request_queue_latency = Gauge(
             name="sglang:avg_request_queue_latency",
             documentation="The average request queue latency.",
