@@ -65,6 +65,7 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+// SGLANG_SHFL_XOR_* adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/csrc/cuda_compat.h#L19-L28
 #ifndef USE_ROCM
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
@@ -122,31 +123,6 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
   old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
                      : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
   return old;
-}
-
-__device__ __forceinline__ float warpReduceSum(float sum_value) {
-  sum_value += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_value, 16);
-  sum_value += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_value, 8);
-  sum_value += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_value, 4);
-  sum_value += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_value, 2);
-  sum_value += SGLANG_SHFL_XOR_SYNC(0xffffffff, sum_value, 1);
-  return sum_value;
-}
-
-__device__ __forceinline__ float blockReduceSum(float sum_value) {
-  static __shared__ float warpLevelSums[WARP_SIZE];
-  const int laneId = threadIdx.x % WARP_SIZE;
-  const int warpId = threadIdx.x / WARP_SIZE;
-
-  sum_value = warpReduceSum(sum_value);
-
-  if (laneId == 0) warpLevelSums[warpId] = sum_value;
-  __syncthreads();
-
-  sum_value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelSums[laneId] : 0;
-  if (warpId == 0) sum_value = warpReduceSum(sum_value);
-
-  return sum_value;
 }
 
 __device__ __forceinline__ float warpReduceMax(float max_value) {
