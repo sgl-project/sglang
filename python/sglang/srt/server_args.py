@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_port_available,
+    is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -300,6 +301,9 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
+        if is_remote_url(self.model_path):
+            self.load_format = "remote"
+
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
@@ -349,9 +353,11 @@ class ServerArgs:
                 "safetensors",
                 "npcache",
                 "dummy",
+                "sharded_state",
                 "gguf",
                 "bitsandbytes",
                 "layered",
+                "remote",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -1091,6 +1097,9 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
+    # The ipc filename for rpc call between Engine and Scheduler
+    rpc_ipc_name: str
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
@@ -1109,6 +1118,7 @@ class PortArgs:
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
+                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1134,6 +1144,7 @@ class PortArgs:
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
+                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
 
 
