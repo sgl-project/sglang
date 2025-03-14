@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from vllm.scalar_type import scalar_types
 
-from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -408,6 +407,8 @@ class MarlinConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["MarlinLinearMethod"]:
         from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+
+        from sglang.srt.layers.linear import LinearBase  # Avoid circular import
 
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
