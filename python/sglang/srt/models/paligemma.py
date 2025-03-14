@@ -161,6 +161,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             pixel_values = torch.tensor(
                     np.array(pixel_values), device=self.vision_tower.device)
             image_features = self.encode_images(pixel_values)
+            #TODO(Xiao) 03/13: this has bug
             # Fill in the placeholder for the image
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()

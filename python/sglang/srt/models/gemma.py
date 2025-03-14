@@ -319,7 +319,6 @@ class GemmaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        logger.info("1 Gemma::forward")
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
