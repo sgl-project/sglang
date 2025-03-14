@@ -66,6 +66,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.utils import ExpertDistributionRecorder
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda_available, is_hip
@@ -75,6 +76,7 @@ _is_hip = is_hip()
 if is_cuda_available():
     from sgl_kernel import bmm_fp8
 
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -1037,6 +1039,7 @@ class DeepseekV2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
+            expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
