@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import base64
+import builtins
 import ctypes
 import dataclasses
 import io
@@ -37,6 +38,7 @@ import time
 import warnings
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
@@ -71,14 +73,31 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+
+# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
-    """Return whether it is HIP on the AMD ROCm platform."""
     return torch.version.hip is not None
 
 
+if is_hip():
+    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
+else:
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+FP8_E4M3_MIN = -FP8_E4M3_MAX
+
+builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
+builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
+
+
+def is_rocm() -> bool:
+    return torch.cuda.is_available() and torch.version.hip
+
+
 def is_cuda():
-    return hasattr(torch, "cuda") and torch.version.cuda is not None
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def is_cuda_alike():
@@ -100,11 +119,11 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def is_cuda_available():
-    return torch.cuda.is_available() and torch.version.cuda
+    return is_cuda()
 
 
 def enable_show_time_cost():
@@ -1047,6 +1066,65 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.hpu.get_device_name(device_id)
 
 
+@lru_cache(maxsize=1)
+def is_habana_available() -> bool:
+    return find_spec("habana_frameworks") is not None
+
+
+@lru_cache(maxsize=8)
+def get_device(device_id: Optional[int] = None) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if device_id is None:
+            return "cuda"
+        return "cuda:{}".format(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if device_id == None:
+            return "xpu"
+        return "xpu:{}".format(device_id)
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu
+
+            if torch.hpu.is_available():
+                if device_id == None:
+                    return "hpu"
+                return "hpu:{}".format(device_id)
+        except ImportError as e:
+            raise ImportError(
+                "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
+            )
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+
+
+@lru_cache(maxsize=1)
+def get_device_count() -> int:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            return torch.cuda.device_count()
+        except RuntimeError:
+            return 0
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            return torch.xpu.device_count()
+        except RuntimeError:
+            return 0
+
+    if is_habana_available():
+        try:
+            import habana_frameworks.torch.hpu
+
+            if torch.hpu.is_available():
+                return torch.hpu.device_count()
+        except (ImportError, RuntimeError):
+            return 0
+
+    return 0  # No accelerators available
+
+
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
@@ -1065,11 +1143,12 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         )
         major, minor = int(major), int(minor)
 
-    # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
-    # Update this once the support is available.
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         try:
-            major, minor = torch.hpu.get_device_capability(device_id)
+            # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
+            # Update this once the support is available.
+            # major, minor = torch.hpu.get_device_capability(device_id)
+            major, minor = None, None
         except Exception as e:
             raise RuntimeError(
                 f"An error occurred while getting device capability of hpu: {e}."
@@ -1344,7 +1423,7 @@ def kill_itself_when_parent_died():
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
     else:
-        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
 def set_uvicorn_logging_configs():
@@ -1473,6 +1552,13 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 def add_prefix(name: str, prefix: str) -> str:
