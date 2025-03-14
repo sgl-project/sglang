@@ -70,7 +70,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
-    page_size: int = 1
+    page_size: int = 4
 
     # Other runtime options
     tp_size: int = 1
