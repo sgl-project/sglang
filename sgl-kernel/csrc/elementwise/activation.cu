@@ -15,8 +15,8 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
-#include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
 
 #ifndef USE_ROCM
 
