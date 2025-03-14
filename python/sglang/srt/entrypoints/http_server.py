@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     VertexGenerateReqInput,
+    UpdateWeightsFromTensorReqInput
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -84,10 +85,14 @@ from sglang.srt.utils import (
     delete_directory,
     kill_process_tree,
     set_uvicorn_logging_configs,
+    MultiprocessingSerializer
 )
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+import torch
+from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -138,12 +143,37 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 ##### Native API endpoints #####
 
+def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
+    if isinstance(tensor, DTensor):
+        return tensor.full_tensor()
+    return tensor
+
 
 @app.get("/health")
 async def health() -> Response:
     """Check the health of the http server."""
     return Response(status_code=200)
 
+
+@app.post("/update_weights_from_tensor")
+async def update_weights_from_tensor(obj: UpdateWeightsFromTensorReqInput, request: Request):
+    """Update model parameter directly from tensor data."""
+    import pickle
+    import base64
+    raw_bytes = base64.b64decode(obj.serialized_named_tensors)  # Base64 解码
+    send_data = pickle.loads(raw_bytes) 
+    obj.serialized_named_tensors=send_data
+    tp_size=len(obj.serialized_named_tensors[1])
+    result = [(obj.serialized_named_tensors[0],LocalSerializedTensor(values=[MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(obj.serialized_named_tensors[1][0])) for _ in range(tp_size)]))]
+    obj.serialized_named_tensors=MultiprocessingSerializer.serialize(result)
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
