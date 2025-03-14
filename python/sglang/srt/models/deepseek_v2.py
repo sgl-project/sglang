@@ -1026,7 +1026,7 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.dp_size = get_attention_dp_size() 
+        self.dp_size = get_attention_dp_size()
         self.aiter_init = False
         self.num_experts_per_tok = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
