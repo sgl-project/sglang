@@ -56,7 +56,6 @@ class _ModelRegistry:
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
         architectures = self._normalize_archs(architectures)
-
         for arch in architectures:
             model_cls = self._try_load_model_cls(arch)
             if model_cls is not None:
