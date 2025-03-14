@@ -39,7 +39,7 @@ jobs:
       run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Filter changes
         id: filter
         uses: dorny/paths-filter@v2
@@ -72,7 +72,7 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -98,7 +98,7 @@ jobs:
         part: [0, 1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -120,7 +120,7 @@ jobs:
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -172,7 +172,7 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -218,7 +218,7 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -252,7 +252,7 @@ jobs:
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -294,7 +294,7 @@ jobs:
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -319,7 +319,7 @@ jobs:
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
