@@ -22,10 +22,7 @@ import numpy as np
 import torch
 from torch import nn
 from transformers import PaliGemmaConfig, SiglipVisionModel
-from transformers.models.paligemma.modeling_paligemma import (
-    PaliGemmaMultiModalProjector,
-)
-
+from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -33,11 +30,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
-from sglang.srt.mm_utils import (
-    get_anyres_image_grid_shape,
-    unpad_image,
-    unpad_image_shape,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -138,9 +130,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        logger.info(f"1 paligemma::encode_images and pixel_values.shape:{pixel_values.shape}")
+        #save the pixel_values
+        torch.save(pixel_values.cpu(), "sgl_pixel_values.pt")
+        
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature =image_outputs #.last_hidden_state # Note: from transformers
+        selected_image_feature =image_outputs.last_hidden_state # Note: from transformers
+        torch.save(selected_image_feature.cpu(), "sgl_selected_image_feature.pt")
+        logger.info(f"2 paligemma::encode_images and selected_image_feature.shape:{selected_image_feature.shape}")
         image_features = self.multi_model_projector(selected_image_feature)
+        torch.save(image_features.cpu(), "sgl_image_features.pt")
         return image_features
 
     @torch.no_grad()
@@ -151,7 +150,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
-        logger.info(f"1 paligemma::forward and inputs_ids.shape:{input_ids.shape}")
+        logger.info(f"1 paligemma::forward and inputs_ids.shape:{input_ids.shape} and forward_batch.forward_mode.is_extend():{forward_batch.forward_mode.is_extend()}")
         if forward_batch.forward_mode.is_extend():
             bs = forward_batch.batch_size
 
@@ -161,8 +160,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
- 
-                        # Got List[List[str]] extend it to List[str]
+            # Got List[List[str]] extend it to List[str]
             # The length of the List should be equal to batch size
 
             pixel_values = [image_inputs[i].pixel_values  for i in range(bs) if image_inputs[i] is not None]
@@ -178,12 +176,11 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
             pt = 0
             for i in range(bs):
-                if image_inputs[i] is None:
+                if image_inputs[i] is None or image_inputs[i].image_offsets is None:
                     continue
                 start_idx = extend_start_loc_cpu[i]
                 seq_len = extend_seq_lens[i]
                 prefix_len = prefix_lens_cpu[i]
-
                 # Multiple images
                 for image_idx, image_offset in enumerate(
                     image_inputs[i].image_offsets
@@ -252,3 +249,4 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
 
 EntryClass = PaliGemmaForConditionalGeneration
+# AutoModel.register(PaliGemmaConfig, PaliGemmaForConditionalGeneration)
