@@ -226,7 +226,7 @@ class DeepseekV2MoE(nn.Module):
 
             self.deepep_dispatcher = DeepEPTokenDispatcher(
                 num_local_experts=config.n_routed_experts // self.tp_size,
-                tok_k=self.top_k,
+                top_k=self.top_k,
                 num_experts=config.n_routed_experts,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
@@ -285,7 +285,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.tp_size > 1:
-            recv_hidden_states, recv_topk_ids, recv_topk_weights, tokens_per_expert = (
+            recv_hidden_states, reorder_topk_ids, seg_indptr = (
                 self.deepep_dispatcher.token_permutation(
                     hidden_states,
                     topk_ids,
@@ -297,7 +297,8 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = (
             self.experts(
                 hidden_states=recv_hidden_states,
-                tokens_per_expert=tokens_per_expert,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor

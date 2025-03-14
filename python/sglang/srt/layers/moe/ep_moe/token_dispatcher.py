@@ -14,6 +14,12 @@ import torch.distributed as dist
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_run_moe_deep_preprocess,
+    deepep_permute_triton_kernel,
+    deepep_post_reorder_triton_kernel,
+    compute_src2dst_triton_kernel
+)
 _buffer_normal = None
 _buffer_low_latency = None
 
@@ -449,7 +455,7 @@ class DeepEPTokenDispatcher:
     def __init__(
         self,
         num_local_experts: int,
-        tok_k: int,
+        top_k: int,
         num_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
@@ -458,13 +464,42 @@ class DeepEPTokenDispatcher:
 
         self._comm_manager = DeepEPManager(
             group=get_tp_group().device_group,
-            router_topk=tok_k,
+            router_topk=top_k,
             permute_fusion=True,
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
             hidden_size=hidden_size,
             params_dtype=params_dtype,
         )
+
+    def deepep_permute(self, topk_ids, hidden_states, num_experts, top_k, use_fp8_w8a8, use_block_quant, fp8_dtype):
+        reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+            topk_ids, num_experts
+        )
+        num_total_tokens = reorder_topk_ids.numel()
+        gateup_input = torch.empty(
+            (int(num_total_tokens), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=(
+                fp8_dtype
+                if (use_fp8_w8a8 and not use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
+        # PreReorder
+        deepep_permute_triton_kernel[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            None,
+            top_k,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+        )
+        self.src2dst = src2dst
+        return reorder_topk_ids, seg_indptr, gateup_input
+
 
     def token_permutation(
         self,
@@ -488,21 +523,33 @@ class DeepEPTokenDispatcher:
         )
         if hidden_states.shape[0] > 0:
             global_input_tokens = hidden_states
-            global_input_tokens = (
-                self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
-            )
+            reorder_topk_ids, seg_indptr, global_input_tokens = self.deepep_permute(topk_ids, hidden_states, num_experts, self._comm_manager.router_topk, False, False, hidden_states.dtype)
         else:
             global_input_tokens = hidden_states
-        tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+            reorder_topk_ids = torch.empty((0,), device=hidden_states.device, dtype=torch.int64)
+            seg_indptr = torch.zeros((self._comm_manager.num_experts + 1,), device=hidden_states.device, dtype=torch.int64)
 
-        return global_input_tokens, topk_ids, topk_weights, tokens_per_expert
+        return global_input_tokens, reorder_topk_ids, seg_indptr
+
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states.shape[0] > 0:
-            hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(
-                hidden_states
+            num_tokens = self.src2dst.shape[0] // self._comm_manager.router_topk
+            output = torch.zeros((num_tokens, hidden_states.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
+            deepep_post_reorder_triton_kernel[(num_tokens,)](
+                hidden_states,
+                output,
+                self.src2dst,
+                self._comm_manager.topk_idx,
+                self._comm_manager.topk_weights,
+                self._comm_manager.router_topk,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
             )
-        hidden_states = self._comm_manager.combine(hidden_states, forward_mode)
+        else:
+            output = torch.zeros((0, hidden_states.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
+
+        hidden_states = self._comm_manager.combine(output, forward_mode)
         return hidden_states.view(self.hidden_shape)
