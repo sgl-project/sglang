@@ -65,17 +65,12 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
-
 #ifndef USE_ROCM
-  #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) \
-      __shfl_xor_sync((mask), (var), (lane_mask))
-  #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
-      __shfl_xor_sync((mask), (var), (lane_mask), (width))
-  #else
-  #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) \
-      __shfl_xor((var), (lane_mask))
-  #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
-      __shfl_xor((var), (lane_mask), (width))
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#else
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor((var), (lane_mask))
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor((var), (lane_mask), (width))
 #endif
 
 #ifndef USE_ROCM
