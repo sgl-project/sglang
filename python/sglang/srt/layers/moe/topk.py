@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import csv
 from typing import Callable, Optional
 
 import torch
@@ -227,11 +226,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    # print(f"topk_ids: {topk_ids}")
     expert_distribution_recorder.record_new_token(topk_ids)
-    # with open("expert_distribution.csv", 'a', newline='') as csvfile:
-    #     writer = csv.writer(csvfile)
-    #     for i in topk_ids_record:
-    #         writer.writerow(i)
 
     return topk_weights, topk_ids

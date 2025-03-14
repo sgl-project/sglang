@@ -47,7 +47,6 @@ def validate_input_length(
     return None
 
 # global expert distribution recording
-#TODO make this a singleton and add endpoints to construct/destruct this
 class ExpertDistributionRecorder:
     # This class is a singleton class
     def __new__(cls):
