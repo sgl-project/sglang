@@ -107,7 +107,7 @@ inline int getSMVersion() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
-#define CEILDIV(x, y) (((x) + (y)-1) / (y))
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
@@ -151,12 +151,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
                      : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
   return old;
 #else
-  int* addr_as_i = (int*) addr;
+  int* addr_as_i = (int*)addr;
   int old = *addr_as_i, assumed;
   do {
-      assumed = old;
-      old = atomicCAS(addr_as_i, assumed,
-          __float_as_int(fmaxf(value, __int_as_float(assumed))));
+    assumed = old;
+    old = atomicCAS(addr_as_i, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
   } while (assumed != old);
   return __int_as_float(old);
 #endif
