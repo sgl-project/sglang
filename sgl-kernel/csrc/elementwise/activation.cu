@@ -27,7 +27,6 @@
 #include "act_and_mul_internal.cuh"
 #endif
 
-
 namespace flashinfer {
 namespace activation {
 
@@ -50,15 +49,13 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
   constexpr float kBeta = 0.7978845608028654f;
   const float f32_val = castToFloat(x);
 
-  const float f32_val_pow_of_3 = __powf(f32_val, 3.f);
-  const float cdf = 0.5f * (1.0f + tanhf((kBeta * (f32_val + kAlpha * f32_val_pow_of_3))));
+  const float cdf = 0.5f * (1.0f + tanhf((kBeta * (f32_val + kAlpha * f32_val * f32_val * f32_val))));
 
   return castFrom<T>(f32_val * cdf);
 }
 
 }  // namespace activation
 }  // namespace flashinfer
-
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
