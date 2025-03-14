@@ -96,17 +96,17 @@ def sgl_per_token_group_quant_fp8(
     )
 
 
-def sgl_per_token_group_quant_int8(
+def sgl_per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
     group_size: int,
     eps: float,
-    int8_min: float,
-    int8_max: float,
+    min_8bit: float,
+    max_8bit: float,
 ) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_int8(
-        input, output_q, output_s, group_size, eps, int8_min, int8_max
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit(
+        input, output_q, output_s, group_size, eps, min_8bit, max_8bit
     )
 
 
