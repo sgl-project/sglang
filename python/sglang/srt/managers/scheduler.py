@@ -69,6 +69,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ExpertDistributionReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -127,6 +128,9 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.managers.utils import ExpertDistributionRecorder
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +407,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (ExpertDistributionReq, self.expert_distribution_handle),
             ]
         )
 
@@ -1891,6 +1896,14 @@ class Scheduler(
             self.send_to_tokenizer.send_pyobj(
                 ProfileReqOutput(success=True, message="Succeeded.")
             )
+
+    def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        if recv_req == ExpertDistributionReq.RESET:
+            expert_distribution_recorder.reset()
+        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+            expert_distribution_recorder.dump_record()
+        else:
+            raise ValueError("Unrecognized ExpertDistributionReq value")
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error

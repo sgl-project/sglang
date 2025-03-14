@@ -343,6 +343,26 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/reset_expert_distribution_record", methods=["GET", "POST"])
+async def reset_expert_distribution_record_async():
+    """Reset expert distribution recording."""
+    _global_state.tokenizer_manager.reset_expert_distribution_record()
+    return Response(
+        content="Reset expert distribution recording.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+async def dump_expert_distribution_record_async():
+    """Dump expert distribution record."""
+    _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return Response(
+        content="Dump expert distribution record.\n",
+        status_code=200,
+    )
+
+
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""

@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import csv
 from typing import Callable, Optional
 
 import torch
@@ -21,6 +22,9 @@ from sglang.srt.utils import get_compiler_backend, is_cuda
 
 _is_cuda = is_cuda()
 
+from sglang.srt.managers.utils import ExpertDistributionRecorder
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
@@ -222,5 +226,12 @@ def select_experts(
             topk=top_k,
             renormalize=renormalize,
         )
+
+    # print(f"topk_ids: {topk_ids}")
+    expert_distribution_recorder.record_new_token(topk_ids)
+    # with open("expert_distribution.csv", 'a', newline='') as csvfile:
+    #     writer = csv.writer(csvfile)
+    #     for i in topk_ids_record:
+    #         writer.writerow(i)
 
     return topk_weights, topk_ids

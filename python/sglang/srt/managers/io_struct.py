@@ -648,6 +648,11 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
+class ExpertDistributionReq(Enum):
+    RESET = 1
+    DUMP_RECORD = 2
+
+
 @dataclass
 class ProfileReq:
     type: ProfileReqType
