@@ -123,7 +123,7 @@ class SamplingParams:
                 )
             if not self.min_new_tokens <= self.max_new_tokens:
                 raise ValueError(
-                    f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
+                    f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
         grammars = [
