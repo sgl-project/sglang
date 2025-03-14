@@ -82,20 +82,6 @@ def bmm_fp8(
     return out
 
 
-def sgl_per_token_group_quant_fp8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    group_size: int,
-    eps: float,
-    fp8_min: float,
-    fp8_max: float,
-) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_fp8(
-        input, output_q, output_s, group_size, eps, fp8_min, fp8_max
-    )
-
-
 def sgl_per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,

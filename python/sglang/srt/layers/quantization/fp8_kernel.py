@@ -37,7 +37,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 _is_cuda = is_cuda()
 if _is_cuda:
     import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
-    from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
+    from sgl_kernel import sgl_per_token_group_quant_8bit, sgl_per_token_quant_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +274,7 @@ def sglang_per_token_group_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
 
