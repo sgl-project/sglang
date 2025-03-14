@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.3.post4"
+version = "0.4.4.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,11 +13,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["requests", "tqdm", "numpy", "IPython", "setproctitle"]
+dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
 
 [project.optional-dependencies]
 runtime_common = [
-    "aiohttp",
     "datasets",
     "decord",
     "fastapi",
@@ -44,8 +43,8 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.0.4.post1",
-    "flashinfer_python==0.2.2.post1",
+    "sgl-kernel==0.0.5",
+    "flashinfer_python==0.2.3",
     "torch==2.5.1",
     "vllm>=0.6.4.post1,<=0.7.2",
     "cuda-python",
@@ -54,7 +53,7 @@ srt = [
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
-srt_hip = ["sglang[runtime_common]", "sgl-kernel==0.0.3.post6", "torch", "vllm==0.6.7.dev2", "outlines==0.1.11"]
+srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.7.dev2", "outlines==0.1.11"]
 
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm

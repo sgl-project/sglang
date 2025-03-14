@@ -112,6 +112,7 @@ void apply_rope_pos_ids_cos_sin_cache(
 /*
  * From csrc/gemm
  */
+torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -171,6 +172,12 @@ void moe_align_block_size(
     torch::Tensor num_tokens_post_pad,
     torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer);
+
+void topk_softmax(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices,
+    torch::Tensor& gating_output);
 
 /*
  * From csrc/speculative

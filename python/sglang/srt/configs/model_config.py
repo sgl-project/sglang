@@ -51,13 +51,14 @@ class ModelConfig:
         self.quantization = quantization
 
         # Parse args
+        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
         self.hf_config = get_config(
-            model_path,
+            self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
@@ -318,6 +319,29 @@ class ModelConfig:
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         return eos_ids
 
+    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+        """
+        Pull the model config files to a temporary
+        directory in case of remote.
+
+        Args:
+            model: The model name or path.
+
+        """
+        from sglang.srt.connector import create_remote_connector
+        from sglang.srt.utils import is_remote_url
+
+        if is_remote_url(self.model_path):
+            logger.info("Pulling model configs from remote...")
+            # BaseConnector implements __del__() to clean up the local dir.
+            # Since config files need to exist all the time, so we DO NOT use
+            # with statement to avoid closing the client.
+            client = create_remote_connector(self.model_path)
+            if is_remote_url(self.model_path):
+                client.pull_files(allow_pattern=["*config.json"])
+                self.model_weights = self.model_path
+                self.model_path = client.get_local_dir()
+
 
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
@@ -408,7 +432,7 @@ def _get_and_verify_dtype(
 
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
+    # 1. Check the model architecture
     # 2. check the `is_embedding` server args
 
     if (
@@ -424,18 +448,25 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         return not is_embedding
 
 
+multimodal_model_archs = [
+    "LlavaLlamaForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaMistralForCausalLM",
+    "LlavaVidForCausalLM",
+    "Grok1VForCausalLM",
+    "Grok1AForCausalLM",
+    "MllamaForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
+]
+
+
 def is_multimodal_model(model_architectures: List[str]):
-    if (
-        "LlavaLlamaForCausalLM" in model_architectures
-        or "LlavaQwenForCausalLM" in model_architectures
-        or "LlavaMistralForCausalLM" in model_architectures
-        or "LlavaVidForCausalLM" in model_architectures
-        or "Grok1VForCausalLM" in model_architectures
-        or "Grok1AForCausalLM" in model_architectures
-        or "MllamaForConditionalGeneration" in model_architectures
-        or "Qwen2VLForConditionalGeneration" in model_architectures
-        or "Qwen2_5_VLForConditionalGeneration" in model_architectures
-        or "MiniCPMV" in model_architectures
+    if any(
+        multi_model_arch in model_architectures
+        for multi_model_arch in multimodal_model_archs
     ):
         return True
     else:

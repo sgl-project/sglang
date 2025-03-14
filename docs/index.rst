@@ -20,6 +20,7 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
+   references/deepseek
    backend/send_request.ipynb
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
@@ -58,7 +59,6 @@ The core features include:
       :maxdepth: 1
       :caption: References
 
-      references/deepseek
       references/general
       references/hardware
       references/advanced_deploy

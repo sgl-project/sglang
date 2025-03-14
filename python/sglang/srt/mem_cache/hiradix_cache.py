@@ -9,11 +9,15 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
     MHATokenToKVPoolHost,
+    MLATokenToKVPool,
+    MLATokenToKVPoolHost,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode, _key_match
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +29,22 @@ class HiRadixCache(RadixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
+        page_size: int,
     ):
-        self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-            token_to_kv_pool_allocator.get_kvcache()
-        )
+        if page_size != 1:
+            raise ValueError(
+                "Page size larger than 1 is not yet supported in HiRadixCache."
+            )
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(self.kv_cache)
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(self.kv_cache)
+        else:
+            raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")
+
         self.tp_group = tp_cache_group
+        self.page_size = page_size
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -45,7 +60,9 @@ class HiRadixCache(RadixCache):
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
-        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, disable=False)
+        super().__init__(
+            req_to_token_pool, token_to_kv_pool_allocator, self.page_size, disable=False
+        )
 
     def reset(self):
         TreeNode.counter = 0
@@ -122,7 +139,7 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int, evict_callback=None):
+    def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
@@ -309,13 +326,11 @@ class HiRadixCache(RadixCache):
             prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child

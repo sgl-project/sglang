@@ -23,6 +23,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import (
+    HostKVCache,
     MHATokenToKVPoolHost,
     TokenToKVPoolAllocator,
 )
@@ -151,7 +152,7 @@ class HiCacheController:
     def __init__(
         self,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        mem_pool_host: MHATokenToKVPoolHost,
+        mem_pool_host: HostKVCache,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
     ):
@@ -248,6 +249,8 @@ class HiCacheController:
         if device_indices is None:
             return None
         self.mem_pool_host.protect_load(host_indices)
+        # to ensure the device indices are ready before accessed by another CUDA stream
+        torch.cuda.current_stream().synchronize()
         self.load_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -323,13 +326,23 @@ class HiCacheController:
 
                 self.layer_done_counter.reset()
                 for i in range(self.mem_pool_host.layer_num):
-                    self.mem_pool_device.transfer_per_layer_kernel(
-                        self.mem_pool_host,
-                        batch_operation.host_indices.to(self.mem_pool_device.device),
-                        batch_operation.device_indices,
-                        i,
-                    )
-                    self.load_stream.synchronize()
+                    if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
+                        self.mem_pool_device.transfer_per_layer_kernel(
+                            self.mem_pool_host,
+                            batch_operation.host_indices.to(
+                                self.mem_pool_device.device
+                            ),
+                            batch_operation.device_indices,
+                            i,
+                        )
+                        self.load_stream.synchronize()
+                    else:
+                        flat_data = self.mem_pool_host.get_flat_data_by_layer(
+                            batch_operation.host_indices, i
+                        )
+                        self.mem_pool_device.transfer_per_layer(
+                            batch_operation.device_indices, flat_data, i
+                        )
                     self.layer_done_counter.increment()
 
                 self.mem_pool_host.complete_io(batch_operation.host_indices)

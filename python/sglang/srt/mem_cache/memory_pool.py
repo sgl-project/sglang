@@ -34,10 +34,10 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+from sgl_kernel.kvcacheio import transfer_kv_all_layer, transfer_kv_per_layer
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
-from sgl_kernel.kvcacheio import transfer_kv_per_layer, transfer_kv_all_layer
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,21 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def get_flat_data(self, indices):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def transfer(self, indices, flat_data):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        raise NotImplementedError()
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+
 
 class TokenToKVPoolAllocator:
     """An allocator managing the indices to kv cache data."""
@@ -130,6 +145,7 @@ class TokenToKVPoolAllocator:
         self.size = size
         self.dtype = dtype
         self.device = device
+        self.page_size = 1
 
         self.free_slots = None
         self.is_not_in_free_group = True
@@ -150,15 +166,14 @@ class TokenToKVPoolAllocator:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-
-        return select_index.to(self.device, non_blocking=True)
+        return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+            self.free_slots = torch.concat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -173,7 +188,9 @@ class TokenToKVPoolAllocator:
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
         self.is_in_free_group = False
         self.free_group = []
 
@@ -183,6 +200,7 @@ class MHATokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -191,6 +209,7 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -208,6 +227,10 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.layer_transfer_counter = None
+        self.capture_mode = False
+        self.alt_stream = torch.cuda.Stream()
+
+        self.layer_transfer_counter = None
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -218,16 +241,22 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.empty(
-                (self.layer_num, self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.empty(
-                (self.layer_num, self.size + 1, self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            self.k_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -287,6 +316,13 @@ class MHATokenToKVPool(KVCache):
         self.k_buffer[layer_id][indices] = k_data
         self.v_buffer[layer_id][indices] = v_data
 
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        k_data, v_data = flat_data[0], flat_data[1]
+        self.k_buffer[layer_id][indices] = k_data
+        self.v_buffer[layer_id][indices] = v_data
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
@@ -323,12 +359,42 @@ class MHATokenToKVPool(KVCache):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
+
         if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        if self.capture_mode and cache_k.shape[0] < 4:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                self.k_buffer[layer_id][loc] = cache_k
+            self.v_buffer[layer_id][loc] = cache_v
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
+
+
+@torch.compile
+def fused_downcast(
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    dtype: torch.dtype,
+    store_dtype: torch.dtype,
+    max_fp8: float,
+    min_fp8: float,
+):
+    cache_k = cache_k / k_scale
+    cache_k = torch.clamp(cache_k, min_fp8, max_fp8)
+    cache_v = cache_v / v_scale
+    cache_v = torch.clamp(cache_v, min_fp8, max_fp8)
+    cache_k = cache_k.to(dtype)
+    cache_v = cache_v.to(dtype)
+    cache_k = cache_k.view(store_dtype)
+    cache_v = cache_v.view(store_dtype)
+    return cache_k, cache_v
 
 
 # This compiled version is slower in the unit test
@@ -343,6 +409,7 @@ class MLATokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -359,6 +426,8 @@ class MLATokenToKVPool(KVCache):
         else:
             self.store_dtype = dtype
         self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.layer_num = layer_num
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -367,20 +436,28 @@ class MLATokenToKVPool(KVCache):
         with memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
-                torch.empty(
-                    (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
+                torch.zeros(
+                    (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
                     dtype=self.store_dtype,
                     device=device,
                 )
                 for _ in range(layer_num)
             ]
 
+        self.layer_transfer_counter = None
+
     def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id)
+
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id].view(self.dtype)
         return self.kv_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id)
+
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
         return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
@@ -403,11 +480,28 @@ class MLATokenToKVPool(KVCache):
         else:
             self.kv_buffer[layer_id][loc] = cache_k
 
+    def get_flat_data(self, indices):
+        # prepare a large chunk of contiguous data for efficient transfer
+        return torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
+
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        for i in range(self.layer_num):
+            self.kv_buffer[i][indices] = flat_data[i]
+
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        self.kv_buffer[layer_id][indices] = flat_data
+
 
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
+        page_size: int,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
@@ -417,6 +511,7 @@ class DoubleSparseTokenToKVPool(KVCache):
         enable_memory_saver: bool,
     ):
         self.size = size
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
@@ -431,17 +526,21 @@ class DoubleSparseTokenToKVPool(KVCache):
         with memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.zeros(
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
             self.v_buffer = [
-                torch.empty((size + 1, head_num, head_dim), dtype=dtype, device=device)
+                torch.zeros(
+                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                )
                 for _ in range(layer_num)
             ]
 
             # [size, head_num, heavy_channel_num] for each layer
             self.label_buffer = [
-                torch.empty(
+                torch.zeros(
                     (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
                 )
                 for _ in range(layer_num)
@@ -473,6 +572,15 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.v_buffer[layer_id][loc] = cache_v
         self.label_buffer[layer_id][loc] = cache_label
 
+    def get_flat_data(self, indices):
+        pass
+
+    def transfer(self, indices, flat_data):
+        pass
+
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        pass
+
 
 class MemoryStateInt(IntEnum):
     IDLE = 0
@@ -491,7 +599,7 @@ def synchronized(func):
     return wrapper
 
 
-class MHATokenToKVPoolHost:
+class HostKVCache(abc.ABC):
 
     def __init__(
         self,
@@ -512,12 +620,7 @@ class MHATokenToKVPoolHost:
 
         self.size = int(device_pool.size * host_to_device_ratio)
         self.dtype = device_pool.store_dtype
-        self.head_num = device_pool.head_num
-        self.head_dim = device_pool.head_dim
-        self.layer_num = device_pool.layer_num
-        self.size_per_token = (
-            self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
-        )
+        self.size_per_token = self.get_size_per_token()
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -536,12 +639,7 @@ class MHATokenToKVPoolHost:
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
-        self.kv_buffer = torch.empty(
-            (2, self.layer_num, self.size, self.head_num, self.head_dim),
-            dtype=self.dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        )
+        self.kv_buffer = self.init_kv_buffer()
 
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
@@ -553,41 +651,29 @@ class MHATokenToKVPoolHost:
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
 
-    def get_key_buffer(self, layer_id):
-        return self.kv_buffer[0, layer_id]
+    @abc.abstractmethod
+    def get_size_per_token(self):
+        raise NotImplementedError()
 
-    def get_value_buffer(self, layer_id):
-        return self.kv_buffer[1, layer_id]
+    @abc.abstractmethod
+    def init_kv_buffer(self):
+        raise NotImplementedError()
 
+    @abc.abstractmethod
+    def transfer(self, indices, flat_data):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def get_flat_data(self, indices):
-        return self.kv_buffer[:, :, indices]
+        raise NotImplementedError()
 
+    @abc.abstractmethod
     def get_flat_data_by_layer(self, indices, layer_id):
-        return self.kv_buffer[:, layer_id, indices]
+        raise NotImplementedError()
 
+    @abc.abstractmethod
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
-
-    def transfer_all_layer_kernel(self, device_pool, src_indices, dst_indices):
-        transfer_kv_all_layer(
-            device_pool.k_buffer,
-            self.kv_buffer[0].pin_memory(),
-            device_pool.v_buffer,
-            self.kv_buffer[1].pin_memory(),
-            src_indices,
-            dst_indices,
-            self.head_num * self.head_dim,
-            self.layer_num,
-            self.head_num * self.head_dim * (device_pool.size + 1),
-            self.head_num * self.head_dim * self.size,
-        )
-
-    @debug_timing
-    def transfer(self, indices, flat_data):
-        # backup prepared data from device to host
-        self.kv_buffer[:, :, indices] = flat_data.to(
-            device=self.device, non_blocking=False
-        )
 
     @synchronized
     def clear(self):
@@ -679,3 +765,112 @@ class MHATokenToKVPoolHost:
         self.free_slots = torch.concat([self.free_slots, indices])
         self.can_use_mem_size += len(indices)
         return len(indices)
+
+
+class MHATokenToKVPoolHost(HostKVCache):
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float = 3.0,
+        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        device: str = "cpu",
+    ):
+        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+
+    def get_size_per_token(self):
+        self.head_num = self.device_pool.head_num
+        self.head_dim = self.device_pool.head_dim
+        self.layer_num = self.device_pool.layer_num
+
+        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+
+    def init_kv_buffer(self):
+        return torch.empty(
+            (2, self.layer_num, self.size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def get_key_buffer(self, layer_id):
+        return self.kv_buffer[0, layer_id]
+
+    def get_value_buffer(self, layer_id):
+        return self.kv_buffer[1, layer_id]
+
+    def transfer_all_layer_kernel(self, device_pool, src_indices, dst_indices):
+        transfer_kv_all_layer(
+            device_pool.k_buffer,
+            self.kv_buffer[0],
+            device_pool.v_buffer,
+            self.kv_buffer[1],
+            src_indices,
+            dst_indices,
+            self.head_num * self.head_dim,
+            self.layer_num,
+            self.head_num * self.head_dim * (device_pool.size + 1),
+            self.head_num * self.head_dim * self.size,
+        )
+
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # backup prepared data from device to host
+        self.kv_buffer[:, :, indices] = flat_data.to(
+            device=self.device, non_blocking=False
+        )
+
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, :, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[:, layer_id, indices]
+
+    def assign_flat_data(self, indices, flat_data):
+        self.kv_buffer[:, :, indices] = flat_data
+
+
+class MLATokenToKVPoolHost(HostKVCache):
+    def __init__(
+        self,
+        device_pool: MLATokenToKVPool,
+        host_to_device_ratio: float = 4.0,
+        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        device: str = "cpu",
+    ):
+        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+
+    def get_size_per_token(self):
+        self.kv_lora_rank = self.device_pool.kv_lora_rank
+        self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        self.layer_num = self.device_pool.layer_num
+
+        return (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
+
+    def init_kv_buffer(self):
+        return torch.empty(
+            (
+                self.layer_num,
+                self.size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # backup prepared data from device to host
+        self.kv_buffer[:, indices] = flat_data.to(
+            device=self.device, non_blocking=False
+        )
+
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, indices]
+
+    def get_flat_data_by_layer(self, indices, layer_id):
+        return self.kv_buffer[layer_id, indices]
+
+    def assign_flat_data(self, indices, flat_data):
+        self.kv_buffer[:, indices] = flat_data

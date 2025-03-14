@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from vllm import _custom_ops as ops
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
@@ -14,6 +13,8 @@ from sglang.srt.utils import is_cuda_available
 _is_cuda_available = is_cuda_available()
 if _is_cuda_available:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+else:
+    from vllm import _custom_ops as ops
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -403,12 +404,12 @@ def _yarn_find_correction_range(
 
 
 def _yarn_linear_ramp_mask(
-    low: float, high: float, dim: int, dtype: torch.dtype
+    low: float, high: float, dim: int, dtype: torch.dtype, device: torch.device = None
 ) -> torch.Tensor:
     if low == high:
         high += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
+    linear_func = (torch.arange(dim, dtype=dtype, device=device) - low) / (high - low)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -688,7 +689,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+            - _yarn_linear_ramp_mask(
+                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
+            )
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
