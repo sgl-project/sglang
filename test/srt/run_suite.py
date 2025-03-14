@@ -8,6 +8,7 @@ suites = {
         "models/lora/test_lora.py",
         "models/lora/test_lora_backend.py",
         "models/lora/test_multi_lora_backend.py",
+        "models/lora/test_multirank.py",
         "models/test_embedding_models.py",
         "models/test_generation_models.py",
         "models/test_qwen_models.py",
