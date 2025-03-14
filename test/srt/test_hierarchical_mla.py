@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDPAttention(unittest.TestCase):
+class TestHierarchicalMLA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -20,14 +20,7 @@ class TestDPAttention(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "2",
-                "--enable-dp-attention",
-                "--dp",
-                "2",
-            ],
+            other_args=["--trust-remote-code", "--enable-hierarchical-cache"],
         )
 
     @classmethod
@@ -44,7 +37,6 @@ class TestDPAttention(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
@@ -57,7 +49,6 @@ class TestDPAttention(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
 
 
