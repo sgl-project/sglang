@@ -452,13 +452,14 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
 
     @staticmethod
     def _process_images_task(images, input_text):
-        result = global_processor.__call__(
-            text=input_text, images=images, return_tensors="pt"
-        )
-        return {
-            "input_ids": result.input_ids,
-            "pixel_values": result.pixel_values,
-        }
+        return global_processor(images, input_text, return_tensors="pt")
+        # result = global_processor.__call__(
+        #     text=input_text, images=images, return_tensors="pt"
+        # )
+        # return {
+        #     "input_ids": result.input_ids,
+        #     "pixel_values": result.pixel_values,
+        # }
 
     async def _process_images(self, images, input_text) -> dict:
         if self.executor is not None:
@@ -470,37 +471,31 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
                 input_text,
             )
         else:
-            return self._process_images_task(images, input_text)
+            return self._processor(images, input_text, return_tensors="pt")
 
     async def process_images_async(
-        self,
-        image_data: List[Union[str, bytes]],
-        input_ids,
-        request_obj,
-        max_req_input_len,
-        *args,
-        **kwargs,
+        self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
         if not image_data:
             return None
-        if isinstance(image_data, str):
+
+        if isinstance(input_text, list):
+            assert len(input_text) and isinstance(input_text[0], int)
+            input_text = self._processor.tokenizer.decode(input_text)
+
+        if not isinstance(image_data, list):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
-            max_req_input_len, input_ids, image_data, image_token
-        )
+        if len(image_data) > 0:
+            images = [load_image(image)[0] for image in image_data]
+        else:
+            images = load_image(image_data[0])[0]
 
-        ret = await self._process_images(base_output.all_frames, base_output.input_text)
+        image_inputs = await self._process_single_image(images, input_text)
+        image_inputs["image_hashes"] = [hash(str(image_data))]
+        image_inputs["input_ids"] = image_inputs["input_ids"].flatten().tolist()
 
-        return {
-            "input_ids": ret["input_ids"].flatten().tolist(),
-            "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.image_hashes,
-            "modalities": request_obj.modalities or ["image"],
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-        }
+        return image_inputs
     
 
 
