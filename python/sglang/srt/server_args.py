@@ -172,6 +172,7 @@ class ServerArgs:
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
+    enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
 
@@ -750,6 +751,11 @@ class ServerArgs:
             "--enable-flashinfer-mla",
             action="store_true",
             help="Enable FlashInfer MLA optimization",
+        )
+        parser.add_argument(
+            "--enable-flashmla",
+            action="store_true",
+            help="Enable FlashMLA decode optimization",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

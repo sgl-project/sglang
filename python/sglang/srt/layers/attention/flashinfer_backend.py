@@ -475,7 +475,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-
+        print(
+            "fffff ",
+            q.shape,
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim).shape,
+        )
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
