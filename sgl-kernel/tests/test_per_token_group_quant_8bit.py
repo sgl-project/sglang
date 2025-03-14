@@ -7,6 +7,11 @@ import triton
 import triton.language as tl
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
+from sglang.srt.utils import is_hip
+
+is_hip_ = is_hip()
+fp8_type_ = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+
 
 @triton.jit
 def _per_token_group_quant_8bit(
@@ -20,7 +25,7 @@ def _per_token_group_quant_8bit(
     N,
     # Avoid to divide zero
     eps,
-    # Information for 8bit data type (int8 or float8_e4m3fn)
+    # Information for 8bit data type (int8 or fp8_type_)
     max_8bit,
     min_8bit,
     # Meta-parameters
@@ -149,7 +154,7 @@ def sglang_per_token_group_quant_8bit(
             [1, 2, 4, 8, 16, 32, 64, 128],  # batch_size
             [64, 128, 256, 512, 1024, 2048],  # seq_len
             [16, 32, 64, 128, 256],  # group_size
-            [torch.int8, torch.float8_e4m3fn],  # dtype
+            [torch.int8, fp8_type_],  # dtype
         )
     ),
 )
