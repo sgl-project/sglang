@@ -57,7 +57,7 @@ Set up SGLang engine for statistic analysis, for high efficiency we use `--dp-si
 ```bash
 python3 -m sglang_router.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --port 30000 --dp-size 8
 ```
-**Experiment 1**: 
+**Experiment 1**:
 We fixed the number of attempts (num_tries) and conducted multiple runs to assess the consistency of the model's performance. The results show that all recorded accuracies lie within ± one standard error deviation from the mean. This suggests that **our metric serves as an effective upper bound for the deviation of reported accuracy**.
 
 To collect the accuracy, run the following command 30 times:
