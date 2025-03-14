@@ -15,6 +15,7 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #ifndef USE_ROCM
@@ -22,6 +23,7 @@
 #include <flashinfer/activation.cuh>
 
 #include "pytorch_extension_utils.h"
+#include "utils.h"
 
 #else
 #include "act_and_mul_internal.cuh"
