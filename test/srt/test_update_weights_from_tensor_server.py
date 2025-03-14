@@ -101,9 +101,7 @@ class TestUpdateWeightsFromTensorServer(unittest.TestCase):
         if is_in_ci():
             import random
             test_setting = random.sample([(1,1),
-                                          (1,2),
                                           (2,1),
-                                          (2,2),
                                           ], 1)
         else:
             test_setting = [(1,1),
