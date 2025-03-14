@@ -1787,7 +1787,7 @@ def run_scheduler_process(
         prefix = f" DP{dp_rank} TP{tp_rank}"
 
     # Config the process
-    kill_itself_when_parent_died()
+    # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
