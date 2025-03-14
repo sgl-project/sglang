@@ -124,8 +124,6 @@ async def health() -> Response:
 @app.post("/send_prefill_request")
 async def send_prefill_request(obj: PrefillOnlyInput, request: Request) -> Response:
     """For Prefill Decode Disaggregation, process prefill request send from decode instance"""
-    print("!!!!!!! recv request from decode !!!!!!!!")
-    print(obj)
     await _global_state.tokenizer_manager.pass_through_prefill_request(obj, request)
     return Response(status_code=200)
 
@@ -610,14 +608,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer, image_token_text):
 
     try:
         # for _ in range(server_args.dp_size):
-        for _ in range(4):
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
+        res = requests.post(
+            url + request_name,
+            json=json_data,
+            headers=headers,
+            timeout=600,
+        )
+        assert res.status_code == 200, f"{res}"
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

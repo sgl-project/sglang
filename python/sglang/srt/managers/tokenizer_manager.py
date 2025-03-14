@@ -270,7 +270,6 @@ class TokenizerManager:
         obj: Union[PrefillOnlyInput, PrefillOnlyOutput],
         request: Optional[fastapi.Request] = None,
     ):  
-        print("!!!!! pass through req to scheduler")
         self.send_to_scheduler.send_pyobj(obj)
 
     async def generate_request(

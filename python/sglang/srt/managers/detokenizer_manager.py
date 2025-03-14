@@ -123,7 +123,6 @@ class DetokenizerManager:
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            print("######## take a look at res: ", output)
             self.send_to_tokenizer.send_pyobj(output)
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):

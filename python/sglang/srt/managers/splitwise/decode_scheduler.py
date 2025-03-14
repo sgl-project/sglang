@@ -477,6 +477,7 @@ class DecodeScheduler:
         else:
             self.kv_cache_receiver = None
 
+        self.kv_cache_pulling_in_progress = False
         self.kv_transfer_stream = torch.cuda.Stream()
         self.kv_cache_transfer_queue = queue.Queue()
         kv_transfer_thread = threading.Thread(target=self.kv_cache_pulling_loop, daemon=True)
@@ -518,9 +519,12 @@ class DecodeScheduler:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # When the server is idle, so self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
+                if not self.waiting_queue and not self.kv_cache_pulling_in_progress:
+                    # When the server is idle, so self-check and re-init some states
+                    # if is a TokenizedGenerateReqInput, the server is not trully idle, becuase the req is put into a queue
+                    # this req might already occupy some memory
+                    self.check_memory()
+                    self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
 
@@ -557,8 +561,10 @@ class DecodeScheduler:
                     self.tp_worker.cur_sampling_info if batch else None
                 )
                 self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
+            elif batch is None and not self.waiting_queue and not self.kv_cache_pulling_in_progress:
                 # When the server is idle, so self-check and re-init some states
+                # if is a TokenizedGenerateReqInput, the server is not trully idle, becuase the req is put into a queue
+                # this req might already occupy some memory.
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -658,7 +664,9 @@ class DecodeScheduler:
     def kv_cache_pulling_loop(self):
         while True:
             req, recv_req = self.kv_cache_transfer_queue.get()
+            self.kv_cache_pulling_in_progress = True
             self._pull_kv_cache(req, recv_req)
+            self.kv_cache_pulling_in_progress = False
 
     @torch.no_grad()
     def _pull_kv_cache(
@@ -668,6 +676,16 @@ class DecodeScheduler:
     ):
         token_ids = req.origin_input_ids + req.output_ids
         context_length = len(token_ids) - 1
+
+        # if self.attn_tp_rank == 0:
+        #     print("???req input size: ", len(req.origin_input_ids))
+        #     print("???req output size: ", len(req.output_ids))
+        #     print("???req prefix size: ", len(req.prefix_indices))
+        #     print(
+        #         f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"???evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"???protected size: {self.tree_cache.protected_size()} \n"
+        #     )
 
         # TODO: this shape is for MLA model, need to have a utility function for this
         shape = (self.token_to_kv_pool.layer_num, context_length, 1, self.token_to_kv_pool.kv_buffer[0].shape[-1])
@@ -689,14 +707,32 @@ class DecodeScheduler:
 
             # Broadcast actual tensor data
             dist.broadcast(kv_cache, src=0)
-            print(f"Rank {self.attn_tp_rank} received:", kv_cache)
 
             # copy kv cache to managed kv pool, and let tree cache keep track of it
             device_indices = self.token_to_kv_pool.alloc(context_length)
             for i in range(self.token_to_kv_pool.layer_num):
                 self.token_to_kv_pool.kv_buffer[i][device_indices] = kv_cache[i]
         
-            self.tree_cache.insert(token_ids, device_indices.clone())
+            new_prefix_len = self.tree_cache.insert(token_ids, device_indices.clone())
+            
+            # TODO: do below stuff if enable radix cache
+            # self.token_to_kv_pool.free(device_indices[:new_prefix_len])
+
+            # new_indices, new_last_node = self.tree_cache.match_prefix(token_ids)
+            # self.tree_cache.inc_lock_ref(new_last_node)
+
+            # req.prefix_indices = new_indices
+            # req.last_node = new_last_node
+
+        # if self.attn_tp_rank == 0:
+        #     print("???req input size: ", len(req.origin_input_ids))
+        #     print("???req output size: ", len(req.output_ids))
+        #     print("???req prefix size: ", len(req.prefix_indices))
+        #     print(
+        #         f"???avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"???evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"???protected size: {self.tree_cache.protected_size()} \n"
+        #     )
 
         # self.req_to_token_pool.req_to_token[req.req_pool_idx][:context_length] = device_indices
         self.waiting_queue.append(req)        
@@ -1022,7 +1058,32 @@ class DecodeScheduler:
                 self.batch_is_full = True
                 break
 
+            # if self.attn_tp_rank == 0:
+            #     print("----------------- before init next round -------------------")
+            #     print("req input size: ", len(req.origin_input_ids))
+            #     print("req output size: ", len(req.output_ids))
+            #     print("req prefix size: ", len(req.prefix_indices))
+            #     print(
+            #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+            #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+            #         f"protected size: {self.tree_cache.protected_size()} \n"
+            #     )
+            #     print("----------------- before init next round -------------------")
+
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
+
+            # if self.attn_tp_rank == 0:
+            #     print("----------------- after init next round -------------------")
+            #     print("req input size: ", len(req.origin_input_ids))
+            #     print("req output size: ", len(req.output_ids))
+            #     print("req prefix size: ", len(req.prefix_indices))
+            #     print(
+            #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+            #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+            #         f"protected size: {self.tree_cache.protected_size()} \n"
+            #     )
+            #     print("----------------- after init next round -------------------")
+
             if self.enable_hierarchical_cache and req.last_node is not None:
                 if req.last_node.evicted:
                     # loading KV cache for the request
@@ -1088,10 +1149,34 @@ class DecodeScheduler:
             self.server_args.enable_custom_logit_processor,
             self.server_args.return_hidden_states,
         )
+
+        # if self.attn_tp_rank == 0:
+        #     print("----------------- before prepare for extend -------------------")
+        #     print("req input size: ", len(req.origin_input_ids))
+        #     print("req output size: ", len(req.output_ids))
+        #     print("req prefix size: ", len(req.prefix_indices))
+        #     print(
+        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"protected size: {self.tree_cache.protected_size()} \n"
+        #     )
+        #     print("----------------- before prepare for extend -------------------")
         new_batch.prepare_for_extend()
 
         # convert list[int] to tensor, also assume output_id for each req is length = 1
         new_batch.output_ids = torch.tensor([req.output_ids[0] for req in can_run_list]).to(f'cuda:{self.attn_tp_rank}')
+
+        # if self.attn_tp_rank == 0:
+        #     print("----------------- after prepare for extend -------------------")
+        #     print("req input size: ", len(req.origin_input_ids))
+        #     print("req output size: ", len(req.output_ids))
+        #     print("req prefix size: ", len(req.prefix_indices))
+        #     print(
+        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"protected size: {self.tree_cache.protected_size()} \n"
+        #     )
+        #     print("----------------- after prepare for extend -------------------")
 
 
         # Mixed-style chunked prefill
@@ -1157,8 +1242,27 @@ class DecodeScheduler:
         if batch.batch_size() < initial_bs:
             self.batch_is_full = False
 
+        
+        # if self.attn_tp_rank == 0:
+        #     print("----------------- before prepare for decode -------------------")
+        #     print(
+        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"protected size: {self.tree_cache.protected_size()} \n"
+        #     )
+        #     print("----------------- before prepare for decode -------------------")
+
         # Update batch tensors
         batch.prepare_for_decode()
+
+        # if self.attn_tp_rank == 0:
+        #     print("----------------- after prepare for decode -------------------")
+        #     print(
+        #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+        #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+        #         f"protected size: {self.tree_cache.protected_size()} \n"
+        #     )
+        #     print("----------------- after prepare for decode -------------------")
         return batch
 
     def run_batch(
@@ -1170,8 +1274,6 @@ class DecodeScheduler:
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-                if (self.attn_tp_rank == 0):
-                    print("!!!!!!! debug model_worker_batch: ", model_worker_batch)
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
@@ -1381,7 +1483,25 @@ class DecodeScheduler:
             req.check_finished()
 
             if req.finished():
+                # if self.attn_tp_rank == 0:
+                #     print("req input size: ", len(req.origin_input_ids))
+                #     print("req output size: ", len(req.output_ids))
+                #     print("req prefix size: ", len(req.prefix_indices))
+                #     print(
+                #         f"avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                #         f"evitcable size: {self.tree_cache.evictable_size()} \n"
+                #         f"protected size: {self.tree_cache.protected_size()} \n"
+                #     )
                 self.tree_cache.cache_finished_req(req)
+                # if self.attn_tp_rank == 0:
+                #     print("!!!req input size: ", len(req.origin_input_ids))
+                #     print("!!!req output size: ", len(req.output_ids))
+                #     print("!!!req prefix size: ", len(req.prefix_indices))
+                #     print(
+                #         f"!!!avaiable size: {self.token_to_kv_pool.available_size()} \n"
+                #         f"!!!evitcable size: {self.tree_cache.evictable_size()} \n"
+                #         f"!!!protected size: {self.tree_cache.protected_size()} \n"
+                #     )
 
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[i])

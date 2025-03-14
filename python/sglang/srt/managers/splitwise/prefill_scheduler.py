@@ -1072,7 +1072,8 @@ class PrefillScheduler:
 
             # Calculate and print the elapsed time
             elapsed_time = end_time - start_time
-            print(f"rank {self.attn_tp_rank} Wall time: {elapsed_time:.4f} seconds")
+            if self.attn_tp_rank == 0:
+                logger.info(f"kv cache send wall time: {elapsed_time:.4f} seconds")
 
     def _send_kv_cache(
         self,
@@ -1080,29 +1081,27 @@ class PrefillScheduler:
     ):
         if self.attn_tp_rank == 0:
             # kv cache sending
-            with self.kv_cache_sender.connect_lock:
 
-                # notify decode to connect to socket if necessary
-                self.distribute_output(req)
+            # notify decode to connect to socket if necessary
+            self.distribute_output(req)
 
-                decode_ip = req.decode_instance_host
-                decode_port = req.decode_instance_port
-                addr_key = (decode_ip, decode_port)
-                self.kv_cache_sender.wait_for_connect(decode_ip, decode_port)
-                lock = self.kv_cache_sender.connections_lock[addr_key]
-                lock.acquire()
+            decode_ip = req.decode_instance_host
+            decode_port = req.decode_instance_port
+            # addr_key = (decode_ip, decode_port)
+            # self.kv_cache_sender.wait_for_connect(decode_ip, decode_port)
 
-            try:
-                token_ids = (req.origin_input_ids + req.output_ids)
-                device_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :len(token_ids) - 1]
-                kv_cache_device = self.token_to_kv_pool.get_flat_data(device_indices)
-                kv_cache_host = kv_cache_device.cpu().contiguous()
-                kv_cache_size = kv_cache_host.numel() * kv_cache_host.element_size()
-                ctypes_buffer = (ctypes.c_byte * kv_cache_size).from_address(kv_cache_host.data_ptr())
-                buffer = memoryview(ctypes_buffer)
-                self.kv_cache_sender.send_kv_cache(buffer, decode_ip, decode_port, kv_cache_size)
-            finally:
-                lock.release()
+            token_ids = (req.origin_input_ids + req.output_ids)
+            device_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :len(token_ids) - 1]
+            kv_cache_device = self.token_to_kv_pool.get_flat_data(device_indices)
+            kv_cache_host = kv_cache_device.cpu().contiguous()
+            kv_cache_size = kv_cache_host.numel() * kv_cache_host.element_size()
+            ctypes_buffer = (ctypes.c_byte * kv_cache_size).from_address(kv_cache_host.data_ptr())
+            buffer = memoryview(ctypes_buffer)
+            start_time = time.perf_counter()
+            self.kv_cache_sender.send_kv_cache(buffer, decode_ip, decode_port, kv_cache_size)
+            end_time = time.perf_counter()
+            elapsed_time = end_time - start_time
+            logger.info(f"Actual kv cache send wall time: {elapsed_time:.4f} seconds")
 
         self.token_to_kv_pool.free_group_end()
         

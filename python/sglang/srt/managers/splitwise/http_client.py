@@ -65,7 +65,6 @@ class HTTPClientManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
-            print(recv_obj)
             self._req_dispatcher(recv_obj)
 
     def _handle_prefill_request(self, prefill_input: PrefillOnlyInput):
@@ -77,10 +76,7 @@ class HTTPClientManager:
             data = asdict(prefill_input)
             data['sampling_params'] = convert_sampling_params(data.get('sampling_params'))
 
-            logger.info("!!!!!!!!!!!")
             response = requests.post(url, json=data, timeout=self.timeout)
-            logger.info(response)
-            logger.info("!!!!!!!!!!!")
             return {"status": "success", "status_code": response.status_code}
         except Exception as e:
             logger.error("!!!!!! error ", str(e))
@@ -95,10 +91,7 @@ class HTTPClientManager:
             url = f"http://{ip}:{port}/return_prefill_result"
             data = asdict(prefill_output)
 
-            logger.info("!!!!!!!!!!!")
             response = requests.post(url, json=data, timeout=self.timeout)
-            logger.info(response)
-            logger.info("!!!!!!!!!!!")
             return {"status": "success", "status_code": response.status_code}
         except Exception as e:
             logger.error("!!!!!! error ", str(e))
