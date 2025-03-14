@@ -33,8 +33,6 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 
 ### Penalizers
 
-To use penalizers you will need to `--disable-overlap`. Please note that this might degrade performance.
-
 * `frequency_penalty: float = 0.0`: Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token.
 * `presence_penalty: float = 0.0`: Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured.
 * `repetition_penalty: float = 0.0`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `1` encourages sampling of new tokens. The penalization scales multiplicatively.
