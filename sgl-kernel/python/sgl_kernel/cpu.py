@@ -84,3 +84,17 @@ def extend_attention(
         sm_scale,
         logit_cap,
     )
+
+
+def weight_packed_linear(
+    x,
+    weight,
+    bias,
+    is_vnni=True,
+):
+    return sgl_kernel.common_ops.weight_packed_linear(
+        x,
+        weight,
+        bias,
+        is_vnni,
+    )
