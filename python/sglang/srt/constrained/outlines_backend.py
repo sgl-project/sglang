@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Constrained decoding with outlines backend."""
-
 import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
@@ -116,6 +115,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         tokenizer,
         whitespace_pattern: bool,
     ):
+
         super().__init__()
 
         try:

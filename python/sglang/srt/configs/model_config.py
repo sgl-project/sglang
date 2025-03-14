@@ -312,7 +312,10 @@ class ModelConfig:
                 )
 
     def get_hf_eos_token_id(self) -> Optional[Set[int]]:
-        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        if "InternVLChatModel" in self.hf_config.architectures:
+            eos_ids = getattr(getattr(self.hf_text_config, "llm_config"), "eos_token_id")
+        else:
+            eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
@@ -436,6 +439,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "MiniCPMV",
     "MultiModalityCausalLM",
+    'InternVLChatModel'
 ]
 
 

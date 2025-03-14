@@ -1984,7 +1984,6 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
             and len(forward_batch.image_inputs) != 0
             and forward_batch.image_inputs[0] is not None
         ):
-
             image_inputs = forward_batch.image_inputs[0]
 
             images_seq_mask = self.prepare_images_seq_mask(

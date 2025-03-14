@@ -308,7 +308,6 @@ class TestOpenAIVisionServer(unittest.TestCase):
             extra_body={"regex": regex},
         )
         text = response.choices[0].message.content
-
         try:
             js_obj = json.loads(text)
         except (TypeError, json.decoder.JSONDecodeError):
