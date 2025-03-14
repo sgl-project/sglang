@@ -35,11 +35,13 @@ from contextlib import asynccontextmanager
 import numpy as np
 import orjson
 import requests
+import torch
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from torch.distributed.tensor import DTensor
 
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
@@ -59,11 +61,12 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
-    UpdateWeightsFromTensorReqInput
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.openai_api.adapter import (
     v1_batches,
     v1_cancel_batch,
@@ -80,19 +83,16 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
     kill_process_tree,
     set_uvicorn_logging_configs,
-    MultiprocessingSerializer
 )
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-import torch
-from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -143,6 +143,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 ##### Native API endpoints #####
 
+
 def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
     if isinstance(tensor, DTensor):
         return tensor.full_tensor()
@@ -156,16 +157,33 @@ async def health() -> Response:
 
 
 @app.post("/update_weights_from_tensor")
-async def update_weights_from_tensor(obj: UpdateWeightsFromTensorReqInput, request: Request):
+async def update_weights_from_tensor(
+    obj: UpdateWeightsFromTensorReqInput, request: Request
+):
     """Update model parameter directly from tensor data."""
-    import pickle
     import base64
+    import pickle
+
     raw_bytes = base64.b64decode(obj.serialized_named_tensors)  # Base64 解码
-    send_data = pickle.loads(raw_bytes) 
-    obj.serialized_named_tensors=send_data
-    tp_size=len(obj.serialized_named_tensors[1])
-    result = [(obj.serialized_named_tensors[0],LocalSerializedTensor(values=[MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(obj.serialized_named_tensors[1][0])) for _ in range(tp_size)]))]
-    obj.serialized_named_tensors=MultiprocessingSerializer.serialize(result)
+    send_data = pickle.loads(raw_bytes)
+    obj.serialized_named_tensors = send_data
+    tp_size = len(obj.serialized_named_tensors[1])
+    result = [
+        (
+            obj.serialized_named_tensors[0],
+            LocalSerializedTensor(
+                values=[
+                    MultiprocessingSerializer.serialize(
+                        _preprocess_tensor_for_update_weights(
+                            obj.serialized_named_tensors[1][0]
+                        )
+                    )
+                    for _ in range(tp_size)
+                ]
+            ),
+        )
+    ]
+    obj.serialized_named_tensors = MultiprocessingSerializer.serialize(result)
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
@@ -174,6 +192,7 @@ async def update_weights_from_tensor(obj: UpdateWeightsFromTensorReqInput, reque
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
 
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
