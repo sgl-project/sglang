@@ -834,18 +834,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
         )
 
         num_new_seq = len(can_run_list)
-
-        total_queue_latency = 0
-        avg_queue_latency = 0
-        for req in can_run_list:
-            print(req.queue_time_start, req.queue_time_end)
-            if req.queue_time_start is not None and req.queue_time_end is not None:
-                total_queue_latency += req.queue_time_end - req.queue_time_start
-        if total_queue_latency > 0:
-            avg_queue_latency = total_queue_latency / num_new_seq
-        else:
-            print("No queue latency Biao Biao")
-
         f = (
             f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
@@ -866,7 +854,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.avg_request_queue_latency = avg_queue_latency
+
+            total_queue_latency = 0
+            for req in can_run_list:
+                if req.queue_time_start is not None and req.queue_time_end is not None:
+                    total_queue_latency += req.queue_time_end - req.queue_time_start
+            if total_queue_latency > 0:
+                self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
 
