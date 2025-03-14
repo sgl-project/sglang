@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend, next_power_of_2
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -263,15 +263,24 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
+        # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
-            max_len = max(ret.global_num_tokens_cpu)
+            ret.global_num_tokens_gpu = torch.tensor(
+                batch.global_num_tokens, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
+                batch.global_num_tokens_for_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            sum_len = sum(batch.global_num_tokens)
             ret.gathered_buffer = torch.zeros(
-                (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+                (sum_len, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
                 device=device,
             )
-
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             return ret

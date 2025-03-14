@@ -22,10 +22,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPoolHost,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +148,7 @@ class HiCacheController:
     def __init__(
         self,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        mem_pool_host: MHATokenToKVPoolHost,
+        mem_pool_host: HostKVCache,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
     ):
@@ -248,6 +245,8 @@ class HiCacheController:
         if device_indices is None:
             return None
         self.mem_pool_host.protect_load(host_indices)
+        # to ensure the device indices are ready before accessed by another CUDA stream
+        torch.cuda.current_stream().synchronize()
         self.load_queue.put(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )

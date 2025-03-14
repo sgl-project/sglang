@@ -54,7 +54,7 @@ class LoadBalanceMethod(Enum):
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(self, server_args, port_args) -> None:
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         # Parse args
         self.max_total_num_tokens = None
         self.server_args = server_args

@@ -318,6 +318,10 @@ class Qwen25Detector(BaseFormatDetector):
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
 
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Qwen 2.5 format tool call."""
+        return self.bot_token in text
+
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -351,6 +355,10 @@ class MistralDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "[TOOL_CALLS] ["
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Mistral format tool call."""
+        return self.bot_token in text
 
     def _clean_text(self, text: str) -> str:
         """
@@ -397,12 +405,21 @@ class Llama32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<|python_tag|>"
 
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Llama 3.2 format tool call."""
+        # depending on the prompt format the Llama model may or may not
+        # prefix the output with the <|python_tag|> token
+        return "<|python_tag|>" in text or text.startswith("{")
+
     def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
         """Parse function calls from text, handling multiple JSON objects."""
-        if "<|python_tag|>" not in text:
+        if "<|python_tag|>" not in text and not text.startswith("{"):
             return []
 
-        _, action_text = text.split("<|python_tag|>")
+        if "<|python_tag|>" in text:
+            _, action_text = text.split("<|python_tag|>")
+        else:
+            action_text = text
 
         # Split by semicolon and process each part
         json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
@@ -500,6 +517,20 @@ class FunctionCallParser:
 
         self.multi_format_parser = MultiFormatParser(detectors)
         self.tools = tools
+
+    def has_tool_call(self, text: str) -> bool:
+        """
+        Check if the given text contains a tool call in the format supported by this parser.
+        This delegates to the detector's implementation.
+
+        :param text: The text to check for tool calls
+        :return: True if the text contains a tool call, False otherwise
+        """
+        # Check all detectors in the multi_format_parser
+        for detector in self.multi_format_parser.detectors:
+            if detector.has_tool_call(text):
+                return True
+        return False
 
     def parse_non_stream(self, full_text: str):
         """
