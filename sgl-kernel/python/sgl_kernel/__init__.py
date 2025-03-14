@@ -9,7 +9,7 @@ if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
         mode=ctypes.RTLD_GLOBAL,
     )
 
-from sgl_kernel import common_ops
+# from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import lightning_attention_decode
 from sgl_kernel.elementwise import (
