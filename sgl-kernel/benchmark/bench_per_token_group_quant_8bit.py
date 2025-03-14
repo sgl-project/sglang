@@ -213,8 +213,6 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
 if __name__ == "__main__":
 
     calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.int8)
-    calculate_diff(
-        batch_size=4, seq_len=128, group_size=64, dst_dtype=fp8_type_
-    )
+    calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=fp8_type_)
 
     benchmark.run(print_data=True)
