@@ -300,7 +300,6 @@ class Gemma3Config(PretrainedConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
-        print(f"Gemma3 config: {vision_config}")
         if text_config is None:
             text_config = Gemma3TextConfig()
             logger.info(
@@ -311,6 +310,8 @@ class Gemma3Config(PretrainedConfig):
 
         if isinstance(vision_config, dict):
             vision_config = SiglipVisionConfig(**vision_config)
+        elif isinstance(vision_config, SiglipVisionConfig):
+            pass
         else:
             vision_config = SiglipVisionConfig()
             logger.info(
@@ -327,6 +328,3 @@ class Gemma3Config(PretrainedConfig):
         self.initializer_range = initializer_range
 
         super().__init__(**kwargs)
-
-
-__all__ = ["Gemma3Config", "Gemma3TextConfig"]

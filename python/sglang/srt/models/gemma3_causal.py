@@ -289,15 +289,13 @@ class Gemma3Attention(nn.Module):
 
         # [s, h, head_dim]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        # [h, s, head_dim]
+        # -> [h, s, head_dim]
         q = q.transpose(0, 1).unsqueeze(0)
         q = self.q_norm(q)
-        # q = q.flatten(-2, -1)
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         # -> [h, s, head_dim]
         k = k.transpose(0, 1).unsqueeze(0)
         k = self.k_norm(k)
-        # k = k.flatten(-2, -1)
 
         # q, k = self.rotary_emb(positions, q, k)
         cos, sin = position_embeddings
@@ -633,7 +631,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        print(f"text_config: {config}")
         self.config = config
         self.quant_config = quant_config
         self.model = Gemma3TextModel(
@@ -738,8 +735,8 @@ class Gemma3ForCausalLM(PreTrainedModel):
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             for param_name, shard_name, shard_id in stacked_params_mapping:
-                if param_name in name:
-                    print(f"{param_name} is already in {name}")
+                # if param_name in name:
+                # print(f"{param_name} is already in {name}")
                 if shard_name not in name:
                     continue
                 name = name.replace(shard_name, param_name)

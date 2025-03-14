@@ -190,7 +190,7 @@ class SiglipVisionLayer(nn.Module):
 class Gemma3MultiModalProjector(nn.Module):
     """Projector for Gemma3 multimodal."""
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: Gemma3Config):
         super().__init__()
 
         self.mm_input_projection_weight = nn.Parameter(
@@ -436,6 +436,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
         **kwargs: object,
     ) -> LogitsProcessor:
         r"""
@@ -517,10 +518,15 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 special_image_mask = special_image_mask.expand_as(inputs_embeds).to(
                     inputs_embeds.device
                 )
+            print(f"image_features: {image_features}")
+            print(f"special_image_mask sum: {special_image_mask.sum()}")
+            print(f"special_image_mask numel: {special_image_mask.numel()}")
+            # print(f"special_image_mask: {special_image_mask.tolist()}")
             if (
                 not is_torchdynamo_compiling()
                 and inputs_embeds[special_image_mask].numel() != image_features.numel()
             ):
+                print("Unexpected")
                 pass
                 # image_tokens_in_text = special_image_mask.sum(dim=1).sum(dim=0)[0]
                 # raise ValueError(
@@ -566,6 +572,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            if "language_model" in name:
+                Gemma3ForCausalLM.load_weights(self, [(name, loaded_weight)])
+                continue
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
