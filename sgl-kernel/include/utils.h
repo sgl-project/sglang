@@ -128,3 +128,81 @@ __device__ __forceinline__ float castToFloat(srcDtype val) {
 }
 
 #endif
+
+// add FP8 support
+
+#ifndef USE_ROCM
+#include <c10/util/Float8_e4m3fn.h>
+using FP8_TYPE = c10::Float8_e4m3fn;
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#else
+#include <c10/util/Float8_e4m3fnuz.h>
+
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+constexpr auto FP8_E4M3_MAX = 224.0f;
+#endif
+
+#define FULL_MASK 0xffffffff
+
+__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
+#ifndef USE_ROCM
+  float old;
+  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
+                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
+  return old;
+#else
+  int* address_as_i = (int*) address;
+  int old = *address_as_i, assumed;
+  do {
+      assumed = old;
+      old = atomicCAS(address_as_i, assumed,
+          __float_as_int(fmaxf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+  return __int_as_float(old);
+#endif
+}
+
+__device__ __forceinline__ float warpReduceMax(float value) {
+  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 16));
+  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 8));
+  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 4));
+  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 2));
+  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 1));
+  return value;
+}
+
+__device__ __forceinline__ float blockReduceMax(float value) {
+  static __shared__ float warpLevelMaxs[WARP_SIZE];
+  const int laneId = threadIdx.x % WARP_SIZE;
+  const int warpId = threadIdx.x / WARP_SIZE;
+
+  value = warpReduceMax(value);
+
+  if (laneId == 0) warpLevelMaxs[warpId] = value;
+  __syncthreads();
+
+  value = (threadIdx.x < blockDim.x / WARP_SIZE) ? warpLevelMaxs[laneId] : 0;
+  if (warpId == 0) value = warpReduceMax(value);
+
+  return value;
+}
+
+// Pads to a multiple of `alignment` rows.
+inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment = 4, bool is_column_major = false) {
+  int64_t rows = tensor.size(0);
+  int64_t cols = tensor.size(1);
+  int64_t pad_rows = (alignment - (rows % alignment)) % alignment;  // Compute padding size
+
+  if (pad_rows == 0) {
+    return tensor;  // Already aligned
+  }
+
+  torch::Tensor padding = torch::zeros({pad_rows, cols}, tensor.options());
+  torch::Tensor tensor_padded = torch::cat({tensor, padding}, 0);  // Pad along rows
+
+  // Ensure column-major layout
+  if (is_column_major) {
+    return tensor_padded.t().contiguous().t();
+  }
+  return tensor_padded;
+}
