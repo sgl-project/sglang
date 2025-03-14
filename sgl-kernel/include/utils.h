@@ -107,7 +107,7 @@ inline int getSMVersion() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define CEILDIV(x, y) (((x) + (y)-1) / (y))
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
@@ -131,7 +131,6 @@ template <typename dstDtype>
 __device__ __forceinline__ dstDtype castFrom(float val) {
   return static_cast<dstDtype>(val);
 }
-
 
 #endif
 
