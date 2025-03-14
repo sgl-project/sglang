@@ -361,7 +361,7 @@ class Req:
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
             ) = None
-        self.hidden_states = []
+        self.hidden_states: List[List[float]] = []
 
         # Embedding (return values)
         self.embedding = None
