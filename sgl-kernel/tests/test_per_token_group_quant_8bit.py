@@ -4,8 +4,8 @@ import pytest
 import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
-from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
 
 def sglang_per_token_group_quant_8bit(
@@ -51,7 +51,9 @@ def sglang_per_token_group_quant_8bit(
         )
     ),
 )
-def test_per_token_group_quant_compare_implementations(batch_size, seq_len, group_size, dtype):
+def test_per_token_group_quant_compare_implementations(
+    batch_size, seq_len, group_size, dtype
+):
     x = torch.randn(
         (batch_size, seq_len, group_size * 2), device="cuda", dtype=torch.float16
     )
@@ -60,7 +62,9 @@ def test_per_token_group_quant_compare_implementations(batch_size, seq_len, grou
         x_q_triton, x_s_triton = per_token_group_quant_int8(x, group_size)
     else:
         x_q_triton, x_s_triton = per_token_group_quant_fp8(x, group_size)
-    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(x, group_size, dtype=dtype)
+    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(
+        x, group_size, dtype=dtype
+    )
 
     assert torch.allclose(
         x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
