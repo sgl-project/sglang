@@ -50,7 +50,6 @@ from sglang.bench_serving import (
     get_model,
     get_request,
     get_tokenizer,
-    parse_request_rate_range,
     remove_prefix,
     sample_random_requests,
 )

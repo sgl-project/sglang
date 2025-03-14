@@ -93,7 +93,6 @@ class TestLoRABackend(unittest.TestCase):
             lora_paths=[adaptor.name for adaptor in model_case.adaptors],
             max_loras_per_batch=model_case.max_loras_per_batch,
             lora_backend=backend,
-            disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.88,
         ) as srt_runner:
