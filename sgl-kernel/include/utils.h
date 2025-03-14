@@ -127,6 +127,12 @@ __device__ __forceinline__ float castToFloat(srcDtype val) {
   return static_cast<srcDtype>(val);
 }
 
+template <typename dstDtype>
+__device__ __forceinline__ dstDtype castFrom(float val) {
+  return static_cast<dstDtype>(val);
+}
+
+
 #endif
 
 // add FP8 support
