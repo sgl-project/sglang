@@ -74,7 +74,7 @@ class StreamingParseResult:
 @dataclass
 class StructureInfo:
     begin: str
-    finish: str
+    end: str
     trigger: str
 
 
@@ -304,6 +304,10 @@ class BaseFormatDetector(ABC):
             return StreamingParseResult()
 
     @abstractmethod
+    def has_tool_call(self, text: str) -> bool:
+        raise NotImplementedError()
+
+    @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
 
@@ -327,7 +331,7 @@ class Qwen25Detector(BaseFormatDetector):
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -348,7 +352,7 @@ class Qwen25Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<tool_call>{"name":"' + name + '", "arguments":',
-            finish="}</tool_call>",
+            end="}</tool_call>",
             trigger="<tool_call>",
         )
 
@@ -408,7 +412,7 @@ class MistralDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
-            finish="}]",
+            end="}]",
             trigger="[TOOL_CALLS]",
         )
 
@@ -430,7 +434,7 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         return "<|python_tag|>" in text or text.startswith("{")
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
             return []
@@ -463,7 +467,7 @@ class Llama32Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<|python_tag|>{"name":"' + name + '", "arguments":',
-            finish="}",
+            end="}",
             trigger="<|python_tag|>",
         )
 

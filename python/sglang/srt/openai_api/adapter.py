@@ -914,7 +914,7 @@ def v1_chat_generate_request(
                             {
                                 "begin": info.begin,
                                 "schema": schema,
-                                "end": info.finish,
+                                "end": info.end,
                             }
                         )
                         tool_trigger_set.add(info.trigger)
