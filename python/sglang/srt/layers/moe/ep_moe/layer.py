@@ -3,7 +3,6 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
-from vllm import _custom_ops as vllm_ops
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -32,6 +31,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+else:
+    from vllm import _custom_ops as vllm_ops
 
 
 logger = logging.getLogger(__name__)
