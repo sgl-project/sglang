@@ -7,6 +7,7 @@ from sglang.srt.configs.qwen2_5_vl_config import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
 )
+from sglang.srt.configs.shieldgemma2 import ShieldGemma2Config
 
 __all__ = [
     "ExaoneConfig",
@@ -17,4 +18,5 @@ __all__ = [
     "MultiModalityConfig",
     "Gemma3Config",
     "Gemma3TextConfig",
+    "ShieldGemma2Config",
 ]
