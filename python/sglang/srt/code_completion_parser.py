@@ -57,7 +57,7 @@ class CompletionTemplate:
 completion_templates: dict[str, CompletionTemplate] = {}
 
 
-def load_completion_template_for_openai_api(tokenizer_manager, completion_template_arg):
+def load_completion_template_for_openai_api(completion_template_arg):
     global completion_template_name
 
     logger.info(

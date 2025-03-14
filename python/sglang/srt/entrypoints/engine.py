@@ -540,9 +540,7 @@ def _launch_subprocesses(
         )
 
     if server_args.completion_template:
-        load_completion_template_for_openai_api(
-            tokenizer_manager, server_args.completion_template
-        )
+        load_completion_template_for_openai_api(server_args.completion_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
