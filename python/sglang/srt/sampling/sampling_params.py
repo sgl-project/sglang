@@ -77,7 +77,7 @@ class SamplingParams:
         self.custom_params = custom_params
 
         # Process some special cases
-        if self.temperature < _SAMPLING_EPS:
+        if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
             self.temperature = 1.0
             self.top_k = 1
@@ -93,9 +93,9 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k < -1 or self.top_k == 0:
+        if self.top_k < 1 or self.top_k == -1:
             raise ValueError(
-                f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}."
+                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
