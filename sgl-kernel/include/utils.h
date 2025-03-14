@@ -151,11 +151,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
                      : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
   return old;
 #else
-  int* address_as_i = (int*) address;
-  int old = *address_as_i, assumed;
+  int* addr_as_i = (int*) addr;
+  int old = *addr_as_i, assumed;
   do {
       assumed = old;
-      old = atomicCAS(address_as_i, assumed,
+      old = atomicCAS(addr_as_i, assumed,
           __float_as_int(fmaxf(value, __int_as_float(assumed))));
   } while (assumed != old);
   return __int_as_float(old);
@@ -163,11 +163,11 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 }
 
 __device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 16));
-  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 8));
-  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 4));
-  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 2));
-  value = fmaxf(val, __shfl_xor_sync(FULL_MASK, value, 1));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
+  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
   return value;
 }
 
