@@ -34,6 +34,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
+    Gemma3Config,
     MultiModalityConfig,
     Qwen2_5_VLConfig,
 )
@@ -46,6 +47,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
     MultiModalityConfig.model_type: MultiModalityConfig,
+    Gemma3Config.model_type: Gemma3Config,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

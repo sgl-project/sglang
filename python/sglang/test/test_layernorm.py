@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, RMSNorm
 
 
 class TestRMSNorm(unittest.TestCase):
@@ -74,7 +74,7 @@ class TestGemmaRMSNorm(unittest.TestCase):
     ):
         torch.manual_seed(seed)
 
-        layer = GemmaRMSNorm(hidden_size).to(dtype=dtype)
+        layer = Gemma3RMSNorm(hidden_size).to(dtype=dtype)
         layer.weight.data.normal_(mean=1.0, std=0.1)
         scale = 1 / (2 * hidden_size)
         x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale

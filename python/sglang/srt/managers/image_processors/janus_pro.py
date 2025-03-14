@@ -60,7 +60,10 @@ class JanusProProcessor(SGLangBaseImageProcessor):
             image_data = [image_data]
 
         base_out = self.load_images(
-            input_ids, image_data, "<image_placeholder>", max_req_input_len
+            input_ids=input_ids,
+            image_data=image_data,
+            image_token="<image_placeholder>",
+            max_req_input_len=max_req_input_len,
         )
         images = base_out.all_frames
         res = await self._process_images(images=images, input_text=base_out.input_text)
