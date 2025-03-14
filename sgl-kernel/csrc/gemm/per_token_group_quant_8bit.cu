@@ -115,7 +115,7 @@ void sgl_per_token_group_quant_8bit(
   do {                                                                                             \
     constexpr int GROUPS_PER_BLOCK = GPB;                                                          \
     dim3 grid((num_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK);                             \
-    dim3 block(GROUPS_PER_BLOCK * THREADS_PER_GROUP);                                              \
+    dim3 block(GROUPS_PER_BLOCK* THREADS_PER_GROUP);                                               \
     per_token_group_quant_8bit_kernel<T, GROUPS_PER_BLOCK, DST_DTYPE><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                         \
         output_q.data_ptr(),                                                                       \

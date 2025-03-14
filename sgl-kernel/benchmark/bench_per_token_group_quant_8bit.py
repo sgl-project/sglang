@@ -4,8 +4,8 @@ import torch
 import triton
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
-from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
 
 def sglang_per_token_group_quant_8bit(
@@ -50,7 +50,9 @@ def calculate_diff(batch_size, seq_len, group_size, dtype):
         x_q_triton, x_s_triton = per_token_group_quant_int8(x.clone(), group_size)
     else:
         x_q_triton, x_s_triton = per_token_group_quant_fp8(x.clone(), group_size)
-    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(x.clone(), group_size, dtype=dtype)
+    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(
+        x.clone(), group_size, dtype=dtype
+    )
 
     if torch.allclose(
         x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
@@ -65,7 +67,9 @@ seq_len_range = [64, 128, 256, 512, 1024, 2048]
 group_size_range = [128]  # For DeepSeek V3/R1
 dtype_range = [torch.int8, torch.float8_e4m3fn]
 
-configs = list(itertools.product(batch_size_range, seq_len_range, group_size_range, dtype_range))
+configs = list(
+    itertools.product(batch_size_range, seq_len_range, group_size_range, dtype_range)
+)
 
 
 @triton.testing.perf_report(
@@ -95,7 +99,9 @@ def benchmark(batch_size, seq_len, group_size, dtype, provider):
         else:
             fn = lambda: per_token_group_quant_fp8(x.clone(), group_size)
     elif provider == "sglang":
-        fn = lambda: sglang_per_token_group_quant_8bit(x.clone(), group_size, dtype=dtype)
+        fn = lambda: sglang_per_token_group_quant_8bit(
+            x.clone(), group_size, dtype=dtype
+        )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
