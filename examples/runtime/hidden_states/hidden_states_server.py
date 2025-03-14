@@ -9,6 +9,7 @@ So avoid getting hidden states and completions alternately.
 """
 
 import requests
+import torch
 
 from sglang.test.test_utils import is_in_ci
 from sglang.utils import print_highlight, terminate_process, wait_for_server
@@ -50,19 +51,30 @@ def main():
         json=json_data,
     )
 
+    terminate_process(server_process)
+
     outputs = response.json()
     for prompt, output in zip(prompts, outputs):
+        for i in range(len(output["meta_info"]["hidden_states"])):
+            output["meta_info"]["hidden_states"][i] = torch.tensor(
+                output["meta_info"]["hidden_states"][i], dtype=torch.bfloat16
+            )
         print("===============================")
         print(
             f"Prompt: {prompt}\n"
             f"Generated text: {output['text']}\n"
             f"Prompt_Tokens: {output['meta_info']['prompt_tokens']}\t"
-            f"Completion_tokens: {output['meta_info']['completion_tokens']}\n"
-            f"Hidden states: {output['meta_info']['hidden_states']}"
+            f"Completion_tokens: {output['meta_info']['completion_tokens']}"
         )
+        print("Hidden states: ")
+        hidden_states = torch.cat(
+            [
+                i.unsqueeze(0) if len(i.shape) == 1 else i
+                for i in output["meta_info"]["hidden_states"]
+            ]
+        )
+        print(hidden_states)
         print()
-
-    terminate_process(server_process)
 
 
 if __name__ == "__main__":
