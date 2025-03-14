@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from vllm import _custom_ops as vllm_ops
 
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
@@ -46,6 +45,8 @@ if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+else:
+    from vllm import _custom_ops as vllm_ops
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -456,44 +457,34 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if num_experts >= 224:
-        if enable_moe_align_block_size_triton:
-            moe_align_block_size_triton(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-            )
-        else:
-            token_cnts_buffer = torch.zeros(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
-            )
-
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                token_cnts_buffer,
-                cumsum_buffer,
-            )
-    else:
-        vllm_ops.moe_align_block_size(
+    if enable_moe_align_block_size_triton:
+        moe_align_block_size_triton(
             topk_ids,
             num_experts,
             block_size,
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
+        )
+    else:
+        token_cnts_buffer = torch.zeros(
+            (num_experts + 1) * num_experts,
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+        cumsum_buffer = torch.zeros(
+            num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        )
+
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            token_cnts_buffer,
+            cumsum_buffer,
         )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
