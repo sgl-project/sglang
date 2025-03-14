@@ -19,7 +19,7 @@ else:
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -129,14 +129,14 @@ class RotaryEmbedding(CustomOp):
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
+        query_pass = query[..., self.rotary_dim:]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
+        key_pass = key[..., self.rotary_dim:]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
@@ -227,14 +227,14 @@ class RotaryEmbedding(CustomOp):
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
+        query_pass = query[..., self.rotary_dim:]
         query_rot = apply_rotary_pos_emb(query_rot, cos, sin, None, 0, rope_mode)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
+        key_pass = key[..., self.rotary_dim:]
         key_rot = apply_rotary_pos_emb(key_rot, cos, sin, None, 0, rope_mode)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
@@ -468,9 +468,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
-            1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
-        ) * self.extrapolation_factor
+                            1
+                            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+                        ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
             + inv_freq_extrapolation * inv_freq_mask
@@ -688,11 +688,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
-            1
-            - _yarn_linear_ramp_mask(
-                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
-            )
-        ) * self.extrapolation_factor
+                            1
+                            - _yarn_linear_ramp_mask(
+                            low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
+                        )
+                        ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
             + inv_freq_extrapolation * inv_freq_mask
@@ -723,8 +723,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
+            query_pass = query[..., self.rotary_dim:]
+            key_pass = key[..., self.rotary_dim:]
 
         self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
         cos_sin = self.cos_sin_cache[
@@ -856,14 +856,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
+        query_pass = query[..., self.rotary_dim:]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
+        key_pass = key[..., self.rotary_dim:]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
@@ -1107,7 +1107,7 @@ def get_rope(
                 k: v
                 for k, v in rope_scaling.items()
                 if k
-                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+                   in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
             }
             rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size,
@@ -1127,14 +1127,14 @@ def get_rope(
                 k: v
                 for k, v in rope_scaling.items()
                 if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
+                   in (
+                       "extrapolation_factor",
+                       "attn_factor",
+                       "beta_fast",
+                       "beta_slow",
+                       "mscale",
+                       "mscale_all_dim",
+                   )
             }
             rotary_emb = DeepseekScalingRotaryEmbedding(
                 head_size,
@@ -1171,6 +1171,33 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+# Copied from transformers
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim=1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+
+    # embedding is performed in float
+    cos = cos.unsqueeze(unsqueeze_dim).float()
+    sin = sin.unsqueeze(unsqueeze_dim).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+
+    return q_embed, k_embed
 
 
 def get_rope_cpu(
@@ -1220,14 +1247,14 @@ def get_rope_cpu(
         k: v
         for k, v in rope_scaling.items()
         if k
-        in (
-            "extrapolation_factor",
-            "attn_factor",
-            "beta_fast",
-            "beta_slow",
-            "mscale",
-            "mscale_all_dim",
-        )
+           in (
+               "extrapolation_factor",
+               "attn_factor",
+               "beta_fast",
+               "beta_slow",
+               "mscale",
+               "mscale_all_dim",
+           )
     }
     extra_kwargs["device"] = device
     rotary_emb = DeepseekScalingRotaryEmbedding(
