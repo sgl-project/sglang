@@ -51,6 +51,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self.multi_model_projector = PaliGemmaMultiModalProjector(config)
 
         self.vision_tower = SiglipVisionModel(self.config.vision_config)
+
+        self.decode = 0
     
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         if not isinstance(image_inputs.im_start_id, list) or not isinstance(
@@ -130,16 +132,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         return new_input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        logger.info(f"1 paligemma::encode_images and pixel_values.shape:{pixel_values.shape}")
-        #save the pixel_values
-        torch.save(pixel_values.cpu(), "sgl_pixel_values.pt")
-        
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature =image_outputs.last_hidden_state # Note: from transformers
-        torch.save(selected_image_feature.cpu(), "sgl_selected_image_feature.pt")
-        logger.info(f"2 paligemma::encode_images and selected_image_feature.shape:{selected_image_feature.shape}")
         image_features = self.multi_model_projector(selected_image_feature)
-        torch.save(image_features.cpu(), "sgl_image_features.pt")
         return image_features
 
     @torch.no_grad()
@@ -150,7 +145,6 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         image_inputs = forward_batch.image_inputs
-        logger.info(f"1 paligemma::forward and inputs_ids.shape:{input_ids.shape} and forward_batch.forward_mode.is_extend():{forward_batch.forward_mode.is_extend()}")
         if forward_batch.forward_mode.is_extend():
             bs = forward_batch.batch_size
 
@@ -164,12 +158,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             # The length of the List should be equal to batch size
 
             pixel_values = [image_inputs[i].pixel_values  for i in range(bs) if image_inputs[i] is not None]
-            logger.info(f"2 paligemma::forward and pixel_values:{len(pixel_values)}")
             pixel_values = torch.tensor(
                     np.array(pixel_values), device=self.vision_tower.device)
-            logger.info(f"3 paligemma::forward and pixel_values.shape:{pixel_values.shape}")
             image_features = self.encode_images(pixel_values)
-            logger.info(f"4 paligemma::forward and image_features.shape:{image_features.shape}")
             # Fill in the placeholder for the image
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
@@ -221,8 +212,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
         elif forward_batch.forward_mode.is_decode():
-            return self.language_model(input_ids, positions, forward_batch)
-
+            return  self.language_model(input_ids, positions, forward_batch)
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # load mm_projector
         projector_weights = {
