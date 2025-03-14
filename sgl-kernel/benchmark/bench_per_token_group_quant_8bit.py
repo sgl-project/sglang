@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
+
 @triton.jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output
@@ -167,7 +168,9 @@ group_size_range = [128]  # For DeepSeek V3/R1
 dst_dtype_range = [torch.int8, torch.float8_e4m3fn]
 
 configs = list(
-    itertools.product(batch_size_range, seq_len_range, group_size_range, dst_dtype_range)
+    itertools.product(
+        batch_size_range, seq_len_range, group_size_range, dst_dtype_range
+    )
 )
 
 
@@ -193,13 +196,9 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "triton":
-        fn = lambda: triton_per_token_group_quant_8bit(
-            x.clone(), group_size, dst_dtype
-        )
+        fn = lambda: triton_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype)
     elif provider == "sglang":
-        fn = lambda: sglang_per_token_group_quant_8bit(
-            x.clone(), group_size, dst_dtype
-        )
+        fn = lambda: sglang_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype)
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
@@ -209,6 +208,8 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
 if __name__ == "__main__":
 
     calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.int8)
-    calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.float8_e4m3fn)
+    calculate_diff(
+        batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.float8_e4m3fn
+    )
 
     benchmark.run(print_data=True)
