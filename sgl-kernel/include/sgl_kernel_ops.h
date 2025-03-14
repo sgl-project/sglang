@@ -133,14 +133,6 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
-void sgl_per_token_group_quant_fp8(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max);
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
