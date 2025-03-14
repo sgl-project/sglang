@@ -1170,27 +1170,29 @@ def v1_chat_generate_response(
         else:
             reasoning_text = None
 
-        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
-            if finish_reason == "stop":
-                finish_reason = "tool_calls"
-            try:
-                parser = FunctionCallParser(tools, tool_call_parser)
-                full_normal_text, call_info_list = parser.parse_non_stream(text)
-                tool_calls = [
-                    ToolCall(
-                        id=str(call_info.tool_index),
-                        function=FunctionResponse(
-                            name=call_info.name, arguments=call_info.parameters
-                        ),
+        if tool_choice != "none" and tools:
+            parser = FunctionCallParser(tools, tool_call_parser)
+            if parser.has_tool_call(text):
+                if finish_reason["type"] == "stop":
+                    finish_reason["type"] = "tool_calls"
+                    finish_reason["matched"] = None
+                try:
+                    full_normal_text, call_info_list = parser.parse_non_stream(text)
+                    tool_calls = [
+                        ToolCall(
+                            id=str(call_info.tool_index),
+                            function=FunctionResponse(
+                                name=call_info.name, arguments=call_info.parameters
+                            ),
+                        )
+                        for call_info in call_info_list
+                    ]
+                except Exception as e:
+                    logger.error(f"Exception: {e}")
+                    return create_error_response(
+                        HTTPStatus.BAD_REQUEST,
+                        "Failed to parse fc related info to json format!",
                     )
-                    for call_info in call_info_list
-                ]
-            except Exception as e:
-                logger.error(f"Exception: {e}")
-                return create_error_response(
-                    HTTPStatus.BAD_REQUEST,
-                    "Failed to parse fc related info to json format!",
-                )
 
         if to_file:
             # to make the choice data json serializable
