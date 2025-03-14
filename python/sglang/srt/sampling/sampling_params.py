@@ -113,7 +113,7 @@ class SamplingParams:
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
-                f"min_new_tokens must be in (0, max_new_tokens], got "
+                f"min_new_tokens must be in [0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
             )
         if self.max_new_tokens is not None:
