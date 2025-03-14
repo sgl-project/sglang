@@ -173,7 +173,7 @@ void moe_align_block_size(
     torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer);
 
-void topk_softmax(torch::Tensor& topk_weights, 
+void topk_softmax(torch::Tensor& topk_weights,
                   torch::Tensor& topk_indices,
                   torch::Tensor& token_expert_indices,
                   torch::Tensor& gating_output);

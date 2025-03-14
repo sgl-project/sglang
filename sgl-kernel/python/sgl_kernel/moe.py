@@ -22,13 +22,13 @@ def moe_align_block_size(
         cumsum_buffer,
     )
 
-def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
-                 token_expert_indices: torch.Tensor,
-                 gating_output: float) -> None:
-    torch.ops.sgl_kernel.topk_softmax(
-        topk_weights, 
-        topk_ids,
-        token_expert_indices, 
-        gating_output
-    )
 
+def topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: float,
+) -> None:
+    torch.ops.sgl_kernel.topk_softmax(
+        topk_weights, topk_ids, token_expert_indices, gating_output
+    )
