@@ -257,7 +257,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             num_experts=self.config.n_routed_experts,
             num_shared_experts=(
                 self.config.n_shared_experts
-                if os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1" and _is_hip
+                if get_bool_env_var("CK_MOE") and _is_hip
                 else 0
             ),
         )
@@ -306,7 +306,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     continue
                 if (
                     _is_hip
-                    and os.getenv("SGLANG_ROCM_AITER_BLOCK_MOE") == "1"
+                    and get_bool_env_var("CK_MOE")
                     and "mlp.shared_experts" in name
                 ):
                     continue
