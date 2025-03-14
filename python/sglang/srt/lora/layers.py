@@ -92,6 +92,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora:
+            print(f"apply lora in column parallel linear")
             output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
@@ -193,6 +194,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        print(f"apply lora")
         backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
         if self.lora_backend.fuse_stacked_lora_b:
             backend_kwargs["output_offset"] = self.output_offset
