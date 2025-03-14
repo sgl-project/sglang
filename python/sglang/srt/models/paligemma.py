@@ -164,108 +164,66 @@ class PaliGemmaForConditionalGeneration(nn.Module):
  
                         # Got List[List[str]] extend it to List[str]
             # The length of the List should be equal to batch size
-            modalities_list = []
-            max_image_offset = []
-            for im in image_inputs:
-                if im and im.modalities is not None:
-                    modalities_list.extend(im.modalities)
-                if im and im.image_offsets:
-                    max_image_offset.append(
-                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
-                    )
-                else:
-                    max_image_offset.append(-1)
 
-            start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
-            need_vision = start_positions <= np.array(max_image_offset)
+            pixel_values = [image_inputs[i].pixel_values  for i in range(bs) if image_inputs[i] is not None]
+            logger.info(f"2 paligemma::forward and pixel_values:{len(pixel_values)}")
+            pixel_values = torch.tensor(
+                    np.array(pixel_values), device=self.vision_tower.device)
+            logger.info(f"3 paligemma::forward and pixel_values.shape:{pixel_values.shape}")
+            image_features = self.encode_images(pixel_values)
+            logger.info(f"4 paligemma::forward and image_features.shape:{image_features.shape}")
+            # Fill in the placeholder for the image
+            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+            extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
+            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            pt = 0
+            for i in range(bs):
+                if image_inputs[i] is None:
+                    continue
+                start_idx = extend_start_loc_cpu[i]
+                seq_len = extend_seq_lens[i]
+                prefix_len = prefix_lens_cpu[i]
 
-            if need_vision.any():
-                bs = forward_batch.batch_size
-                pixel_values = [
-                    image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
-                ]
-                image_sizes = [
-                    image_inputs[i].image_sizes for i in range(bs) if need_vision[i]
-                ]
-
-                ########## Encode Image ########
-
-                if pixel_values[0].ndim == 4:
-                    # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    np.concatenate(pixel_values, axis=0)
-                    # ndim=4
-                    concat_images = torch.tensor(
-                        np.concatenate(pixel_values, axis=0),
-                        device=self.vision_tower.device,
-                    )
-                    image_features = self.encode_images(concat_images)
-                    split_sizes = [image.shape[0] for image in pixel_values]
-                    image_features = torch.split(image_features, split_sizes, dim=0)
-                    # hd image_features: BS, num_patch, 576, 4096
-                else:
-                    # normal pixel: BS, C=3, H=336, W=336
-                    pixel_values = torch.tensor(
-                        np.array(pixel_values), device=self.vision_tower.device
-                    )
-                    image_features = self.encode_images(pixel_values)
-                    # image_features: BS, 576, 4096
-
-
-                # Fill in the placeholder for the image
-                extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-                extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
-                prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-                pt = 0
-                for i in range(bs):
-                    if not need_vision[i]:
-                        continue
-
-                    start_idx = extend_start_loc_cpu[i]
-                    seq_len = extend_seq_lens[i]
-                    prefix_len = prefix_lens_cpu[i]
-
-                    # Multiple images
-                    for image_idx, image_offset in enumerate(
-                        image_inputs[i].image_offsets
+                # Multiple images
+                for image_idx, image_offset in enumerate(
+                    image_inputs[i].image_offsets
+                ):
+                    if (
+                        image_offset + image_inputs[i].image_pad_len[image_idx]
+                        <= prefix_len
                     ):
-                        if (
-                            image_offset + image_inputs[i].image_pad_len[image_idx]
-                            <= prefix_len
-                        ):
-                            continue
-                        if image_offset >= prefix_len + seq_len:
-                            break
+                        continue
+                    if image_offset >= prefix_len + seq_len:
+                        break
 
-                        tmp_image_feature = image_features[pt][image_idx]
-                        pad_len = tmp_image_feature.shape[0]
+                    tmp_image_feature = image_features[pt][image_idx]
+                    pad_len = tmp_image_feature.shape[0]
 
-                        input_offset = image_offset - prefix_len
-                        left_idx = start_idx + input_offset
-                        right_idx = left_idx + pad_len
-                        assert right_idx > start_idx
-                        if input_offset < 0:
-                            left_idx = start_idx
-                            tmp_image_feature = tmp_image_feature[-input_offset:]
-                        if right_idx > start_idx + seq_len:
-                            tmp_image_feature = tmp_image_feature[
-                                : start_idx + seq_len - right_idx
-                            ]
-                            right_idx = start_idx + seq_len
-                        try:
-                            input_embeds[left_idx:right_idx] = tmp_image_feature
-                        except RuntimeError as e:
-                            print(f"RuntimeError in image encoding: {e}")
-                            print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
-                            print(
-                                f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
-                            )
-                    pt += 1
-
+                    input_offset = image_offset - prefix_len
+                    left_idx = start_idx + input_offset
+                    right_idx = left_idx + pad_len
+                    assert right_idx > start_idx
+                    if input_offset < 0:
+                        left_idx = start_idx
+                        tmp_image_feature = tmp_image_feature[-input_offset:]
+                    if right_idx > start_idx + seq_len:
+                        tmp_image_feature = tmp_image_feature[
+                            : start_idx + seq_len - right_idx
+                        ]
+                        right_idx = start_idx + seq_len
+                    try:
+                        input_embeds[left_idx:right_idx] = tmp_image_feature
+                    except RuntimeError as e:
+                        print(f"RuntimeError in image encoding: {e}")
+                        print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
+                        print(
+                            f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
+                        )
+                pt += 1
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
         elif forward_batch.forward_mode.is_decode():
-
             return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
