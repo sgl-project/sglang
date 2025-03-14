@@ -455,7 +455,6 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
         result = global_processor.__call__(
             text=input_text, images=images, return_tensors="pt"
         )
-        print(f"result:{result} and type: {type(result)}")
         return {
             "input_ids": result.input_ids,
             "pixel_values": result.pixel_values,
@@ -522,7 +521,6 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         image_data: Union[str, bytes],
         image_processor=None,
     ):
-        logger.info(f"1 Qwen2VLImageProcessor::_process_single_image_task, image_data:{image_data} and image_processor:{image_processor}")
         image_processor = image_processor or global_processor.image_processor
 
         try:
@@ -574,7 +572,6 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         *args,
         **kwargs,
     ):  
-        logger.info(f"1 Qwen2VLImageProcessor::process_images_async, image_data:{image_data} and input_text:{input_text}")
         if not image_data:
             return None
 
