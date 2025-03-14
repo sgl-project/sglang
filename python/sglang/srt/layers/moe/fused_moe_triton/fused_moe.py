@@ -27,7 +27,7 @@ from sglang.srt.utils import (
     is_hip,
 )
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 _enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
 
