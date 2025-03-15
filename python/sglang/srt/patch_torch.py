@@ -43,15 +43,12 @@ def _reduce_tensor_modified(*args, **kwargs):
     modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_to_uuid(
         modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
     )
-    print(f'hi _reduce_tensor_modified {original_args=} {modified_args=}', flush=True)
     return original_fn, tuple(modified_args)
 
 
 def _rebuild_cuda_tensor_modified(*args):
-    print(f'hi _rebuild_cuda_tensor_modified original {args=}', flush=True)
     args = list(args)
     args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(args[_REDUCE_TENSOR_ARG_DEVICE_INDEX])
-    print(f'hi _rebuild_cuda_tensor_modified modified {args=}', flush=True)
     return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
 
 
