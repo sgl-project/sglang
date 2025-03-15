@@ -11,3 +11,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+import torch
+
+
+def monkey_patch_torch_reductions():
+    """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
+
+    import torch.multiprocessing.reductions
+
+    torch.multiprocessing.reductions._reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
+    torch.multiprocessing.reductions._rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
+
+    torch.multiprocessing.reductions.reduce_tensor = _reduce_tensor_modified
+    torch.multiprocessing.reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+
+
+# The signature has not been changed for years, and we will not need this when the next version is released,
+# so it looks safe to use a constant.
+_REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+
+
+def _reduce_tensor_modified(*args, **kwargs):
+    original_fn, original_args = torch.multiprocessing.reductions._reduce_tensor_original(*args, **kwargs)
+    modified_args = list(original_args)
+    modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_to_uuid(
+        modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
+    )
+    return original_fn, tuple(modified_args)
+
+
+def _rebuild_cuda_tensor_modified(*args):
+    args = list(args)
+    args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(args[_REDUCE_TENSOR_ARG_DEVICE_INDEX])
+    return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
+
+
+def _device_to_uuid(device: int) -> str:
+    return str(torch.cuda.get_device_properties(device).uuid)
+
+
+def _device_from_uuid(device_uuid: str) -> int:
+    for device in range(torch.cuda.device_count()):
+        if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
+            return device
+    raise Exception("Invalid device_uuid=" + device_uuid)
