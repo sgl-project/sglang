@@ -16,11 +16,10 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DeviceMesh, DTensor
-
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.server import Engine
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
+from torch.distributed.tensor import DeviceMesh, DTensor
 
 
 class VerlEngine:
@@ -30,6 +29,7 @@ class VerlEngine:
         nnodes: int = 1,
         **kwargs,
     ):
+        _monkey_patch_torch_reductions()
         self._device_mesh_cpu = device_mesh_cpu
         self._tp_rank = device_mesh_cpu.get_local_rank()
         self._tp_size = device_mesh_cpu.size()
@@ -145,3 +145,20 @@ def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
     if isinstance(tensor, DTensor):
         return tensor.full_tensor()
     return tensor
+
+
+# Put it in this file, because it is not used in other parts of SGLang
+def _monkey_patch_torch_reductions():
+    """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
+
+    import torch.multiprocessing.reductions
+    reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
+    rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
+
+    def reduce_tensor_modified(*args, **kwargs):
+        original_output = reduce_tensor_original(*args, **kwargs)
+        return TODO
+
+    def rebuild_cuda_tensor_modified(*args, **kwargs):
+        original_output = rebuild_cuda_tensor_original(*args, **kwargs)
+        return TODO
