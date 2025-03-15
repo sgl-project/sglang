@@ -275,6 +275,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             f"context_len={self.model_config.context_len}"
         )
 
+        # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
         # Init running status

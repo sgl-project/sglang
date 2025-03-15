@@ -7,7 +7,6 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MHATokenToKVPoolHost,

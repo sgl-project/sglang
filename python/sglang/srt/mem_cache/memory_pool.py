@@ -297,9 +297,6 @@ class MHATokenToKVPool(KVCache):
             self.k_buffer[i][indices] = k_data[i]
             self.v_buffer[i][indices] = v_data[i]
 
-    def register_layer_transfer_counter(self, layer_transfer_counter):
-        self.layer_transfer_counter = layer_transfer_counter
-
     def transfer_per_layer_kernel(
         self, host_pool, host_indices, device_indices, layer_id
     ):
@@ -312,13 +309,6 @@ class MHATokenToKVPool(KVCache):
             device_indices,
             self.head_num * self.head_dim,
         )
-
-    def transfer_per_layer(self, indices, flat_data, layer_id):
-        # transfer prepared data from host to device
-        flat_data = flat_data.to(device=self.device, non_blocking=False)
-        k_data, v_data = flat_data[0], flat_data[1]
-        self.k_buffer[layer_id][indices] = k_data
-        self.v_buffer[layer_id][indices] = v_data
 
     def transfer_per_layer(self, indices, flat_data, layer_id):
         # transfer prepared data from host to device
@@ -677,7 +667,7 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def assign_flat_data(self, indices, flat_data):
-        self.kv_buffer[:, :, indices] = flat_data
+        raise NotImplementedError()
 
     @synchronized
     def clear(self):
@@ -775,8 +765,8 @@ class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 3.0,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        host_to_device_ratio: float = 4.0,
+        pin_memory: bool = True,
         device: str = "cpu",
     ):
         super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
