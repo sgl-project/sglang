@@ -25,6 +25,8 @@ class TestDPAttention(unittest.TestCase):
                 "--tp",
                 "2",
                 "--enable-dp-attention",
+                "--dp",
+                "2",
             ],
         )
 
