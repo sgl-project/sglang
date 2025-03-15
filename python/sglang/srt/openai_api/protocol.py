@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
 
 
@@ -322,6 +322,15 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+
+    @root_validator(pre=True)
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
