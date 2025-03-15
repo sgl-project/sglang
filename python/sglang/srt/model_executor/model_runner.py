@@ -70,7 +70,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
-    cuda_device_count_stateless,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -263,16 +262,7 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
-        # Check available GPUs before setting device
-        if self.device == "cuda":
-            available_gpus = cuda_device_count_stateless()
-            if available_gpus == 0:
-                raise RuntimeError("No CUDA GPUs are available.")
-            if self.gpu_id >= available_gpus or self.gpu_id < 0:
-                raise ValueError(
-                    f"Invalid gpu_id {self.gpu_id}. Available GPU ids: 0 to {available_gpus - 1}"
-                )
-            torch.cuda.set_device(self.gpu_id)
+        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
