@@ -55,6 +55,7 @@ cutlass_default = root / "3rdparty" / "cutlass"
 cutlass = Path(os.environ.get("CUSTOM_CUTLASS_SRC_DIR", default=cutlass_default))
 flashinfer = root / "3rdparty" / "flashinfer"
 deepgemm = root / "3rdparty" / "deepgemm"
+flashmla = root / "3rdparty" / "flashmla"
 include_dirs = [
     root / "include",
     root / "csrc",
@@ -70,6 +71,7 @@ include_dirs = [
 class CustomBuildPy(build_py):
     def run(self):
         self.copy_deepgemm_to_build_lib()
+        self.copy_flashmla_to_build_lib()
         self.make_jit_include_symlinks()
         build_py.run(self)
 
@@ -102,6 +104,23 @@ class CustomBuildPy(build_py):
 
         # Copy deepgemm/deep_gemm to the build directory
         src_dir = os.path.join(str(deepgemm.resolve()), "deep_gemm")
+
+        # Remove existing directory if it exists
+        if os.path.exists(dst_dir):
+            shutil.rmtree(dst_dir)
+
+        # Copy the directory
+        shutil.copytree(src_dir, dst_dir)
+
+    def copy_flashmla_to_build_lib(self):
+        """
+        This function copies FlashMLA to python's site-packages
+        """
+        dst_dir = os.path.join(self.build_lib, "flash_mla")
+        os.makedirs(dst_dir, exist_ok=True)
+
+        # Copy flashmla/flash_mla to the build directory
+        src_dir = os.path.join(str(flashmla.resolve()), "flash_mla")
 
         # Remove existing directory if it exists
         if os.path.exists(dst_dir):
