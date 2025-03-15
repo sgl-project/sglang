@@ -152,26 +152,32 @@ def _monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
     import torch.multiprocessing.reductions
-    reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
-    rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
 
-    # The signature has not been changed for years, and we will not need this when the next version is released,
-    # so it looks safe to use a constant.
-    arg_device_index = 6
+    torch.multiprocessing.reductions._reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
+    torch.multiprocessing.reductions._rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
 
-    def reduce_tensor_modified(*args, **kwargs):
-        original_fn, original_args = reduce_tensor_original(*args, **kwargs)
-        modified_args = list(original_args)
-        modified_args[arg_device_index] = _device_to_uuid(modified_args[arg_device_index])
-        return original_fn, tuple(modified_args)
+    torch.multiprocessing.reductions.reduce_tensor = _reduce_tensor_modified
+    torch.multiprocessing.reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
 
-    def rebuild_cuda_tensor_modified(*args):
-        args = list(args)
-        args[arg_device_index] = _device_from_uuid(args[arg_device_index])
-        return rebuild_cuda_tensor_original(*args)
 
-    torch.multiprocessing.reductions.reduce_tensor = reduce_tensor_modified
-    torch.multiprocessing.reductions.rebuild_cuda_tensor = rebuild_cuda_tensor_modified
+# The signature has not been changed for years, and we will not need this when the next version is released,
+# so it looks safe to use a constant.
+_REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+
+
+def _reduce_tensor_modified(*args, **kwargs):
+    original_fn, original_args = torch.multiprocessing.reductions._reduce_tensor_original(*args, **kwargs)
+    modified_args = list(original_args)
+    modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_to_uuid(
+        modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
+    )
+    return original_fn, tuple(modified_args)
+
+
+def _rebuild_cuda_tensor_modified(*args):
+    args = list(args)
+    args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(args[_REDUCE_TENSOR_ARG_DEVICE_INDEX])
+    return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
 
 
 def _device_to_uuid(device: int) -> str:
