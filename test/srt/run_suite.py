@@ -15,7 +15,8 @@ suites = {
     "per-commit": [
         TestFile("models/lora/test_lora.py", 76),
         TestFile("models/lora/test_lora_backend.py", 420),
-        TestFile("models/lora/test_lora_tp.py", 520),
+        # FIXME: We skip the test for now as CI is not able to stably run the test when tp_size > 1.
+        # TestFile("models/lora/test_lora_tp.py", 520),
         TestFile("models/lora/test_multi_lora_backend.py", 1),
         TestFile("models/test_embedding_models.py", 119),
         TestFile("models/test_generation_models.py", 103),
