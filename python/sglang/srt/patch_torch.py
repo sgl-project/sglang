@@ -20,6 +20,9 @@ def monkey_patch_torch_reductions():
 
     import torch.multiprocessing.reductions
 
+    if hasattr(torch.multiprocessing.reductions, '_reduce_tensor_original'):
+        return
+
     torch.multiprocessing.reductions._reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
     torch.multiprocessing.reductions._rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
 
