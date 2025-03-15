@@ -29,6 +29,8 @@ def monkey_patch_torch_reductions():
     torch.multiprocessing.reductions.reduce_tensor = _reduce_tensor_modified
     torch.multiprocessing.reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
 
+    torch.multiprocessing.reductions.init_reductions()
+
 
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
@@ -41,12 +43,15 @@ def _reduce_tensor_modified(*args, **kwargs):
     modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_to_uuid(
         modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
     )
+    print(f'hi _reduce_tensor_modified {original_args=} {modified_args=}', flush=True)
     return original_fn, tuple(modified_args)
 
 
 def _rebuild_cuda_tensor_modified(*args):
+    print(f'hi _rebuild_cuda_tensor_modified original {args=}', flush=True)
     args = list(args)
     args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(args[_REDUCE_TENSOR_ARG_DEVICE_INDEX])
+    print(f'hi _rebuild_cuda_tensor_modified modified {args=}', flush=True)
     return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
 
 
