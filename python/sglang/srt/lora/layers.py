@@ -1,3 +1,5 @@
+from typing import List, Tuple
+
 import torch
 from torch import nn
 
@@ -38,8 +40,22 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        pass
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        pass
+
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+    """
+    Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
+
+    Note: The current version does not yet implement the LoRA functionality.
+    This class behaves exactly the same as the base VocabParallelEmbedding.
+    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
+    """
+
     def __init__(
         self,
         base_layer: VocabParallelEmbedding,
@@ -101,6 +117,16 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        shard_size = self.base_layer.output_partition_sizes[0]
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        B = B[start_idx:end_idx, :]
+        return B
+
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
@@ -120,6 +146,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_gate_up = A_buffer
         if self.lora_backend.fuse_stacked_lora_b:
+            # TODO: avoid using contiguous() in GPU.
             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
             self.B_buffer_gate_up = torch.cat(
                 (B_buffer[0], B_buffer[1]), dim=-2
@@ -141,6 +168,16 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             if self.lora_backend.fuse_output_scaling_add
             else base_output + lora_output * self.scaling
         )
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        # Since the outputs for both gate and up are identical, we use a random one.
+        shard_size = self.base_layer.output_partition_sizes[0]
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        return B[:, start_idx:end_idx, :]
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -210,6 +247,27 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             else base_output + lora_output * self.scaling
         )
 
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(
+        self, B: List[torch.Tensor], tp_rank: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B_q, B_kv = B
+        base_layer = self.base_layer
+        q_proj_shard_size = base_layer.q_proj_shard_size
+        kv_proj_shard_size = base_layer.kv_proj_shard_size
+        num_kv_head_replicas = base_layer.num_kv_head_replicas
+
+        q_start_idx = q_proj_shard_size * tp_rank
+        q_end_idx = q_start_idx + q_proj_shard_size
+
+        kv_shard_id = tp_rank // num_kv_head_replicas
+        kv_start_idx = kv_proj_shard_size * kv_shard_id
+        kv_end_idx = kv_start_idx + kv_proj_shard_size
+
+        return B_q[q_start_idx:q_end_idx, :], B_kv[:, kv_start_idx:kv_end_idx, :]
+
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
@@ -273,6 +331,16 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             output = output_
             output_bias = self.base_layer.bias
         return output, output_bias
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        shard_size = self.base_layer.input_size_per_partition
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        A = A[:, start_idx:end_idx].contiguous()
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
 
 
 def get_lora_layer(
