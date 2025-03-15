@@ -9,8 +9,8 @@ __global__ void transfer_kv_kernel(
     T* __restrict__ dst_k,
     const T* __restrict__ src_v,
     T* __restrict__ dst_v,
-    const int32_t* __restrict__ src_indices,
-    const int32_t* __restrict__ dst_indices,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
     int64_t num_items,
     int64_t item_size,
     int64_t src_layer_offset,
@@ -30,8 +30,8 @@ __global__ void transfer_kv_kernel(
   }
 
   // Compute the per-item offsets
-  const int32_t src_offset = src_indices[warp_id] * item_size;
-  const int32_t dst_offset = dst_indices[warp_id] * item_size;
+  const int64_t src_offset = src_indices[warp_id] * item_size;
+  const int64_t dst_offset = dst_indices[warp_id] * item_size;
 
   // pad each chunk per thread to be 8 bytes
   const int total_chunks = item_size * sizeof(T) / 8;
@@ -83,8 +83,8 @@ void transfer_kv_launcher_T(
       dst_k.data_ptr<T>(),
       src_v.data_ptr<T>(),
       dst_v.data_ptr<T>(),
-      src_indices.data_ptr<int32_t>(),
-      dst_indices.data_ptr<int32_t>(),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
       num_items,
       item_size,
       src_layer_offset,

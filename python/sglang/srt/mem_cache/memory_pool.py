@@ -63,7 +63,7 @@ class ReqToTokenPool:
         self.device = device
         with memory_saver_adapter.region():
             self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
+                (size, max_context_len), dtype=torch.int64, device=device
             )
         self.free_slots = list(range(size))
 
@@ -674,7 +674,7 @@ class HostKVCache(abc.ABC):
     def clear(self):
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
