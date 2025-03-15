@@ -18,7 +18,7 @@ jobs:
         build_type: ['all', 'srt']
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main

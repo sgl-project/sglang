@@ -25,7 +25,7 @@ jobs:
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup docker
         run: |
@@ -45,6 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
           docker exec ci_sglang pip install -e "python[dev_hip]"
 
@@ -63,7 +64,7 @@ jobs:
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup docker
         run: |
@@ -83,6 +84,7 @@ jobs:
       - name: Install dependencies
         run: |
           docker exec ci_sglang pip install --upgrade pip
+          docker exec ci_sglang pip uninstall sgl-kernel -y || true
           docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
           docker exec ci_sglang pip install -e "python[dev_hip]"
 

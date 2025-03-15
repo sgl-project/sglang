@@ -23,6 +23,7 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.gemm import (
+    awq_dequantize,
     bmm_fp8,
     cublas_grouped_gemm,
     fp8_blockwise_scaled_mm,
@@ -32,7 +33,7 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_fp8,
     sgl_per_token_quant_fp8,
 )
-from sgl_kernel.moe import moe_align_block_size
+from sgl_kernel.moe import moe_align_block_size, topk_softmax
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
