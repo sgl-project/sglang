@@ -80,7 +80,7 @@ def patch_model(
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
             yield torch.compile(
-                torch.no_grad()(model.forward),
+                torch.inference_mode()(model.forward),
                 mode="max-autotune-no-cudagraphs",
                 dynamic=False,
             )

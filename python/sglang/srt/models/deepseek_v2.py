@@ -1069,7 +1069,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,

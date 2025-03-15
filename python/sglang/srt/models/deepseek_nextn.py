@@ -144,7 +144,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             )
             self.logits_processor = LogitsProcessor(config)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,

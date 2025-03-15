@@ -105,7 +105,7 @@ class LlavaVidForCausalLM(nn.Module):
 
         return image_features
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.LongTensor,
