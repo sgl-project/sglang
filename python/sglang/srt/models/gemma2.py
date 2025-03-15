@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, GemmaRMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,

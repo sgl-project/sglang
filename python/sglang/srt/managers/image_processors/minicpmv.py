@@ -50,9 +50,11 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
             return None
         if not isinstance(image_data, list):
             image_data = [image_data]
-
         base_output = self.load_images(
-            input_ids, image_data, self.IMAGE_TOKEN, max_req_input_len
+            input_ids=input_ids,
+            image_data=image_data,
+            image_token=self.IMAGE_TOKEN,
+            max_req_input_len=max_req_input_len,
         )
         if base_output is None:
             return None
