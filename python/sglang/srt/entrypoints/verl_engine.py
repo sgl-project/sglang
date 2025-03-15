@@ -161,3 +161,14 @@ def _monkey_patch_torch_reductions():
 
     def rebuild_cuda_tensor_modified(*args, **kwargs):
         return rebuild_cuda_tensor_original(*args, **kwargs)
+
+
+def _device_to_uuid(device: int) -> str:
+    return str(torch.cuda.get_device_properties(device).uuid)
+
+
+def _device_from_uuid(device_uuid: str) -> int:
+    for device in range(torch.cuda.device_count()):
+        if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
+            return device
+    raise Exception("Invalid device_uuid=" + device_uuid)
