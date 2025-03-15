@@ -639,11 +639,10 @@ class HostKVCache(abc.ABC):
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
-        self.can_use_mem_size = self.size
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self.clear()
 
     @abc.abstractmethod
     def get_size_per_token(self):
