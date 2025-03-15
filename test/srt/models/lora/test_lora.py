@@ -22,9 +22,13 @@ from sglang.test.runners import HFRunner, SRTRunner
 LORA_SETS = [
     # {
     #     "base": "meta-llama/Llama-2-7b-hf",
-    #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRA"],
+    #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+
+    # test multi-rank case
+    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B","RuterNorway/Llama-2-7b-chat-norwegian-LoRa"]},
+    
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
@@ -268,101 +272,9 @@ class TestLoRA(unittest.TestCase):
                 hf_outputs.output_strs[i],
             )
             assert (
-                srt_no_lora_outputs.output_strs[i].strip(" ")
-                == hf_no_lora_outputs.output_strs[i]
+                 srt_no_lora_outputs[i].output_strs.strip(" ")
+                 == hf_no_lora_outputs[i].output_strs
             )
-
-    def different_ranks_lora(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
-        """Test LoRA with different ranks in an end-to-end setting"""
-        print("=================== testing different ranks LoRA =======================")
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-        
-        # Define different ranks for testing
-        # Instead of setting rank directly, we'll simulate by using different LoRA configurations
-        lora_ranks = [8, 16, 32, 64]
-        print(f"Testing with different simulated LoRA ranks: {lora_ranks}")
-        
-        results = {}
-        
-        # Get the original LoRA configuration first
-        with SRTRunner(
-            base_path,
-            tp_size=tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=all_lora_paths,
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-        ) as srt_runner:
-            # Run with the default configuration as baseline
-            print("\n--- Baseline run with default rank ---")
-            import time
-            start_time = time.time()
-            baseline_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=[all_lora_paths[0]] * len(prompts)
-            )
-            end_time = time.time()
-            baseline_time = end_time - start_time
-            baseline_tokens = sum(len(output) for output in baseline_outputs.output_strs)
-            
-            print(f"Baseline completed in {baseline_time:.4f} seconds")
-            print(f"Tokens per second: {baseline_tokens / baseline_time:.2f}")
-            print(f"Sample output: {baseline_outputs.output_strs[0][:100]}...")
-            
-            # Store baseline results
-            results['baseline'] = {
-                "time": baseline_time,
-                "output": baseline_outputs.output_strs,
-                "tokens_per_second": baseline_tokens / baseline_time
-            }
-        
-        # Run with different batch sizes to simulate different ranks
-        # This is not a perfect simulation but gives an indication of performance differences
-        for i, rank in enumerate(lora_ranks):
-            print(f"\n--- Simulating rank {rank} with different batch configuration ---")
-            
-            batch_size = min(len(prompts), max(1, int(8 / (rank/16))))  # Adjust batch size based on rank
-            test_prompts = prompts[:batch_size]
-            
-            with SRTRunner(
-                base_path,
-                tp_size=tp_size,
-                torch_dtype=torch_dtype,
-                model_type="generation",
-                lora_paths=all_lora_paths,
-                max_loras_per_batch=i+1,  # Adjust max_loras_per_batch to simulate different rank load
-                disable_cuda_graph=True,
-                disable_radix_cache=True,
-            ) as srt_runner:
-                # Time the generation
-                import time
-                start_time = time.time()
-                srt_outputs = srt_runner.forward(
-                    test_prompts, max_new_tokens=max_new_tokens, lora_paths=[all_lora_paths[0]] * len(test_prompts)
-                )
-                end_time = time.time()
-                
-                # Calculate per-token metrics for fair comparison
-                total_tokens = sum(len(output) for output in srt_outputs.output_strs)
-                tokens_per_second = total_tokens / (end_time - start_time)
-                
-                # Scale the time to match the baseline number of tokens for fair comparison
-                scaled_time = baseline_tokens / tokens_per_second
-                
-                # Store results
-                results[rank] = {
-                    "time": scaled_time,
-                    "output": srt_outputs.output_strs,
-                    "tokens_per_second": tokens_per_second
-                }
-                
-                print(f"Simulated rank {rank} completed. Raw time: {end_time - start_time:.4f}s")
-                print(f"Scaled time for comparison: {scaled_time:.4f}s")
-                print(f"Tokens per second: {tokens_per_second:.2f}")
-                print(f"Sample output: {srt_outputs.output_strs[0][:100]}...")
-    
-   
 
     def test_all(self):
         for lora_set in LORA_SETS:
@@ -375,10 +287,6 @@ class TestLoRA(unittest.TestCase):
                 # self.base_inference(
                 #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
                 # )
-                # self.different_ranks_lora(
-                #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
-                # )
-
 
 
 if __name__ == "__main__":
