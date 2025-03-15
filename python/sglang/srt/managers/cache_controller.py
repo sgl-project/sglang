@@ -264,12 +264,20 @@ class HiCacheController:
             while not self.stop_event.is_set():
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
-                    self.mem_pool_host.transfer_all_layer_kernel(
-                        self.mem_pool_device,
-                        operation.device_indices.to(self.mem_pool_device.device),
-                        operation.host_indices.to(self.mem_pool_device.device),
-                    )
-                    self.write_stream.synchronize()
+                    if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
+                        self.mem_pool_host.transfer_all_layer_kernel(
+                            self.mem_pool_device,
+                            operation.device_indices,
+                            operation.host_indices.to(self.mem_pool_device.device),
+                        )
+                        self.write_stream.synchronize()
+                    else:
+                        operation.data = self.mem_pool_device.get_flat_data(
+                            operation.device_indices
+                        )
+                        self.mem_pool_host.assign_flat_data(
+                            operation.host_indices, operation.data
+                        )
                     self.mem_pool_host.complete_io(operation.host_indices)
                     for node_id in operation.node_ids:
                         if node_id != 0:

@@ -241,22 +241,26 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size + self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size + self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -808,7 +812,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             dst_indices,
             self.head_num * self.head_dim,
             self.layer_num,
-            self.head_num * self.head_dim * (device_pool.size + 1),
+            self.head_num * self.head_dim * (device_pool.size + device_pool.page_size),
             self.head_num * self.head_dim * self.size,
         )
 
