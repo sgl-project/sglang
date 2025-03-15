@@ -16,13 +16,14 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   return val;
 }
 
-template <typename T, int GROUPS_PER_BLOCK = 16, typename DST_DTYPE>
+template <typename T, typename DST_DTYPE>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
     float* __restrict__ output_s,
     const int group_size,
     const int num_groups,
+    const int groups_per_block,
     const float eps,
     const float min_8bit,
     const float max_8bit) {
@@ -30,7 +31,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int local_group_id = threadIdx.x / threads_per_group;
   const int lane_id = threadIdx.x % threads_per_group;
 
-  const int block_group_id = blockIdx.x * GROUPS_PER_BLOCK;
+  const int block_group_id = blockIdx.x * groups_per_block;
   const int block_group_offset = (block_group_id + local_group_id) * group_size;
 
   float local_absmax = eps;
@@ -110,56 +111,34 @@ void sgl_per_token_group_quant_8bit(
   }
 
   auto dst_type = output_q.scalar_type();
+  const int num_blocks = num_groups / groups_per_block;
+  const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-#define LAUNCH_KERNEL(T, GPB, DST_DTYPE)                                                           \
-  do {                                                                                             \
-    constexpr int GROUPS_PER_BLOCK = GPB;                                                          \
-    dim3 grid((num_groups + GROUPS_PER_BLOCK - 1) / GROUPS_PER_BLOCK);                             \
-    dim3 block(GROUPS_PER_BLOCK* THREADS_PER_GROUP);                                               \
-    per_token_group_quant_8bit_kernel<T, GROUPS_PER_BLOCK, DST_DTYPE><<<grid, block, 0, stream>>>( \
-        static_cast<T*>(input.data_ptr()),                                                         \
-        output_q.data_ptr(),                                                                       \
-        static_cast<float*>(output_s.data_ptr()),                                                  \
-        group_size,                                                                                \
-        num_groups,                                                                                \
-        (float)eps,                                                                                \
-        (float)min_8bit,                                                                           \
-        (float)max_8bit);                                                                          \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                              \
+  do {                                                                           \
+    dim3 grid(num_blocks);                                                       \
+    dim3 block(num_threads);                                                     \
+    per_token_group_quant_8bit_kernel<T, DST_DTYPE><<<grid, block, 0, stream>>>( \
+        static_cast<T*>(input.data_ptr()),                                       \
+        output_q.data_ptr(),                                                     \
+        static_cast<float*>(output_s.data_ptr()),                                \
+        group_size,                                                              \
+        num_groups,                                                              \
+        groups_per_block,                                                        \
+        (float)eps,                                                              \
+        (float)min_8bit,                                                         \
+        (float)max_8bit);                                                        \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {
-      if (groups_per_block == 16) {
-        LAUNCH_KERNEL(scalar_t, 16, int8_t);
-      } else if (groups_per_block == 8) {
-        LAUNCH_KERNEL(scalar_t, 8, int8_t);
-      } else if (groups_per_block == 4) {
-        LAUNCH_KERNEL(scalar_t, 4, int8_t);
-      } else if (groups_per_block == 2) {
-        LAUNCH_KERNEL(scalar_t, 2, int8_t);
-      } else {
-        LAUNCH_KERNEL(scalar_t, 1, int8_t);
-      }
+      LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
     } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
-      if (groups_per_block == 16) {
-        LAUNCH_KERNEL(scalar_t, 16, c10::Float8_e4m3fn);
-      } else if (groups_per_block == 8) {
-        LAUNCH_KERNEL(scalar_t, 8, c10::Float8_e4m3fn);
-      } else if (groups_per_block == 4) {
-        LAUNCH_KERNEL(scalar_t, 4, c10::Float8_e4m3fn);
-      } else if (groups_per_block == 2) {
-        LAUNCH_KERNEL(scalar_t, 2, c10::Float8_e4m3fn);
-      } else {
-        LAUNCH_KERNEL(scalar_t, 1, c10::Float8_e4m3fn);
-      }
+      LAUNCH_KERNEL(scalar_t, c10::Float8_e4m3fn);
       return true;
-    } else {
-      std::ostringstream oss;
-      oss << "Unsupported output_q scalar type: " << dst_type;
-      TORCH_CHECK(false, oss.str());
     }
-    return true;
+    return false;
   });
 
 #undef LAUNCH_KERNEL
