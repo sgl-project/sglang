@@ -489,8 +489,6 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
         image_inputs["input_ids"] = image_inputs["input_ids"].flatten().tolist()
 
         return image_inputs
-    
-
 
 
 class Qwen2VLImageProcessor(BaseImageProcessor):
@@ -559,7 +557,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         request_obj,
         *args,
         **kwargs,
-    ):  
+    ):
         if not image_data:
             return None
 

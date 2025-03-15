@@ -13,16 +13,18 @@
 # ==============================================================================
 """PaliGemma - Google's Cutting-Edge Open Vision Language Model. """
 
+import logging
 import math
 import re
 from typing import Iterable, List, Optional, Tuple
-import logging
 
 import numpy as np
 import torch
 from torch import nn
 from transformers import PaliGemmaConfig, SiglipVisionModel
-from transformers.models.paligemma.modeling_paligemma import PaliGemmaMultiModalProjector
+from transformers.models.paligemma.modeling_paligemma import (
+    PaliGemmaMultiModalProjector,
+)
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import ImageInputs
@@ -32,6 +34,7 @@ from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(
@@ -53,7 +56,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self.vision_tower = SiglipVisionModel(self.config.vision_config)
 
         self.decode = 0
-    
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         if not isinstance(image_inputs.im_start_id, list) or not isinstance(
             image_inputs.im_end_id, list
@@ -133,7 +136,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature =image_outputs.last_hidden_state # Note: from transformers
+        selected_image_feature = (
+            image_outputs.last_hidden_state
+        )  # Note: from transformers
         image_features = self.multi_model_projector(selected_image_feature)
         return image_features
 
@@ -157,11 +162,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             # Got List[List[str]] extend it to List[str]
             # The length of the List should be equal to batch size
 
-            pixel_values = [image_inputs[i].pixel_values  for i in range(bs) if image_inputs[i] is not None]
+            pixel_values = [
+                image_inputs[i].pixel_values
+                for i in range(bs)
+                if image_inputs[i] is not None
+            ]
             pixel_values = torch.tensor(
-                    np.array(pixel_values), device=self.vision_tower.device)
+                np.array(pixel_values), device=self.vision_tower.device
+            )
             image_features = self.encode_images(pixel_values)
-            #TODO(Xiao) 03/13: this has bug
+            # TODO(Xiao) 03/13: this has bug
             # Fill in the placeholder for the image
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
@@ -174,9 +184,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 seq_len = extend_seq_lens[i]
                 prefix_len = prefix_lens_cpu[i]
                 # Multiple images
-                for image_idx, image_offset in enumerate(
-                    image_inputs[i].image_offsets
-                ):
+                for image_idx, image_offset in enumerate(image_inputs[i].image_offsets):
                     if (
                         image_offset + image_inputs[i].image_pad_len[image_idx]
                         <= prefix_len
@@ -213,7 +221,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
         elif forward_batch.forward_mode.is_decode():
-            return  self.language_model(input_ids, positions, forward_batch)
+            return self.language_model(input_ids, positions, forward_batch)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # load mm_projector
         projector_weights = {
@@ -238,6 +247,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
 
 EntryClass = PaliGemmaForConditionalGeneration
 # AutoModel.register(PaliGemmaConfig, PaliGemmaForConditionalGeneration)

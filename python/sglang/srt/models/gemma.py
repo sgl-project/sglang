@@ -16,8 +16,8 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/gemma.py#L1
 """Inference-only Gemma model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
 import logging
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -41,6 +41,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
 
 class GemmaMLP(nn.Module):
     def __init__(
