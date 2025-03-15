@@ -1,5 +1,5 @@
 import itertools
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton

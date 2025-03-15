@@ -1,5 +1,4 @@
 import json
-import multiprocessing as mp
 import os
 import random
 import threading
@@ -8,7 +7,6 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from typing import List, Optional
 
 import numpy as np
 import requests
@@ -18,7 +16,6 @@ import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,

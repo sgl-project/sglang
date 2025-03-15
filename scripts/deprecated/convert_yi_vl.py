@@ -5,8 +5,6 @@ Usage: python3 scripts/convert_yi_vl.py --model-path <path-to-model>
 """
 
 import argparse
-import json
-import os
 
 from transformers import AutoConfig, AutoTokenizer
 

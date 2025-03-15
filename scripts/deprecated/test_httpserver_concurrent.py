@@ -9,11 +9,8 @@ The capital of the United Kindom is London.\nThe capital of the United Kingdom i
 
 import argparse
 import asyncio
-import json
-import time
 
 import aiohttp
-import requests
 
 
 async def send_request(url, data, delay=0):
