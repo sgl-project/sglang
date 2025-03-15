@@ -15,7 +15,10 @@ from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -46,6 +49,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
     def forward_decode(
         self,
@@ -67,7 +71,27 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     k,
                     v,
                 )
+        bs = forward_batch.batch_size
 
+        kv_indices = torch.empty(
+            forward_batch.seq_lens_sum,
+            dtype=torch.int32,
+            device=forward_batch.req_pool_indices.device,
+        )
+
+        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), 64)
+        flashmla_index = torch.full(
+            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=kv_indices.device
+        )
+        create_flashmla_kv_indices_triton[(bs,)](
+            self.indices_updater_decode.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            self.kv_indptr,
+            flashmla_index,
+            max_seqlen_pad,
+            bs,
+        )
         mla_metadata, mla_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
             1 * self.num_q_heads // self.num_kv_heads,
@@ -75,17 +99,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        reshape_q = q.view(
-            forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
-        )
+        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(
                 -1, 64, 1, 576
             ),  # TODO num_blocks x page_block_size x num_heads_k x head_size
-            block_table=forward_batch.out_cache_loc.to(torch.int32).view(
-                forward_batch.batch_size, -1
-            ),
+            block_table=flashmla_index,
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
             head_dim_v=512,  # TODO Retrieve from config.
             tile_scheduler_metadata=mla_metadata,
@@ -99,4 +120,4 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         2. Modifying the indexing of kv cache is also needed, but I haven't done that yet.
         3. The consistency of the output shape hasn't been confirmed yet.
         """
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

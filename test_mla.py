@@ -67,11 +67,9 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     tile_scheduler_metadata, num_splits = get_mla_metadata(
         cache_seqlens, s_q * h_q // h_kv, h_kv
     )
-    print(cache_seqlens)
 
     # print(tile_scheduler_metadata,num_splits.shape)
     def flash_mla():
-        print(q.shape, blocked_k.shape)
         return flash_mla_with_kvcache(
             q,
             blocked_k,
@@ -102,6 +100,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
         return out, lse
 
     out_flash, lse_flash = flash_mla()
+    print("block table:", block_table.shape, block_table)
     out_torch, lse_torch = ref_mla()
     cal_diff(out_flash, out_torch, "out")
     cal_diff(lse_flash, lse_torch, "lse")
@@ -128,8 +127,8 @@ def main(torch_dtype):
     d, dv = 576, 512
     causal = True
 
-    for b in [128]:
-        for s in [4096]:
+    for b in [1]:
+        for s in [10]:
             for h_q in [16]:  # TP = 8, 4, 2, 1
                 for s_q in [1]:  # MTP = 1, 2
                     for varlen in [False]:
@@ -152,4 +151,5 @@ if __name__ == "__main__":
     if args.dtype == "fp16":
         torch_dtype = torch.float16
 
+    main(torch_dtype)
     main(torch_dtype)

@@ -392,6 +392,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        print("qdsad1dsa ", k_buffer.shape)
         reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
         o = decode_wrapper.run(
             reshaped_q[:, :, : layer.v_head_dim],

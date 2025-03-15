@@ -37,3 +37,62 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
+
+
+"""
+[1,2,3,4,64,65,66]#当前所有的kv cache
+req_pool_indices_ptr=[0,1]
+page_kernel_lens_ptr=[4,3] #每个batch的长度
+result_ptr = [bs,max_kvlen]
+[
+    [1]
+    [2]
+]
+"""
+
+
+@triton.jit
+def create_flashmla_kv_indices_triton(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_indptr,
+    result_ptr,
+    max_len,
+    num_batches,
+):
+    BATCH_BLOCK_SIZE: tl.constexpr = 16
+    seq_block_size: tl.constexpr = 512
+
+    batch_id = tl.program_id(axis=0)
+    seq_block_id = tl.program_id(axis=1)
+
+    batch_idx = batch_id * BATCH_BLOCK_SIZE + tl.arange(0, BATCH_BLOCK_SIZE)
+    seq_idx = seq_block_id * seq_block_size + tl.arange(0, seq_block_size)
+    batch_mask = batch_idx < num_batches
+    req_pool_index = tl.load(req_pool_indices_ptr + batch_idx, mask=batch_mask)
+    kv_indices_offset = tl.load(kv_indptr + batch_idx, mask=batch_mask)
+    seq_len = tl.load(page_kernel_lens_ptr + batch_idx, mask=batch_mask)
+
+    for b in range(BATCH_BLOCK_SIZE):
+        # 报错
+        valid_batch = batch_idx[b] < num_batches
+        if not valid_batch:
+            continue
+        pos_mask = seq_idx < seq_len[b]
+        if not tl.sum(pos_mask):
+            continue
+        for s in range(seq_block_size):
+            if not pos_mask[s]:
+                continue
+            i = seq_idx[s]
+            token_idx = tl.load(req_to_token_ptr + req_pool_index[b] + i)
+            page_idx = (token_idx + 1) // 64
+            skip = False
+            if i > 0:
+                prev_token_idx = tl.load(req_to_token_ptr + req_pool_index[b] + (i - 1))
+                prev_page_idx = (prev_token_idx + 1) // 64
+                skip = page_idx == prev_page_idx
+            if not skip:
+                result_offset = batch_idx[b] * max_len + i
+                tl.store(result_ptr + result_offset, page_idx)
