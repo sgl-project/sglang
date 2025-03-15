@@ -453,13 +453,6 @@ class PaliGemmaImageProcessor(BaseImageProcessor):
     @staticmethod
     def _process_images_task(images, input_text):
         return global_processor(images, input_text, return_tensors="pt")
-        # result = global_processor.__call__(
-        #     text=input_text, images=images, return_tensors="pt"
-        # )
-        # return {
-        #     "input_ids": result.input_ids,
-        #     "pixel_values": result.pixel_values,
-        # }
 
     async def _process_images(self, images, input_text) -> dict:
         if self.executor is not None:
