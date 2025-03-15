@@ -156,6 +156,7 @@ sources = [
     "csrc/gemm/per_token_group_quant_fp8.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/gemm/per_tensor_quant_fp8.cu",
+    "csrc/gemm/per_token_quant_int8.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
