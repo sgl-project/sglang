@@ -111,9 +111,14 @@ def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
 
 
+def is_completion_template_defined() -> bool:
+    global completion_template_name
+    return completion_template_name != None
+
+
 def generate_completion_prompt_from_request(request: ChatCompletionRequest) -> str:
     global completion_template_name
-    if (completion_template_name == None) or (request.suffix == ""):
+    if request.suffix == "":
         return request.prompt
 
     return generate_completion_prompt(

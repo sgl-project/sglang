@@ -33,7 +33,10 @@ except ImportError:
     # outlines.integrations.utils
     from outlines.integrations.utils import convert_json_schema_to_str
 
-from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
+from sglang.srt.code_completion_parser import (
+    generate_completion_prompt_from_request,
+    is_completion_template_defined,
+)
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -505,8 +508,11 @@ def v1_generate_request(
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
 
-        prompt = generate_completion_prompt_from_request(request)
-        prompts.append(prompt)
+        if is_completion_template_defined():
+            prompt = generate_completion_prompt_from_request(request)
+            prompts.append(prompt)
+        else:
+            prompts.append(request.prompt)
 
         lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
