@@ -164,6 +164,21 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     NUM_CONFIGS = 1
 
 
+class TestEAGLE3Engine(TestEAGLEEngine):
+    BASE_CONFIG = {
+        "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+        "speculative_draft_model_path": "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+        "speculative_algorithm": "EAGLE3",
+        "speculative_num_steps": 5,
+        "speculative_eagle_topk": 16,
+        "speculative_num_draft_tokens": 64,
+        "mem_fraction_static": 0.7,
+        "cuda_graph_max_bs": 5,
+        "dtype": "float16",
+    }
+    NUM_CONFIGS = 1
+
+
 class TestEAGLEServer(unittest.TestCase):
     PROMPTS = [
         "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nToday is a sunny day and I like[/INST]"
