@@ -160,6 +160,7 @@ sources = [
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
     "csrc/speculative/speculative_sampling.cu",
+    "csrc/speculative/packbit.cu",
     "csrc/torch_extension.cc",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",

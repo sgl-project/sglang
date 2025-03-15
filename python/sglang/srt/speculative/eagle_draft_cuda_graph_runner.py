@@ -22,6 +22,10 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):

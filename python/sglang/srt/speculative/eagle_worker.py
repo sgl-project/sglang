@@ -1,10 +1,12 @@
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
+from sgl_kernel import segment_packbits
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
@@ -275,9 +277,7 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.server_args.speculative_num_draft_tokens,
-            batch.sampling_info.is_all_greedy,
         )
-
         return ret, out_cache_loc
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -307,7 +307,7 @@ class EAGLEWorker(TpModelWorker):
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
-            # we don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
                 break
 
@@ -322,7 +322,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.model_runner.model.forward(
+            logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
             self._detect_nan_if_needed(logits_output)
@@ -351,11 +351,10 @@ class EAGLEWorker(TpModelWorker):
         # Post process based on verified outputs.
         # Pick indices that we care (accepeted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepeted_indices_cpu
+            res.accepeted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[
-            res.accepeted_indices_cpu
-        ]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
+
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = ForwardMode.DECODE
         batch.spec_info = res.draft_input
@@ -407,7 +406,7 @@ class EAGLEWorker(TpModelWorker):
             batch_next_token_ids,
         ]
 
-        # Add output logprobs to the request.
+        # Add output logprobs to the request
         pt = 0
         next_token_logprobs = logits_output.next_token_logprobs.tolist()
         verified_ids = batch_next_token_ids.tolist()
@@ -489,7 +488,7 @@ class EAGLEWorker(TpModelWorker):
         if self.enable_nan_detection:
             logits = logits_output.next_token_logits
             if torch.any(torch.isnan(logits)):
-                logger.warning("Detected errors during sampling! NaN in the logits.")
+                logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
