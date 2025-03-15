@@ -268,7 +268,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             # note: replace with config.qkv_bias once available
-            qkv_bias=config.num_hidden_layers > 80, 
+            qkv_bias=config.num_hidden_layers < 80, 
             prefix=add_prefix("self_attn", prefix),
         )
 
