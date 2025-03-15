@@ -255,6 +255,7 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        kv_cache_length: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -271,6 +272,7 @@ class Req:
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
+        self.kv_cache_length = kv_cache_length
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):

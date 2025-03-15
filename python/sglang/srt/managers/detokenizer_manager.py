@@ -44,6 +44,8 @@ from sglang.utils import (
     get_exception_traceback,
 )
 
+from sglang.srt.managers.pd_disaggregation_controller import PD_DISAGGREGATION_PORT
+
 logger = logging.getLogger(__name__)
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
@@ -76,9 +78,14 @@ class DetokenizerManager:
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
+        if server_args.kv_transfer_config is not None and server_args.kv_transfer_config.role == "decode":
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PULL, f"tcp://{server_args.kv_transfer_config.prefill_dist_init_host}:{PD_DISAGGREGATION_PORT}", False
+            )
+        else:
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None

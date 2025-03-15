@@ -668,12 +668,14 @@ class PrefilledReqInput(TokenizedGenerateReqInput):
 @dataclass
 class KVTransferReqInput:
     rid: str
-    kv_transfer_agent_addr: str
+    src_addr: str
+    dst_addr: str
     dst_ptr: int
 
 
 @dataclass
 class KVTransferReqOutput:
+    dst_addr: str
     code: int # 0: success, 1: failed
 
 

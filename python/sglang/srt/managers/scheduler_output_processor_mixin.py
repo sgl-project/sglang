@@ -69,7 +69,7 @@ class SchedulerOutputProcessorMixin:
 
                 if req.pd_step == PDStep.PREFILL:
                     req.pd_step = PDStep.DISPATCHING
-                    self.kv_transfer_agent.set_kv_buffer(req)
+                    req.kv_cache_length = self.kv_transfer_agent.set_kv_buffer(req)
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
@@ -491,7 +491,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.pd_step == PDStep.DISPATCHING:
-                self.send_to_decode.send_pyobj(PrefilledReqInput(req.rid, self.kv_transfer_agent.addr, req.kv_cache_length))
+                self.kv_transfer_agent.dispatch_prefilled_req(req)
                 continue
 
             if (

@@ -49,15 +49,23 @@ class KVTransferAgent:
         self.kv_buffer[req.rid] = kv_cache
         return len(kv_cache)
 
-    async def get_kv_buffer(self, req: PrefilledReqInput) -> torch.Tensor:
+    async def get_kv_buffer(self, req: Req) -> torch.Tensor:
         dst_ptr = self._allocate_transfer_kv_buffer(req.rid)
-        self.send_to_pd_disagg_controller.send_pyobj(KVTransferReqInput(req.rid, req.kv_agent_addr, dst_ptr))
+        self.send_to_pd_disagg_controller.send_pyobj(KVTransferReqInput(
+            rid=req.rid,
+            src_addr=req.kv_transfer_agent_addr,
+            dst_addr=self.addr,
+            dst_ptr=dst_ptr
+        ))
         kv_cache = self._read_bytes_from_buffer(dst_ptr, req.kv_cache_length)
         await self._wait_for_transfer_done(req.rid)
         self._free_transfer_kv_buffer(dst_ptr, req.kv_cache_length)
         del self.kv_buffer[req.rid]
         loaded_tensor = safetensors_load(kv_cache)["tensor"].to(self.device)
         return loaded_tensor
+    
+    def dispatch_prefilled_req(self, req: Req):
+        self.send_to_pd_disagg_controller.send_pyobj(PrefilledReqInput(req.rid, self.addr, req.kv_cache_length))
 
     async def _wait_for_transfer_done(self, rid: str):
         if rid not in self.ack_events:
@@ -70,7 +78,10 @@ class KVTransferAgent:
         kv_cache_length = len(kv_cache)
         src_ptr = self._allocate_transfer_kv_buffer(kv_cache_length)
         # TODO: send data to remote_addr
-        self.send_to_pd_disagg_controller.send_pyobj(KVTransferReqOutput(0))
+        self.send_to_pd_disagg_controller.send_pyobj(KVTransferReqOutput(
+            dst_addr=req.dst_addr,
+            code=0
+        ))
         self._free_transfer_kv_buffer(src_ptr, kv_cache_length)
 
     def _handle_kv_transfer_resp(self, req_id: str):

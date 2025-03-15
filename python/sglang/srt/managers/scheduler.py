@@ -76,6 +76,7 @@ from sglang.srt.managers.schedule_batch import (
     ImageInputs,
     Req,
     ScheduleBatch,
+    PDStep,
     global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -112,7 +113,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -345,14 +345,14 @@ class Scheduler(SchedulerOutputProcessorMixin):
             # Init kv transfer agent
             self.kv_transfer_agent = KVTransferAgent(
                 server_args.kv_transfer_config,
-                self.device,
-                self.tp_rank
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.model_config.num_layers,
+                self.tp_rank,
+                self.device
             )
             t = threading.Thread(target=self.kv_transfer_agent.event_loop, daemon=True)
             t.start()
-
-            if server_args.kv_transfer_config.role == "prefill":
-                self.send_to_decode = get_zmq_socket(context, zmq.PUSH, f"tcp://{server_args.kv_transfer_config.decode_dist_init_host}:{PD_DISAGGREGATION_PORT}", False)
 
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -373,7 +373,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (PrefilledReqInput, self.handle_prefilled_request),
+                (PrefilledReqInput, self.handle_generate_request),
                 (FlushCacheReq, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -616,7 +616,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
     def handle_generate_request(
         self,
-        recv_req: TokenizedGenerateReqInput,
+        recv_req: Union[TokenizedGenerateReqInput, PrefilledReqInput],
     ):
         # Create a new request
         if (
@@ -659,6 +659,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
+
+            if isinstance(recv_req, PrefilledReqInput):
+                req.kv_transfer_agent_addr = recv_req.kv_transfer_agent_addr
+                req.kv_cache_length = recv_req.kv_cache_length
+                req.pd_step = PDStep.DECODE
 
             if (
                 recv_req.session_params is not None
@@ -766,10 +771,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
-    
-    def handle_prefilled_request(self, req: PrefilledReqInput):
-        # TODO: convert to Req
-        self.waiting_queue.append(req)
 
     def _add_request_to_queue(self, req: Req):
         self.waiting_queue.append(req)
