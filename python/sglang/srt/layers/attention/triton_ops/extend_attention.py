@@ -310,7 +310,7 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-        
+
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -331,8 +331,9 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if _is_hip and kv_indices.shape[0]==0 and get_bool_env_var("CK_MOE"):
+    if _is_hip and kv_indices.shape[0] == 0 and get_bool_env_var("CK_MOE"):
         import aiter
+
         aiter.flash_attn_varlen_func(
             q_extend,
             k_extend,
@@ -344,7 +345,7 @@ def extend_attention_fwd(
             softmax_scale=sm_scale,
         )
         return
-    
+
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
