@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 class KVTransferConfig(BaseModel):
     role: str = "prefill" # "prefill" or "decode"
     
+    
+    transfor_engine_local_host: str = None
+    transfor_engine_metadata_server: str = None
     decode_dist_init_host: str = None
     prefill_dist_init_host: str = None
 

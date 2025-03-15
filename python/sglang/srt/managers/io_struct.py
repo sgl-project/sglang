@@ -661,12 +661,12 @@ class ProfileReqOutput:
 
 @dataclass
 class PrefilledReqInput(TokenizedGenerateReqInput):
-    kv_transfer_agent_addr: str
+    kv_transfer_src: str
     kv_cache_length: int
 
 
 @dataclass
-class KVTransferReqInput:
+class KVTransferFetch:
     rid: str
     src_addr: str
     dst_addr: str
@@ -674,8 +674,9 @@ class KVTransferReqInput:
 
 
 @dataclass
-class KVTransferReqOutput:
+class KVTransferAck:
     dst_addr: str
+    rid: str
     code: int # 0: success, 1: failed
 
 

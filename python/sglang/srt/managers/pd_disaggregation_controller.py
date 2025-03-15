@@ -3,12 +3,12 @@ from typing import Union
 
 from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import get_zmq_socket
-from sglang.srt.managers.io_struct import KVTransferReqInput, KVTransferReqOutput, PrefilledReqInput
 from sglang.utils import TypeBasedDispatcher
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
 )
+from sglang.srt.managers.io_struct import KVTransferFetch, KVTransferAck, PrefilledReqInput
 
 PD_DISAGGREGATION_PORT = 16000
 
@@ -36,8 +36,8 @@ class PDAggregationController:
                 (BatchEmbeddingOut, self.handle_batch_out),
                 (BatchStrOut, self.handle_batch_out),
                 (PrefilledReqInput, self.handle_prefilled_req),
-                (KVTransferReqInput, self.handle_kv_transfer_req),
-                (KVTransferReqOutput, self.handle_kv_transfer_resp),
+                (KVTransferFetch, self.handle_kv_transfer_req),
+                (KVTransferAck, self.handle_kv_transfer_resp),
             ]
         )
 
@@ -46,10 +46,10 @@ class PDAggregationController:
             recv_obj = self.recv_from_transfer_agent.recv_pyobj()
             self._request_dispatcher(recv_obj)
 
-    def _handle_kv_transfer_req(self, req: KVTransferReqInput):
+    def _handle_kv_transfer_req(self, req: KVTransferFetch):
         self.send_to_transfer_agent[req.src_addr].send_pyobj(req)
 
-    def _handle_kv_transfer_resp(self, req: KVTransferReqOutput):
+    def _handle_kv_transfer_resp(self, req: KVTransferAck):
         self.send_to_transfer_agent[req.dst_addr].send_pyobj(req)
 
     def _handle_prefilled_req(self, req: PrefilledReqInput):
