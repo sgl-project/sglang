@@ -141,7 +141,7 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 Add arguments `--speculative-algorithm`, `--speculative-draft-model-path`,
 `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 ```
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote --tp 8
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
 ```
 - The draft model are available at huggingface: [lmsys/DeepSeek-V3-NextN](https://huggingface.co/lmsys/DeepSeek-V3-NextN), [lmsys/DeepSeek-R1-NextN](https://huggingface.co/lmsys/DeepSeek-R1-NextN). It can also be exported from original DeepSeek-V3/R1 model with [export_deepseek_nextn.py](https://github.com/sgl-project/sglang/blob/main/scripts/export_deepseek_nextn.py) script.
 - The best configuratin for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
