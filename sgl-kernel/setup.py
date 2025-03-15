@@ -100,25 +100,12 @@ class CustomBuildPy(build_py):
         flash_mla_include_dir = os.path.join(self.build_lib, "flash_mla/include")
         os.makedirs(flash_mla_include_dir, exist_ok=True)
 
-        # Use FlashMLA's own CUTLASS
-        flashmla_cutlass_dir = flashmla.resolve() / "csrc" / "cutlass"
-        flashmla_third_party_dirs = [
-            flashmla_cutlass_dir / "include" / "cute",
-            flashmla_cutlass_dir / "include" / "cutlass",
-        ]
-
-        # Create symlinks for FlashMLA
-        for d in flashmla_third_party_dirs:
-            dirname = str(d).split("/")[-1]
-            src_dir = d
+        # Create empty directories for FlashMLA's include paths
+        # This is safer than creating symlinks as the targets might not exist in CI
+        for dirname in ["cute", "cutlass"]:
             dst_dir = f"{flash_mla_include_dir}/{dirname}"
-
-            if os.path.exists(dst_dir):
-                if os.path.islink(dst_dir):
-                    os.unlink(dst_dir)
-                else:
-                    shutil.rmtree(dst_dir)
-            os.symlink(src_dir, dst_dir, target_is_directory=True)
+            if not os.path.exists(dst_dir):
+                os.makedirs(dst_dir, exist_ok=True)
 
     def copy_deepgemm_to_build_lib(self):
         """
