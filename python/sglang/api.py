@@ -175,7 +175,7 @@ def gen_int(
 
 def gen_string(
     name: Optional[str] = None,
-    max_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -192,7 +192,7 @@ def gen_string(
 ):
     return SglGen(
         name,
-        max_tokens,
+        max_completion_tokens,
         None,
         stop,
         stop_token_ids,
