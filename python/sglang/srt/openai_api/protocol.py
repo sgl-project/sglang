@@ -187,7 +187,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Literal["stop", "length", "content_filter"]
     matched_stop: Union[None, int, str] = None
 
 
@@ -204,7 +204,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -366,7 +366,9 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: str
+    finish_reason: Literal[
+        "stop", "length", "tool_calls", "content_filter", "function_call"
+    ]
     matched_stop: Union[None, int, str] = None
 
 
@@ -390,7 +392,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+    ] = None
     matched_stop: Union[None, int, str] = None
 
 
