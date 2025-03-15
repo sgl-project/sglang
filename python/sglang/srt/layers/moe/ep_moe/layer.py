@@ -188,7 +188,7 @@ class EPMoE(torch.nn.Module):
 
         if _is_hip and get_bool_env_var("CK_MOE"):
             self.routed_scaling_factor = routed_scaling_factor
-            self.expert_mask = torch.empty(
+            self.expert_mask = torch.zeros(
                 (self.num_experts + self.num_shared_experts + 1),
                 device="cuda",
                 dtype=torch.int,
