@@ -171,11 +171,11 @@ def lightning_attn_func(q, k, v, s):
 
     if d > 128:
         # split over head
-        if 64 % d:
+        if d % 64 == 0:
             m = 64
-        elif 32 % d:
+        elif d % 32 == 0:
             m = 32
-        elif 16 % d:
+        elif d % 16 == 0:
             m = 16
         arr = [m * i for i in range(d // m + 1)]
         if arr[-1] != d:
