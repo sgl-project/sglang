@@ -3,7 +3,7 @@ import builtins
 import inspect
 import re
 from copy import deepcopy
-from typing import Callable, Dict, Optional, Type, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Type, Union
 
 import torch
 from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
@@ -61,6 +61,42 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
     return QUANTIZATION_METHODS[quantization]
+
+
+def may_auto_override_quant_config(
+    hf_quant_config: Optional[Dict[str, Any]],
+    quantization: str,
+) -> Tuple[Type[QuantizationConfig], str]:
+    """Automatically detect and potentially override quantization config.
+
+    This function iterates through all registered quantization methods.
+    It checks if any method should override the current quantization
+    settings. This is mainly used when users haven't explicitly specified
+    a quantization method through function parameters or CLI arguments.
+    It allows the system to automatically select the best method based
+    on model configuration, regardless of what's in the HF config.
+    For example, it can automatically switch from AWQ to AWQ Marlin to
+    support MOE fused layers.
+
+    This implementation aligns with VLLM's approach:
+    https://github.com/vllm-project/vllm/blob/c77620d22d43daa7e0440e6267cbdd83f849ac64/vllm/config.py#L633
+
+    Args:
+        hf_quant_config: Quantization configuration dictionary from
+            Hugging Face model config, can be None.
+        quantization: Current specified quantization method name.
+
+    Returns:
+        A tuple containing:
+        - Quantization config class: Either the original or overridden
+          quantization config class.
+        - Quantization method name: Either the original or updated
+          quantization method name.
+    """
+    for name, cls in QUANTIZATION_METHODS.items():
+        if cls.override_quantization_method(hf_quant_config, quantization):
+            return cls, name
+    return QUANTIZATION_METHODS[quantization], quantization
 
 
 # Match dynamic rules with module name (prefix) and override quantize
