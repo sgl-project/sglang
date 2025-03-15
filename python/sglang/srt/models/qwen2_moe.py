@@ -170,6 +170,7 @@ class Qwen2MoeAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
+        qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -201,7 +202,7 @@ class Qwen2MoeAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=qkv_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -266,6 +267,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            # note: replace with config.qkv_bias once available
+            qkv_bias=config.num_hidden_layers > 80, 
             prefix=add_prefix("self_attn", prefix),
         )
 
