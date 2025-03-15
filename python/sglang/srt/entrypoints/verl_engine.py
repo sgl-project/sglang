@@ -160,5 +160,4 @@ def _monkey_patch_torch_reductions():
         return TODO
 
     def rebuild_cuda_tensor_modified(*args, **kwargs):
-        original_output = rebuild_cuda_tensor_original(*args, **kwargs)
-        return TODO
+        return rebuild_cuda_tensor_original(*args, **kwargs)
