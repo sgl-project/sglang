@@ -508,11 +508,10 @@ def v1_generate_request(
                 "To compute logprobs of input prompt, please use the native /generate API."
             )
 
+        prompt = request.prompt
         if is_completion_template_defined():
             prompt = generate_completion_prompt_from_request(request)
-            prompts.append(prompt)
-        else:
-            prompts.append(request.prompt)
+        prompts.append(prompt)
 
         lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
