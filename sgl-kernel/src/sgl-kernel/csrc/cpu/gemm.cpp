@@ -7,10 +7,10 @@ namespace {
 // convert to vnni format
 // from [N, K] to [K/2, N, 2] for bfloat16 and float16
 template <typename scalar_t>
-inline void pack_vnni(scalar_t* __restrict__ packed, const scalar_t* __restrict__ weight, int N, int K) {
-  for (int n = 0; n < N; ++n) {
-    for (int k = 0; k < K / VNNI_BLK; ++k) {
-      for (int d = 0; d < VNNI_BLK; ++d) {
+inline void pack_vnni(scalar_t* __restrict__ packed, const scalar_t* __restrict__ weight, int64_t N, int64_t K) {
+  for (int64_t n = 0; n < N; ++n) {
+    for (int64_t k = 0; k < K / VNNI_BLK; ++k) {
+      for (int64_t d = 0; d < VNNI_BLK; ++d) {
         packed[k * N * VNNI_BLK + n * VNNI_BLK + d] = weight[n * K + k * VNNI_BLK + d];
       }
     }
@@ -18,12 +18,12 @@ inline void pack_vnni(scalar_t* __restrict__ packed, const scalar_t* __restrict_
 }
 
 template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int size) {
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
-  int d;
+  int64_t d;
   #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d);
@@ -37,12 +37,12 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int size) {
+inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
-  int d;
+  int64_t d;
   #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
@@ -59,7 +59,7 @@ template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
       const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
-      const float* __restrict__ bias, int K, int lda, int ldb, int ldc) {
+      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
@@ -69,7 +69,7 @@ template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B, at::BFloat16* __restrict__ C,
-      const float* __restrict__ bias, int K, int lda, int ldb, int ldc) {
+      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
 
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
@@ -91,13 +91,13 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
     };
     Unroll<ROWS * COLS>{}(loadc);
 
-    const int K2 = K >> 1;
-    const int lda2 = lda >> 1;
-    const int ldb2 = ldb; // ldb * 2 >> 1;
+    const int64_t K2 = K >> 1;
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb; // ldb * 2 >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const float* b_ptr = reinterpret_cast<const float*>(B);
 
-    auto compute = [&](auto i, int k) {
+    auto compute = [&](auto i, int64_t k) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
 
@@ -112,7 +112,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
-    for (int k = 0; k < K2; ++k) {
+    for (int64_t k = 0; k < K2; ++k) {
       Unroll<ROWS * COLS>{}(compute, k);
     }
 
@@ -148,7 +148,7 @@ struct brgemm {
   static inline void apply(
       const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
       float* __restrict__ Ctmp, const float* __restrict__ bias,
-      int M, int N, int K, int lda, int ldb, int ldc) {
+      int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
 
     constexpr int BLOCK_N = block_size_n();
     at::native::cpublas::brgemm(
@@ -156,7 +156,7 @@ struct brgemm {
         A, B, Ctmp);
 
     // copy from Ctmp to C
-    for (int m = 0; m < M; ++m) {
+    for (int64_t m = 0; m < M; ++m) {
       if constexpr (has_bias) {
         copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N);
       } else {
@@ -173,12 +173,12 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     float* __restrict__ Ctmp,
     const float* __restrict__ bias,
-    int M,
-    int N,
-    int K,
-    int lda,
-    int ldb,
-    int ldc,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
     bool brg) {
 
   if (brg) {
@@ -189,16 +189,16 @@ void tinygemm_kernel(
   }
 
   // pattern: 1-4-16
-  constexpr int BLOCK_M = 4;
-  constexpr int BLOCK_N = 64;
-  const int MB = div_up(M, BLOCK_M);
-  const int NB = div_up(N, BLOCK_N);
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 64;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
   for (int mb = 0; mb < MB; ++mb) {
-    int mb_start = mb * BLOCK_M;
-    int mb_size = std::min(BLOCK_M, M - mb_start);
-    for (int nb = 0; nb < NB; ++nb) {
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(BLOCK_N, N - nb_start);
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
       switch(mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
@@ -225,35 +225,35 @@ void weight_packed_linear_kernel_impl(
     const scalar_t* __restrict__ mat1,
     const scalar_t* __restrict__ mat2,
     const float* __restrict__ bias,
-    int M,
-    int N,
-    int K,
-    int mat1_strideM,
-    int out_strideM) {
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
 
-  constexpr int BLOCK_M = block_size_m();
-  constexpr int BLOCK_N = block_size_n();
-  const int MB = div_up(M, BLOCK_M);
-  const int NB = div_up(N, BLOCK_N);
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
 
   // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
   const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>);
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, MB * NB, 0, [&](int begin, int end) {
-      int mb{0}, nb{0};
+    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+      int64_t mb{0}, nb{0};
       data_index_init(begin, mb, MB, nb, NB);
 
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
-      for (int i = begin; i < end; ++i) {
+      for (int64_t i = begin; i < end; ++i) {
         UNUSED(i);
-        int mb_start = mb * BLOCK_M;
-        int mb_size = std::min(M - mb_start, BLOCK_M);
-        int nb_start = nb * BLOCK_N;
-        int nb_size = std::min(N - nb_start, BLOCK_N);
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
 
         tinygemm_kernel<scalar_t, has_bias>(
             /*   A */ mat1 + mb_start * mat1_strideM,
@@ -289,23 +289,23 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   //     w2 : [E,  K,  N]
   CHECK_INPUT(weight);
 
-  const int ndim = weight.ndimension();
+  const int64_t ndim = weight.ndimension();
   TORCH_CHECK(ndim == 2 || ndim == 3, "expect weight to be 2d or 3d, got ", ndim, "d tensor.");
   const auto st = weight.scalar_type();
-  const int E = ndim == 3 ? weight.size(0) : 1;
-  const int OC = ndim == 3 ? weight.size(1) : weight.size(0);
-  const int IC = ndim == 3 ? weight.size(2) : weight.size(1);
+  const int64_t E = ndim == 3 ? weight.size(0) : 1;
+  const int64_t OC = ndim == 3 ? weight.size(1) : weight.size(0);
+  const int64_t IC = ndim == 3 ? weight.size(2) : weight.size(1);
 
   // we handle 2 TILE_N at a time.
   TORCH_CHECK(OC % TILE_N == 0, "invalid weight out features ", OC);
   TORCH_CHECK(IC % TILE_K == 0, "invalid weight input features ", IC);
 
-  constexpr int BLOCK_N = block_size_n();
-  const int NB = div_up(OC, BLOCK_N);
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t NB = div_up(OC, BLOCK_N);
 
   // use phony sizes here [E, OC, IC], for each [E], [OC, IC] -> [IC / 2, OC, 2]
   auto packed_weight = at::empty_like(weight);
-  const int stride = OC * IC;
+  const int64_t stride = OC * IC;
 
   TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
       "expect weight to be bfloat16, float16.");
@@ -315,15 +315,15 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
     scalar_t* packed_data = packed_weight.data_ptr<scalar_t>();
 
     // parallel on {E, NB}
-    at::parallel_for(0, E * NB, 0, [&](int begin, int end) {
-      int e{0}, nb{0};
+    at::parallel_for(0, E * NB, 0, [&](int64_t begin, int64_t end) {
+      int64_t e{0}, nb{0};
       data_index_init(begin, e, E, nb, NB);
 
-      for (int i = begin; i < end; ++i) {
+      for (int64_t i = begin; i < end; ++i) {
         UNUSED(i);
 
-        int n = nb * BLOCK_N;
-        int n_size = std::min(BLOCK_N, OC - n);
+        int64_t n = nb * BLOCK_N;
+        int64_t n_size = std::min(BLOCK_N, OC - n);
         pack_vnni<scalar_t>(
             packed_data + e * stride + n * IC,
             w_data + e * stride + n * IC,
@@ -351,9 +351,9 @@ at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
 
-  int M = mat1.size(0);
-  int N = mat2.size(0);
-  int K = mat2.size(1);
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat2.size(1);
   CHECK_EQ(mat1.size(1), K);
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
@@ -361,8 +361,8 @@ at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
   auto out = at::empty({M, N}, mat1.options());
 
   // strides
-  int mat1_strideM = mat1.stride(0);
-  int out_strideM = out.stride(0);
+  int64_t mat1_strideM = mat1.stride(0);
+  int64_t out_strideM = out.stride(0);
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
