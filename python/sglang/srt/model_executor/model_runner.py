@@ -1037,8 +1037,8 @@ def _unwrap_tensor(tensor, tp_rank):
         from sglang.srt.patch_torch import monkey_patch_torch_reductions
 
         monkey_patch_torch_reductions()
-        return tensor.get(tp_rank)
-    return tensor
+        tensor = tensor.get(tp_rank)
+    return tensor.to(torch.cuda.current_device())
 
 
 @dataclass
