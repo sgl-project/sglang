@@ -20,11 +20,15 @@ def monkey_patch_torch_reductions():
 
     import torch.multiprocessing.reductions
 
-    if hasattr(torch.multiprocessing.reductions, '_reduce_tensor_original'):
+    if hasattr(torch.multiprocessing.reductions, "_reduce_tensor_original"):
         return
 
-    torch.multiprocessing.reductions._reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
-    torch.multiprocessing.reductions._rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
+    torch.multiprocessing.reductions._reduce_tensor_original = (
+        torch.multiprocessing.reductions.reduce_tensor
+    )
+    torch.multiprocessing.reductions._rebuild_cuda_tensor_original = (
+        torch.multiprocessing.reductions.rebuild_cuda_tensor
+    )
 
     torch.multiprocessing.reductions.reduce_tensor = _reduce_tensor_modified
     torch.multiprocessing.reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
@@ -38,7 +42,9 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
 def _reduce_tensor_modified(*args, **kwargs):
-    original_fn, original_args = torch.multiprocessing.reductions._reduce_tensor_original(*args, **kwargs)
+    original_fn, original_args = (
+        torch.multiprocessing.reductions._reduce_tensor_original(*args, **kwargs)
+    )
     modified_args = list(original_args)
     modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_to_uuid(
         modified_args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
@@ -48,7 +54,9 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 def _rebuild_cuda_tensor_modified(*args):
     args = list(args)
-    args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(args[_REDUCE_TENSOR_ARG_DEVICE_INDEX])
+    args[_REDUCE_TENSOR_ARG_DEVICE_INDEX] = _device_from_uuid(
+        args[_REDUCE_TENSOR_ARG_DEVICE_INDEX]
+    )
     return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
 
 
@@ -57,7 +65,9 @@ def _device_to_uuid(device: int) -> str:
 
 
 def _device_from_uuid(device_uuid: str) -> int:
-    assert isinstance(device_uuid, str), 'The reduction function is probably not patched'
+    assert isinstance(
+        device_uuid, str
+    ), "The reduction function is probably not patched"
     for device in range(torch.cuda.device_count()):
         if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
             return device
