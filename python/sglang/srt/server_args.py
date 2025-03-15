@@ -439,7 +439,7 @@ class ServerArgs:
         parser.add_argument(
             "--device",
             type=str,
-            default=None,
+            default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
