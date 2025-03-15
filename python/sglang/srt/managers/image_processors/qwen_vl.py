@@ -25,7 +25,6 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
 
     @staticmethod

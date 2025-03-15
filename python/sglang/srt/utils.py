@@ -42,6 +42,7 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
 
 import numpy as np
@@ -526,6 +527,9 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
+        if parent_pid == os.getpid():
+            sys.exit(0)
+
         try:
             itself.kill()
 
@@ -774,12 +778,22 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
-    if socket_type == zmq.PUSH:
+
+    def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-    elif socket_type == zmq.PULL:
+
+    def set_recv_opt():
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
@@ -1572,3 +1586,29 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def is_remote_url(url: Union[str, Path]) -> bool:
+    """
+    Check if the URL is a remote URL of the format:
+    <connector_type>://<host>:<port>/<model_name>
+    """
+    if isinstance(url, Path):
+        return False
+
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    return m is not None
+
+
+def parse_connector_type(url: str) -> str:
+    """
+    Parse the connector type from the URL of the format:
+    <connector_type>://<path>
+    """
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    if m is None:
+        return ""
+
+    return m.group(1)
