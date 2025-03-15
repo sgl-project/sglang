@@ -27,6 +27,7 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul

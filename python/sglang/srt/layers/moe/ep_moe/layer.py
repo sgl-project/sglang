@@ -188,13 +188,13 @@ class EPMoE(torch.nn.Module):
 
         if _is_hip and get_bool_env_var("CK_MOE"):
             self.routed_scaling_factor = routed_scaling_factor
-            self.expert_mask = torch.zeros(
+            self.expert_mask = torch.empty(
                 (self.num_experts + self.num_shared_experts + 1),
                 device="cuda",
                 dtype=torch.int,
             )
-            self.expert_mask[self.start_expert_id : self.end_expert_id + 1] = 1
-            self.expert_mask[self.num_experts : -1] = 1
+            self.expert_mask[self.start_expert_id : self.end_expert_id + 1].fill_(1)
+            self.expert_mask[self.num_experts : -1].fill_(1)
             self.num_experts_per_partition += self.num_shared_experts
 
         self.quant_method.create_weights(
