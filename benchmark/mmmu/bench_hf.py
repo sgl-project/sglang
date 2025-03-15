@@ -54,6 +54,7 @@ def eval_mmmu(args):
         prefix = prompt.split("<")[0]
         suffix = prompt.split(">")[1]
         if image is not None:
+            image = image.convert("RGB")
             messages = [
                 {
                     "role": "user",
@@ -67,25 +68,20 @@ def eval_mmmu(args):
                     ],
                 }
             ]
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = processor(
-                text=[text],
-                images=[image],
-                padding=True,
+            model_inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                add_generation_prompt=True,
                 return_tensors="pt",
             ).to(model.device)
-
-            generated_ids = model.generate(
-                **inputs, generation_config=generation_config
+            # print(model_inputs)
+            input_len = model_inputs["input_ids"].shape[-1]
+            generation = model.generate(
+                **model_inputs, generation_config=generation_config
             )
-
-            response = processor.decode(
-                generated_ids[0],
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[len(text) :]
+            generation = generation[0][input_len:]
+            response = processor.decode(generation, skip_special_tokens=True)
             print(f"response: {response}")
         else:  # multiple images actually
             if sample["question_type"] == "multiple-choice":
