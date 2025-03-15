@@ -18,6 +18,21 @@ import shutil
 import sys
 from pathlib import Path
 
+# Setup flash_mla at the top level for tests to find
+# This makes the module importable without installation
+root_dir = Path(__file__).parent.resolve()
+module_src = root_dir / "3rdparty" / "flashmla" / "flash_mla"
+module_dest = root_dir / "flash_mla"
+
+if module_src.exists() and not module_dest.exists():
+    try:
+        os.symlink(module_src, module_dest, target_is_directory=True)
+        print(f"Created symbolic link from {module_src} to {module_dest}")
+    except (OSError, NotImplementedError):
+        if module_src.exists():
+            shutil.copytree(module_src, module_dest)
+            print(f"Copied directory from {module_src} to {module_dest}")
+
 import torch
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
