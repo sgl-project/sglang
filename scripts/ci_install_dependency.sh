@@ -26,4 +26,4 @@ pip install transformers==4.45.2 sentence_transformers accelerate==1.4.0 peft pa
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # reinstall sgl-kernel
-pip install sgl-kernel==0.0.5 --force-reinstall --no-deps
+pip install sgl-kernel==0.0.5.post1 --force-reinstall --no-deps
