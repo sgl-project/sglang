@@ -60,6 +60,7 @@ def _device_to_uuid(device: int) -> str:
 
 
 def _device_from_uuid(device_uuid: str) -> int:
+    assert isinstance(device_uuid, str), 'The reduction function is probably not patched'
     for device in range(torch.cuda.device_count()):
         if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
             return device
