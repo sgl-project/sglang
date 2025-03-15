@@ -36,6 +36,7 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import torch
 import uvloop
 
+from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -537,6 +538,9 @@ def _launch_subprocesses(
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
+
+    if server_args.completion_template:
+        load_completion_template_for_openai_api(server_args.completion_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
