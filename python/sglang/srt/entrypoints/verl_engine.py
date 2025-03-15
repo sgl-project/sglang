@@ -155,12 +155,18 @@ def _monkey_patch_torch_reductions():
     reduce_tensor_original = torch.multiprocessing.reductions.reduce_tensor
     rebuild_cuda_tensor_original = torch.multiprocessing.reductions.rebuild_cuda_tensor
 
+    ARG_DEVICE_INDEX = 6
+
     def reduce_tensor_modified(*args, **kwargs):
-        original_output = reduce_tensor_original(*args, **kwargs)
-        return TODO
+        original_output = list(reduce_tensor_original(*args, **kwargs)
+        original_output[ARG_DEVICE_INDEX] = _device_to_uuid(original_output[ARG_DEVICE_INDEX])
+        return tuple(original_output)
 
     def rebuild_cuda_tensor_modified(*args, **kwargs):
         return rebuild_cuda_tensor_original(*args, **kwargs)
+
+    torch.multiprocessing.reductions.reduce_tensor = reduce_tensor_modified
+    torch.multiprocessing.reductions.rebuild_cuda_tensor = rebuild_cuda_tensor_modified
 
 
 def _device_to_uuid(device: int) -> str:
