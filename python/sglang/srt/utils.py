@@ -776,6 +776,21 @@ def get_zmq_socket(
     return socket
 
 
+# def dump_to_file(dirpath, name, value):
+#     from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+#     if get_tensor_model_parallel_rank() != 0:
+#         return
+
+#     os.makedirs(dirpath, exist_ok=True)
+#     if value.dtype is torch.bfloat16:
+#         value = value.float()
+#     value = value.cpu().numpy()
+#     output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
+#     logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
+#     np.save(output_filename, value)
+
+
 def dump_to_file(dirpath, name, value):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -786,9 +801,28 @@ def dump_to_file(dirpath, name, value):
     if value.dtype is torch.bfloat16:
         value = value.float()
     value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
+
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npz")
+
+    # Check if file exists already
+    if os.path.exists(output_filename):
+        # Load existing arrays
+        existing_data = np.load(output_filename, allow_pickle=True)
+        arrays = list(existing_data.values())
+        # Add new array
+        arrays.append(value)
+        # Create dictionary with unique keys
+        save_dict = {f"arr_{i}": arr for i, arr in enumerate(arrays)}
+        logger.info(
+            f"Append tensor to {output_filename}. New shape = {value.shape}, Total tensors = {len(arrays)}"
+        )
+        np.savez(output_filename, **save_dict)
+    else:
+        # First time saving, use savez with a single array
+        logger.info(
+            f"Create new tensor dump at {output_filename}. Shape = {value.shape}"
+        )
+        np.savez(output_filename, arr_0=value)
 
 
 def is_triton_3():

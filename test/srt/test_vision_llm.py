@@ -1,6 +1,7 @@
 """
 """
 
+import dataclasses
 import unittest
 from io import BytesIO
 
@@ -9,7 +10,6 @@ import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import dataclasses
 from transformers import (
     AutoModel,
     AutoModelForImageTextToText,
@@ -17,13 +17,12 @@ from transformers import (
     AutoTokenizer,
 )
 
+import sglang as sgl
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.conversation import generate_chat_conv
+from sglang.srt.conversation import chat_templates, generate_chat_conv
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
-import sglang as sgl
-from sglang.srt.conversation import chat_templates
 
 MiniCPMV = "openbmb/MiniCPM-V-2_6"
 QWEN25VL = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -158,7 +157,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             ),
         )
         return model_runner.model
-        
+
 
 class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
@@ -249,33 +248,33 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
             model_path=self.model_path,
             chat_template=self.chat_template,
             debug_tensor_dump_output_folder=self.debug_tensor_dump_output_folder,
-            disable_cuda_graph=True
+            disable_cuda_graph=True,
         )
-        
+
         vlm = sgl.Engine(**dataclasses.asdict(server_args))
-        
+
         # Get conversation template and image token
         conv = chat_templates[self.chat_template].copy()
         image_token = conv.image_token
-        
+
         # Prepare prompt with image
         prompt = f"What's in this image?\n{image_token}"
-        
+
         # Generate with same parameters as HF
         sampling_params = {
             "temperature": self.temperature,
             "max_new_tokens": self.max_new_tokens,
             "top_k": self.top_k,
-            "top_p": self.top_p
+            "top_p": self.top_p,
         }
-        
+
         # Generate output from SGLang
         sgl_output = vlm.generate(
             prompt=prompt,
             image_data=self.image_url,
             sampling_params=sampling_params,
         )
-        
+
         # Get HF output with scores
         inputs = self.get_processor_output()
         with torch.no_grad():
@@ -289,27 +288,30 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
                 top_p=self.top_p,
             )
             hf_logits = hf_outputs.scores
-        
+
         # Load SGLang logits
-        data = np.load(f"self.debug_tensor_dump_output_folder/pytorch_dump_{self.debug_tensor_dump_output_folder}.npz")
+        data = np.load(
+            f"self.debug_tensor_dump_output_folder/pytorch_dump_{self.debug_tensor_dump_output_folder}.npz"
+        )
         decode_logits = []
-        
+
         # Extract only decode step logits
         for key in data.files:
             tensor = data[key]
             if tensor.shape[0] == 1:  # decode step logits
                 decode_logits.append(tensor)
-        
+
         sgl_logits = torch.tensor(np.array(decode_logits)).to(self.device)
-        
+
         # Convert to numpy and compare
         hf_logits_np = hf_logits.cpu().numpy()
         sgl_logits_np = sgl_logits.cpu().numpy()
-        
+
         np.testing.assert_allclose(hf_logits_np, sgl_logits_np)
-        
+
         # Cleanup
         vlm.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
