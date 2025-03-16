@@ -17,12 +17,7 @@
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-import asyncio
-import math
-from typing import List, Union
-
 import torch
-from PIL import Image, ImageOps
 
 from sglang.srt.managers.image_processor import BaseImageProcessor
 from sglang.srt.managers.image_processors.base_image_processor import (
@@ -32,34 +27,17 @@ from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
+    models = [DeepseekVL2ForCausalLM]
+
     def __init__(self, hf_config, server_args, _processor):
-        # with contextlib.suppress(ValueError):
-        #     AutoProcessor.register("DeepseekVLV2Processor", DeepseekVLV2Processor)
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<image>"
 
     @staticmethod
-    def _process_images_task(image, input_text, max_req_input_len):
+    def _process_images_task(image, input_text, **kwargs):
         return get_global_processor().__call__(
-            conversations=input_text, images=image, max_req_input_len=max_req_input_len
+            conversations=input_text, images=image, **kwargs
         )
-
-    async def _process_images(self, image_data, input_text, max_req_input_len):
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            image_inputs = await loop.run_in_executor(
-                self.executor,
-                DeepseekVL2ImageProcessor._process_images_task,
-                image_data,
-                input_text,
-                max_req_input_len,
-            )
-        else:
-            image_inputs = self._process_images_task(
-                image_data, input_text, max_req_input_len
-            )
-
-        return image_inputs
 
     async def process_images_async(
         self, image_data, input_ids, request_obj, max_req_input_len, *args, **kwargs
@@ -97,8 +75,3 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
         }
-
-
-ImageProcessorMapping = {
-    DeepseekVL2ForCausalLM: DeepseekVL2ImageProcessor,
-}
