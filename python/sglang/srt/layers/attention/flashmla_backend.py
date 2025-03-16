@@ -3,10 +3,11 @@ from __future__ import annotations
 """
 Support attention backend for flashMLA.
 
-
+Current initial integration of FlashMLA shows normal accuracy, but performance is slightly lacking.
 #TODO
-1. Hard-code the reshaping of kv cache.
-
+Support FlashMLA decode with cudagraph
+Enable speculative sampling in FlashMLA
+Integrate FA3 prefill
 """
 
 
@@ -19,10 +20,7 @@ from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import (
-    create_flashinfer_kv_indices_triton,
-    create_flashmla_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -32,7 +30,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
-# TODO current hard code
+# FlashMLA only supports pagesize=64
 PAGE_SIZE = 64
 
 
@@ -91,21 +89,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
         bs = forward_batch.batch_size
 
-        kv_indices = torch.empty(
-            forward_batch.seq_lens_sum,
-            dtype=torch.int32,
-            device=forward_batch.req_pool_indices.device,
-        )
-
-        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), 64)
+        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), PAGE_SIZE)
         flashmla_index = torch.full(
-            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=kv_indices.device
+            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=q.device
         )
         create_flashmla_kv_indices_triton[(bs,)](
             self.indices_updater_decode.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
-            self.kv_indptr,
             None,
             flashmla_index,
             self.indices_updater_decode.req_to_token.size(1),

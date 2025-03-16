@@ -3,11 +3,9 @@ import unittest
 
 import numpy as np
 import torch
-import triton
 
-from sglang.srt.layers.attention.utils import (
+from sglang.srt.layers.attention.flashinfer_utils import (
     create_flashinfer_kv_indices_triton,
-    create_flashmla_kv_indices_triton,
 )
 
 
@@ -62,22 +60,7 @@ class TestCreateKvIndices(unittest.TestCase):
             kv_indices_triton,
             req_to_token.size(1),
         )
-        max_seqlen_pad = triton.cdiv(paged_kernel_lens.max().item(), 64)
-        flashmla_index = torch.full(
-            (batch, max_seqlen_pad), -1, dtype=torch.int32, device=kv_indptr.device
-        )
-        seq_blocks = (max_seqlen_pad + 511) // 512
-        create_flashmla_kv_indices_triton[(batch,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            kv_indptr,
-            None,
-            flashmla_index,
-            req_to_token.size(1),
-            flashmla_index.size(1),
-            max_seqlen_pad,
-        )
+
         # Check
         self.assertTrue(torch.equal(kv_indices_ref, kv_indices_triton))
 
