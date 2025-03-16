@@ -61,6 +61,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils._contextlib import _DecoratorContextManager
 from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
@@ -125,6 +126,63 @@ def is_flashinfer_available():
 
 def is_cuda_available():
     return is_cuda()
+
+
+_ENABLE_TORCH_INFERENCE_MODE = os.getenv(
+    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
+).lower() in ("true", "1")
+
+
+class DynamicGradMode(_DecoratorContextManager):
+    """
+    A combination of torch.no_grad and torch.inference_mode,
+    with their behavior controlled by an environment variable. Just refer to them.
+    """
+
+    @staticmethod
+    def set_inference_mode(mode: bool):
+        if isinstance(mode, bool):
+            global _ENABLE_TORCH_INFERENCE_MODE
+
+            _ENABLE_TORCH_INFERENCE_MODE = mode
+        else:
+            logger.warning("mode is not a boolean object")
+
+    def __init__(self, mode=True):
+        if not torch._jit_internal.is_scripting():
+            super().__init__()
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self.mode = mode
+        else:
+            self.prev = False
+
+    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
+        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
+            return super().__new__(cls)
+        return cls()(mode_or_orig_func)
+
+    def __enter__(self) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context = torch._C._InferenceMode(self.mode)
+            self._inference_mode_context.__enter__()
+        else:
+            self.prev = torch.is_grad_enabled()
+            torch.set_grad_enabled(False)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
+        else:
+            torch.set_grad_enabled(self.prev)
+
+    def clone(self) -> "DynamicGradMode":
+        r"""
+        Create a copy of this class
+        """
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            return self.__class__(self.mode)
+        else:
+            return self.__class__()
 
 
 def enable_show_time_cost():
