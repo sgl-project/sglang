@@ -127,6 +127,7 @@ class MultModalityDataPaddingPatternSingleToken(MultiModalityDataPaddingPattern)
 
         input_ids_with_image = []
         for image_cnt, _ in enumerate(image_grid_thws):
+            print(f"image_cnt {image_cnt}")
             num_image_tokens = self.num_data_token_calc_func(image_grid_thws[image_cnt])
             if image_cnt == 0:
                 non_image_tokens = input_ids[: image_indices[image_cnt]]
@@ -194,13 +195,24 @@ def embed_image_inputs(
         torch.tensor(placeholder_token_ids, device=input_ids.device),
     ).unsqueeze(-1)
 
+    print(f"{input_ids=}")
+    print(f"{special_image_mask=}")
+
     num_image_tokens_in_input_ids = special_image_mask.sum()
+
+    print(f"{num_image_tokens_in_input_ids=}")
 
     if num_image_tokens_in_input_ids == 0:
         # unexpected
         inputs_embeds = input_embedding(input_ids)
     else:
+        # print(f"Getting image feature")
+
         image_embedding = image_embedding_func(image_input)
+
+        # assert image_embedding.shape[0] == input_ids.shape[0], f"{image_embedding.shape[0]} vs input_ids.shape[0]"
+
+        # print(f"image_embedding: {image_embedding.shape}")
 
         if image_embedding.dim() == 2:
             num_image_tokens_in_embedding = image_embedding.shape[0]
@@ -288,6 +300,7 @@ def general_mm_embed_routine(
         inputs_embeds = embed_tokens(input_ids)
     else:
         image = forward_batch.merge_image_inputs()
+        print(f"num images: {len(image.image_hashes)}")
         inputs_embeds = embed_image_inputs(
             image_input=image,
             input_ids=input_ids,

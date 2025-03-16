@@ -8,6 +8,8 @@ from transformers import (
     PretrainedConfig,
     ProcessorMixin,
 )
+from transformers.models.auto import IMAGE_PROCESSOR_MAPPING
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
 
 def remove_if_exists(mapping, key):
