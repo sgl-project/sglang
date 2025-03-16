@@ -21,7 +21,9 @@ import torch.nn as nn
 
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+_is_cuda = is_cuda_available()
+
+if _is_cuda:
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -117,7 +119,7 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-if not is_cuda_available():
+if not _is_cuda:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

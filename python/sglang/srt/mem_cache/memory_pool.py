@@ -172,7 +172,7 @@ class TokenToKVPoolAllocator:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index))
+            self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -183,7 +183,7 @@ class TokenToKVPoolAllocator:
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.concat(self.free_group))
+            self.free(torch.cat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -340,6 +340,7 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.capture_mode and cache_k.shape[0] < 4:
+            # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
             with self.device_module.stream(self.alt_stream):
@@ -738,7 +739,7 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.concat([self.free_slots, indices])
+        self.free_slots = torch.cat([self.free_slots, indices])
         self.can_use_mem_size += len(indices)
         return len(indices)
 
