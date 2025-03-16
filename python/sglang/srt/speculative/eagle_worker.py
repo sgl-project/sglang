@@ -155,7 +155,6 @@ class EAGLEWorker(TpModelWorker):
             )
 
             self.draft_attn_backend = FlashInferMLAMultiStepDraftBackend(
-                self.model_runner,
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
