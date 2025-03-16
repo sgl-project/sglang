@@ -131,14 +131,6 @@ def is_device_avaliable():
     return is_cuda_available() or is_xpu()
 
 
-def is_triton_available():
-    if is_cuda() or is_xpu() or is_hip():
-        return get_bool_env_var("TRITON_AVAILABLE", default="true")
-    else:
-        # update once CPU/HPU supports triton
-        return False
-
-
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
