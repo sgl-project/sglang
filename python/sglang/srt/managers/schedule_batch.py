@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import Enum, auto
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,7 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -143,165 +145,185 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class Modality(Enum):
+    IMAGE = auto()
+    MULTI_IMAGES = auto()
+    VIDEO = auto()
+    AUDIO = auto()
+
+
 @dataclasses.dataclass
-class MultimodalInputs:
-    """The image related inputs."""
+class MultimodalDataItem:
+    """
+    A single multimodal data, from a single image/video/audio or other
+    """
 
-    pixel_values: Union[torch.Tensor, np.array]
-    data_hashes: Optional[list] = None
-    image_sizes: Optional[list] = None
-    image_offsets: Optional[list] = None
-    image_pad_len: Optional[list] = None
-    pad_values: Optional[list] = None
-    modalities: Optional[list] = None
-    num_image_tokens: Optional[int] = None
+    modality: Modality
 
-    # Llava related
-    aspect_ratio_ids: Optional[List[torch.Tensor]] = None
+    hash: int = None
+    pad_value: int = None
+
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
     aspect_ratio_mask: Optional[List[torch.Tensor]] = None
 
-    # QWen2-VL related
-    # [num_of_images, t, h, w]
-    image_grid_thws: torch.Tensor = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-    # Qwen2-VL video related
-    video_token_id: Optional[int] = None
-    video_grid_thws: List[Tuple[int, int, int]] = None
+    image_sizes: Tuple[int, int] = None
+    image_offsets: Optional[list] = None
+
+    # the real data, pixel_values or audio_features
+    # data: Union[List[torch.Tensor], List[np.array]]
+    pixel_values: Union[torch.Tensor, np.array] = None
+    image_grid_thws: Union[torch.Tensor, np.array] = None
+    video_grid_thws: Union[torch.Tensor, np.array] = None
+
+    image_emb_mask: Optional[torch.Tensor] = None
+    image_spatial_crop: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
-    # deepseek vl2 related
-    images_emb_mask: Optional[List[torch.Tensor]] = None
-    image_spatial_crop: Optional[List[torch.Tensor]] = None
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
 
-    # The id of the single-image placeholder token
+    audio_features: Union[torch.Tensor, np.array] = None
+    audio_feature_lens: Optional[List[torch.Tensor]] = None
+
+    @staticmethod
+    def is_empty_list(l):
+        if l is None:
+            return True
+        return len([item for item in flatten_nested_list(l) if item is not None]) == 0
+
+    def set_pad_value(self):
+        """
+        Set the pad value after first hashign the data
+        """
+
+        def hash_feature(f):
+            if isinstance(f, list):
+                return hash(tuple(flatten_nested_list(f)))
+            elif isinstance(f, np.ndarray):
+                arr = np.ascontiguousarray(f)
+                arr_bytes = arr.tobytes()
+                return hash(arr_bytes)
+            return hash(f)
+
+        if self.is_audio():
+            self.hash = hash_feature(self.audio_features)
+        else:
+            self.hash = hash_feature(self.pixel_values)
+
+        assert self.hash is not None
+        self.pad_value = self.hash % (1 << 30)
+
+    def is_audio(self):
+        return (
+            self.modality == Modality.AUDIO
+        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+
+    def is_image(self):
+        return (
+            self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
+        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+
+    def is_video(self):
+        return (
+            self.modality == Modality.VIDEO
+        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+
+    def validate(self):
+        ...
+        # TODO
+
+
+@dataclasses.dataclass
+class MultimodalInputs:
+    """The multimodal data related inputs."""
+
+    # items of data
+    mm_items: List[MultimodalDataItem]
+    image_pad_len: Optional[list] = None
+    num_image_tokens: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_position_delta: Optional[torch.Tensor] = None
+
+    # image
     im_token_id: Optional[torch.Tensor] = None
-
-    # All the images in the batch should share the same special image
-    # bound token ids.
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
-    # [num_images, 2 (w, h)]
-    tgt_sizes: Optional[list] = None
+
+    # video
+    video_token_id: Optional[int] = None
 
     # audio
     audio_start_id: Optional[torch.Tensor] = None
     audio_end_id: Optional[torch.Tensor] = None
-    audio_features: Optional[List[torch.Tensor]] = None
-    audio_feature_lens: Optional[List[torch.Tensor]] = None
 
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(
-            pixel_values=obj["pixel_values"],
-            data_hashes=obj["data_hashes"],
+            mm_items=obj["mm_items"],
         )
+
+        assert isinstance(ret.mm_items, list)
+        ret.mm_items = [
+            item
+            for item in ret.mm_items
+            if item.is_audio() or item.is_image() or item.is_video()
+        ]
+
+        assert len(ret.mm_items) != 0
 
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        ret.pad_values = [x % (1 << 30) for x in ret.data_hashes]
+        for item in ret.mm_items:
+            item.set_pad_value()
 
         optional_args = [
-            "image_sizes",
             "modalities",
-            "aspect_ratio_ids",
-            "aspect_ratio_mask",
-            "image_grid_thws",
-            "images_emb_mask",
-            "image_spatial_crop",
             "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
-            "tgt_sizes",
             "audio_start_id",
             "audio_end_id",
-            "audio_features",
-            "audio_feature_lens",
         ]
         for arg in optional_args:
             if arg in obj:
                 setattr(ret, arg, obj[arg])
 
-        # validate
-        assert (
-            isinstance(ret.pixel_values, torch.Tensor)
-            or isinstance(ret.pixel_values, np.ndarray)
-            or isinstance(ret.pixel_values, list)
-        )
-
-        assert ret.audio_features is None or isinstance(ret.audio_features, list)
-
         return ret
 
     def contains_image_inputs(self) -> bool:
         """ """
-        return self.pixel_values is not None and self.pixel_values != []
+        return any(item.is_image() for item in self.mm_items)
 
     def contains_audio_inputs(self) -> bool:
         """ """
-        return self.audio_features is not None and self.audio_features != []
+        return any(item.is_audio() for item in self.mm_items)
+
+    def collect_image_inputs(self) -> List[torch.Tensor]:
+        return [item.pixel_values for item in self.mm_items if item.is_image()]
 
     def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
         """
-        if isinstance(self.pixel_values, list):
-            # in some rare cases, pixel values are list of patches with different shapes
-            # e.g. minicpm
-            self.pixel_values += other.pixel_values
-        else:
-            assert (
-                self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
-            ), f"{self.pixel_values.shape[1:]} vs {other.pixel_values.shape[1:]}"
-            self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
-
-        # args would be stacked along first dim
-        # usually these are already tensors
-        stack_args = [
-            # TODO: merge with image_grid_thws, basically the same thing
-            "tgt_sizes",
-            "image_spatial_crop",
-        ]
-        for arg in stack_args:
-            if getattr(self, arg, None) is None:
-                setattr(self, arg, getattr(other, arg, None))
-            elif getattr(other, arg, None) is not None:
-                # self and other both not None
-                setattr(
-                    self,
-                    arg,
-                    torch.cat([getattr(self, arg), getattr(other, arg)], dim=0),
-                )
-
-        if self.image_grid_thws is None:
-            self.image_grid_thws = other.image_grid_thws
-        elif other.image_grid_thws is not None:
-            self.image_grid_thws = torch.concat(
-                [self.image_grid_thws, other.image_grid_thws]
-            )
 
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        self.data_hashes += other.data_hashes
-        self.pad_values = [x % (1 << 30) for x in self.data_hashes]
 
         # args needed to be merged
         optional_args = [
-            "audio_features",
-            "image_sizes",
+            "items",
             "image_offsets",
             "image_pad_len",
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
-            "aspect_ratio_ids",
-            "aspect_ratio_mask",
-            "images_emb_mask",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
