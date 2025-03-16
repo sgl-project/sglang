@@ -1289,7 +1289,7 @@ class MlpProjector(nn.Module):
             high_x, low_x = x_or_tuple
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
-            x = torch.concat([high_x, low_x], dim=-1)
+            x = torch.cat([high_x, low_x], dim=-1)
         else:
             x = x_or_tuple
 
