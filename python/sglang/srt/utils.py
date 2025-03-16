@@ -792,7 +792,13 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
+    import os
+
+    import numpy as np
+    import torch
+
     from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.utils.logger import logger
 
     if get_tensor_model_parallel_rank() != 0:
         return
@@ -808,21 +814,37 @@ def dump_to_file(dirpath, name, value):
     if os.path.exists(output_filename):
         # Load existing arrays
         existing_data = np.load(output_filename, allow_pickle=True)
-        arrays = list(existing_data.values())
-        # Add new array
-        arrays.append(value)
-        # Create dictionary with unique keys
-        save_dict = {f"arr_{i}": arr for i, arr in enumerate(arrays)}
+        keys = list(existing_data.keys())
+
+        # Get existing values
+        save_dict = {}
+
+        # First, copy all existing data
+        for key in keys:
+            save_dict[key] = existing_data[key]
+
+        # Then, determine the next decode index
+        next_idx = 0
+        for key in keys:
+            if key.startswith("decode_"):
+                idx = int(key.split("_")[1])
+                next_idx = max(next_idx, idx + 1)
+
+        # Add new decode tensor
+        save_dict[f"decode_{next_idx}"] = value
+
         logger.info(
-            f"Append tensor to {output_filename}. New shape = {value.shape}, Total tensors = {len(arrays)}"
+            f"Append decode_{next_idx} tensor to {output_filename}. "
+            f"New shape = {value.shape}, Total tensors = {len(save_dict)}"
         )
         np.savez(output_filename, **save_dict)
     else:
-        # First time saving, use savez with a single array
+        # First time saving, use prefill as the key
         logger.info(
-            f"Create new tensor dump at {output_filename}. Shape = {value.shape}"
+            f"Create new tensor dump at {output_filename}. "
+            f"Shape = {value.shape}, Type = prefill"
         )
-        np.savez(output_filename, arr_0=value)
+        np.savez(output_filename, prefill=value)
 
 
 def is_triton_3():
