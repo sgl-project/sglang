@@ -1,12 +1,15 @@
 """
 """
 
+import multiprocessing as mp
 import unittest
 from io import BytesIO
+from typing import Type
 
 import numpy as np
 import requests
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
@@ -18,6 +21,30 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
+
+
+def init_process_group():
+    """Initialize the default process group"""
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="tcp://127.0.0.1:29500",
+            world_size=1,
+            rank=0,
+        )
+
+
+def run_test_class(test_class):
+    """Run a single test class in its own process"""
+    # Initialize test class
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(test_class)
+    runner = unittest.TextTestRunner()
+    result = runner.run(suite)
+
+    if not result.wasSuccessful():
+        raise RuntimeError(f"Tests failed for {test_class.__name__}")
 
 
 # Test the logits output between HF and SGLang
@@ -31,6 +58,14 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         cls.processor = ""
         response = requests.get(cls.image_url)
         cls.main_image = Image.open(BytesIO(response.content))
+        cls.model_runner = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.model_runner is not None:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            cls.model_runner = None
 
     def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
@@ -211,5 +246,74 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         self.compare_outputs(sglang_output, hf_output)
 
 
+try:
+    import librosa
+
+    librosa_installed = True
+except:
+    librosa_installed = False
+
+if librosa_installed:
+
+    class TestMiniCPMOLogits(TestMiniCPMVLogits):
+        @classmethod
+        def setUpClass(cls):
+            super().setUpClass()
+            cls.model_path = "openbmb/MiniCPM-o-2_6"
+            cls.tokenizer = AutoTokenizer.from_pretrained(
+                cls.model_path, trust_remote_code=True
+            )
+            cls.processor = AutoProcessor.from_pretrained(
+                cls.model_path, trust_remote_code=True
+            )
+            cls.chat_template = "minicpmo"
+            cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            cls.hf_model = (
+                AutoModel.from_pretrained(
+                    cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+                )
+                .eval()
+                .to(cls.device)
+            )
+
+else:
+    print(
+        "MiniCPMO accuracy test skipped: requires the following packages that were not found in your environment: librosa. Run `pip install librosa`"
+    )
+
+
+def find_vision_llm_test_classes() -> list[Type[VisionLLMLogitsBase]]:
+    """Automatically find all test classes inheriting from VisionLLMLogitsBase"""
+    test_classes = []
+    for name, obj in globals().items():
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, VisionLLMLogitsBase)
+            and obj != VisionLLMLogitsBase
+        ):
+            test_classes.append(obj)
+    return test_classes
+
+
 if __name__ == "__main__":
-    unittest.main()
+
+    # TODO: Use standard unittest
+    mp.set_start_method("spawn", force=True)
+
+    # Run each test class in sequence in its own process
+    test_classes = find_vision_llm_test_classes()
+    print(f"{test_classes}")
+    for test_class in test_classes:
+        print(f"\nRunning tests for {test_class.__name__}")
+        process = mp.Process(target=run_test_class, args=(test_class,))
+        process.start()
+        process.join()
+        kill_process_tree(process.pid)
+
+        if process.exitcode != 0:
+            print(
+                f"Test class {test_class.__name__} failed with exit code {process.exitcode}"
+            )
+            exit(1)
+        print(f"Completed tests for {test_class.__name__}\n")
