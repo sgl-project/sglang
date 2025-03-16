@@ -24,6 +24,7 @@ from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
+    get_device,
     get_hpu_memory_capacity,
     get_nvgpu_memory_capacity,
     is_cuda,
@@ -52,7 +53,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: nullable_str = None
     context_length: Optional[int] = None
-    device: str = "cuda"
+    device: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
@@ -186,6 +187,9 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
 
+        if self.device is None:
+            self.device = get_device()
+
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
@@ -284,7 +288,6 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_cuda_graph_padding = True
             self.disable_overlap_schedule = True
             logger.info(
                 "Overlap scheduler is disabled because of using "
@@ -438,9 +441,8 @@ class ServerArgs:
         parser.add_argument(
             "--device",
             type=str,
-            default="cuda",
-            choices=["cuda", "xpu", "hpu", "cpu"],
-            help="The device type.",
+            default=ServerArgs.device,
+            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",

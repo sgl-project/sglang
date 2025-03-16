@@ -19,7 +19,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 Memory pool.
 
 SGLang has two levels of memory pool.
-ReqToTokenPool maps a a request to its token locations.
+ReqToTokenPool maps a request to its token locations.
 TokenToKVPoolAllocator manages the indices to kv cache data.
 KVCache actually holds the physical kv cache.
 """
@@ -172,7 +172,7 @@ class TokenToKVPoolAllocator:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index))
+            self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -183,7 +183,7 @@ class TokenToKVPoolAllocator:
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.concat(self.free_group))
+            self.free(torch.cat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -227,7 +227,8 @@ class MHATokenToKVPool(KVCache):
 
         self.layer_transfer_counter = None
         self.capture_mode = False
-        self.alt_stream = torch.cuda.Stream()
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream()
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -339,11 +340,13 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.capture_mode and cache_k.shape[0] < 4:
-            self.alt_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.alt_stream):
+            # Overlap the copy of K and V cache for small batch size
+            current_stream = self.device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with self.device_module.stream(self.alt_stream):
                 self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
+            current_stream.wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
@@ -736,7 +739,7 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.concat([self.free_slots, indices])
+        self.free_slots = torch.cat([self.free_slots, indices])
         self.can_use_mem_size += len(indices)
         return len(indices)
 

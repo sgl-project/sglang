@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -481,6 +482,7 @@ def suppress_other_loggers():
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
+    logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -528,6 +530,10 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
     if include_parent:
         try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
@@ -1570,6 +1576,16 @@ def next_power_of_2(n: int):
 
 
 setattr(triton, "next_power_of_2", next_power_of_2)
+
+
+@contextmanager
+def empty_context(*args, **kwargs):
+    try:
+        # Setup code goes here
+        yield
+    finally:
+        # Cleanup code goes here
+        pass
 
 
 def add_prefix(name: str, prefix: str) -> str:

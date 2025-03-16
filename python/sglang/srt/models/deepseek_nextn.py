@@ -41,9 +41,13 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import awq_dequantize
 
 
 class DeepseekModelNextN(nn.Module):
@@ -261,14 +265,21 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self_attn = self.model.decoder.self_attn
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                w = ops.awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                    0,
-                    0,
-                    0,
-                ).T
+                if _is_cuda:
+                    w = awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                    ).T
+                else:
+                    w = ops.awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
             else:
                 w = self_attn.kv_b_proj.weight
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
