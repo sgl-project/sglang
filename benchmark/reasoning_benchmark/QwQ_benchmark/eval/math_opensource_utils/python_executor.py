@@ -21,8 +21,6 @@ from timeout_decorator import timeout
 from tqdm import tqdm
 
 
-
-
 class GenericRuntime:
     GLOBAL_DICT = {}
     LOCAL_DICT = None
@@ -36,7 +34,7 @@ class GenericRuntime:
             self.exec_code(c)
 
     def exec_code(self, code_piece: str) -> None:
-        if regex.search(r'(\s|^)?input\(', code_piece):
+        if regex.search(r"(\s|^)?input\(", code_piece):
             # regex.search(r'(\s|^)?os.', code_piece):
             raise RuntimeError()
         exec(code_piece, self._global_vars)
@@ -61,14 +59,14 @@ class GenericRuntime:
 
     @property
     def answer(self):
-        return self._global_vars['answer']
+        return self._global_vars["answer"]
 
 
 class DateRuntime(GenericRuntime):
     GLOBAL_DICT = {
-        'datetime': datetime.datetime,
-        'timedelta': dateutil.relativedelta.relativedelta,
-        'relativedelta': dateutil.relativedelta.relativedelta
+        "datetime": datetime.datetime,
+        "timedelta": dateutil.relativedelta.relativedelta,
+        "relativedelta": dateutil.relativedelta.relativedelta,
     }
 
 
@@ -78,7 +76,7 @@ class CustomDict(dict):
 
 
 class ColorObjectRuntime(GenericRuntime):
-    GLOBAL_DICT = {'dict': CustomDict}
+    GLOBAL_DICT = {"dict": CustomDict}
 
 
 class PythonExecutor:
@@ -98,7 +96,7 @@ class PythonExecutor:
         self.timeout_length = timeout_length
 
     def process_generation_to_code(self, gens: str):
-        return [g.strip().split('\n') for g in gens]
+        return [g.strip().split("\n") for g in gens]
 
     @staticmethod
     def execute(
@@ -108,42 +106,42 @@ class PythonExecutor:
         answer_symbol=None,
         answer_expr=None,
         timeout_length=10,
-        auto_mode=False
+        auto_mode=False,
     ):
         try:
             if auto_mode:
                 if "print(" in code[-1]:
                     program_io = io.StringIO()
                     with redirect_stdout(program_io):
-                        timeout(timeout_length)(runtime.exec_code)('\n'.join(code))
+                        timeout(timeout_length)(runtime.exec_code)("\n".join(code))
                     program_io.seek(0)
                     result = program_io.read()
                 else:
                     print(code)
-                    timeout(timeout_length)(runtime.exec_code)('\n'.join(code[:-1]))
+                    timeout(timeout_length)(runtime.exec_code)("\n".join(code[:-1]))
                     result = timeout(timeout_length)(runtime.eval_code)(code[-1])
             else:
                 if get_answer_from_stdout:
                     program_io = io.StringIO()
                     with redirect_stdout(program_io):
-                        timeout(timeout_length)(runtime.exec_code)('\n'.join(code))
+                        timeout(timeout_length)(runtime.exec_code)("\n".join(code))
                     program_io.seek(0)
                     result = program_io.read()
                 elif answer_symbol:
-                    timeout(timeout_length)(runtime.exec_code)('\n'.join(code))
+                    timeout(timeout_length)(runtime.exec_code)("\n".join(code))
                     result = runtime._global_vars[answer_symbol]
                 elif answer_expr:
-                    timeout(timeout_length)(runtime.exec_code)('\n'.join(code))
+                    timeout(timeout_length)(runtime.exec_code)("\n".join(code))
                     result = timeout(timeout_length)(runtime.eval_code)(answer_expr)
                 else:
-                    timeout(timeout_length)(runtime.exec_code)('\n'.join(code[:-1]))
+                    timeout(timeout_length)(runtime.exec_code)("\n".join(code[:-1]))
                     result = timeout(timeout_length)(runtime.eval_code)(code[-1])
             report = "Done"
-            str(result)           # codec check
+            str(result)  # codec check
             pickle.dumps(result)  # serialization check
         except:
-            result = ''
-            report = traceback.format_exc().split('\n')[-2]
+            result = ""
+            report = traceback.format_exc().split("\n")[-2]
         return result, report
 
     def apply(self, code):
@@ -170,7 +168,7 @@ class PythonExecutor:
                 answer_symbol=self.answer_symbol,
                 answer_expr=self.answer_expr,
                 timeout_length=self.timeout_length,  # this timeout not work
-                auto_mode=True
+                auto_mode=True,
             )
             future = pool.map(executor, all_code_snippets, timeout=self.timeout_length)
             iterator = future.result()
@@ -234,5 +232,5 @@ print(result)
     print(predictions)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     _test()

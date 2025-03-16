@@ -65,13 +65,23 @@ def trajectory_to_text(trajectory: list) -> str:
 
 
 def is_execution_success(output):
-    error_key_words = ["error", "exception", "no algorithms", "no algorithms", "cannot", "nan", "..."]
+    error_key_words = [
+        "error",
+        "exception",
+        "no algorithms",
+        "no algorithms",
+        "cannot",
+        "nan",
+        "...",
+    ]
     success = all([k not in output.lower() for k in error_key_words])
     return success
 
 
 def extract_program(text: str = None, trajectory: list = None, last_only=False) -> str:
-    assert text is not None or trajectory is not None, "Either text or trajectory should be provided."
+    assert (
+        text is not None or trajectory is not None
+    ), "Either text or trajectory should be provided."
     if trajectory is None:
         try:
             trajectory = text_to_trajectory(text)
@@ -101,7 +111,13 @@ def extract_program(text: str = None, trajectory: list = None, last_only=False) 
     if len(import_lines) > 0:
         program_list[0] = "\n".join(import_lines) + "\n" + program_list[0]
     for i, program in enumerate(program_list[:-1]):
-        program_list[i] = "\n".join([line for line in program.split("\n") if not line.strip().startswith("print(")])
+        program_list[i] = "\n".join(
+            [
+                line
+                for line in program.split("\n")
+                if not line.strip().startswith("print(")
+            ]
+        )
 
     if last_only:
         program = program_list[-1]
@@ -187,6 +203,7 @@ print(result)
 ```"""
 
     import pprint
+
     trajectory = text_to_trajectory(traj_text)
     pprint.pprint(trajectory)
 

@@ -13,10 +13,9 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
-from tqdm import tqdm
-
-from livecodebench_v5_utils.testing_util import run_test
 from livecodebench_v5_utils.pass_k_utils import compute_metrics_from_results
+from livecodebench_v5_utils.testing_util import run_test
+from tqdm import tqdm
 
 
 def _temp_run(sample, generation, debug, result, metadata_list, timeout):
@@ -38,7 +37,9 @@ def check_correctness(sample, generation, timeout, debug=True):
         args=(sample, generation, debug, result, metadata_list, timeout),
     )
     p.start()
-    p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
+    p.join(
+        timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5
+    )
     if p.is_alive():
         p.kill()
     if not result:
@@ -61,7 +62,9 @@ def evaluate_generations_by_problem(args):
     for o_idx, o in enumerate(problem_generations):
         curr_res = [-2]
         try:
-            curr_res, curr_metadata = check_correctness(sample, o, timeout=timeout, debug=debug)
+            curr_res, curr_metadata = check_correctness(
+                sample, o, timeout=timeout, debug=debug
+            )
             if debug:
                 print(f"\nSuccessful compilation of task {o_idx}!")
             fixed = []
@@ -120,11 +123,19 @@ def evaluate_generations(
 
     # generations are code generations in the same order of the dataset
 
-    inputs = [[(generations_list[index], samples_list[index], debug, timeout), index] for index in range(len(generations_list))]
+    inputs = [
+        [(generations_list[index], samples_list[index], debug, timeout), index]
+        for index in range(len(generations_list))
+    ]
 
     with tqdm(total=len(inputs)) as pbar:
-        with ProcessPoolExecutor(max_workers=1 if debug else num_process_evaluate) as executor:
-            futures = {executor.submit(evaluate_generations_by_problem, arg): index for arg, index in inputs}
+        with ProcessPoolExecutor(
+            max_workers=1 if debug else num_process_evaluate
+        ) as executor:
+            futures = {
+                executor.submit(evaluate_generations_by_problem, arg): index
+                for arg, index in inputs
+            }
 
             results = {}
             metadata = {}
@@ -133,7 +144,9 @@ def evaluate_generations(
                 results[index], metadata[index] = future.result()
                 pbar.update(1)
 
-    assert len(results) == len(inputs), f"results = {len(results)} inputs = {len(inputs)} {results=}"
+    assert len(results) == len(
+        inputs
+    ), f"results = {len(results)} inputs = {len(inputs)} {results=}"
     # results = {i: r for r, (_, i) in zip(results, inputs)}
 
     return results, metadata
@@ -153,7 +166,9 @@ def codegen_metrics(
     remap_index = []
     results = defaultdict(list)
     metadatas = defaultdict(list)
-    for idx, (sample, generation_list) in enumerate(zip(samples_list, generations_list)):
+    for idx, (sample, generation_list) in enumerate(
+        zip(samples_list, generations_list)
+    ):
         assert isinstance(generation_list, list), generations_list[0]
         for generation in generation_list:
             assert isinstance(generation, str), generations_list[0]
@@ -188,7 +203,9 @@ def codegen_metrics(
         else:
             final_metadata[i] = [json.dumps(x) for x in final_metadata[i]]
 
-        assert len(final_metadata[i]) == len(generations_list[0]), f"{len(final_metadata[i])=}"
+        assert len(final_metadata[i]) == len(
+            generations_list[0]
+        ), f"{len(final_metadata[i])=}"
 
     return [metrics, results, final_metadata]
 
@@ -217,11 +234,16 @@ if __name__ == "__main__":
 
     print(
         check_correctness(
-            {"input_output": json.dumps({
-                "inputs": ")))))",
-                "outputs": "0",
-            },)},
+            {
+                "input_output": json.dumps(
+                    {
+                        "inputs": ")))))",
+                        "outputs": "0",
+                    },
+                )
+            },
             "\nMOD = 998244353\n\nS = input().strip()\nn = len(S)\n\nif n % 2 != 0:\n    print(0)\n    exit()\n\n# Initialize DP table\ndp = [[0] * (n + 2) for _ in range(n + 1)]\ndp[0][0] = 1\n\nfor i in range(1, n + 1):\n    c = S[i-1]\n    for b in range(n + 1):\n        if dp[i-1][b] == 0:\n            continue\n        if c == '(':\n            new_b = b + 1\n            if new_b <= n:\n                dp[i][new_b] = (dp[i][new_b] + dp[i-1][b]) % MOD\n        elif c == ')':\n            if b > 0:\n                new_b = b - 1\n                dp[i][new_b] = (dp[i][new_b] + dp[i-1][b]) % MOD\n        else:  # '?'\n            # Replace with '('\n            new_b = b + 1\n            if new_b <= n:\n                dp[i][new_b] = (dp[i][new_b] + dp[i-1][b]) % MOD\n            # Replace with ')'\n            if b > 0:\n                new_b = b - 1\n                dp[i][new_b] = (dp[i][new_b] + dp[i-1][b]) % MOD\n\nprint(dp[n][0] % MOD)\n",
             6,
             debug=True,
-        ))
+        )
+    )

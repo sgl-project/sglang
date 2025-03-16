@@ -16,6 +16,7 @@ from typing import Union
 
 import regex
 from latex2sympy2 import latex2sympy
+
 # from uniform_eval.bundled.latex2sympy2.latex2sympy2 import latex2sympy
 
 
@@ -271,7 +272,7 @@ def numeric_equal(prediction: float, reference: float):
 
 
 def symbolic_equal(a, b):
-    from sympy import simplify, N
+    from sympy import N, simplify
     from sympy.parsing.latex import parse_latex
     from sympy.parsing.sympy_parser import parse_expr
 
@@ -348,6 +349,7 @@ def call_with_timeout(func, *args, timeout=1, **kwargs):
         return False
 
     return output_queue.get()
+
 
 def _test_math_equal():
     # print(math_equal("0.0833333333333333", "\\frac{1}{12}"))

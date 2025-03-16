@@ -6,13 +6,11 @@ import logging
 import os
 import random
 from pathlib import Path
-from typing import Iterable, Union, Any
+from typing import Any, Iterable, Union
 
 import numpy as np
 
 from .examples import get_examples
-
-
 
 
 def set_seed(seed: int = 42) -> None:
