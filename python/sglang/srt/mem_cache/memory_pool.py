@@ -62,7 +62,7 @@ class ReqToTokenPool:
         self.device = device
         with memory_saver_adapter.region():
             self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int64, device=device
+                (size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(size))
 
