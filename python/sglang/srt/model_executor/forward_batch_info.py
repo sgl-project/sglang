@@ -332,7 +332,7 @@ class ForwardBatch:
 
         return ret
 
-    def get_merged_image_inputs(self) -> Optional[ImageInputs]:
+    def merge_image_inputs(self) -> Optional[ImageInputs]:
         """
         Merge all image inputs in the batch into a single ImageInputs object.
 
@@ -357,6 +357,16 @@ class ForwardBatch:
             merged.pixel_values = torch.from_numpy(merged.pixel_values)
 
         return merged
+
+    def contains_image_inputs(self) -> bool:
+        """ """
+        if self.image_inputs is None:
+            return True
+        return any(
+            image_input.pixel_values is not None and image_input.pixel_values is not []
+            for image_input in self.image_inputs
+            if image_input is not None
+        )
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch

@@ -9,8 +9,6 @@ import PIL
 import torch
 from PIL.Image import Image
 from transformers import (
-    AutoImageProcessor,
-    AutoProcessor,
     BaseImageProcessor,
     BatchFeature,
     LlamaConfig,
@@ -20,6 +18,7 @@ from transformers import (
 )
 from transformers.image_utils import to_numpy_array
 
+from sglang.srt.configs.utils import register_image_processor, register_processor
 from sglang.srt.mm_utils import expand2square
 
 
@@ -625,5 +624,5 @@ class VLMImageProcessorConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-AutoProcessor.register(MultiModalityConfig, VLChatProcessor, exist_ok=True)
-AutoImageProcessor.register(VLMImageProcessorConfig, None, VLMImageProcessor, None)
+register_processor(MultiModalityConfig, VLChatProcessor)
+register_image_processor(MultiModalityConfig, VLMImageProcessor)

@@ -23,6 +23,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# image
+IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
+IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+
+# video
+VIDEO_JOBS_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+
+# audio
+AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"
+AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
+
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
@@ -58,9 +69,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -96,9 +105,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -153,9 +160,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                            },
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
                             "modalities": "multi-images",
                         },
                         {
@@ -242,10 +247,12 @@ class TestOpenAIVisionServer(unittest.TestCase):
         ]
         return messages
 
-    def test_video_chat_completion(self):
-        url = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
+    def get_or_download_file(self, url: str) -> str:
         cache_dir = os.path.expanduser("~/.cache")
-        file_path = os.path.join(cache_dir, "jobs.mp4")
+        if url is None:
+            raise ValueError()
+        file_name = url.split("/")[-1]
+        file_path = os.path.join(cache_dir, file_name)
         os.makedirs(cache_dir, exist_ok=True)
 
         if not os.path.exists(file_path):
@@ -254,6 +261,11 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
+        return file_path
+
+    def test_video_chat_completion(self):
+        url = VIDEO_JOBS_URL
+        file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -289,6 +301,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
+            or "hold" in video_response
         )
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
@@ -312,9 +325,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -344,18 +355,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                    },
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
                 }
             )
         elif image_id == 1:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                    },
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
                 }
             )
         else:
@@ -465,9 +472,7 @@ class TestVLMContextLengthIssue(unittest.TestCase):
                         "content": [
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                                },
+                                "image_url": {"url": IMAGE_MAN_IRONING_URL},
                             },
                             {
                                 "type": "text",

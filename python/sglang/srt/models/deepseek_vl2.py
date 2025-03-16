@@ -1,33 +1,19 @@
-import collections
-import itertools
-import math
-import warnings
-from enum import Enum
-from functools import partial
-from typing import Callable, Iterable, List, Optional, Tuple, Type, Union
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
 
-from sglang.srt.configs import DeepseekVL2Config
 from sglang.srt.configs.deepseekvl2 import (
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
 )
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    LinearBase,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternImageTokens,
+    general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -206,6 +192,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         language_config = config.language_config
         self.language_model = DeepseekV2ForCausalLM(language_config)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.language_model.model.embed_tokens
+
     def _init_vision_module(
         self, vision_config, quant_config: Optional[QuantizationConfig]
     ) -> nn.Module:
@@ -213,7 +202,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         try:
             import timm
         except ImportError:
-            raise ImportError("Please install timm") from ImportError
+            raise ImportError(
+                "To use this model, Please install timm==1.0.15"
+            ) from ImportError
 
         model = timm.create_model(
             "vit_so400m_patch14_siglip_384.webli",
@@ -234,34 +225,19 @@ class DeepseekVL2ForCausalLM(nn.Module):
         **kwargs: object,
     ):
 
-        input_embeds = self.language_model.model.embed_tokens(input_ids)
-        if forward_batch.forward_mode.is_extend() and forward_batch.image_inputs != [
-            None
-        ]:
-            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().numpy()
-            for idx, image in enumerate(forward_batch.image_inputs):
-                if image is None:
-                    continue
-                start_idx = extend_start_loc_cpu[idx]
-                end_idx = start_idx + extend_seq_lens_cpu[idx]
-                pixel_values = image.pixel_values.to(
-                    device="cuda", dtype=torch.bfloat16
-                )
-                image_seq_mask = image.image_seq_mask.to(device="cuda")
-                image_spatial_crop = image.image_spatial_crop
-                input_embeds[start_idx:end_idx] = self.prepare_inputs_embeds(
-                    pixel_values,
-                    image_seq_mask,
-                    image_spatial_crop,
-                    input_embeds[start_idx:end_idx],
-                )
-
-        outputs = self.language_model.forward(
+        inputs_embeds = general_mm_embed_routine(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            embed_tokens=self.get_input_embeddings(),
+            image_embedding_func=self.get_image_feature,
+        )
+
+        outputs = self.language_model.forward(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=inputs_embeds,
         )
 
         return outputs
@@ -287,22 +263,24 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        helper = MultiModalityDataPaddingPatternImageTokens(
+            image_token_id=image_inputs.im_token_id
+        )
+
+        input_ids = helper.pad_input_tokens(input_ids, image_inputs)
         return input_ids
 
-    def prepare_inputs_embeds(
-        self,
-        pixel_values,
-        images_seq_mask,
-        images_spatial_crop,
-        input_embeds,
-    ):
+    def get_image_feature(self, image_input: ImageInputs):
+        pixel_values = image_input.pixel_values.type(
+            next(self.vision.parameters()).dtype
+        ).to(device=next(self.vision.parameters()).device)
         image_feature = self.vision.forward_features(pixel_values)
         images_embeds = self.projector(image_feature)
         _, hw, n_dim = images_embeds.shape
         h = w = int(hw**0.5)
-
         tile_index = 0
         images_in_this_batch = []
+        images_spatial_crop = image_input.image_spatial_crop
         for jdx in range(images_spatial_crop.shape[1]):
             num_width_tiles, num_height_tiles = images_spatial_crop[0, jdx]
             if num_width_tiles == 0 or num_height_tiles == 0:
@@ -379,13 +357,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
             images_in_this_batch.append(global_local_features)
 
-        if len(images_in_this_batch) > 0:
-            images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-            input_embeds.masked_scatter_(
-                images_seq_mask.unsqueeze(-1), images_in_this_batch
-            )
-
-        return input_embeds
+        return torch.cat(images_in_this_batch, dim=0)
 
 
 EntryClass = DeepseekVL2ForCausalLM

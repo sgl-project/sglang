@@ -6,6 +6,7 @@ from sglang.srt.configs.gemma3 import Gemma3Config, Gemma3TextConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.qwen2_5_vl_config import (
     Qwen2_5_VLConfig,
+    Qwen2_5_VLImageProcessor,
     Qwen2_5_VLVisionConfig,
 )
 
@@ -16,6 +17,7 @@ __all__ = [
     "DeepseekVL2Config",
     "Qwen2_5_VLConfig",
     "Qwen2_5_VLVisionConfig",
+    "Qwen2_5_VLImageProcessor",
     "MultiModalityConfig",
     "Gemma3Config",
     "Gemma3TextConfig",
