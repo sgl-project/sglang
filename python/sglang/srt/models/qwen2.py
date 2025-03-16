@@ -361,7 +361,7 @@ class Qwen2ForCausalLM(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

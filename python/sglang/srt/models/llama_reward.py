@@ -44,7 +44,7 @@ class LlamaForSequenceClassification(nn.Module):
 
         self.eos_token_id = config.eos_token_id
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -91,7 +91,7 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         super().__init__(config, quant_config, prefix=prefix)
         self.weights = self.Weights(config.hidden_size, self.num_labels)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

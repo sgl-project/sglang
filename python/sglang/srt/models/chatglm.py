@@ -392,7 +392,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

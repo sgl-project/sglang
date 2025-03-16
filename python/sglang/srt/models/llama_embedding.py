@@ -24,7 +24,7 @@ class LlamaEmbeddingModel(nn.Module):
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

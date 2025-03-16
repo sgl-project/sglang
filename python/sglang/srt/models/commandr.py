@@ -352,7 +352,7 @@ class CohereForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

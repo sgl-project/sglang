@@ -45,7 +45,7 @@ class LlamaForClassification(nn.Module):
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

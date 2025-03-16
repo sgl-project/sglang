@@ -268,7 +268,7 @@ class GPTBigCodeForCausalLM(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

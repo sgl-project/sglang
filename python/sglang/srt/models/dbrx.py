@@ -409,7 +409,7 @@ class DbrxForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
