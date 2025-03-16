@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed import utils as dist_utils

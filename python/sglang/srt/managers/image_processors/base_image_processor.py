@@ -13,6 +13,7 @@ from PIL import Image
 
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
+from sglang.utils import logger
 
 global global_processor
 
@@ -119,6 +120,11 @@ class BaseImageProcessor(ABC):
     ) -> BaseImageProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
+
+        Args:
+
+            discard_alpha_channel: if True, discards the alpha channel in the returned images
+
         """
         image_hashes, image_sizes = [], []
         all_frames = []
@@ -133,7 +139,7 @@ class BaseImageProcessor(ABC):
         if return_text:
             text_parts = input_text.split(image_token)
 
-        # roughly calculate the max number of frames under the max_req_input_len limit
+        # TODO(mick): load from server_args, env, or sampling_params
         MAX_NUM_FRAMES = 30
         estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
         total_frame_count = sum(estimated_frames_list)

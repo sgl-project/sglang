@@ -43,7 +43,7 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ImageInputs, ModelWorkerBatch
-    from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -51,9 +51,8 @@ if TYPE_CHECKING:
 
 
 class ForwardMode(IntEnum):
-    # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
-    PREFILL = auto()
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+    # It is also called "prefill" in common terminology.
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
@@ -153,6 +152,12 @@ class ForwardBatch:
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
+    # For logits and logprobs post processing
+    temp_scaled_logprobs: bool = False
+    temperature: torch.Tensor = None
+    top_p_normalized_logprobs: bool = False
+    top_p: torch.Tensor = None
+
     # Position information
     positions: torch.Tensor = None
 
@@ -189,7 +194,7 @@ class ForwardBatch:
 
     # Attention backend
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: BaseTokenToKVPool = None
+    token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
     # For DP attention
@@ -229,7 +234,6 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -259,15 +263,24 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
+        # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
-            max_len = max(ret.global_num_tokens_cpu)
+            ret.global_num_tokens_gpu = torch.tensor(
+                batch.global_num_tokens, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
+                batch.global_num_tokens_for_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            sum_len = sum(batch.global_num_tokens)
             ret.gathered_buffer = torch.zeros(
-                (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+                (sum_len, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
                 device=device,
             )
-
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             return ret
@@ -370,7 +383,7 @@ class ForwardBatch:
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
 
-        self.mrope_positions = torch.concat(
+        self.mrope_positions = torch.cat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
         )
@@ -417,8 +430,8 @@ def compute_position_kernel(
     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
-    # TODO: optimize this?
-    cumsum_start = 0
+    # NOTE: This can be slow for large bs
+    cumsum_start = tl.cast(0, tl.int64)
     for i in range(pid):
         cumsum_start += tl.load(extend_seq_lens + i)
 
@@ -436,7 +449,7 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
-    positions = torch.concat(
+    positions = torch.cat(
         [
             torch.arange(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
