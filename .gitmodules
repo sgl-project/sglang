@@ -10,6 +10,3 @@
 [submodule "sgl-kernel/3rdparty/deepgemm"]
 	path = sgl-kernel/3rdparty/deepgemm
 	url = https://github.com/deepseek-ai/DeepGEMM
-[submodule "sgl-kernel/3rdparty/flashmla"]
-	path = sgl-kernel/3rdparty/flashmla
-	url = https://github.com/deepseek-ai/FlashMLA
