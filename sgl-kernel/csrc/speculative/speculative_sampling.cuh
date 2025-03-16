@@ -36,8 +36,8 @@ template <
     typename DType,
     typename IdType>
 __global__ void TreeSpeculativeSamplingTargetOnly(
-    IdType* predicts,
-    IdType* accept_index,
+    IdType* predicts,          // mutable
+    IdType* accept_index,      // mutable
     IdType* accept_token_num,  // mutable
     IdType* candidates,
     IdType* retrive_index,
@@ -158,8 +158,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 
 template <typename DType, typename IdType>
 cudaError_t TreeSpeculativeSamplingTargetOnly(
-    IdType* predicts,
-    IdType* output_token_ids,
+    IdType* predicts,                   // mutable
+    IdType* output_token_ids,           // mutable
     IdType* output_accepted_token_num,  // mutable
     IdType* candidates,
     IdType* retrive_index,

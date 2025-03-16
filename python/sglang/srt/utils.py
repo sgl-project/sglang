@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -1633,6 +1634,16 @@ def next_power_of_2(n: int):
 
 
 setattr(triton, "next_power_of_2", next_power_of_2)
+
+
+@contextmanager
+def empty_context(*args, **kwargs):
+    try:
+        # Setup code goes here
+        yield
+    finally:
+        # Cleanup code goes here
+        pass
 
 
 def add_prefix(name: str, prefix: str) -> str:
