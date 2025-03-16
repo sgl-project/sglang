@@ -23,13 +23,6 @@ def get_global_processor():
     return global_processor
 
 
-def init_global_processor(sglang_image_processor, server_args: ServerArgs):
-    """Init the global processor for multi-modal models."""
-    global global_processor
-    transformers.logging.set_verbosity_error()
-    global_processor = sglang_image_processor._build_processor(server_args=server_args)
-
-
 @dataclasses.dataclass
 class BaseImageProcessorOutput:
     image_hashes: list[int]
