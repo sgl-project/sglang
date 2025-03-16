@@ -300,12 +300,6 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
 
         sgl_logits_output = tuple(decode_logits)
 
-        print("-------------------------------sgl_logits_output-------------------")
-
-        print(sgl_logits_output)
-
-        print("-------------------------------sgl_logits_output-------------------")
-
         # Compare logits
         self.compare_outputs(sgl_logits_output, hf_logits_output)
 
