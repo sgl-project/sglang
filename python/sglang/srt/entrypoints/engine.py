@@ -246,7 +246,16 @@ class Engine:
 
     def shutdown(self):
         """Shutdown the engine"""
-        kill_process_tree(os.getpid(), include_parent=False)
+        kill_process_tree(
+            os.getpid(), include_parent=self.server_args.kill_parent_process_on_quit
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return False
 
     def start_profile(self):
         loop = asyncio.get_event_loop()
