@@ -34,8 +34,9 @@ from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.multi_modality_padding import (
+from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
+    general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -264,10 +265,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         kwargs["local_attn_masks"] = local_attn_masks
         return kwargs
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_image_features(self, pixel_values: torch.Tensor):
+    def get_image_feature(self, image_input: ImageInputs):
         """
         Projects the last hidden state from the vision model into language model space.
 
@@ -277,6 +278,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
+        pixel_values = image_input.pixel_values
         pixel_values = pixel_values.to("cuda")
         pixel_values = pixel_values.to(dtype=self.language_model.dtype())
 
@@ -305,7 +307,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             return inputs_embeds
         else:
             # print(f"image tokens from input_ids: {inputs_embeds[special_image_mask].numel()}")
-            image_features = self.get_image_features(image_input.pixel_values)
+            image_features = self.get_image_feature(image_input.pixel_values)
 
             # print(f"image tokens from image embeddings: {image_features.numel()}")
             num_image_tokens_in_embedding = (
@@ -397,20 +399,13 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             llm_input_ids = input_ids
 
-        merged_image_input = forward_batch.get_merged_image_inputs()
-
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and merged_image_input is not None
-        ):
-            inputs_embeds = self.embed_image_inputs(
-                input_ids=llm_input_ids,
-                forward_batch=forward_batch,
-                image_input=merged_image_input,
-            )
-        else:
-            llm_input_ids.clamp_(min=0, max=self.vocab_size - 1)
-            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+        inputs_embeds = general_mm_embed_routine(
+            input_ids=llm_input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            embed_tokens=self.get_input_embeddings(),
+            image_embedding_func=self.get_image_feature,
+        )
 
         outputs = self.language_model(
             input_ids=None,
