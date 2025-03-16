@@ -268,8 +268,8 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
             "top_p": self.top_p,
         }
 
-        # Generate output from SGLang
-        sgl_output = vlm.generate(
+        # Generate output from SGLang used to save the logits
+        _ = vlm.generate(
             prompt=prompt,
             image_data=self.image_url,
             sampling_params=sampling_params,
@@ -295,13 +295,26 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
         )
         decode_logits = []
 
-        # Extract only decode step logits
-        for key in data.files:
-            tensor = data[key]
-            if tensor.shape[0] == 1:  # decode step logits
-                decode_logits.append(tensor)
+        # Get first token's logits from the last position of the prefill
+        prefill_logits = data["prefill"]
+        first_token_logits = prefill_logits[-1]  # Shape (vocab_size,)
 
-        sgl_logits = torch.tensor(np.array(decode_logits)).to(self.device)
+        # Convert to tensor and reshape to match HF format (1, vocab_size)
+        first_token_tensor = torch.tensor(first_token_logits).reshape(1, -1)
+
+        # Get all decode step logits
+        decode_logits = []
+        decode_logits.append(first_token_tensor)  # Add first token from prefill
+
+        # Add remaining decode steps
+        for key in sorted(
+            [k for k in data.keys() if k.startswith("decode_")],
+            key=lambda x: int(x.split("_")[1]),
+        ):
+            # Each is shape (1, vocab_size)
+            decode_logits.append(torch.tensor(data[key][0]))
+
+        sgl_logits = torch.tensor(decode_logits).to(self.device)
 
         # Convert to numpy and compare
         hf_logits_np = hf_logits.cpu().numpy()
