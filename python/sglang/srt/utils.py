@@ -824,18 +824,14 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
-    import os
-
-    import numpy as np
-    import torch
 
     from sglang.srt.distributed import get_tensor_model_parallel_rank
-    from sglang.utils.logger import logger
 
     if get_tensor_model_parallel_rank() != 0:
         return
 
     os.makedirs(dirpath, exist_ok=True)
+
     if value.dtype is torch.bfloat16:
         value = value.float()
     value = value.cpu().numpy()
@@ -866,14 +862,14 @@ def dump_to_file(dirpath, name, value):
         save_dict[f"decode_{next_idx}"] = value
 
         logger.info(
-            f"Append decode_{next_idx} tensor to {output_filename}. "
+            f"Append decode_{next_idx} tensor logits to {output_filename}. "
             f"New shape = {value.shape}, Total tensors = {len(save_dict)}"
         )
         np.savez(output_filename, **save_dict)
     else:
         # First time saving, use prefill as the key
         logger.info(
-            f"Create new tensor dump at {output_filename}. "
+            f"Create Prefill tensor logits at {output_filename}. "
             f"Shape = {value.shape}, Type = prefill"
         )
         np.savez(output_filename, prefill=value)
