@@ -383,7 +383,7 @@ class ForwardBatch:
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
 
-        self.mrope_positions = torch.concat(
+        self.mrope_positions = torch.cat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
         )
@@ -449,7 +449,7 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
-    positions = torch.concat(
+    positions = torch.cat(
         [
             torch.arange(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device

@@ -152,7 +152,7 @@ class RadixCache(BasePrefixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.concat(value)
+            value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int32, device=self.device)
         return value, last_node
@@ -317,7 +317,7 @@ class RadixCache(BasePrefixCache):
                 _dfs_helper(child)
 
         _dfs_helper(self.root_node)
-        return torch.concat(values)
+        return torch.cat(values)
 
     ##### Internal Helper Functions #####
 

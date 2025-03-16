@@ -828,7 +828,7 @@ class MiniCPMVBaseModel(nn.Module):
                 )
 
             if isinstance(image_embeds, list):
-                image_embeds = torch.concat(image_embeds)
+                image_embeds = torch.cat(image_embeds)
 
             return MiniCPMVImageEmbeddingInputs(
                 image_bounds=image_bounds,
