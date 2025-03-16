@@ -1,0 +1,23 @@
+# common
+vllm==0.7.1
+openai>=0.28.1,<=1.65.5
+packaging
+numpy
+tqdm
+datasets==2.14.6
+
+# math_eval
+sympy==1.12
+word2number
+Pebble
+timeout-decorator
+latex2sympy2==1.9.1
+
+# livecodebench
+psutil
+
+# ifeval
+absl-py
+langdetect
+immutabledict
+nltk
