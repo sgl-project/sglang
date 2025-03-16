@@ -9,6 +9,14 @@ Currently, this repository contains the code to reproduce the following scores.
 | LiveCodeBench 2408-2502  | 63.4    |
 | IFeval(Strict Prompt Acc)| 83.9    |
 
+## Download data
+```
+wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/aime24.jsonl
+wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/aime25.jsonl
+wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/ifeval.jsonl
+wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/livecodebench_v5.jsonl
+
+```
 
 ## Run benchmark
 ```
