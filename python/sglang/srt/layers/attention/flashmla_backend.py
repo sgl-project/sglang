@@ -88,10 +88,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             self.kv_indptr,
+            None,
             flashmla_index,
+            self.indices_updater_decode.req_to_token.size(1),
+            flashmla_index.size(1),
             max_seqlen_pad,
-            bs,
         )
+        print(flashmla_index)
         mla_metadata, mla_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
             1 * self.num_q_heads // self.num_kv_heads,

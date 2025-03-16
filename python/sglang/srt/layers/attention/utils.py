@@ -151,6 +151,6 @@ def create_flashmla_kv_indices_triton(
         )
         tl.store(
             kv_indices_ptr 
-            + req_pool_index * kv_indices_ptr_stride
+            + pid * kv_indices_ptr_stride
             + paged_offset_out, data // PAGED_SIZE,
             mask=mask_out)
