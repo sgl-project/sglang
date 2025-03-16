@@ -20,10 +20,10 @@ pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --force-rei
 
 pip install torch_memory_saver --force-reinstall
 
-pip install transformers==4.45.2 sentence_transformers accelerate==1.4.0 peft pandas datasets
+pip install transformers==4.48.3 sentence_transformers accelerate==1.4.0 peft pandas datasets
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
 # reinstall sgl-kernel
-pip install sgl-kernel==0.0.5 --force-reinstall --no-deps
+pip install sgl-kernel==0.0.5.post1 --force-reinstall --no-deps
