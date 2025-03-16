@@ -1178,9 +1178,7 @@ class ScheduleBatch:
                 self.seq_lens, last_loc
             )
 
-        self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
-        )
+        self.req_to_token_pool.write((self.req_pool_indices, locs), self.out_cache_loc)
 
     def filter_batch(
         self,
