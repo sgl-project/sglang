@@ -3,6 +3,10 @@ from __future__ import annotations
 """
 Support attention backend for flashMLA.
 
+
+#TODO
+1. Hard-code the reshaping of kv cache.
+
 """
 
 
@@ -28,6 +32,10 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
+# TODO current hard code
+PAGE_SIZE = 64
+
+
 class FlashMLABackend(FlashInferMLAAttnBackend):
     """Flashinfer attention kernels."""
 
@@ -42,7 +50,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
 
-        print("test Flashmla backend")
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -50,6 +57,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             get_attention_tp_size()
         )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.num_local_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.kv_lora_rank = model_runner.model_config.kv_lora_rank
+        self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.v_head_dim = model_runner.model_config.v_head_dim
+        self.scaling = model_runner.model_config.scaling
+        self.data_type = model_runner.kv_cache_dtype
+        self.q_data_type = model_runner.dtype
+        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
     def forward_decode(
         self,
@@ -94,7 +112,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             flashmla_index.size(1),
             max_seqlen_pad,
         )
-        print(flashmla_index)
+
         mla_metadata, mla_splits = get_mla_metadata(
             forward_batch.seq_lens.to(torch.int32),
             1 * self.num_q_heads // self.num_kv_heads,
@@ -106,21 +124,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
-            k_cache=k_cache.view(
-                -1, 64, 1, 576
-            ),  # TODO num_blocks x page_block_size x num_heads_k x head_size
+            k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
             block_table=flashmla_index,
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
-            head_dim_v=512,  # TODO Retrieve from config.
+            head_dim_v=self.kv_lora_rank,  # TODO Retrieve from config.
             tile_scheduler_metadata=mla_metadata,
             num_splits=mla_splits,
             softmax_scale=layer.scaling,
             causal=False,
         )
-        """
-        #TODO
-        1. Hard-code the reshaping of kv cache.
-        2. Modifying the indexing of kv cache is also needed, but I haven't done that yet.
-        3. The consistency of the output shape hasn't been confirmed yet.
-        """
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
