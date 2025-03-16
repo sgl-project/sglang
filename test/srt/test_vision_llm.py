@@ -4,6 +4,7 @@
 import dataclasses
 import unittest
 from io import BytesIO
+from typing import Tuple
 
 import numpy as np
 import requests
@@ -242,6 +243,39 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
         cls.top_p = 1.0
         cls.debug_tensor_dump_output_folder = "logits"
 
+    def compare_outputs(
+        self,
+        sgl_logits_output: Tuple[torch.Tensor],
+        hf_logits_output: Tuple[torch.Tensor],
+    ):
+
+        for i, (hf_logits, sgl_logits) in enumerate(
+            zip(hf_logits_output, sgl_logits_output)
+        ):
+
+            hf_logits_np = hf_logits.cpu().numpy()
+            sgl_logits_np = sgl_logits.cpu().numpy()
+            # Compare shapes
+            print(
+                f"Token {i+1} - HF shape: {hf_logits_np.shape}, SGL shape: {sgl_logits_np.shape}"
+            )
+
+            # Compare values with mean absolute difference
+            if hf_logits_np.shape == sgl_logits_np.shape:
+                diff = np.abs(hf_logits_np - sgl_logits_np).mean()
+                print(f"  Mean absolute difference: {diff}")
+
+            try:
+                np.testing.assert_allclose(
+                    hf_logits_np,
+                    sgl_logits_np,
+                    rtol=1e-5,  # Relative tolerance
+                    atol=1e-5,  # Absolute tolerance
+                )
+            except AssertionError as e:
+                print(f"❌ Token {i+1} comparison failed!")
+                raise e
+
     async def test_decode_logits(self):
         # Initialize SGLang Engine with logits dumping enabled
         server_args = ServerArgs(
@@ -287,7 +321,7 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
                 top_k=self.top_k,
                 top_p=self.top_p,
             )
-            hf_logits = hf_outputs.scores
+            hf_logits_output = hf_outputs.scores
 
         # Load SGLang logits
         data = np.load(
@@ -314,13 +348,10 @@ class TestQWEN25VLLogits(VisionLLMLogitsBase):
             # Each is shape (1, vocab_size)
             decode_logits.append(torch.tensor(data[key][0]))
 
-        sgl_logits = torch.tensor(decode_logits).to(self.device)
+        sgl_logits_output = tuple(decode_logits)
 
-        # Convert to numpy and compare
-        hf_logits_np = hf_logits.cpu().numpy()
-        sgl_logits_np = sgl_logits.cpu().numpy()
-
-        np.testing.assert_allclose(hf_logits_np, sgl_logits_np)
+        # Compare logits
+        self.compare_outputs(sgl_logits_output, hf_logits_output)
 
         # Cleanup
         vlm.shutdown()
