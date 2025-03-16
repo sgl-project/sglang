@@ -340,6 +340,7 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.capture_mode and cache_k.shape[0] < 4:
+            # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
             with self.device_module.stream(self.alt_stream):
