@@ -20,7 +20,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPTokenDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -805,14 +804,6 @@ class DeepEPMoE(EPMoE):
             correction_bias,
             custom_routing_function,
             activation,
-        )
-
-        self.token_dispatcher = DeepEPTokenDispatcher(
-            num_local_experts=self.num_experts_per_partition,
-            top_k=self.top_k,
-            num_experts=self.num_experts,
-            hidden_size=hidden_size,
-            params_dtype=params_dtype,
         )
 
     def forward(

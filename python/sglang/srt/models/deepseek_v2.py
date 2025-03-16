@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -44,7 +45,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPTokenDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -224,10 +225,12 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = DeepEPTokenDispatcher(
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                top_k=self.top_k,
+            self.deepep_dispatcher = DeepEPDispatcher(
+                group=parallel_state.get_tp_group().device_group,
+                router_topk=self.top_k,
+                permute_fusion=True,
                 num_experts=config.n_routed_experts,
+                num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
             )
@@ -263,7 +266,7 @@ class DeepseekV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
-        topk_ids = torch.full(
+        topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
         topk_weights = torch.empty(
@@ -274,7 +277,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             if self.n_shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
-            topk_weights, topk_ids = select_experts(
+            topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 top_k=self.top_k,
@@ -286,9 +289,9 @@ class DeepseekV2MoE(nn.Module):
             )
         if self.tp_size > 1:
             recv_hidden_states, reorder_topk_ids, seg_indptr = (
-                self.deepep_dispatcher.token_permutation(
+                self.deepep_dispatcher.dispatch(
                     hidden_states,
-                    topk_ids,
+                    topk_idx,
                     topk_weights,
                     self.num_experts,
                     forward_mode,
@@ -304,7 +307,7 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
         if self.tp_size > 1:
-            final_hidden_states = self.deepep_dispatcher.token_unpermutation(
+            final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states, forward_mode
             )
         if shared_output is not None:
