@@ -527,6 +527,9 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
+        if parent_pid == os.getpid():
+            sys.exit(0)
+
         try:
             itself.kill()
 
