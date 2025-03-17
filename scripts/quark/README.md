@@ -6,7 +6,7 @@ This guide explains how to use Quark to perform INT4-FP8 quantization on a shard
 
 ## Installation
 
-1. Download Quark from [LINK] and extract the archive to access the Python wheel package and examples folder.
+1. Download [Quark](https://amd.com/bin/public/amdOpenDownload?filename=amd_quark-0.7%2080c639ab2c.zip) and extract the archive to access the Python wheel package and examples folder.
 
 2. Install Quark using:
 ```bash
