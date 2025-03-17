@@ -134,9 +134,12 @@ class Engine:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+            self.thread = threading.Thread(target=self._start_loop, daemon=True)
             self.thread.start()
+
+    def _start_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
     def generate(
         self,
