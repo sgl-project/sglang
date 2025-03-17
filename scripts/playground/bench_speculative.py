@@ -182,6 +182,12 @@ def main(args, server_args):
                     "--enable-flashinfer-mla",
                 ]
             )
+        if server_args.enable_flashmla:
+            other_args.extend(
+                [
+                    "--enable-flashmla",
+                ]
+            )
 
         if server_args.quantization:
             other_args.extend(
