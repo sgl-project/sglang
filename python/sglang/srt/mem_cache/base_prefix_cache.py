@@ -48,3 +48,6 @@ class BasePrefixCache(ABC):
 
     def pretty_print(self):
         raise NotImplementedError()
+
+    def load_from_extended(self, req) -> bool:
+        return False

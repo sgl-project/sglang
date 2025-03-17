@@ -5,6 +5,7 @@ import queue
 import random
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -97,6 +98,9 @@ def parse_args():
         default="performance_metrics.jsonl",
         help="File to log performance metrics",
     )
+    parser.add_argument(
+        "--enable-session-cache", action="store_true", help="Enable session cache"
+    )
     return parser.parse_args()
 
 
@@ -161,7 +165,7 @@ async def async_request_sglang_generate(
     return output
 
 
-def gen_payload(prompt, output_len):
+def gen_payload(prompt, output_len, session_id: Optional[str] = None):
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -174,6 +178,11 @@ def gen_payload(prompt, output_len):
         "return_logprob": False,
         "logprob_start_len": -1,
     }
+
+    if session_id:
+        payload["session_params"] = {
+            "id": session_id,
+        }
     return payload
 
 
@@ -221,6 +230,8 @@ class WorkloadGenerator:
     def __init__(self, args):
         # Construct the base URL for requests
         self.url = f"http://{args.host}:{args.port}/generate"
+        self.open_session_url = f"http://{args.host}:{args.port}/open_session"
+        self.close_session_url = f"http://{args.host}:{args.port}/close_session"
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -240,11 +251,28 @@ class WorkloadGenerator:
             dataset_path=args.dataset_path,
         )
         self.candidate_inputs = [i[0] for i in self.candidate_inputs]
+        self.session_ids = None
+        if args.enable_session_cache:
+            self.session_ids = []
+            self.open_session(args)
 
-        init_requests = [
-            (i, gen_payload(self.candidate_inputs[i], args.output_length))
-            for i in range(args.num_clients)
-        ]
+        init_requests = []
+        for i in range(args.num_clients):
+            session_id = None
+            if self.session_ids is not None:
+                session_id = self.session_ids[i]
+
+            init_requests.append(
+                (
+                    i,
+                    gen_payload(
+                        self.candidate_inputs[i],
+                        args.output_length,
+                        session_id,
+                    ),
+                )
+            )
+
         self.client_records = {
             i: {"round": 0, "history": init_requests[i][1]["text"]}
             for i in range(args.num_clients)
@@ -255,6 +283,40 @@ class WorkloadGenerator:
         self.response_queue = queue.Queue()
         self.pbar = tqdm(total=args.num_clients * args.num_rounds)
         self.performance_metrics = {"ttft": [], "latency": []}
+
+    def open_session(self, args):
+        # capacity_of_str_len no work at session_controller
+        self.capacity_of_str_len = 0
+        for i in range(args.num_clients):
+            session_id = "session-" + str(uuid.uuid4())
+            self.session_ids.append(session_id)
+
+            open_session_json_data = {
+                "capacity_of_str_len": self.capacity_of_str_len,
+                "session_id": session_id,
+            }
+
+            res = requests.post(
+                self.open_session_url,
+                json=open_session_json_data,
+                timeout=600,
+            )
+            assert res.status_code == 200, f"{res}"
+
+    def close_session(self):
+        for session_id in self.session_ids:
+            close_session_json_data = {
+                "session_id": session_id,
+            }
+            print(f"close_session_json_data is {close_session_json_data}")
+
+            res = requests.post(
+                self.close_session_url,
+                json=close_session_json_data,
+                timeout=600,
+            )
+
+            assert res.status_code == 200, f"{res}"
 
     async def handle_request(self, item):
         try:
@@ -317,12 +379,16 @@ class WorkloadGenerator:
                     self.client_records[client_id][
                         "history"
                     ] += self.candidate_inputs.pop()
+                    session_id = None
+                    if self.session_ids is not None:
+                        session_id = self.session_ids[client_id]
                     self.ready_queue.append(
                         (
                             client_id,
                             gen_payload(
                                 self.client_records[client_id]["history"],
                                 args.output_length,
+                                session_id,
                             ),
                         )
                     )
@@ -341,6 +407,9 @@ class WorkloadGenerator:
         request_thread.join()
         response_thread.join()
         self.pbar.close()
+
+        if self.session_ids is not None:
+            self.close_session()
 
         performance_data = {
             "summary": {

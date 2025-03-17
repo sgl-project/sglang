@@ -435,3 +435,6 @@ class HiRadixCache(RadixCache):
                     if not cur_child.evicted:
                         stack.append(cur_child)
         return ret_list
+
+    def load_from_extended(self, req) -> bool:
+        return req.last_node_global is not None and req.last_node_global.evicted

@@ -183,6 +183,19 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
+    # When the `session_cache_meta_manager` parameter is specified,
+    # the session cache feature is enabled. The metadata information
+    # for the session cache can be stored in the local memory (memkv),
+    # or it can be stored using Redis, etcd, and so on.
+    session_cache_meta_manager: Optional[str] = None
+
+    # When the session cache feature is enabled, if this parameter is set to None,
+    # it indicates that only the GPU will be used to store the session cache.
+    # Additionally, this parameter can also specify multiple connectors such as
+    # memkv, redis, 3fs, and others.
+    session_cache_connectors: Optional[List[str]] = None
+    enable_session_cache: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -310,6 +323,14 @@ class ServerArgs:
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+        if self.session_cache_meta_manager is not None:
+            self.disable_radix_cache = True
+
+            if self.session_cache_connectors is not None:
+                self.enable_hierarchical_cache = True
+            else:
+                self.enable_hierarchical_cache = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1007,6 +1028,26 @@ class ServerArgs:
             action="store_true",
             help="Enable hierarchical cache",
         )
+        parser.add_argument(
+            "--session-cache-meta-manager",
+            type=str,
+            default=ServerArgs.session_cache_meta_manager,
+            help="When the session_cache_meta_manager parameter is specified, the session "
+            "cache feature is enabled. The metadata information for the session cache can "
+            "be stored in the local machine's memory (memkv), or it can be stored using "
+            "Redis, etcd, and so on. Currently, only memkv is supported, for example "
+            "'--session-cache-meta-manager memkv'",
+        )
+        parser.add_argument(
+            "--session-cache-connectors",
+            type=str,
+            nargs="+",
+            default=ServerArgs.session_cache_connectors,
+            help="When the session cache feature is enabled, if this parameter is set to "
+            "None, it indicates that only the GPU will be used to store the session cache. "
+            "Additionally, this parameter can also specify multiple connectors such as memkv, redis, 3fs, and others. Currently, only memkv is supported, for example "
+            " '--session-cache-connectors memkv://1?size=100GB'.",
+        )
 
         # Server warmups
         parser.add_argument(
@@ -1042,6 +1083,7 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        args.enable_session_cache = args.session_cache_meta_manager is not None
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

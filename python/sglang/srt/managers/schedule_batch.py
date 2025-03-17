@@ -416,12 +416,16 @@ class Req:
             if enable_hierarchical_cache:
                 self.prefix_indices, self.last_node, self.last_node_global = (
                     tree_cache.match_prefix(
-                        key=self.adjust_max_prefix_ids(), include_evicted=True
+                        key=self.adjust_max_prefix_ids(),
+                        include_evicted=True,
+                        sid=self.session_id,
                     )
                 )
             else:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
-                    rid=self.rid, key=self.adjust_max_prefix_ids()
+                    rid=self.rid,
+                    key=self.adjust_max_prefix_ids(),
+                    sid=self.session_id,
                 )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 

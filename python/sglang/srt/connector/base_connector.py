@@ -29,6 +29,9 @@ class BaseConnector(ABC):
             existing_handler = signal.getsignal(sig)
             signal.signal(sig, self._close_by_signal(existing_handler))
 
+    def get_url(self):
+        return self.url
+
     def get_local_dir(self):
         return self.local_dir
 

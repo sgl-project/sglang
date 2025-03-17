@@ -447,7 +447,7 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
+        self, req: Req, has_chunked_req: bool, load_from_extended: bool = False
     ):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
@@ -468,11 +468,7 @@ class PrefillAdder:
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                enable_hierarchical_cache
-                and req.last_node_global is not None
-                and req.last_node_global.evicted
-            ):
+            if load_from_extended:
                 req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
                     req.last_node_global, req.prefix_indices
                 )

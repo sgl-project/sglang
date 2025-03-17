@@ -120,11 +120,19 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def set_flat_data(self, val, indices):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def transfer(self, indices, flat_data):
         raise NotImplementedError()
 
     @abc.abstractmethod
     def transfer_per_layer(self, indices, flat_data, layer_id):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_kv_cache_shape(self, length: int):
         raise NotImplementedError()
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
@@ -282,6 +290,12 @@ class MHATokenToKVPool(KVCache):
         )
         return flatten
 
+    def set_flat_data(self, flatten, indices):
+        k_data, v_data = flatten[0], flatten[1]
+        for i in range(self.layer_num):
+            self.k_buffer[i][indices] = k_data[i]
+            self.v_buffer[i][indices] = v_data[i]
+
     @debug_timing
     def transfer(self, indices, flat_data):
         # transfer prepared data from host to device
@@ -350,6 +364,9 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
+
+    def get_kv_cache_shape(self, length: int):
+        return (2, self.layer_num, length, self.head_num, self.head_dim)
 
 
 @torch.compile
@@ -461,6 +478,10 @@ class MLATokenToKVPool(KVCache):
         # prepare a large chunk of contiguous data for efficient transfer
         return torch.stack([self.kv_buffer[i][indices] for i in range(self.layer_num)])
 
+    def set_flat_data(self, flatten, indices):
+        for i in range(self.layer_num):
+            self.kv_buffer[i][indices] = flatten[i]
+
     @debug_timing
     def transfer(self, indices, flat_data):
         # transfer prepared data from host to device
@@ -472,6 +493,9 @@ class MLATokenToKVPool(KVCache):
         # transfer prepared data from host to device
         flat_data = flat_data.to(device=self.device, non_blocking=False)
         self.kv_buffer[layer_id][indices] = flat_data
+
+    def get_kv_cache_shape(self, length: int):
+        return (length, self.layer_num, 1, self.kv_lora_rank + self.qk_rope_head_dim)
 
 
 class DoubleSparseTokenToKVPool(KVCache):

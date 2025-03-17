@@ -1683,3 +1683,22 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+def convert_to_bytes(data_size_str):
+    import pint
+
+    ureg = pint.UnitRegistry()
+    ureg.define("KB = 1024 * byte")
+    ureg.define("MB = 1024 * KB")
+    ureg.define("GB = 1024 * MB")
+    ureg.define("TB = 1024 * GB")
+    ureg.define("kb = 1024 * byte")
+    ureg.define("mb = 1024 * kb")
+    ureg.define("gb = 1024 * mb")
+    ureg.define("tb = 1024 * gb")
+
+    data_size = ureg(data_size_str)
+    converted = data_size.to("byte")
+
+    return converted

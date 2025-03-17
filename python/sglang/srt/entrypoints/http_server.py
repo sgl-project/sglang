@@ -742,22 +742,83 @@ def _wait_and_warmup(
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    try:
-        for i in range(server_args.dp_size):
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
-    except Exception:
-        last_traceback = get_exception_traceback()
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
-        return
+    # when session cache is enable, open_session req
+    # should be sended at first.
+    if server_args.enable_session_cache:
+        session_id = "session-warm-up"
+        open_session_name = "/open_session"
+        close_session_name = "/close_session"
+
+        open_session_json_data = {
+            "capacity_of_str_len": 16,
+            "session_id": session_id,
+        }
+
+        close_session_json_data = {
+            "session_id": session_id,
+        }
+
+        json_data["session_params"] = {
+            "id": session_id,
+        }
+
+        logger.debug(f"json data is {json_data}")
+
+        try:
+            # send open session req
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + open_session_name,
+                    json=open_session_json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+
+            # send generate req
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+
+            # send close session req
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + close_session_name,
+                    json=close_session_json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+
+        except Exception:
+            last_traceback = get_exception_traceback()
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error(f"Initialization failed. warmup error: {last_traceback}")
+            kill_process_tree(os.getpid())
+            return
+    else:
+        try:
+            for _ in range(server_args.dp_size):
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+        except Exception:
+            last_traceback = get_exception_traceback()
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error(f"Initialization failed. warmup error: {last_traceback}")
+            kill_process_tree(os.getpid())
+            return
 
     # Debug print
     # logger.info(f"{res.json()=}")

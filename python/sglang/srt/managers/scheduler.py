@@ -36,6 +36,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.connector import create_remote_connector
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -95,6 +96,8 @@ from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.session_cache.base_meta import get_meta_manager_class
+from sglang.srt.mem_cache.session_cache.session_cache import SessionCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -165,6 +168,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
+        self.enable_session_cache = server_args.enable_session_cache
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -430,7 +434,22 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.tp_worker.get_memory_pool()
         )
 
-        if (
+        if self.enable_session_cache:
+            self.meta_manager = get_meta_manager_class(
+                server_args.session_cache_meta_manager
+            )
+            self.connectors = []
+            if server_args.session_cache_connectors is not None:
+                for arg in server_args.session_cache_connectors:
+                    self.connectors.append(create_remote_connector(arg))
+            self.tree_cache = SessionCache(
+                tp=self.tp_rank,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                metadata_manager=self.meta_manager,
+                connectors=self.connectors,
+            )
+        elif (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
@@ -668,6 +687,15 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
+
+            if (
+                recv_req.session_params is None or recv_req.session_params.id is None
+            ) and self.enable_session_cache:
+                req.finished_reason = FINISH_ABORT(
+                    f"Invalid request: session id should not be None when enable session cache."
+                )
+                self.waiting_queue.append(req)
+                return
 
             if (
                 recv_req.session_params is not None
@@ -1086,8 +1114,12 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.enable_hierarchical_cache,
             )
 
+            load_from_extended = self.tree_cache.load_from_extended(req)
+
             res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
+                req,
+                self.chunked_req,
+                load_from_extended,
             )
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
