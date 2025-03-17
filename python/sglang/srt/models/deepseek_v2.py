@@ -1045,6 +1045,7 @@ class DeepseekV2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
         # Gather
@@ -1059,7 +1060,11 @@ class DeepseekV2Model(nn.Module):
             )
             dp_gather(input_ids, local_input_ids, forward_batch, "embedding")
 
-        hidden_states = self.embed_tokens(input_ids)
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
         residual = None
         if _is_hip and get_bool_env_var("CK_MOE"):
             model_dim = hidden_states.shape[-1]
@@ -1165,8 +1170,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
