@@ -953,7 +953,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        
+
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
@@ -969,8 +969,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)

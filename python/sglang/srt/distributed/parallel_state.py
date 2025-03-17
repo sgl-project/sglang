@@ -189,7 +189,9 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
-    use_message_queue_broadcaster: bool  # a hint of whether to use message queue broadcaster
+    use_message_queue_broadcaster: (
+        bool  # a hint of whether to use message queue broadcaster
+    )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
