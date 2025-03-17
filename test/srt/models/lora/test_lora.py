@@ -25,15 +25,25 @@ LORA_SETS = [
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
-
     # test multi-rank case
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B","RuterNorway/Llama-2-7b-chat-norwegian-LoRa"]},
-    {"base": "meta-llama/Llama-3.1-8B-Instruct", "loras": ["algoprog/fact-generation-llama-3.1-8b-instruct-lora","Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"]}
-    
+    {
+        "base": "meta-llama/Llama-2-7b-hf",
+        "loras": [
+            "winddude/wizardLM-LlaMA-LoRA-7B",
+            "RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
+        ],
+    },
+    {
+        "base": "meta-llama/Llama-3.1-8B-Instruct",
+        "loras": [
+            "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+        ],
+    },
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
-        # "base": "mistralai/Mistral-7B-Instruct-v0.3",
+    # "base": "mistralai/Mistral-7B-Instruct-v0.3",
     #     "loras": [
     #         "/home/ying/test_lora",
     #         "/home/ying/test_lora_1",
@@ -273,8 +283,8 @@ class TestLoRA(unittest.TestCase):
                 hf_outputs.output_strs[i],
             )
             assert (
-                 srt_no_lora_outputs[i].output_strs.strip(" ")
-                 == hf_no_lora_outputs[i].output_strs
+                srt_no_lora_outputs[i].output_strs.strip(" ")
+                == hf_no_lora_outputs[i].output_strs
             )
 
     def test_all(self):
@@ -295,6 +305,5 @@ if __name__ == "__main__":
         mp.set_start_method("spawn")
     except RuntimeError:
         pass
-
 
     unittest.main(warnings="ignore")

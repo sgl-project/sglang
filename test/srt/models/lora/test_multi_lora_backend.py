@@ -34,7 +34,6 @@ MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
     ),
-    
     # multi-rank case
     LoRAModelCase(
         base="meta-llama/Llama-2-7b-hf",
@@ -46,7 +45,7 @@ MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=1e-1,
-            )
+            ),
         ],
         max_loras_per_batch=2,
     ),

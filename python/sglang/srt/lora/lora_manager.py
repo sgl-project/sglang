@@ -136,8 +136,12 @@ class LoRAManager:
         max_len = int(torch.max(seg_lens))
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
 
-        lora_ranks = torch.empty((self.max_loras_per_batch,), dtype=torch.int64, device="cuda")
-        scalings = torch.empty((self.max_loras_per_batch,), dtype=torch.int64, device="cuda")
+        lora_ranks = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+        )
+        scalings = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+        )
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
             lora = self.loras[lora_path]
@@ -150,8 +154,8 @@ class LoRAManager:
             seg_indptr=seg_indptr,
             max_len=max_len,
             weight_indices=weight_indices,
-            lora_ranks = lora_ranks,
-            scalings = scalings
+            lora_ranks=lora_ranks,
+            scalings=scalings,
         )
         self.lora_backend.set_batch_info(batch_info)
 
@@ -174,9 +178,7 @@ class LoRAManager:
                 )
 
     def set_lora_module(self, module_name, module):
-        lora_module = get_lora_layer(
-            module, self.scaling, self.lora_backend
-        )
+        lora_module = get_lora_layer(module, self.scaling, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 

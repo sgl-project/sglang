@@ -144,9 +144,9 @@ class LoRAMemoryPool:
                     )
                     c = get_stacked_multiply(lora_weight_name)
                     if lora_weight_name:
-                        self.A_buffer[lora_weight_name][layer_id][buffer_id][:lora_rank * c, :].copy_(
-                            weights
-                        )
+                        self.A_buffer[lora_weight_name][layer_id][buffer_id][
+                            : lora_rank * c, :
+                        ].copy_(weights)
                 else:
                     lora_weight_name = get_weight_name(
                         name, self.lora_weight_names, LoRAType.LORA_B
@@ -157,11 +157,11 @@ class LoRAMemoryPool:
                             for stacked_id in range(c):
                                 self.B_buffer[lora_weight_name][layer_id][stacked_id][
                                     buffer_id
-                                ][:,:lora_rank].copy_(weights[stacked_id])
+                                ][:, :lora_rank].copy_(weights[stacked_id])
                         else:
-                            self.B_buffer[lora_weight_name][layer_id][0][
-                                buffer_id
-                            ][:,:lora_rank].copy_(weights)
+                            self.B_buffer[lora_weight_name][layer_id][0][buffer_id][
+                                :, :lora_rank
+                            ].copy_(weights)
 
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType

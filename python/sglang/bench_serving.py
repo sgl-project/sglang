@@ -989,7 +989,7 @@ async def benchmark(
     if len(lora_names) != 0:
         lora_name = lora_names[0]
 
-    print("lora_names",lora_names)
+    print("lora_names", lora_names)
 
     test_input = RequestFuncInput(
         model=model_id,
@@ -1034,7 +1034,7 @@ async def benchmark(
         if len(lora_names) == 1:
             lora_name = lora_names[0]
         elif len(lora_names) > 1:
-            idx = random.randint(0,len(lora_names)-1)
+            idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
             lora_name = None
@@ -1376,11 +1376,13 @@ def set_ulimit(target_soft_limit=65535):
         except ValueError as e:
             print(f"Fail to set RLIMIT_NOFILE: {e}")
 
+
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
         for lora_name in values:
             getattr(namespace, self.dest).append(lora_name)
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
