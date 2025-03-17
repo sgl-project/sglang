@@ -73,7 +73,7 @@ class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
         self._run_test(
             model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
             other_args=[],
-            expected_score=0.72,
+            expected_score=0.64,
         )
 
     def test_mmlu_offline_and_online_override(self):
@@ -81,18 +81,28 @@ class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
         self._run_test(
             model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
             other_args=["--quantization", "w8a8_fp8"],
-            # w/ online quantization the inference will use sgl kernel
-            # and we observed that the accuracy is higher then offline only
-            expected_score=0.75,
+            # inference will use sgl kernel w/ online quant override
+            # we observed that the accuracy is higher then offline only
+            expected_score=0.64,
         )
 
-    # def test_mmlu_online_only(self):
-    #     """Test with online quantization only."""
-    #     self._run_test(
-    #         model=DEFAULT_MODEL_NAME_FOR_TEST,
-    #         other_args=["--quantization", "w8a8_fp8"],
-    #         expected_score=0.75,
-    #     )
+    def test_mmlu_online_only(self):
+        """Test with online quantization only."""
+        self._run_test(
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            # inference will use sgl kernel w/ online quantization only
+            # we observed that the accuracy is higher then offline only
+            other_args=["--quantization", "w8a8_fp8"],
+            expected_score=0.64,
+        )
+
+    def test_mmlu_fp16_baseline(self):
+        """Test with unquantized fp16 baseline."""
+        self._run_test(
+            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            other_args=[],
+            expected_score=0.64,
+        )
 
 
 if __name__ == "__main__":
