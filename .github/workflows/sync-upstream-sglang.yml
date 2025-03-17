@@ -22,13 +22,16 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
       - name: Configure Git
+        env:
+          GIT_USER_EMAIL: ${{ secrets.GIT_USER_EMAIL }}
+          GIT_USER_NAME: ${{ secrets.GIT_USER_NAME }}
         run: |
-          git config --global user.email "carsonsow@gmail.com"
-          git config --global user.name "carsonhxsu"
+          git config --global user.email "$GIT_USER_EMAIL"
+          git config --global user.name "$GIT_USER_NAME"
 
       - name: Fetch upstream changes
         run: |
           git remote add upstream git@github.com:sgl-project/sglang.git
           git fetch upstream main
-          git merge upstream/main --allow-unrelated-histories
+          git merge -X theirs upstream/main --allow-unrelated-histories
           git push origin main
