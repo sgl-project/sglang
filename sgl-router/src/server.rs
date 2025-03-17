@@ -1,12 +1,14 @@
 use crate::router::PolicyConfig;
 use crate::router::Router;
-use actix_web::{error, get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder, Error};
+use actix_web::{
+    error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use bytes::Bytes;
 use env_logger::Builder;
+use futures_util::StreamExt;
 use log::{info, LevelFilter};
 use std::collections::HashMap;
 use std::io::Write;
-use futures_util::StreamExt;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -27,10 +29,7 @@ impl AppState {
     }
 }
 
-async fn sink_handler(
-    _req: HttpRequest,
-    mut payload: web::Payload,
-) -> Result<HttpResponse, Error> {
+async fn sink_handler(_req: HttpRequest, mut payload: web::Payload) -> Result<HttpResponse, Error> {
     // Drain the payload
     while let Some(chunk) = payload.next().await {
         if let Err(err) = chunk {
@@ -202,7 +201,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .app_data(web::JsonConfig::default().limit(config.max_payload_size).error_handler(json_error_handler))
+            .app_data(
+                web::JsonConfig::default()
+                    .limit(config.max_payload_size)
+                    .error_handler(json_error_handler),
+            )
             .app_data(web::PayloadConfig::default().limit(config.max_payload_size))
             .service(generate)
             .service(v1_chat_completions)
