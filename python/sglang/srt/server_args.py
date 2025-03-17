@@ -182,9 +182,6 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
-    # Whether to send SIGKILL to parent process when receiving SIGQUIT
-    kill_parent_process_on_quit: bool = True
-
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -1033,19 +1030,11 @@ class ServerArgs:
             help="Inject the outputs from jax as the input of every layer.",
         )
 
-        # Whether to send SIGKILL to parent process when receiving SIGQUIT
-        parser.add_argument(
-            "--no-kill-parent-process-on-quit",
-            action="store_false",
-            help="Do not send SIGKILL to parent process when receiving SIGQUIT",
-        )
-
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        args.kill_parent_process_on_quit = not args.no_kill_parent_process_on_quit
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
