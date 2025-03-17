@@ -1523,7 +1523,7 @@ def is_valid_ipv6_address(address: str) -> bool:
 
 
 def configure_ipv6(dist_init_addr):
-    addr = server_args.dist_init_addr
+    addr = dist_init_addr
     end = addr.find("]")
     if end == -1:
         raise ValueError("invalid IPv6 address format: missing ']'")

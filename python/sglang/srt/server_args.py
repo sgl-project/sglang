@@ -23,6 +23,7 @@ from typing import List, Optional
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
+    configure_ipv6,
     get_amdgpu_memory_capacity,
     get_device,
     get_hpu_memory_capacity,
@@ -51,7 +52,7 @@ class ServerArgs:
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
     quantization: Optional[str] = None
-    quantization_param_path: nullable_str = None
+    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     device: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -138,7 +139,7 @@ class ServerArgs:
 
     # Double Sparsity
     enable_double_sparsity: bool = False
-    ds_channel_config_path: str = None
+    ds_channel_config_path: Optional[str] = None
     ds_heavy_channel_num: int = 32
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
@@ -170,7 +171,7 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
+    tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     enable_flashinfer_mla: bool = False
     enable_flashmla: bool = False
@@ -1132,10 +1133,8 @@ class PortArgs:
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             elif server_args.dist_init_addr.startswith("["):  # ipv6 address
-
-                port, host = PortArgs.configure_ipv6(server_args)
-
-                dist_init_addr = (host, str(port))
+                port_num, host = configure_ipv6(server_args.dist_init_addr)
+                dist_init_addr = (host, str(port_num))
             else:
                 dist_init_addr = server_args.dist_init_addr.split(":")
 
