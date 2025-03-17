@@ -44,4 +44,5 @@ python quantize_sharded.py \
 Notes:
 - Quark's LLM quantization is built on PyTorch and 🤗 Transformers, which currently do not support direct loading of sharded Grok-1 checkpoints.
 - To work around this, the script first merges the sharded checkpoints into a single unsharded model, stored in the path specified by `--intermediate`.
+- Input model must be stored locally. For example, download https://huggingface.co/lmzheng/grok-1 to your local directory and specify its path using the `--input` argument.
 - The final quantized and sharded checkpoint is saved at the path provided to --output.
