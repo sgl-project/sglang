@@ -290,6 +290,7 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   finish:
+    if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
