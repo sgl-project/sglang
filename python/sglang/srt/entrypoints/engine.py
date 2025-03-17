@@ -129,28 +129,21 @@ class Engine:
         )
 
     def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
-        return_hidden_states: bool = False,
-        stream: bool = False,
-    ) -> Union[Dict, Iterator[Dict]]:
-        """
-        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
-        Please refer to `GenerateReqInput` for the documentation.
-        """
+            self,
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Union[List[Dict], Dict]] = None,
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            image_data: Optional[Union[List[str], str]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            custom_logit_processor: Optional[Union[List[str], str]] = None,
+            return_hidden_states: bool = False,
+            stream: bool = False,
+        ) -> Union[Dict, Iterator[Dict]]:
+
         modalities_list = []
         if image_data is not None:
             modalities_list.append("image")
@@ -170,23 +163,29 @@ class Engine:
             return_hidden_states=return_hidden_states,
             stream=stream,
         )
-        loop = asyncio.get_event_loop()
+
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
-
             def generator_wrapper():
                 while True:
                     try:
+                        loop = asyncio.get_running_loop()
                         chunk = loop.run_until_complete(generator.__anext__())
                         yield chunk
                     except StopAsyncIteration:
                         break
-
             return generator_wrapper()
         else:
-            ret = loop.run_until_complete(generator.__anext__())
-            return ret
+            try:
+                loop = asyncio.get_running_loop()
+                future = loop.create_task(generator.__anext__())
+                return loop.run_until_complete(future)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(generator.__anext__())
+
 
     async def async_generate(
         self,
