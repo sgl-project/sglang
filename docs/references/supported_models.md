@@ -43,6 +43,8 @@
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
 - Multi-modal embedding models
   - `python -m sglang.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding --chat-template gme-qwen2-vl`
+- CLIP
+  - `python -m sglang.launch_server --model-path openai/clip-vit-large-patch14-336 --is-embedding`
 
 ## Reward Models
 
