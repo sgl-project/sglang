@@ -102,5 +102,14 @@ jobs:
     ]
     runs-on: ubuntu-latest
     steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
