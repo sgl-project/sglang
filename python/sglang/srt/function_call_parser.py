@@ -4,14 +4,18 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 import partial_json_parser
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 from pydantic import BaseModel
 
-from sglang.srt.openai_api.protocol import Tool
+from sglang.srt.openai_api.protocol import (
+    StructuralTagResponseFormat,
+    StructuresResponseFormat,
+    Tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -595,3 +599,35 @@ class FunctionCallParser:
         return [
             detector.structure_info() for detector in self.multi_format_parser.detectors
         ]
+
+    def get_structure_tag(self) -> StructuralTagResponseFormat:
+        tool_structures: List[StructuresResponseFormat] = list()
+        tool_trigger_set: Set[str] = set()
+
+        for wrapper in self.structure_infos():
+            for tool in self.tools:
+                function = tool.function
+                name = function.name
+                assert name is not None
+                info = wrapper(name)
+
+                # use schema in strict mode, else accept any tool
+                if function.strict:
+                    schema = function.parameters
+                else:
+                    schema = True  # accept any valid json
+
+                tool_structures.append(
+                    StructuresResponseFormat(
+                        begin=info.begin,
+                        schema=schema,  # type: ignore
+                        end=info.end,
+                    )
+                )
+                tool_trigger_set.add(info.trigger)
+
+        return StructuralTagResponseFormat(
+            type="structural_tag",
+            structures=tool_structures,
+            triggers=list(tool_trigger_set),
+        )

@@ -45,7 +45,7 @@ from sglang.srt.conversation import (
     generate_embedding_convs,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
+from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -885,7 +885,7 @@ def v1_chat_generate_request(
         #  - stop: Custom stop tokens.
         #  - image_data: None or a list of image strings (URLs or base64 strings).
         #    None skips any image processing in GenerateReqInput.
-        enforced_tag = None
+        strict_tag = None
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -900,37 +900,9 @@ def v1_chat_generate_request(
                 else:
                     tools = [item.function.model_dump() for item in request.tools]
 
-            if request.tools and request.tool_choice != "none":
-                assert tools is not None
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
-                parser = FunctionCallParser(tools, tool_call_parser)
-
-                tool_trigger_set: Set[str] = set()
-                tool_structures: List[Dict[str, Any]] = list()
-
-                for wrapper in parser.structure_infos():
-                    for tool in tools:
-                        info = wrapper(tool["name"])
-
-                        # use schema in strict mode, else accept any tool
-                        if tool["strict"]:
-                            schema = tool["parameters"]["properties"]
-                        else:
-                            schema = True  # accept any valid json
-
-                        tool_structures.append(
-                            {
-                                "begin": info.begin,
-                                "schema": schema,
-                                "end": info.end,
-                            }
-                        )
-                        tool_trigger_set.add(info.trigger)
-
-                enforced_tag = {
-                    "structures": tool_structures,
-                    "triggers": list(tool_trigger_set),
-                }
+                parser = FunctionCallParser(request.tools, tool_call_parser)
+                strict_tag = parser.get_structure_tag()
 
             if chat_template_name is None:
                 openai_compatible_messages = []
@@ -1037,7 +1009,7 @@ def v1_chat_generate_request(
                 request.response_format.model_dump(by_alias=True)
             )
 
-        if enforced_tag is not None:
+        if strict_tag is not None:
             if (
                 sampling_params.get("regex")
                 or sampling_params.get("ebnf")
@@ -1048,7 +1020,9 @@ def v1_chat_generate_request(
                     "Constrained decoding is not compatible with tool calls."
                 )
             else:
-                sampling_params["structural_tag"] = json.dumps(enforced_tag)
+                sampling_params["structural_tag"] = convert_json_schema_to_str(
+                    strict_tag.model_dump(by_alias=True)
+                )
 
         sampling_params_list.append(sampling_params)
 
