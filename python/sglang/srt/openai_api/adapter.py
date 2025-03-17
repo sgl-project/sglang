@@ -20,18 +20,13 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Type, Union
+
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from pydantic import ValidationError
+from pydantic import ValidationError, BaseModel
 
-try:
-    from outlines.fsm.json_schema import convert_json_schema_to_str
-except ImportError:
-    # Before outlines 0.0.47, convert_json_schema_to_str is under
-    # outlines.integrations.utils
-    from outlines.integrations.utils import convert_json_schema_to_str
 
 from sglang.srt.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -84,6 +79,39 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 chat_template_name = None
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 class FileMetadata:
