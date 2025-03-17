@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,7 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGQUIT)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2
