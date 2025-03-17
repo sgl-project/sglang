@@ -4,17 +4,17 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
-DEFAULT_MLA_MODEL_NAME_FOR_TEST = 'deepseek-ai/DeepSeek-V3'
 
 class TestDeepEPMoE(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -29,7 +29,7 @@ class TestDeepEPMoE(unittest.TestCase):
                 "--ep-size",
                 "8",
                 "--enable-dp-attention",
-                "--enable-ep-moe",
+                "--enable-deepep-moe",
                 "--disable-cuda-graph",
             ],
         )
