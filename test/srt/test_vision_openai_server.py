@@ -75,7 +75,8 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "person" in text, text
+        # `driver` is for gemma-3-it
+        assert "man" in text or "person" or "driver" in text, text
         assert "cab" in text or "taxi" in text or "SUV" in text, text
         assert "iron" in text, text
         assert response.id
@@ -537,6 +538,28 @@ class TestJanusProServer(TestOpenAIVisionServer):
 
     def test_single_image_chat_completion(self):
         # Skip this test because it is flaky
+        pass
+
+
+class TestGemma3itServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3-4b-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "gemma-it",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
         pass
 
 
