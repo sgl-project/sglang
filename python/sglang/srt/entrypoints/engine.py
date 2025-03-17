@@ -320,7 +320,10 @@ class Engine:
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
         to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors)
+                for _ in range(self.server_args.tp_size)
+            ],
             load_format=load_format,
             flush_cache=flush_cache,
         )
