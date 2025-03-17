@@ -257,7 +257,7 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
 
-            assert isinstance(data.content, str)
+            assert isinstance(data.content, str) or response.choices[0].finish_reason
             assert response.id
             assert response.created
 

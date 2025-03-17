@@ -36,6 +36,7 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import torch
 import uvloop
 
+from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -248,6 +249,13 @@ class Engine:
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return False
+
     def start_profile(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.start_profile())
@@ -312,7 +320,10 @@ class Engine:
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
         to avoid duplicated operations such as clearing cache."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors),
+            serialized_named_tensors=[
+                MultiprocessingSerializer.serialize(named_tensors)
+                for _ in range(self.server_args.tp_size)
+            ],
             load_format=load_format,
             flush_cache=flush_cache,
         )
@@ -537,6 +548,9 @@ def _launch_subprocesses(
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
+
+    if server_args.completion_template:
+        load_completion_template_for_openai_api(server_args.completion_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
