@@ -161,6 +161,13 @@ def get_quant_config(
     # parameters or CLI arguments (--quantization flag). This behavior
     # aligns with VLLM's auto-detection mechanism:
     # https://github.com/vllm-project/vllm/blob/c77620d22d43daa7e0440e6267cbdd83f849ac64/vllm/config.py#L633
+    #
+    # TODO: This ensures that DeepSeek v2/v3-awq models work correctly by transforming
+    # to awq-marlin quantization method. However, DeepSeek v2-Lite-awq requires special handling.
+    # Auto/manual adjustment of GPTQ_MARLIN_MIN_THREAD_K (128 -> 64) is required for DeepSeek v2-Lite-awq
+    # model using Marlin kernel. Need to investigate further to determine if this issue is more
+    # widespread and should be exposed as a configurable toggle in the future.
+    # Reference: https://github.com/sgl-project/sglang/pull/4426#issuecomment-2727350258
     quant_cls, model_config.quantization = may_auto_override_quant_config(
         hf_quant_config, model_config.quantization
     )
