@@ -202,7 +202,7 @@ class DefaultModelLoader(BaseModelLoader):
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
     ) -> Optional[str]:
-        """Download model from ModelScope hub if VLLM_USE_MODELSCOPE is True.
+        """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
