@@ -1433,9 +1433,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(
-                                    role="assistant", tool_calls=[tool_call]
-                                ),
+                                delta=DeltaMessage(tool_calls=[tool_call]),
                                 finish_reason=(
                                     None
                                     if request.stream_options
@@ -1455,30 +1453,34 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     else:
                         # No tool calls => just treat this as normal text
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(content=delta if delta else None),
-                            finish_reason=(
-                                None
-                                if request.stream_options
-                                and request.stream_options.include_usage
-                                else finish_reason_type
-                            ),
-                            matched_stop=(
-                                finish_reason["matched"]
-                                if finish_reason and "matched" in finish_reason
-                                else None
-                            ),
-                            logprobs=choice_logprobs,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        stream_buffers[index] = new_stream_buffer
-                        is_firsts[index] = is_first
+                        if delta or not (
+                            request.stream_options
+                            and request.stream_options.include_usage
+                        ):
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(content=delta if delta else None),
+                                finish_reason=(
+                                    None
+                                    if request.stream_options
+                                    and request.stream_options.include_usage
+                                    else finish_reason_type
+                                ),
+                                matched_stop=(
+                                    finish_reason["matched"]
+                                    if finish_reason and "matched" in finish_reason
+                                    else None
+                                ),
+                                logprobs=choice_logprobs,
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                choices=[choice_data],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                            stream_buffers[index] = new_stream_buffer
+                            is_firsts[index] = is_first
                 if (
                     finish_reason_type == "stop"
                     and request.tool_choice != "none"
