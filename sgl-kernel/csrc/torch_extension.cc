@@ -129,21 +129,24 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
       "Tensor uniform_samples, Tensor target_probs, Tensor draft_probs, "
+      "float threshold_single, float threshold_acc, "
       "bool deterministic, int cuda_stream) -> ()");
   m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
 
   m.def(
-      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! "
-      "retrive_next_sibling, "
-      "int topk, int depth, int draft_token_num) -> ()");
-  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor target_predict, int cuda_stream) -> ()");
+  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
-      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
-      "int topk, int depth, int draft_token_num) -> ()");
-  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+
+  m.def("segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int cuda_stream) -> ()");
+  m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
 
   /*
    * From FlashInfer

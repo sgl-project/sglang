@@ -19,32 +19,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, rotate_half
 from sglang.srt.utils import add_prefix
-
-
-# Copied from transformers, modeling_qwen2_vl.py
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-
-    return q_embed, k_embed
 
 
 class VisionAttention(nn.Module):
@@ -168,7 +144,7 @@ class VisionAttention(nn.Module):
             cos, sin = position_embeddings
             original_shape = q.shape
             q, k = q.view(s, head, -1), k.view(s, head, -1)
-            q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q, k = q.reshape(original_shape), k.reshape(original_shape)
 
         if self.use_qkv_parallel:

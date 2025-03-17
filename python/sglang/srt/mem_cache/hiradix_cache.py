@@ -303,9 +303,9 @@ class HiRadixCache(RadixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.concat(value)
+            value = torch.cat(value)
         else:
-            value = torch.tensor([], dtype=torch.int32)
+            value = torch.tensor([], dtype=torch.int64)
 
         last_node_global = last_node
         while last_node.evicted:
