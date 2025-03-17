@@ -149,6 +149,7 @@ class ModelRunner:
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+                "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
@@ -223,6 +224,9 @@ class ModelRunner:
                         "MLA optimization is turned on. Use flashinfer mla backend."
                     )
                     server_args.attention_backend = "flashinfer_mla"
+                elif server_args.enable_flashmla:
+                    logger.info("MLA optimization is turned on. Use flashmla decode.")
+                    server_args.attention_backend = "flashmla"
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     server_args.attention_backend = "triton"
@@ -258,6 +262,14 @@ class ModelRunner:
                 # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
                     "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                )
+                server_args.chunked_prefill_size = -1
+                server_args.disable_radix_cache = True
+
+            if self.model_config.hf_config.architectures == ["DeepseekVL2ForCausalLM"]:
+                # TODO: deepseek-vl2 does not support radix cache now, set disable_radix_cache=True automatically
+                logger.info(
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for deekseek-vl2."
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
@@ -840,6 +852,10 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashInferMLAAttnBackend(self)
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+            self.attn_backend = FlashMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1008,6 +1024,22 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+    def save_remote_model(self, url: str):
+        from sglang.srt.model_loader.loader import RemoteModelLoader
+
+        logger.info(f"Saving model to {url}")
+        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
+
+    def save_sharded_model(
+        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
+    ):
+        from sglang.srt.model_loader.loader import ShardedStateLoader
+
+        logger.info(
+            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
+        )
+        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
