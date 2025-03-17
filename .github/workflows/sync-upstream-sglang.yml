@@ -33,6 +33,7 @@ jobs:
 
       - name: Fetch upstream changes
         run: |
+          cd sglang-lyra
           git remote add upstream git@github.com:sgl-project/sglang.git
           git fetch upstream main
           git merge -X theirs upstream/main --allow-unrelated-histories
