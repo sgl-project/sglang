@@ -944,16 +944,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Scatter
-        if self.dp_size != 1:
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
-
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -965,6 +955,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
             if self.dp_size != 1:
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
                 hidden_states, local_hidden_states = (
                     forward_batch.gathered_buffer,
                     hidden_states,
@@ -974,11 +965,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+
+        # Scatter
+        if self.dp_size != 1:
+            # important: forward batch.gathered_buffer is used both after scatter and after gather.
+            # be careful about this!
+            hidden_states, global_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+
         return hidden_states, residual
 
 
@@ -1023,18 +1025,6 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
-        # Gather
-        if self.dp_size != 1:
-            input_ids, local_input_ids = (
-                torch.empty(
-                    (forward_batch.gathered_buffer.shape[0],),
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
-                ),
-                input_ids,
-            )
-            dp_gather(input_ids, local_input_ids, forward_batch, "embedding")
 
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -1085,15 +1075,6 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> torch.Tensor:
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-
-        if self.dp_size != 1:
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
