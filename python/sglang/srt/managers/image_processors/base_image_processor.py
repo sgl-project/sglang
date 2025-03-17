@@ -111,7 +111,7 @@ class BaseImageProcessor(ABC):
 
     def load_images(
         self,
-        input_ids: list,
+        input_ids: list[int],
         image_data,
         image_token: str,
         max_req_input_len: int,
@@ -122,22 +122,21 @@ class BaseImageProcessor(ABC):
         Each frame of video/image will be replaced by a single image token
 
         Args:
-
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-        image_hashes, image_sizes = [], []
-        all_frames = []
-        new_text_parts = []
 
         if isinstance(input_ids, list) and return_text:
             assert len(input_ids) and isinstance(input_ids[0], int)
             input_text = self._processor.tokenizer.decode(input_ids)
         else:
             input_text = input_ids
-
         if return_text:
-            text_parts = input_text.split(image_token)
+            import re
+
+            pattern = "(" + "|".join(re.escape(sep) for sep in [image_token]) + ")"
+            # split text into list of normal text and special tokens
+            text_parts = re.split(pattern, input_text)
 
         # TODO(mick): load from server_args, env, or sampling_params
         MAX_NUM_FRAMES = 30
@@ -145,53 +144,65 @@ class BaseImageProcessor(ABC):
         total_frame_count = sum(estimated_frames_list)
         # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
         # e.g., 0.1 suggests that 1 frame out of 10 input frames should be used
-        scaling_factor = min(1.0, MAX_NUM_FRAMES / total_frame_count)
+        _scaling_factor = min(1.0, MAX_NUM_FRAMES / max(1, total_frame_count))
 
         assert len(image_data) == len(estimated_frames_list)
 
-        # Process each input with allocated frames
-        for image_index, (image, estimated_frames) in enumerate(
-            zip(image_data, estimated_frames_list)
-        ):
-            if len(all_frames) >= MAX_NUM_FRAMES:
-                max_frames_to_process = 0
-            else:
-                max_frames_to_process = max(1, int(estimated_frames * scaling_factor))
-
-            if max_frames_to_process == 0:
-                frames = []
-            else:
-                try:
-                    if isinstance(image, str) and image.startswith("video:"):
-                        path = image[len("video:") :]
-                        frames = BaseImageProcessor.encode_video(
-                            path, frame_count_limit=max_frames_to_process
-                        )
+        image_index, audio_index = 0, 0
+        hashes, image_sizes, images, audios = [], [], [], []
+        new_text = ""
+        for index, text_part in enumerate(text_parts):
+            try:
+                if text_part == image_token:
+                    # load as image
+                    frames_to_process = estimated_frames_list[image_index]
+                    if frames_to_process == 0:
+                        frames = []
                     else:
-                        raw_image, _size = load_image(image)
-                        if discard_alpha_channel:
-                            raw_image = raw_image.convert("RGB")
-                        frames = [raw_image]
-                    assert len(frames) != 0
-                except FileNotFoundError as e:
-                    print(e)
-                    return None
+                        image_file = image_data[image_index]
+                        if isinstance(image_file, str) and image_file.startswith(
+                            "video:"
+                        ):
+                            # video
+                            path = image_file[len("video:") :]
+                            frames = self.encode_video(
+                                path, frame_count_limit=frames_to_process
+                            )
+                        else:
+                            # image
+                            raw_image, _size = load_image(image_file)
+                            if discard_alpha_channel:
+                                raw_image = raw_image.convert("RGB")
+                            frames = [raw_image]
+                        if len(frames) == 0:
+                            continue
 
-                image_sizes += [frames[0].size] * len(frames)
-                image_hashes += [hash(image)] * len(frames)
-                all_frames += frames
+                    image_sizes += frames[0].size * len(frames)
+                    hashes += [hash(image_file)] * len(frames)
+                    images += frames
+                    image_index += 1
+                    if frames_to_process != 0:
+                        new_text += image_token * len(frames)
+                    assert frames_to_process == len(frames)
+                else:
+                    # TODO(mick): handle video
+                    # normal text
+                    new_text += text_part
 
-            if return_text:
-                new_text_parts.append(text_parts[image_index])
-            if max_frames_to_process != 0:
-                new_text_parts.append(image_token * len(frames))
-            assert max_frames_to_process >= len(frames)
-        if return_text:
-            new_text_parts.append(text_parts[-1])
+            except Exception as e:
+                import openai
 
-        input_text = "".join(new_text_parts)
+                logger.error(f"An exception occurred while loading images: {e}")
+                raise BadRequestError(
+                    f"An exception occurred while loading images: {e}"
+                )
+                continue
+
         return BaseImageProcessorOutput(
-            image_hashes, image_sizes, all_frames, input_text
+            image_hashes=hashes,
+            image_sizes=image_sizes,
+            all_frames=images,
+            input_text=new_text,
         )
 
 
