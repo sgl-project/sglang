@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import is_cuda_available, is_device_avaliable
+from sglang.srt.utils import is_cuda_available, is_hardware_acceleration_available
 
 if is_cuda_available():
     from sgl_kernel import (
@@ -116,7 +116,7 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-if not is_device_avaliable():
+if not is_hardware_acceleration_available():
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
