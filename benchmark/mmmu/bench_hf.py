@@ -2,7 +2,7 @@
     Bench the huggingface vLM with benchmark MMMU
 
     Usage:
-        python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct --dataset-path 
+        python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct --dataset-path
 
     The eval output will be logged
 """
