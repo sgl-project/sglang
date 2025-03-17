@@ -50,8 +50,7 @@ def main(args):
     data_path = args.data_path
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     if not os.path.isfile(data_path):
-        data_path = "/shared/public/data/gsm8k/test.jsonl"
-        # data_path = download_and_cache_file(url)
+        data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
 
     # Construct prompts

@@ -9,14 +9,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
-    input_to_float8
 )
-
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -41,8 +40,7 @@ class W8A8Fp8Config(QuantizationConfig):
     - If CUTLASS is not supported: Falls back to per-token weight quantization
     """
 
-    def __init__(self,
-                 is_checkpoint_fp8_serialized: bool = False):
+    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod
@@ -90,7 +88,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
-        
+
         if self.quantization_config.is_checkpoint_fp8_serialized:
             weight_scale = layer.weight_scale.detach()
             # If checkpoint offline quantized with w8a8_fp8, load the weight and weight_scale directly.
@@ -98,7 +96,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight, weight_scale=weight_scale
                 )
-        
+
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
@@ -120,7 +118,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
 
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -136,7 +133,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             if self.quantization_config.is_checkpoint_fp8_serialized
             else params_dtype
         )
-        
+
         weight_loader = extra_weight_attrs.get("weight_loader")
         self.logical_widths = output_partition_sizes
 
