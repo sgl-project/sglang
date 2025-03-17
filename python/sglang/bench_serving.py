@@ -1530,12 +1530,6 @@ if __name__ == "__main__":
         action=LoRAPathAction,
         help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
     )
-    # parser.add_argument(
-    #     "--lora-name",
-    #     type=str,
-    #     default=None,
-    #     help="The name of LoRA adapter",
-    # )
     parser.add_argument(
         "--prompt-suffix",
         type=str,
