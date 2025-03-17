@@ -18,7 +18,6 @@ This file implements python APIs for the inference engine.
 """
 
 import asyncio
-
 import atexit
 import dataclasses
 import logging
