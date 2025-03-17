@@ -474,7 +474,7 @@ multimodal_model_archs = [
     "MiniCPMV",
     "MultiModalityCausalLM",
     "DeepseekVL2ForCausalLM",
-    "CLIPModel"
+    "CLIPModel",
 ]
 
 
