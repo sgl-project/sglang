@@ -36,11 +36,11 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
-from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
@@ -457,8 +457,9 @@ def load_image(image_file: Union[str, bytes]):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        image = Image.open(BytesIO(response.content))
+        response = requests.get(image_file, stream=True, timeout=timeout).raw
+        image = Image.open(response)
+        response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -1579,6 +1580,16 @@ def next_power_of_2(n: int):
 
 
 setattr(triton, "next_power_of_2", next_power_of_2)
+
+
+@contextmanager
+def empty_context(*args, **kwargs):
+    try:
+        # Setup code goes here
+        yield
+    finally:
+        # Cleanup code goes here
+        pass
 
 
 def add_prefix(name: str, prefix: str) -> str:
