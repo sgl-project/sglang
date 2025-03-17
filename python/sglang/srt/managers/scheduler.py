@@ -444,6 +444,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_worker.get_tp_cpu_group(),
                     page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
                 )
             else:
                 self.tree_cache = RadixCache(
