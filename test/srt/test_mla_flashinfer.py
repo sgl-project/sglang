@@ -67,7 +67,7 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
                     "--enable-torch-compile",
                     "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--enable-flashinfer-mla",
                     "--flashinfer-mla-disable-ragged",
                 ]
@@ -109,7 +109,7 @@ class TestFlashinferMLAMTP(unittest.TestCase):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",

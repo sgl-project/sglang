@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
     MHATokenToKVPoolHost,
+    MLATokenToKVPool,
+    MLATokenToKVPoolHost,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
@@ -25,11 +28,22 @@ class HiRadixCache(RadixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
+        page_size: int,
     ):
-        self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-            token_to_kv_pool_allocator.get_kvcache()
-        )
+        if page_size != 1:
+            raise ValueError(
+                "Page size larger than 1 is not yet supported in HiRadixCache."
+            )
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(self.kv_cache)
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(self.kv_cache)
+        else:
+            raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")
+
         self.tp_group = tp_cache_group
+        self.page_size = page_size
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -45,7 +59,9 @@ class HiRadixCache(RadixCache):
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
-        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, disable=False)
+        super().__init__(
+            req_to_token_pool, token_to_kv_pool_allocator, self.page_size, disable=False
+        )
 
     def reset(self):
         TreeNode.counter = 0
@@ -287,9 +303,9 @@ class HiRadixCache(RadixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.concat(value)
+            value = torch.cat(value)
         else:
-            value = torch.tensor([], dtype=torch.int32)
+            value = torch.tensor([], dtype=torch.int64)
 
         last_node_global = last_node
         while last_node.evicted:
@@ -309,13 +325,11 @@ class HiRadixCache(RadixCache):
             prefix_len = _key_match(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child

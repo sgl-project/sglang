@@ -197,11 +197,11 @@ Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSe
 #master
 python3 -m sglang.launch_server \
 	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
-	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
 #cluster
 python3 -m sglang.launch_server \
 	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
-	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote --enable-torch-compile --torch-compile-max-bs 8
+	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
 ```
 
 > **Note that the launch command here enables `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).

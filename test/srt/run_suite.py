@@ -18,6 +18,7 @@ suites = {
         TestFile("models/lora/test_multi_lora_backend.py", 1),
         TestFile("models/test_embedding_models.py", 119),
         TestFile("models/test_generation_models.py", 103),
+        TestFile("models/test_grok_models.py", 60),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
@@ -71,6 +72,7 @@ suites = {
         TestFile("test_vision_openai_server.py", 344),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_eval_fp8_accuracy.py", 172),
+        TestFile("test_create_kvindices.py", 2),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
