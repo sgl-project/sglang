@@ -30,6 +30,7 @@ from sglang.srt.managers.image_processors.base_image_processor import (
 )
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
+
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         # with contextlib.suppress(ValueError):
@@ -43,9 +44,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             conversations=input_text, images=image, max_req_input_len=max_req_input_len
         )
 
-    async def _process_images(
-        self, image_data, input_text, max_req_input_len
-    ):
+    async def _process_images(self, image_data, input_text, max_req_input_len):
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             image_inputs = await loop.run_in_executor(
@@ -98,6 +97,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
         }
+
 
 ImageProcessorMapping = {
     DeepseekVL2ForCausalLM: DeepseekVL2ImageProcessor,

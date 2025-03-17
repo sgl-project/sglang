@@ -1,15 +1,18 @@
-import os
-from typing import Tuple
-
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torchvision.transforms as T
 from PIL import Image, ImageOps
-from transformers import LlamaTokenizerFast
-from transformers import PretrainedConfig,AutoProcessor,ProcessorMixin
+from transformers import (
+    AutoProcessor,
+    LlamaTokenizerFast,
+    PretrainedConfig,
+    ProcessorMixin,
+)
+
 
 def select_best_resolution(image_size, candidate_resolutions):
     # used for cropping
@@ -441,6 +444,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         return tokenized_str, images_list, images_seq_mask, images_spatial_crop
 
+
 class DeepseekVL2VisionEncoderConfig(PretrainedConfig):
     model_type: str = "vision"
 
@@ -658,5 +662,6 @@ class DeepseekVL2Config(PretrainedConfig):
         self.global_view_pos = global_view_pos
         self.candidate_resolutions = candidate_resolutions
         self.architectures = ["DeepseekVL2ForCausalLM"]
+
 
 AutoProcessor.register(DeepseekVL2Config, DeepseekVLV2Processor)

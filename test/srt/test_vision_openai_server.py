@@ -532,9 +532,10 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
-    
+
     def test_video_chat_completion(self):
         pass
+
 
 class TestJanusProServer(TestOpenAIVisionServer):
     @classmethod
@@ -563,6 +564,7 @@ class TestJanusProServer(TestOpenAIVisionServer):
         # Skip this test because it is flaky
         pass
 
+
 class TestGemma3itServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -583,6 +585,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
 
 if __name__ == "__main__":
     unittest.main()

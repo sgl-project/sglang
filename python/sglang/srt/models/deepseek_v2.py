@@ -1023,7 +1023,7 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-      
+
         # Gather
         if self.dp_size != 1:
             input_ids, local_input_ids = (
@@ -1040,7 +1040,7 @@ class DeepseekV2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-         
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]

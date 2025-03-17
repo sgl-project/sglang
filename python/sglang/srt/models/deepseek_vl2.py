@@ -16,6 +16,7 @@ from sglang.srt.configs.deepseekvl2 import (
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
 )
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -32,7 +33,6 @@ from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
-from sglang.srt.layers.attention.vision import VisionAttention
 
 
 class DeepseekVL2MlpProjector(nn.Module):
@@ -180,7 +180,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- vision encoder ------------
         vision_config = config.vision_config
-        self.vision = self._init_vision_module(vision_config,quant_config)
+        self.vision = self._init_vision_module(vision_config, quant_config)
 
         # ----------- vl projector ------------
         projector_config = config.projector_config
@@ -207,9 +207,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         self.language_model = DeepseekV2ForCausalLM(language_config)
 
     def _init_vision_module(
-        self,
-        vision_config,
-        quant_config: Optional[QuantizationConfig]
+        self, vision_config, quant_config: Optional[QuantizationConfig]
     ) -> nn.Module:
         # TODO: refactor vision model through timm wrapper from transformers
         try:
@@ -227,7 +225,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         model = model.to(dtype=torch.get_default_dtype())
         return model
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,
