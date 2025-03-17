@@ -46,6 +46,7 @@ class SeparatorStyle(IntEnum):
     METAMATH = auto()
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
+    GEMMA3 = auto()
 
 
 @dataclasses.dataclass
@@ -299,6 +300,18 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
+        elif self.sep_style == SeparatorStyle.GEMMA3:
+            ret = system_prompt
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    if i == 0:
+                        ret += message + self.sep
+                    else:
+                        ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
+
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -618,7 +631,6 @@ register_conv_template(
     )
 )
 
-
 register_conv_template(
     Conversation(
         name="deepseek-vl2",
@@ -633,6 +645,20 @@ register_conv_template(
         sep="\n\n",
         sep2="<｜end▁of▁sentence｜>",
         stop_str=["User:", "<｜end▁of▁sentence｜>"],
+    )
+)
+
+# Reference: https://huggingface.co/google/gemma-3-4b-it/blob/main/config.json
+register_conv_template(
+    Conversation(
+        name="gemma-it",
+        system_message="You are a helpful assistant.",
+        system_template="<bos><start_of_turn>user{system_message}\n\n",
+        roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
+        sep="<end_of_turn>\n",
+        sep_style=SeparatorStyle.GEMMA3,
+        stop_str=["<end_of_turn>"],
+        image_token="<start_of_image>",
     )
 )
 
