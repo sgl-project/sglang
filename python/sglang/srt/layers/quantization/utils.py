@@ -1,5 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
-# Adaped from https://github.com/vllm-project/vllm/blob/main/vllm/scalar_type.py
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/scalar_type.py
 
 import functools
 import struct

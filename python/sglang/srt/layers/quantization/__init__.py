@@ -7,7 +7,6 @@ from typing import Callable, Dict, Optional, Type, Union
 
 import torch
 
-# Try to import vllm related modules
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
     from vllm.model_executor.layers.quantization.awq import AWQConfig
