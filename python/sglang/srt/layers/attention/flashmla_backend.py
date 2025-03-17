@@ -58,6 +58,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
+        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata, tuple] = None
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -66,6 +67,46 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+
+        bs = forward_batch.batch_size
+        spec_info = forward_batch.spec_info
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if spec_info is None:
+                max_seqlen_pad = triton.cdiv(
+                    forward_batch.seq_lens.max().item(), PAGE_SIZE
+                )
+                flashmla_index = torch.full(
+                    (bs, max_seqlen_pad),
+                    -1,
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
+                create_flashmla_kv_indices_triton[(bs,)](
+                    self.indices_updater_decode.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    None,
+                    flashmla_index,
+                    self.indices_updater_decode.req_to_token.size(1),
+                    flashmla_index.size(1),
+                    max_seqlen_pad,
+                )
+                mla_metadata, mla_splits = get_mla_metadata(
+                    forward_batch.seq_lens.to(torch.int32),
+                    1 * self.num_q_heads // self.num_kv_heads,
+                    self.num_kv_heads,
+                )
+                self.forward_metadata = (
+                    mla_metadata,
+                    mla_splits,
+                    flashmla_index,
+                )
+            else:
+                super().init_forward_metadata(forward_batch)
+        else:
+            super().init_forward_metadata(forward_batch)
 
     def forward_decode(
         self,
@@ -88,31 +129,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     v,
                 )
         bs = forward_batch.batch_size
-
-        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), PAGE_SIZE)
-        flashmla_index = torch.full(
-            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=q.device
-        )
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.indices_updater_decode.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            None,
-            flashmla_index,
-            self.indices_updater_decode.req_to_token.size(1),
-            flashmla_index.size(1),
-            max_seqlen_pad,
-        )
-
-        mla_metadata, mla_splits = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            1 * self.num_q_heads // self.num_kv_heads,
-            self.num_kv_heads,
-        )
+        mla_metadata, mla_splits, flashmla_index = self.forward_metadata
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-
         o, _ = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
