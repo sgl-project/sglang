@@ -14,7 +14,7 @@ Here we take the deployment of deepseekR1 as an example.
 
 1. At least two Kubernetes nodes, each with 2 H20 systems and 8 GPUs, are required.
 
-2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the instructions in this [document](https://github.com/kubernetes-sigs/lws/blob/main/docs/setup/install.md)
+2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the instructions in this [document](https://lws.sigs.k8s.io/docs/installation/)
 
 
 ## Basic Example
