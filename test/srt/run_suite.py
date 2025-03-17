@@ -75,7 +75,7 @@ suites = {
         TestFile("test_eval_fp8_accuracy.py", 172),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_hicache.py", 60),
-        TestFile("test_hicache_mla", 90),
+        TestFile("test_hicache_mla.py", 90),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
