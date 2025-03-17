@@ -27,7 +27,6 @@ from vllm import _custom_ops as ops
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
-    get_tp_group,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -159,7 +158,6 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -274,10 +272,15 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
         topk_idx = torch.full(
-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            (hidden_states.size(0), self.top_k),
+            -1,
+            dtype=torch.int,
+            device=hidden_states.device,
         )
         topk_weights = torch.empty(
-            (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            (hidden_states.size(0), self.top_k),
+            dtype=torch.float32,
+            device=hidden_states.device,
         )
         if forward_mode is not None and not forward_mode.is_idle():
             # router_logits: (num_tokens, n_experts)
@@ -1050,6 +1053,25 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if not (
+            global_server_args_dict["enable_deepep_moe"]
+            and isinstance(self.mlp, DeepseekV2MoE)
+        ):
+            return self.forward_normal(
+                positions, hidden_states, forward_batch, residual
+            )
+        else:
+            return self.forward_deepep(
+                positions, hidden_states, forward_batch, residual
+            )
+
+    def forward_normal(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -1077,22 +1099,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
             if self.dp_size != 1:
-                if global_server_args_dict["enable_deepep_moe"] and isinstance(
-                    self.mlp, DeepseekV2MoE
-                ):
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-                    hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
-                    return hidden_states, residual
-                else:
-                    hidden_states, local_hidden_states = (
-                        forward_batch.gathered_buffer,
-                        hidden_states,
-                    )
-                    dp_gather(
-                        hidden_states, local_hidden_states, forward_batch, self.layer_id
-                    )
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather(
+                    hidden_states, local_hidden_states, forward_batch, self.layer_id
+                )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
@@ -1100,6 +1113,38 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def forward_deepep(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # Self Attention
+        if not forward_batch.forward_mode.is_idle():
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+        # Fully Connected
+        if self.dp_size != 1:
+            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
 

@@ -3,7 +3,10 @@ from typing import Callable, List, Optional, Tuple
 
 import deep_gemm
 import torch
-from deep_gemm import get_col_major_tma_aligned_tensor
+from deep_gemm import (
+    get_col_major_tma_aligned_tensor,
+    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+)
 from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
@@ -832,6 +835,7 @@ class DeepEPMoE(EPMoE):
     ):
         # Todo @sleepcoo: use m_grouped_gemm_fp8_fp8_bf16_nt_masked after low_latency dispatch (decode)
         if True:  # not forward_mode.is_decode():
+            # if not forward_mode.is_decode():
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         else:
             return self.forward_deepgemm_masked(

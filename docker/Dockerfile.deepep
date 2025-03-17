@@ -1,6 +1,6 @@
-FROM lmsysorg/sglang:latest as base
+FROM lmsysorg/sglang:latest
 
-#cmake
+# CMake
 RUN apt-get update \
 && apt-get install -y --no-install-recommends \
 build-essential \
@@ -11,19 +11,18 @@ libssl-dev \
 && ./cmake-3.27.4-linux-x86_64.sh --skip-license --prefix=/usr/local \
 && rm cmake-3.27.4-linux-x86_64.sh
 
-#python
+# Python
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
     && ln -s /usr/bin/python3 /usr/bin/python
 
-
-# gdrcopy
+# GDRCopy
 WORKDIR /tmp
 RUN git clone https://github.com/NVIDIA/gdrcopy.git
 WORKDIR /tmp/gdrcopy
-RUN git checkout v2.4.1
+RUN git checkout v2.4.4
 
 RUN apt update
 RUN apt install -y nvidia-dkms-535
@@ -37,7 +36,7 @@ RUN dpkg -i libgdrapi_*.deb
 RUN dpkg -i gdrcopy-tests_*.deb
 RUN dpkg -i gdrcopy_*.deb
 
-ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.1/
+ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 
 # IBGDA dependency
 RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
@@ -47,10 +46,10 @@ RUN apt-get install -y libfabric-dev
 WORKDIR /sgl-workspace
 RUN git clone https://github.com/deepseek-ai/DeepEP.git
 
-# nvshmem
+# NVSHMEM
 WORKDIR /sgl-workspace
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.1.7/source/nvshmem_src_3.1.7-1.txz
-RUN tar -xf nvshmem_src_3.1.7-1.txz \
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
+RUN tar -xf nvshmem_src_3.2.5-1.txz \
     && mv nvshmem_src nvshmem
 
 WORKDIR /sgl-workspace/nvshmem
@@ -61,6 +60,7 @@ ENV CUDA_HOME=/usr/local/cuda
 RUN NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
     NVSHMEM_IBGDA_SUPPORT=1 \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
@@ -69,9 +69,9 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
     && cd build \
     && make install -j
 
-
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install python setup.py install
 
+# Set workspace
 WORKDIR /sgl-workspace

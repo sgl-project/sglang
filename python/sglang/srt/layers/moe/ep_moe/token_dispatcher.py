@@ -195,7 +195,6 @@ class DeepEPDispatcher:
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.recv_expert_count = None
-        self.tokens_per_expert = None
         self.params_dtype = params_dtype
         self.params_bytes = 2
         # Metadata
@@ -204,9 +203,9 @@ class DeepEPDispatcher:
         # Handle used for combine operation
         self.handle = None
 
-        self.num_max_dispatch_tokens_per_rank = 256
-        self.return_recv_hook = True
-        self.async_finish = not self.return_recv_hook
+        # `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
+        # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
+        self.num_max_dispatch_tokens_per_rank = 128
 
         if not use_deepep:
             raise ImportError(
@@ -268,7 +267,7 @@ class DeepEPDispatcher:
         num_experts: int,
         forward_mode: ForwardMode,
         previous_event=None,
-        num_max_dispatch_tokens_per_rank: int = 256,
+        num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
@@ -280,6 +279,7 @@ class DeepEPDispatcher:
         )
         # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
+            # if not forward_mode.is_decode():
             (
                 hidden_states,
                 topk_idx,
@@ -290,11 +290,16 @@ class DeepEPDispatcher:
             ) = self.dispatch_normal(
                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
             )
-            self.tokens_per_expert = torch.tensor(
-                num_recv_tokens_per_expert_list,
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
+            if hidden_states.shape[0] > 0:
+                reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
+                    topk_idx,
+                    hidden_states,
+                    num_experts,
+                    self.router_topk,
+                    False,
+                    False,
+                    hidden_states.dtype,
+                )
         else:
             hidden_states, recv_expert_count, handle, event, hook = (
                 self.dispatch_low_latency(
@@ -305,20 +310,9 @@ class DeepEPDispatcher:
                 )
             )
             self.recv_expert_count = recv_expert_count
-        tokens_per_expert = self.get_number_of_tokens_per_expert()
         self.handle = handle
         self.topk_idx = topk_idx
         self.topk_weights = topk_weights
-        if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
-                topk_idx,
-                hidden_states,
-                num_experts,
-                self.router_topk,
-                False,
-                False,
-                hidden_states.dtype,
-            )
         return hidden_states, reorder_topk_ids, seg_indptr
 
     def dispatch_normal(
@@ -363,10 +357,6 @@ class DeepEPDispatcher:
             allocate_on_comm_stream=False,
         )
 
-        self.tokens_per_expert = torch.tensor(
-            num_recv_tokens_per_expert_list, device=x.device, dtype=torch.int64
-        )
-
         return (
             recv_x,
             recv_topk_idx,
@@ -383,17 +373,57 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
     ):
+        """
+        # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'
+        # Please please make sure to change DeepEP code in internode_ll.cu dispatch / combine first and then reinstall!
+        # More details refer: https://github.com/deepseek-ai/DeepEP/issues/15#issuecomment-2709715782
+        +
+        diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
+        index f60e933..cddaabf 100644
+        --- a/csrc/kernels/internode_ll.cu
+        +++ b/csrc/kernels/internode_ll.cu
+        @@ -307,14 +307,14 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
+                    int num_topk, int num_experts, int rank, int num_ranks,
+                    void* workspace, cudaStream_t stream, int phases) {
+            constexpr int kNumMaxTopK = 9;
+        -    constexpr int kNumWarpsPerGroup = 10;
+        -    constexpr int kNumWarpGroups = 3;
+        +    constexpr int kNumWarpsPerGroup = 8;
+        +    constexpr int kNumWarpGroups = 4;
+            EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
+        +
+            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+            const auto num_sms = cell_div(num_experts, kNumWarpGroups);
+            EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
+        -    EP_HOST_ASSERT(cell_div(static_cast<int>(hidden * 2 / sizeof(int4)), 32 * (num_warps - 1)) <= 2);
+        +    // EP_HOST_ASSERT(cell_div(static_cast<int>(hidden * 2 / sizeof(int4)), 32 * (num_warps - 1)) <= 2);
+        +
+            // Workspace checks
+            auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
+        @@ -505,8 +505,8 @@ void combine(void* combined_x,
+                    int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+                    int num_topk, int num_experts, int rank, int num_ranks,
+                    void* workspace, cudaStream_t stream, int phases) {
+        -    constexpr int kNumWarpsPerGroup = 10;
+        -    constexpr int kNumWarpGroups = 3;
+        +    constexpr int kNumWarpsPerGroup = 8;
+        +    constexpr int kNumWarpGroups = 4;
+            constexpr int kNumMaxTopk = 9;
+        +
+            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+        """
+
         recv_hidden_states, recv_expert_count, handle, event, hook = (
             self.buffer_low_latency.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
-                async_finish=self.async_finish,
-                return_recv_hook=self.return_recv_hook,
+                async_finish=False,
+                return_recv_hook=False,  # True for double-batch overlapping, need call hook()
             )
         )
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        # hook()
         return recv_hidden_states, recv_expert_count, handle, event, hook
 
     def combine(
@@ -407,6 +437,7 @@ class DeepEPDispatcher:
         )
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
+            # if not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.zeros(
@@ -461,11 +492,11 @@ class DeepEPDispatcher:
                 topk_idx,
                 topk_weights,
                 handle,
-                async_finish=self.async_finish,
-                return_recv_hook=self.return_recv_hook,
+                async_finish=False,
+                return_recv_hook=False,  # True for double-batch overlapping, need call hook()
             )
         )
-        hook() if self.return_recv_hook else event_overlap.current_stream_wait()
+        # hook()
         return combined_hidden_states, event_overlap, hook
 
     def _indices_to_multihot(self, indices, probs):
@@ -493,27 +524,6 @@ class DeepEPDispatcher:
 
     def get_dispached_metadata(self) -> torch.Tensor:
         return self.topk_idx, self.topk_weights
-
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """
-        Get the number of tokens per expert.
-        """
-        return self.tokens_per_expert
-
-    def get_permuted_hidden_states_by_experts(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
-            self.topk_idx, self.topk_weights
-        )
-        self.hidden_shape_before_permute = hidden_states.shape
-        hidden_states, self.reversed_mapping_for_combine = permute(
-            hidden_states,
-            self.dispatched_routing_map,
-            num_out_tokens=self.tokens_per_expert.sum(),
-            fused=self.permute_fusion,
-        )
-        return hidden_states
 
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
