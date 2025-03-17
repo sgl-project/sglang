@@ -1,15 +1,7 @@
 import argparse
 import glob
-from dataclasses import dataclass
 
-from sglang.test.test_utils import run_unittest_files
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
+from sglang.test.test_utils import TestFile, run_unittest_files
 
 suites = {
     "per-commit": [

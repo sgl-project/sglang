@@ -172,7 +172,7 @@ class TokenToKVPoolAllocator:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index))
+            self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -183,7 +183,7 @@ class TokenToKVPoolAllocator:
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.concat(self.free_group))
+            self.free(torch.cat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -622,11 +622,10 @@ class HostKVCache(abc.ABC):
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
-        self.can_use_mem_size = self.size
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self.clear()
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -656,7 +655,7 @@ class HostKVCache(abc.ABC):
     def clear(self):
         self.mem_state.fill_(0)
         self.can_use_mem_size = self.size
-        self.free_slots = torch.arange(self.size, dtype=torch.int32)
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     @synchronized
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
@@ -739,7 +738,7 @@ class HostKVCache(abc.ABC):
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.concat([self.free_slots, indices])
+        self.free_slots = torch.cat([self.free_slots, indices])
         self.can_use_mem_size += len(indices)
         return len(indices)
 
