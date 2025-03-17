@@ -11,17 +11,17 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code via SSH URL
-        run: |
-          git clone git@github.com:TMElyralab/sglang-lyra.git
-          cd sglang-lyra
-
       - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Checkout code via SSH URL
+        run: |
+          git clone git@github.com:TMElyralab/sglang-lyra.git
+          cd sglang-lyra
 
       - name: Configure Git
         env:
