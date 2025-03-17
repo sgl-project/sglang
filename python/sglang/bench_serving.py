@@ -986,10 +986,10 @@ async def benchmark(
     # Warmup
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
-    if len(lora_names) != 0:
+    if lora_names != None and len(lora_names) != 0:
         lora_name = lora_names[0]
-
-    print("lora_names", lora_names)
+    else:
+        lora_name = None
 
     test_input = RequestFuncInput(
         model=model_id,
@@ -1031,9 +1031,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
-        if len(lora_names) == 1:
-            lora_name = lora_names[0]
-        elif len(lora_names) > 1:
+        if lora_names != None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
         else:
