@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend, next_power_of_2
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -207,6 +207,9 @@ class ImageInputs:
         return ret
 
     def merge(self, other):
+        """
+        merge image inputs when requests are being merged
+        """
         assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
         self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
