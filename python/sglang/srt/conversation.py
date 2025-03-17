@@ -16,6 +16,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
+import re
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -303,6 +304,14 @@ class Conversation:
                 if message:
                     if type(message) is tuple:
                         message, _, _ = message
+                    if 'user' in role:
+                        if len(self.modalities) > 1:
+                            image_section = "\n".join([f"Image-{i+1}: <image>" for i in range(len(self.modalities))])
+                            message = re.sub(r"<image>", "", message, count=len(self.modalities)).strip()
+                            message = f"{image_section}\n{message}"
+                        else:
+                            message = message.replace("<image>", "", 1).strip()
+                            message = f"<image>\n{message}"
                     ret += role + message + self.sep
                 else:
                     ret += role
