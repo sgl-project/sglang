@@ -341,12 +341,21 @@ def extend_attention_fwd(
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-            if Lq <= 128:
-                BLOCK_M, BLOCK_N = (128, 128)
-            elif Lq <= 256:
-                BLOCK_M, BLOCK_N = (64, 64)
+            # 8.9 has a much smaller shared memory size (100K) than 8.0 (160K)
+            if CUDA_CAPABILITY[1] == 9:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
             else:
-                BLOCK_M, BLOCK_N = (32, 64)
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
