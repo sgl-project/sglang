@@ -128,7 +128,7 @@ async def async_request_trt_llm(
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
-                            ttft = time.perf_counter() - st
+                            ttft = timestamp - st
                             output.ttft = ttft
 
                         # Decoding phase
@@ -220,7 +220,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = data.get("usage", {}).get(
+                                output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
@@ -1006,7 +1006,7 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
 

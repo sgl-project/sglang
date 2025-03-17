@@ -14,11 +14,12 @@
 """
 The entry point of inference server. (SRT = SGLang Runtime)
 
-This file implements HTTP APIs for the inferenc engine via fastapi.
+This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
 import dataclasses
+import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -259,6 +260,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
+@app.api_route("/generate_from_file", methods=["POST"])
+async def generate_from_file_request(file: UploadFile, request: Request):
+    """Handle a generate request, this is purely to work with input_embeds."""
+    content = await file.read()
+    input_embeds = json.loads(content.decode("utf-8"))
+
+    obj = GenerateReqInput(
+        input_embeds=input_embeds,
+        sampling_params={
+            "repetition_penalty": 1.2,
+            "temperature": 0.2,
+            "max_new_tokens": 512,
+        },
+    )
+
+    try:
+        ret = await _global_state.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"Error: {e}")
+        return _create_error_response(e)
+
+
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -283,7 +307,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.post("/flush_cache")
+@app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
     _global_state.tokenizer_manager.flush_cache()
@@ -614,7 +638,7 @@ def launch_server(
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(

@@ -6,9 +6,7 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import (
-    create_flashinfer_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -86,7 +84,7 @@ class TritonAttnBackend(AttentionBackend):
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.zeros(
+                kv_indices = torch.empty(
                     forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
@@ -102,7 +100,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
-            attn_logits = torch.zeros(
+            attn_logits = torch.empty(
                 (
                     bs,
                     self.num_head,
@@ -129,7 +127,7 @@ class TritonAttnBackend(AttentionBackend):
             # Different with flashinfer kv_indptr and kv_indices construction
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.zeros(
+            kv_indices = torch.empty(
                 kv_indptr[-1], dtype=torch.int32, device=self.device
             )
             create_flashinfer_kv_indices_triton[(bs,)](
@@ -168,7 +166,7 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens, dim=0
             )
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.zeros(
+            kv_indices = torch.empty(
                 forward_batch.extend_prefix_lens.sum().item(),
                 dtype=torch.int32,
                 device=self.device,
@@ -312,6 +310,7 @@ class TritonAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
@@ -532,7 +531,7 @@ class TritonMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        kv_indices = torch.zeros(
+        kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
                 forward_batch.batch_size * self.topk * self.max_context_len,
@@ -577,16 +576,19 @@ class TritonMultiStepDraftBackend:
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
-    def init_forward_metadata_replay_cuda_graph(self, forward_batch):
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                forward_batch.batch_size,
+                bs,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 seq_lens_sum=-1,
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
+                seq_lens_cpu=None,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
