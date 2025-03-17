@@ -48,7 +48,20 @@ MULTI_LORA_MODELS = [
                 prefill_tolerance=1e-1,
             )
         ],
-        max_loras_per_batch=4,
+        max_loras_per_batch=2,
+    ),
+    LoRAModelCase(
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        adaptors=[
+            LoRAAdaptor(
+                name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+            ),
+            LoRAAdaptor(
+                name="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                prefill_tolerance=1e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
     ),
 ]
 

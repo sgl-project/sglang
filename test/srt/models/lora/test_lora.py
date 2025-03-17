@@ -28,6 +28,7 @@ LORA_SETS = [
 
     # test multi-rank case
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B","RuterNorway/Llama-2-7b-chat-norwegian-LoRa"]},
+    {"base": "meta-llama/Llama-3.1-8B-Instruct", "loras": ["algoprog/fact-generation-llama-3.1-8b-instruct-lora","Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"]}
     
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
