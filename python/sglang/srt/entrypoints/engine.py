@@ -248,6 +248,13 @@ class Engine:
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return False
+
     def start_profile(self):
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.tokenizer_manager.start_profile())
