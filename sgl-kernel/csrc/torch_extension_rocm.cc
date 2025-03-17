@@ -66,7 +66,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
-   
+
    /*
    * From csrc/speculative
    */
