@@ -16,7 +16,9 @@ python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
 
 Benchmark Results:
 
-| Model                 | SGLang | HuggingFace |
-|-----------------------|--------|-------------|
-| Qwen2-VL-7B-Instruct | 0.479  | —           |
-| Gemma-3-it-4B        | 0.423  | 0.403       |
+| Model                   | SGLang | HuggingFace |
+|-------------------------|--------|-------------|
+| Qwen2-VL-7B-Instruct   | 0.479  | —           |
+| Qwen2.5-VL-7B-Instruct | 0.431  | —           |
+| MiniCPM-V-2.6         | 0.435  | —           |
+| Gemma-3-it-4B         | 0.423  | 0.403       |
