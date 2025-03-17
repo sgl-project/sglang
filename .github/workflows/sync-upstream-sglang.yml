@@ -24,6 +24,6 @@ jobs:
       - name: Fetch upstream changes
         run: |
           git remote add upstream git@github.com:sgl-project/sglang.git
-          git fetch upstream
+          git fetch upstream main
           git merge upstream/main
           git push origin main
