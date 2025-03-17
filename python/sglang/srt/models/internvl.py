@@ -19,6 +19,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.multi_modality_padding import (
+    MultiModalityDataPaddingPatternTokenPairs,
+)
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -172,39 +175,8 @@ class InternVLChatModel(nn.Module):
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
-        pad_values = image_inputs.pad_values
-        media_token_pairs = media_token_pairs
-        start_tokens = [s for s, _e in media_token_pairs]
-        end_tokens = [e for _s, e in media_token_pairs]
-        # First start token marks new media
-        media_start_token = start_tokens[0]
-
-        padded_ids = []
-        last_idx = 0
-        media_idx = -1
-
-        start_indices = [i for i, x in enumerate(input_ids) if x in start_tokens]
-        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens]
-
-        if len(start_indices) != len(end_indices):
-            return input_ids
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
-
-            if input_ids[start_idx] == media_start_token:
-                media_idx += 1
-
-            num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[media_idx]
-            padded_ids.extend([pad_value] * num_tokens)
-
-            last_idx = end_idx
-
-        padded_ids.extend(input_ids[last_idx:])
-
-        assert len(input_ids) == len(padded_ids)
-        return padded_ids
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        return pattern.pad_input_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         if self.llm_architectures == "Qwen2ForCausalLM":

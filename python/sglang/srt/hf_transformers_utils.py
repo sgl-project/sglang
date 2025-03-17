@@ -218,10 +218,12 @@ def get_tokenizer(
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 
+
 def get_tokenizer_from_processor(processor):
     if isinstance(processor, PreTrainedTokenizerBase):
         return processor
     return processor.tokenizer
+
 
 def get_processor(
     tokenizer_name: str,

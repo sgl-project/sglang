@@ -603,6 +603,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+
 class TestInternVL2_5Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -616,7 +617,10 @@ class TestInternVL2_5Server(TestOpenAIVisionServer):
             other_args=["--trust-remote-code", "--chat-template", "internvl2_5"],
         )
         cls.base_url += "/v1"
+
     def test_regex(self):
         pass
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,11 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer, get_tokenizer_from_processor
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,

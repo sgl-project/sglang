@@ -19,7 +19,6 @@ from data_utils import (
     process_single_sample,
 )
 from datasets import concatenate_datasets, load_dataset
-
 from internvl_chat import InternVLChat
 from qwen2vl_chat import Qwen2VLChat
 

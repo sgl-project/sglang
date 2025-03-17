@@ -49,7 +49,11 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer, get_tokenizer_from_processor
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
     get_image_processor,

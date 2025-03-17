@@ -50,6 +50,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
 
+
 @dataclasses.dataclass
 class Conversation:
     """A class that manages prompt templates and keeps all conversation history."""
@@ -318,10 +319,17 @@ class Conversation:
                 if message:
                     if type(message) is tuple:
                         message, _, _ = message
-                    if 'user' in role:
+                    if "user" in role:
                         if len(self.modalities) > 1:
-                            image_section = "\n".join([f"Image-{i+1}: <image>" for i in range(len(self.modalities))])
-                            message = re.sub(r"<image>", "", message, count=len(self.modalities)).strip()
+                            image_section = "\n".join(
+                                [
+                                    f"Image-{i+1}: <image>"
+                                    for i in range(len(self.modalities))
+                                ]
+                            )
+                            message = re.sub(
+                                r"<image>", "", message, count=len(self.modalities)
+                            ).strip()
                             message = f"{image_section}\n{message}"
                         else:
                             message = message.replace("<image>", "", 1).strip()
