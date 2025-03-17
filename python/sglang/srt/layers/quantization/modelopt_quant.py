@@ -5,18 +5,21 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    apply_fp8_linear,
+    convert_to_channelwise,
     cutlass_fp8_supported,
     requantize_with_max_scale,
 )
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -70,7 +73,13 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        return ModelOptFp8LinearMethod(self) if isinstance(layer, LinearBase) else None
+
+        if isinstance(layer, LinearBase):
+            return ModelOptFp8LinearMethod(self)
+        if isinstance(layer, AttentionBackend):
+            return ModelOptFp8KVCacheMethod(self)
+
+        return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -153,6 +162,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
+        # cutlass sgl-kernel only supports per-channel scale
+        if self.cutlass_fp8_supported:
+            max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
@@ -171,3 +183,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
+
+
+class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
+    """
+    Handles loading FP8 kv-cache scaling factors from modelopt quantized checkpoints.
+    """
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__(quant_config)

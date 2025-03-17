@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import openai
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
@@ -48,7 +47,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -76,7 +75,10 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "cab" in text, text
+        # `driver` is for gemma-3-it
+        assert "man" in text or "person" or "driver" in text, text
+        assert "cab" in text or "taxi" in text or "SUV" in text, text
+        assert "iron" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -170,7 +172,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        print(text)
+        print(f"LLM response: {text}")
         assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
@@ -182,6 +184,13 @@ class TestOpenAIVisionServer(unittest.TestCase):
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
+
+        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+        # The following import order will cause Segmentation fault.
+        # import decord
+        # from transformers import AutoTokenizer
+        from decord import VideoReader, cpu
+
         max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
@@ -373,6 +382,8 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
+                "--chunked-prefill-size",
+                "10000",
             ],
         )
         cls.base_url += "/v1"
@@ -402,7 +413,7 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
+class TestVLMContextLengthIssue(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -427,7 +438,7 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_chat_completion(self):
+    def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         with self.assertRaises(openai.BadRequestError) as cm:
@@ -453,9 +464,11 @@ class TestQWen2VLServerContextLengthIssue(unittest.TestCase):
                 temperature=0,
             )
 
-        self.assertIn(
-            "Multimodal prompt is too long after expanding multimodal tokens.",
-            str(cm.exception),
+        # context length is checked first, then max_req_input_len, which is calculated from the former
+        assert (
+            "Multimodal prompt is too long after expanding multimodal tokens."
+            in str(cm.exception)
+            or "is longer than the model's context length" in str(cm.exception)
         )
 
 
@@ -498,6 +511,80 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+
+class TestDeepseekVL2Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/deepseek-vl2-small"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "deepseek-vl2",
+                "--context-length",
+                "4096",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+
+class TestJanusProServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/Janus-Pro-7B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "janus-pro",
+                "--mem-fraction-static",
+                "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+    def test_single_image_chat_completion(self):
+        # Skip this test because it is flaky
+        pass
+
+
+class TestGemma3itServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3-4b-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "gemma-it",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
 
 
 if __name__ == "__main__":

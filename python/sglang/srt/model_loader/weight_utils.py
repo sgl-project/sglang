@@ -25,10 +25,10 @@ import filelock
 import gguf
 import huggingface_hub.constants
 import numpy as np
+import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -62,7 +62,6 @@ enable_hf_transfer()
 
 
 class DisabledTqdm(tqdm):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, disable=True)
 
@@ -121,7 +120,7 @@ def convert_bin_to_safetensor_file(
         )
 
     # check if the tensors are the same
-    reloaded = load_file(sf_filename)
+    reloaded = safetensors.torch.load_file(sf_filename)
     for k in loaded:
         pt_tensor = loaded[k]
         sf_tensor = reloaded[k]
@@ -133,7 +132,6 @@ def convert_bin_to_safetensor_file(
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
-
     quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
@@ -402,15 +400,34 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def decrypt(fn, key):
+    raise NotImplementedError()
+
+
+def safetensors_encrypted_weights_iterator(
+    hf_weights_files: List[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
+):
+    raise NotImplementedError()
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
+    decryption_key: Optional[str] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     If is_all_weights_sharded is True, it uses more optimize read by reading an
     entire file instead of reading each tensor one by one.
     """
+    if decryption_key:
+        yield from safetensors_encrypted_weights_iterator(
+            hf_weights_files, is_all_weights_sharded, decryption_key
+        )
+        return
+
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -420,15 +437,9 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        if not is_all_weights_sharded:
-            with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
-                    param = f.get_tensor(name)
-                    yield name, param
-        else:
-            result = load_file(st_file, device="cpu")
-            for name, param in result.items():
-                yield name, param
+        result = safetensors.torch.load_file(st_file, device="cpu")
+        for name, param in result.items():
+            yield name, param
 
 
 def pt_weights_iterator(
@@ -444,7 +455,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location="cpu")
+        state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
         del state
         torch.cuda.empty_cache()
@@ -574,6 +585,51 @@ def composed_weight_loader(
     return composed_loader
 
 
+def runai_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files."""
+    from runai_model_streamer import SafetensorsStreamer
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with SafetensorsStreamer() as streamer:
+        for st_file in tqdm(
+            hf_weights_files,
+            desc="Loading safetensors using Runai Model Streamer",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+        ):
+            streamer.stream_file(st_file)
+            yield from streamer.get_tensors()
+
+
+def set_runai_streamer_env(load_config: LoadConfig):
+    if load_config.model_loader_extra_config:
+        extra_config = load_config.model_loader_extra_config
+
+        if "concurrency" in extra_config and isinstance(
+            extra_config.get("concurrency"), int
+        ):
+            os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(
+                extra_config.get("concurrency")
+            )
+
+        if "memory_limit" in extra_config and isinstance(
+            extra_config.get("memory_limit"), int
+        ):
+            os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(
+                extra_config.get("memory_limit")
+            )
+
+    runai_streamer_s3_endpoint = os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
+    aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
+    if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
+        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -644,9 +700,20 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         return remapped_name
 
     possible_scale_names = [".k_scale", ".v_scale"]
+    modelopt_scale_names = [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"]
     for scale_name in possible_scale_names:
         if name.endswith(scale_name):
-            remapped_name = name.replace(scale_name, f".attn{scale_name}")
+            # Check and remap the name based on modelopt scale names
+            if any(
+                modelopt_scale_name in name
+                for modelopt_scale_name in modelopt_scale_names
+            ):
+                remapped_name = name.replace(
+                    f".self_attn.{scale_name[1]}_proj{scale_name}",
+                    f".self_attn.attn{scale_name}",
+                )
+            else:
+                remapped_name = name.replace(scale_name, f".attn{scale_name}")
             if remapped_name not in params_dict:
                 print_warning_once(
                     f"Found {scale_name} in the checkpoint (e.g. {name}), "

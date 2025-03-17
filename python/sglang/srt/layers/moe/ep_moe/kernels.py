@@ -1,10 +1,18 @@
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 logger = logging.getLogger(__name__)
 
 
@@ -138,6 +146,73 @@ def silu_and_mul_triton_kernel(
 
 
 @triton.jit
+def tanh(x):
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
+def gelu_and_mul_triton_kernel(
+    gateup_output,
+    down_input,
+    hidden_size,
+    reorder_topk_ids,
+    scales,
+    start_expert_id,
+    end_expert_id,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+
+    pid = tl.program_id(0)
+    expert_id = tl.load(reorder_topk_ids + pid)
+    if expert_id >= start_expert_id and expert_id <= end_expert_id:
+        gateup_output_ptr = gateup_output + pid * hidden_size
+        gate_output_ptr = gateup_output_ptr
+        up_output_ptr = gateup_output_ptr + half_hidden_size
+        down_input_ptr = down_input + pid * half_hidden_size
+
+        if scales is not None:
+            scale = tl.load(scales + expert_id - start_expert_id)
+            scale = (1 / scale).to(InDtype)
+        else:
+            scale = 1
+
+        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            mask = offset < half_hidden_size
+
+            gate_output = tl.load(gate_output_ptr + offset, mask=mask).to(tl.float32)
+            up_output = tl.load(up_output_ptr + offset, mask=mask)
+
+            # gelu & mul & quantize
+            # https://pytorch.org/docs/stable/generated/torch.nn.GELU.html
+            # sqrt(2/pi)
+            kAlpha = 0.7978845608028654
+            gate_output = (
+                0.5
+                * gate_output
+                * (
+                    1
+                    + tanh(
+                        kAlpha
+                        * (
+                            gate_output
+                            + 0.044715 * gate_output * gate_output * gate_output
+                        )
+                    )
+                )
+            )
+            gate_output = gate_output.to(InDtype)
+
+            gelu_mul_output = gate_output * up_output * scale
+            gelu_mul_output = gelu_mul_output.to(OutDtype)
+            tl.store(down_input_ptr + offset, gelu_mul_output, mask=mask)
+
+
+@triton.jit
 def post_reorder_triton_kernel(
     down_output_ptr,
     output_ptr,
@@ -218,12 +293,19 @@ def grouped_gemm_triton_kernel(
     seg_indptr,
     weight_indices,
     m_num_tiles_indptr,
-    use_fp8_w8a8,
     scale_a,
     scale_b,
+    use_fp8_w8a8: tl.constexpr,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     a_stride_0: tl.constexpr,
     b_stride_0: tl.constexpr,
     b_stride_1: tl.constexpr,
+    as_stride_0: tl.constexpr,
+    as_stride_1: tl.constexpr,
+    bs_stride_0: tl.constexpr,
+    bs_stride_2: tl.constexpr,
+    bs_stride_1: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -260,6 +342,12 @@ def grouped_gemm_triton_kernel(
         + (n_range_start + offs_bn[:, None]) * b_stride_1
         + offs_k[None, :]
     )
+
+    if group_k > 0 and group_n > 0:
+        a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0
+        offs_bsn = (n_range_start + offs_bn) // group_n
+        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_tile = tl.load(
@@ -268,14 +356,23 @@ def grouped_gemm_triton_kernel(
         b_tile = tl.load(
             b_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
         )
-        accumulator = tl.dot(a_tile, b_tile.T, accumulator)
+
+        if group_k > 0 and group_n > 0:
+            k_start = k * BLOCK_SIZE_K
+            offs_ks = k_start // group_k
+            a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1)
+            b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
+            accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
+        else:
+            accumulator = tl.dot(a_tile, b_tile.T, accumulator)
         a_ptr += BLOCK_SIZE_K
         b_ptr += BLOCK_SIZE_K
 
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
         scale_a_value = tl.load(scale_a + expert_id)
         scale_b_value = tl.load(scale_b + expert_id)
         accumulator *= scale_a_value * scale_b_value
+
     c_tile = accumulator.to(c_dtype)
 
     offs_cm = m_range_start + tl.arange(0, BLOCK_SIZE_M)
@@ -307,14 +404,29 @@ def grouped_gemm_triton(
     use_fp8_w8a8: bool = False,
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
+    block_shape: Optional[List[int]] = None,
 ):
     assert weight_column_major == True  # TODO: more
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
+    if block_shape is not None:
+        assert len(block_shape) == 2
+        block_n, block_k = block_shape[0], block_shape[1]
+        if _is_cuda:
+            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+        else:
+            a, scale_a = per_token_group_quant_fp8(a, block_k)
+
+        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+    # TODO: adjust config or tune kernel
+    # Reduce block size to prevent L40 shared memory overflow.
     config = {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 128,
     }
 
@@ -338,12 +450,19 @@ def grouped_gemm_triton(
         seg_indptr,
         weight_indices,
         m_num_tiles_indptr,
-        use_fp8_w8a8,
         scale_a,
         scale_b,
+        use_fp8_w8a8,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
         a.stride(0),
         b.stride(0),
         b.stride(1),
+        scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
+        scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
+        scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
+        scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
+        scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
         **config,
     )
     return c

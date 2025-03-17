@@ -22,7 +22,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instr
 
 ## DeepSeek V3/R1
 
-Please refer to [DeepSeek documents for reference.](https://docs.sglang.ai/references/deepseek.html#running-examples-on-multi-node).
+Please refer to [DeepSeek documents for reference](https://docs.sglang.ai/references/deepseek.html#running-examples-on-multi-node).
 
 ## Multi-Node Inference on SLURM
 
@@ -71,7 +71,7 @@ srun --ntasks=2 --nodes=2 --output="SLURM_Logs/%x_%j_node$SLURM_NODEID.out" \
     --model-path "$model" \
     --grammar-backend "xgrammar" \
     --tp "$tp_size" \
-    --nccl-init-addr "$NCCL_INIT_ADDR" \
+    --dist-init-addr "$NCCL_INIT_ADDR" \
     --nnodes 2 \
     --node-rank "$SLURM_NODEID" &
 
