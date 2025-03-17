@@ -22,11 +22,9 @@ import uuid
 from http import HTTPStatus
 from typing import Dict, List, Type, Union
 
-
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from pydantic import ValidationError, BaseModel
-
+from pydantic import BaseModel, ValidationError
 
 from sglang.srt.code_completion_parser import (
     generate_completion_prompt_from_request,
