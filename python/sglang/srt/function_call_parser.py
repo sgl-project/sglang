@@ -447,7 +447,7 @@ class Llama32Detector(BaseFormatDetector):
         # Only process if we found valid JSON objects
         if all_actions:
             calls = self.parse_base_json(all_actions, tools)
-        return StreamingParseResult(normal_text=normal_text, calls=calls)
+        return StreamingParseResult(normal_text=text, calls=calls)
 
 
 class MultiFormatParser:
