@@ -5,16 +5,16 @@ import functools
 import struct
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Union
 from types import MappingProxyType
-from typing import List, Mapping, Tuple
+from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
+
 
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
-    fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
+    fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
 ) -> bool:
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
@@ -40,7 +40,8 @@ def is_layer_skipped(
                 raise ValueError(
                     f"Detected some but not all shards of {prefix} "
                     "are quantized. All shards of fused layers "
-                    "to have the same precision.")
+                    "to have the same precision."
+                )
     else:
         is_skipped = prefix in ignored_layers
 
@@ -49,11 +50,12 @@ def is_layer_skipped(
 
 
 def per_tensor_dequantize(
-        tensor: torch.Tensor, inv_scale: Union[float,
-                                               torch.Tensor]) -> torch.Tensor:
+    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
+) -> torch.Tensor:
     fake_qweight = tensor.to(torch.float16)
     dq_weight = fake_qweight * inv_scale
     return dq_weight
+
 
 def all_close_1d(x: torch.Tensor) -> bool:
     assert len(x.shape) == 1
@@ -61,12 +63,12 @@ def all_close_1d(x: torch.Tensor) -> bool:
 
 
 def convert_to_channelwise(
-        weight_scale: torch.Tensor,
-        logical_widths: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+    weight_scale: torch.Tensor, logical_widths: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # Create channelwise buffer
-    weight_scale_channel = torch.empty((sum(logical_widths), 1),
-                                       dtype=torch.float32,
-                                       device=weight_scale.device)
+    weight_scale_channel = torch.empty(
+        (sum(logical_widths), 1), dtype=torch.float32, device=weight_scale.device
+    )
 
     # Expand each scale to match the size of each logical matrix.
     start = 0
@@ -79,8 +81,8 @@ def convert_to_channelwise(
 
 
 def requantize_with_max_scale(
-        weight: torch.Tensor, weight_scale: torch.Tensor,
-        logical_widths: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # Max scale to be used for requanitzation.
     max_w_scale = weight_scale.max()
 
@@ -90,18 +92,17 @@ def requantize_with_max_scale(
     # from disk in this case. Skip requantization in this case (since)
     # we already are quantized with the single scale.
     # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
-    unfused_module_in_checkpoint = (weight_scale[-1]
-                                    > torch.finfo(torch.float8_e4m3fn).min)
+    unfused_module_in_checkpoint = (
+        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    )
 
     # If unfused checkpoint, need requanize with the single scale.
     if unfused_module_in_checkpoint:
         start = 0
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
-            weight_dq = per_tensor_dequantize(weight[start:end, :],
-                                              weight_scale[idx])
-            weight[start:end, :], _ = ops.scaled_fp8_quant(
-                weight_dq, max_w_scale)
+            weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            weight[start:end, :], _ = ops.scaled_fp8_quant(weight_dq, max_w_scale)
             start = end
 
     return max_w_scale, weight
@@ -176,8 +177,7 @@ class ScalarType:
             max_mantissa = max_mantissa - 1
 
         max_exponent = (1 << self.exponent) - 2
-        if (self.nan_repr == NanRepr.EXTD_RANGE_MAX_MIN
-                or self.nan_repr == NanRepr.NONE):
+        if self.nan_repr == NanRepr.EXTD_RANGE_MAX_MIN or self.nan_repr == NanRepr.NONE:
             assert (
                 self.exponent < 11
             ), f"Cannot represent max/min as a double for type {self.__str__()}"
@@ -193,38 +193,39 @@ class ScalarType:
         exponent_bias = (1 << (self.exponent - 1)) - 1
         exponent_bias_double = (1 << 10) - 1  # double e = 11
 
-        max_exponent_double = (max_exponent - exponent_bias +
-                               exponent_bias_double)
+        max_exponent_double = max_exponent - exponent_bias + exponent_bias_double
 
         # shift the mantissa and exponent into the proper positions for an
         # IEEE double and bitwise-or them together.
-        return (max_mantissa <<
-                (52 - self.mantissa)) | (max_exponent_double << 52)
+        return (max_mantissa << (52 - self.mantissa)) | (max_exponent_double << 52)
 
     def _floating_point_max(self) -> float:
         double_raw = self._floating_point_max_int()
-        return struct.unpack('!d', struct.pack('!Q', double_raw))[0]
+        return struct.unpack("!d", struct.pack("!Q", double_raw))[0]
 
     def _raw_max(self) -> Union[int, float]:
         if self.is_floating_point():
             return self._floating_point_max()
         else:
-            assert (self.size_bits < 64 or self.size_bits == 64
-                    and self.is_signed()), "Cannot represent max as an int"
+            assert (
+                self.size_bits < 64 or self.size_bits == 64 and self.is_signed()
+            ), "Cannot represent max as an int"
             return (1 << self.mantissa) - 1
 
     def _raw_min(self) -> Union[int, float]:
         if self.is_floating_point():
-            assert self.is_signed(
+            assert (
+                self.is_signed()
             ), "We currently assume all floating point types are signed"
             sign_bit_double = 1 << 63
 
             max_raw = self._floating_point_max_int()
             min_raw = max_raw | sign_bit_double
-            return struct.unpack('!d', struct.pack('!Q', min_raw))[0]
+            return struct.unpack("!d", struct.pack("!Q", min_raw))[0]
         else:
-            assert (not self.is_signed() or self.size_bits
-                    <= 64), "Cannot represent min as a int64_t"
+            assert (
+                not self.is_signed() or self.size_bits <= 64
+            ), "Cannot represent min as a int64_t"
 
             if self.is_signed():
                 return -(1 << (self.size_bits - 1))
@@ -255,8 +256,7 @@ class ScalarType:
         or_and_advance(self._finite_values_only, 1)
         or_and_advance(self.nan_repr.value, 8)
 
-        assert offset <= 64, \
-            f"ScalarType fields too big {offset} to fit into an int64"
+        assert offset <= 64, f"ScalarType fields too big {offset} to fit into an int64"
 
         return val
 
@@ -310,8 +310,7 @@ class ScalarType:
         If the type is a floating point type that follows IEEE 754
         conventions
         """
-        return self.nan_repr == NanRepr.IEEE_754.value and \
-            not self._finite_values_only
+        return self.nan_repr == NanRepr.IEEE_754.value and not self._finite_values_only
 
     def __str__(self) -> str:
         """
@@ -327,8 +326,14 @@ class ScalarType:
           - if bias is not present it means its zero
         """
         if self.is_floating_point():
-            ret = "float" + str(self.size_bits) + "_e" + str(
-                self.exponent) + "m" + str(self.mantissa)
+            ret = (
+                "float"
+                + str(self.size_bits)
+                + "_e"
+                + str(self.exponent)
+                + "m"
+                + str(self.mantissa)
+            )
 
             if not self.is_ieee_754():
                 if self._finite_values_only:
@@ -356,41 +361,43 @@ class ScalarType:
     #
 
     @classmethod
-    def int_(cls, size_bits: int, bias: Optional[int]) -> 'ScalarType':
+    def int_(cls, size_bits: int, bias: Optional[int]) -> "ScalarType":
         "Create a signed integer scalar type (size_bits includes sign-bit)."
         ret = cls(0, size_bits - 1, True, bias if bias else 0)
         ret.id  # noqa B018: make sure the id is cached
         return ret
 
     @classmethod
-    def uint(cls, size_bits: int, bias: Optional[int]) -> 'ScalarType':
+    def uint(cls, size_bits: int, bias: Optional[int]) -> "ScalarType":
         """Create a unsigned integer scalar type."""
         ret = cls(0, size_bits, False, bias if bias else 0)
         ret.id  # noqa B018: make sure the id is cached
         return ret
 
     @classmethod
-    def float_IEEE754(cls, exponent: int, mantissa: int) -> 'ScalarType':
+    def float_IEEE754(cls, exponent: int, mantissa: int) -> "ScalarType":
         """
         Create a standard floating point type
         (i.e. follows IEEE 754 conventions).
         """
-        assert (mantissa > 0 and exponent > 0)
+        assert mantissa > 0 and exponent > 0
         ret = cls(exponent, mantissa, True, 0)
         ret.id  # noqa B018: make sure the id is cached
         return ret
 
     @classmethod
-    def float_(cls, exponent: int, mantissa: int, finite_values_only: bool,
-               nan_repr: NanRepr) -> 'ScalarType':
+    def float_(
+        cls, exponent: int, mantissa: int, finite_values_only: bool, nan_repr: NanRepr
+    ) -> "ScalarType":
         """
         Create a non-standard floating point type
         (i.e. does not follow IEEE 754 conventions).
         """
-        assert (mantissa > 0 and exponent > 0)
-        assert (nan_repr != NanRepr.IEEE_754), (
+        assert mantissa > 0 and exponent > 0
+        assert nan_repr != NanRepr.IEEE_754, (
             "use `float_IEEE754` constructor for floating point types that "
-            "follow IEEE 754 conventions")
+            "follow IEEE 754 conventions"
+        )
         ret = cls(exponent, mantissa, True, 0, finite_values_only, nan_repr)
         ret.id  # noqa B018: make sure the id is cached
         return ret
