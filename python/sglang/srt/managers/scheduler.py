@@ -895,7 +895,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
             spec_accept_length = 0
@@ -913,7 +912,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
 

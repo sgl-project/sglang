@@ -36,11 +36,11 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
-from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
@@ -453,8 +453,9 @@ def load_image(image_file: Union[str, bytes]):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        image = Image.open(BytesIO(response.content))
+        response = requests.get(image_file, stream=True, timeout=timeout).raw
+        image = Image.open(response)
+        response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -481,6 +482,7 @@ def suppress_other_loggers():
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
+    logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -527,10 +529,11 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
     if include_parent:
-        if parent_pid == os.getpid():
-            sys.exit(0)
-
         try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
@@ -1573,6 +1576,16 @@ def next_power_of_2(n: int):
 
 
 setattr(triton, "next_power_of_2", next_power_of_2)
+
+
+@contextmanager
+def empty_context(*args, **kwargs):
+    try:
+        # Setup code goes here
+        yield
+    finally:
+        # Cleanup code goes here
+        pass
 
 
 def add_prefix(name: str, prefix: str) -> str:
