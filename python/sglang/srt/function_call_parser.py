@@ -129,9 +129,7 @@ class BaseFormatDetector(ABC):
         return results
 
     @abstractmethod
-    def detect_and_parse(
-        self, text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -333,9 +331,7 @@ class Qwen25Detector(BaseFormatDetector):
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
 
-    def detect_and_parse(
-        self, text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -396,9 +392,7 @@ class MistralDetector(BaseFormatDetector):
         else:
             return ""
 
-    def detect_and_parse(
-        self, text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
@@ -444,15 +438,15 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         return "<|python_tag|>" in text or text.startswith("{")
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
-            _, action_text = text.split("<|python_tag|>")
+            normal_text, action_text = text.split("<|python_tag|>")
         else:
-            action_text = text
+            normal_text, action_text = "", text
 
         # Split by semicolon and process each part
         json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
