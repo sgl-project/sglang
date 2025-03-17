@@ -9,7 +9,7 @@
 
 namespace {
 
-// dispatcher
+// dispatch bool
 #define AT_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)                                 \
   [&] {                                                                          \
     if (BOOL_V) {                                                                \
@@ -19,6 +19,27 @@ namespace {
       constexpr bool BOOL_NAME = false;                                          \
       return __VA_ARGS__();                                                      \
     }                                                                            \
+  }()
+
+// dispatch: bfloat16, float16, int8_t
+#define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                                    \
+  [&] {                                                                         \
+    switch (TYPE) {                                                             \
+      case at::ScalarType::BFloat16 : {                                         \
+        using packed_t = at::BFloat16;                                          \
+        return __VA_ARGS__();                                                   \
+      }                                                                         \
+      case at::ScalarType::Half: {                                              \
+        using packed_t = at::Half;                                              \
+        return __VA_ARGS__();                                                   \
+      }                                                                         \
+      case at::ScalarType::Char : {                                             \
+        using packed_t = int8_t;                                                \
+        return __VA_ARGS__();                                                   \
+      }                                                                         \
+      default:                                                                  \
+        TORCH_CHECK(false, "Unsupported floating data type.\n");                \
+    }                                                                           \
   }()
 
 

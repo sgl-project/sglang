@@ -4,17 +4,64 @@
 
 namespace {
 
+// packed   layout:
+//   quants {N, K}  int8_t
+//   comp   {N}     int32_t
+template <int BLOCK_N>
+inline void s8s8_compensation(int8_t* __restrict__ packed, int K) {
+#if defined(CPU_CAPABILITY_AVX512)
+  constexpr int COLS = BLOCK_N / 16;
+  __m512i vcomp[COLS];
+
+  for (int col = 0; col < COLS; ++col) {
+    vcomp[col] = _mm512_setzero_si512();
+  }
+
+  const int64_t offset = BLOCK_N * K;
+  const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+  for (int k = 0; k < K / 4; ++k) {
+    for (int col = 0; col < COLS; ++col) {
+      __m512i vb = _mm512_loadu_si512((const __m512i *)(packed + k * BLOCK_N * 4 + col * 64));
+      vcomp[col] = _mm512_dpbusd_epi32(vcomp[col], off, vb);
+    }
+  }
+
+  for (int col = 0; col < COLS; ++col) {
+    _mm512_storeu_si512((__m512i *)(packed + offset + col * 64), vcomp[col]);
+  }
+#else
+  TORCH_CHECK(false, "s8s8_compensation not implemented!");
+#endif
+}
+
 // convert to vnni format
 // from [N, K] to [K/2, N, 2] for bfloat16 and float16
-template <typename scalar_t>
-inline void pack_vnni(scalar_t* __restrict__ packed, const scalar_t* __restrict__ weight, int64_t N, int64_t K) {
-  for (int64_t n = 0; n < N; ++n) {
-    for (int64_t k = 0; k < K / VNNI_BLK; ++k) {
-      for (int64_t d = 0; d < VNNI_BLK; ++d) {
+template <typename packed_t>
+inline void pack_vnni(packed_t* __restrict__ packed, const packed_t* __restrict__ weight, int N, int K) {
+  const int VNNI_BLK = 2;
+  for (int n = 0; n < N; ++n) {
+    for (int k = 0; k < K / VNNI_BLK; ++k) {
+      for (int d = 0; d < VNNI_BLK; ++d) {
         packed[k * N * VNNI_BLK + n * VNNI_BLK + d] = weight[n * K + k * VNNI_BLK + d];
       }
     }
   }
+}
+
+template <>
+inline void pack_vnni<int8_t>(int8_t* __restrict__ packed, const int8_t* __restrict__ weight, int N, int K) {
+  constexpr int BLOCK_N = block_size_n();
+  TORCH_CHECK(N == BLOCK_N);
+
+  const int VNNI_BLK = 4;
+  for (int n = 0; n < N; ++n) {
+    for (int k = 0; k < K / VNNI_BLK; ++k) {
+      for (int d = 0; d < VNNI_BLK; ++d) {
+        packed[k * N * VNNI_BLK + n * VNNI_BLK + d] = weight[n * K + k * VNNI_BLK + d];
+      }
+    }
+  }
+  s8s8_compensation<BLOCK_N>(packed, K);
 }
 
 template <typename scalar_t>
@@ -304,15 +351,21 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   const int64_t NB = div_up(OC, BLOCK_N);
 
   // use phony sizes here [E, OC, IC], for each [E], [OC, IC] -> [IC / 2, OC, 2]
-  auto packed_weight = at::empty_like(weight);
+  auto packed_weight = at::empty({}, weight.options());
   const int64_t stride = OC * IC;
 
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
-      "expect weight to be bfloat16, float16.");
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf || st == at::kChar,
+      "expect weight to be bfloat16, float16 or int8.");
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "convert_weight_packed", [&] {
-    const scalar_t* w_data = weight.data_ptr<scalar_t>();
-    scalar_t* packed_data = packed_weight.data_ptr<scalar_t>();
+  CPU_DISPATCH_PACKED_TYPES(st, [&] {
+    // adjust most inner dimension size
+    const int packed_row_size = get_row_size<packed_t>(IC);
+    auto sizes = weight.sizes().vec();
+    sizes[ndim - 1] = packed_row_size;
+    packed_weight.resize_(sizes);
+
+    const packed_t* w_data = weight.data_ptr<packed_t>();
+    packed_t* packed_data = packed_weight.data_ptr<packed_t>();
 
     // parallel on {E, NB}
     at::parallel_for(0, E * NB, 0, [&](int64_t begin, int64_t end) {
@@ -324,8 +377,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 
         int64_t n = nb * BLOCK_N;
         int64_t n_size = std::min(BLOCK_N, OC - n);
-        pack_vnni<scalar_t>(
-            packed_data + e * stride + n * IC,
+        pack_vnni<packed_t>(
+            packed_data + e * OC * packed_row_size + n * packed_row_size,
             w_data + e * stride + n * IC,
             n_size,
             IC);
