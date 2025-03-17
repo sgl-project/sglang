@@ -25,5 +25,5 @@ jobs:
         run: |
           git remote add upstream git@github.com:sgl-project/sglang.git
           git fetch upstream main
-          git merge upstream/main --allow-unrelated-histories --ff-only
+          git merge upstream/main --allow-unrelated-histories
           git push origin main
