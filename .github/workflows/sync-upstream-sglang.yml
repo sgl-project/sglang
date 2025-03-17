@@ -21,6 +21,11 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
+      - name: Configure Git
+        run: |
+          git config --global user.email "carsonsow@gmail.com"
+          git config --global user.name "carsonhxsu"
+
       - name: Fetch upstream changes
         run: |
           git remote add upstream git@github.com:sgl-project/sglang.git
