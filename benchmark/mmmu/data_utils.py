@@ -187,7 +187,7 @@ def construct_prompt(sample, config):
         index2ans = {}
         for option in options:
             prediction_range.append(start_chr)
-            example += f"({start_chr}) {option}\n"
+            example += f"{start_chr}. {option}\n"
             index2ans[start_chr] = option
             start_chr = chr(ord(start_chr) + 1)
         empty_prompt_sample_structure = config["multi_choice_example_format"]

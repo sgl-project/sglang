@@ -9,6 +9,7 @@
 
 import argparse
 import random
+import re
 
 import torch
 from data_utils import save_json
@@ -16,85 +17,32 @@ from eval_utils import (
     EvalArgs,
     eval_result,
     get_sampling_params,
+    load_model,
     prepare_samples,
     process_result,
 )
+from Qwen2VLchat import Qwen2VLchat
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationConfig
 
 
 @torch.no_grad()
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
-
-    model = AutoModelForImageTextToText.from_pretrained(
-        args.model_path,
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
-    model = model.eval().cuda()
-
-    processor = AutoProcessor.from_pretrained(
-        args.model_path, torch_dtype="auto", device_map="auto"
-    )
-
+    model = load_model(args.model_path)
+    model.build_model()
     samples = prepare_samples(eval_args)
     out_samples = dict()
-
-    sampling_params = get_sampling_params(eval_args)
-    generation_config = GenerationConfig(
-        max_new_tokens=sampling_params["max_new_tokens"],
-        do_sample=False,
-    )
-
     answer_dict = {}
     for sample in tqdm(samples):
-        prompt = sample["final_input_prompt"]
-        image = sample["image"]
-        prefix = prompt.split("<")[0]
-        suffix = prompt.split(">")[1]
+        image = sample["image_1"]
         if image is not None:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prefix},
-                        {
-                            "type": "image",
-                            "image": image,
-                        },
-                        {"type": "text", "text": suffix},
-                    ],
-                }
-            ]
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = processor(
-                text=[text],
-                images=[image],
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-
-            generated_ids = model.generate(
-                **inputs, generation_config=generation_config
-            )
-
-            response = processor.decode(
-                generated_ids[0],
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[len(text) :]
-            print(f"response: {response}")
+            response = model.chat(sample)
         else:  # multiple images actually
             if sample["question_type"] == "multiple-choice":
                 all_choices = sample["all_choices"]
                 response = random.choice(all_choices)
-
             else:
                 response = "INVALID GENERATION FOR MULTIPLE IMAGE INPUTS"
-
         process_result(response, sample, answer_dict, out_samples)
 
     args.output_path = f"{args.model_path}_val_hf.json"

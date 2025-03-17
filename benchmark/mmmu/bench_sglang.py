@@ -18,6 +18,7 @@ from eval_utils import (
     EvalArgs,
     eval_result,
     get_sampling_params,
+    load_model,
     prepare_samples,
     process_result,
 )
@@ -35,64 +36,30 @@ def eval_mmmu(args):
 
     if server_args.chat_template is None:
         raise ValueError("Chat template must be provided for this benchmark")
-
+    model = load_model(args.model_path)
     backend = Engine(**dataclasses.asdict(server_args))
-
     out_samples = dict()
-
-    sampling_params = get_sampling_params(eval_args)
-
     samples = prepare_samples(eval_args)
 
     answer_dict = {}
 
     for sample in tqdm(samples):
-        prompt = sample["final_input_prompt"]
-        image = sample["image"]
-        buff = BytesIO()
-        image.save(buff, format="PNG")
-        base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
-        prefix = prompt.split("<")[0]
-        suffix = prompt.split(">")[1]
-        request_dict = {
-            "model": "",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prefix,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_str}"
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": suffix,
-                        },
-                    ],
-                }
-            ],
-        }
-
-        conv = generate_chat_conv(
-            ChatCompletionRequest(**request_dict),
-            template_name=server_args.chat_template,
-        )
-        prompt = conv.get_prompt()
+        image = sample["image_1"]
         if image is not None:
+            request_dict = model.build_prompt_sglang(sample)
+            conv = generate_chat_conv(
+                ChatCompletionRequest(**request_dict),
+                template_name=server_args.chat_template,
+            )
+            prompt = conv.get_prompt()
+            print(f"\033[31m{prompt}\033[0m")
             gen_out = backend.generate(
                 prompt=prompt,
                 image_data=conv.image_data,
-                sampling_params=sampling_params,
+                sampling_params=model.sampling_params,
             )["text"]
-
             response = gen_out
-
+            print(f"\033[32m{response}\033[0m")
         else:  # multiple images actually
             if sample["question_type"] == "multiple-choice":
                 all_choices = sample["all_choices"]

@@ -465,6 +465,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "MiniCPMV",
     "MultiModalityCausalLM",
+    "InternVLChatModel"
 ]
 
 

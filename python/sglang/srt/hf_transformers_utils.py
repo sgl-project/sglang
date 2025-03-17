@@ -26,6 +26,7 @@ from transformers import (
     AutoTokenizer,
     PretrainedConfig,
     PreTrainedTokenizer,
+    PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -86,7 +87,10 @@ def get_config(
         for key, val in config.language_config.__dict__.items():
             setattr(config, key, val)
         setattr(config, "architectures", ["MultiModalityCausalLM"])
-
+    if isinstance(model, str) and "InternVL" in model:
+        for key, val in config.llm_config.__dict__.items():
+            if not hasattr(config, key):
+                setattr(config, key, val)
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
@@ -212,6 +216,10 @@ def get_tokenizer(
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 
+def get_tokenizer_from_processor(processor):
+    if isinstance(processor, PreTrainedTokenizerBase):
+        return processor
+    return processor.tokenizer
 
 def get_processor(
     tokenizer_name: str,
@@ -228,8 +236,8 @@ def get_processor(
         tokenizer_revision=tokenizer_revision,
         **kwargs,
     )
-
-    attach_additional_stop_token_ids(processor.tokenizer)
+    tokenizer = get_tokenizer_from_processor(processor)
+    attach_additional_stop_token_ids(tokenizer)
     return processor
 
 
