@@ -18,6 +18,15 @@ This file implements python APIs for the inference engine.
 """
 
 import asyncio
+import platform
+import sys
+
+import nest_asyncio
+
+nest_asyncio.apply()
+if sys.version_info >= (3, 10) and platform.system() == "Windows":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import atexit
 import dataclasses
 import logging
@@ -170,9 +179,13 @@ class Engine:
             return_hidden_states=return_hidden_states,
             stream=stream,
         )
-        loop = asyncio.get_event_loop()
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
+        generator = self.tokenizer_manager.generate_request(obj, None)
         if stream:
 
             def generator_wrapper():
