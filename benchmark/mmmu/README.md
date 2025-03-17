@@ -15,8 +15,7 @@ python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
 ```
 
 Some popular model results:
-
-1. Qwen/Qwen2-VL-2B-Instruct: 0.241
-2. Qwen/Qwen2-VL-7B-Instruct: 0.255
-3. Qwen/Qwen2.5-VL-3B-Instruct: 0.245
-4. Qwen/Qwen2.5-VL-7B-Instruct: 0.242
+1. Qwen/Qwen2-VL-7B-Instruct(sglang): 0.48
+2. Qwen/Qwen2-VL-7B-Instruct(hf): 0.482
+3. OpenGVLab/InternVL2_5-38B(sglang): 0.612
+4. OpenGVLab/InternVL2_5-38B(hf): 0.61
