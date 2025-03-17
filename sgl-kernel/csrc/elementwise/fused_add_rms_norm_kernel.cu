@@ -46,7 +46,10 @@ void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::T
         static_cast<c_type*>(weight.data_ptr()),
         batch_size,
         hidden_size,
-        eps,
+        hidden_size,      // stride_input (distance between rows)
+        hidden_size,      // stride_residual (distance between rows)
+        static_cast<float>eps,
+        false,            // enable_pdl if not needed
         torch_current_stream);
     TORCH_CHECK(
         status == cudaSuccess, "FusedAddRMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
