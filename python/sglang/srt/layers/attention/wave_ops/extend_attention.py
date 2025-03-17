@@ -29,6 +29,7 @@ from iree.turbine.kernel.wave.utils import (
     get_default_scheduling_params,
 )
 from iree.turbine.kernel.wave.constraints import MMAType
+from iree.turbine.kernel.wave.scheduling.schedule import SchedulingType
 
 from iree.turbine.kernel.wave.templates.attention_common import AttentionShape
 from iree.turbine.kernel.wave.templates.extend_attention import (
@@ -89,6 +90,7 @@ def get_wave_kernel(
     config = get_default_run_config()
     compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
     config["gpu-native-math-precision"] = True
+    config["wave_runtime"] = True
     launch_context = tk.gen.TestLaunchContext(
         hyperparams,
         canonicalize=True,
@@ -96,7 +98,7 @@ def get_wave_kernel(
         run_bench=False,
         run_config=config,
         compile_config=compile_config,
-        schedule=False,
+        schedule=SchedulingType.NONE,
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
