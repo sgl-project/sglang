@@ -30,7 +30,7 @@ from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
 
 MiniCPMV = "openbmb/MiniCPM-V-2_6"
-QWEN25VL = "Qwen/Qwen2.5-VL-7B-Instruct"
+QWEN2VL = "Qwen/Qwen2-VL-7B-Instruct"
 
 
 # Test the logits output between HF and SGLang
@@ -219,11 +219,11 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         self.compare_outputs(sglang_output, hf_output)
 
 
-class TestQWEN25VLLogits(VisionLLMLogitsBase):
+class TestQWEN2VLLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = QWEN25VL
+        cls.model_path = QWEN2VL
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
