@@ -148,7 +148,7 @@ def lightning_attention_decode_naive(q, k, v, past_kv, slope):
             kv.to(torch.float32),
         )
         output.append(qkv)
-    output = torch.concat(output, dim=-2)
+    output = torch.cat(output, dim=-2)
 
     return output.to(original_dtype), kv
 

@@ -7,8 +7,9 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.utils import is_cuda
 
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
+_is_cuda = is_cuda()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
