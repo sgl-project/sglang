@@ -1,7 +1,6 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
-import asyncio
 import copy
 import os
 import random

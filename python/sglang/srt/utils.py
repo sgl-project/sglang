@@ -55,13 +55,11 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from packaging.version import Version, parse
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
-from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,

@@ -1,11 +1,8 @@
-import itertools
 from typing import Tuple
 
 import deep_gemm
-import numpy as np
 import torch
 import triton
-import triton.language as tl
 from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,

@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
