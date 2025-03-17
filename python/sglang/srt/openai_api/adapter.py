@@ -1156,7 +1156,7 @@ def v1_chat_generate_response(
                     finish_reason["type"] = "tool_calls"
                     finish_reason["matched"] = None
                 try:
-                    full_normal_text, call_info_list = parser.parse_non_stream(text)
+                    text, call_info_list = parser.parse_non_stream(text)
                     tool_calls = [
                         ToolCall(
                             id=str(call_info.tool_index),
@@ -1179,9 +1179,9 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": text if tool_calls is None else None,
+                    "content": text if text else None,
                     "tool_calls": tool_calls,
-                    "reasoning_content": reasoning_text,
+                    "reasoning_content": reasoning_text if reasoning_text else None,
                 },
                 "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
@@ -1196,9 +1196,9 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if tool_calls is None else None,
+                    content=text if text else None,
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text,
+                    reasoning_content=reasoning_text if reasoning_text else None,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
@@ -1343,9 +1343,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             tokenizer_manager.server_args.reasoning_parser
                             and request.separate_reasoning
                         ):
-                            delta = DeltaMessage(role="assistant", reasoning_content="")
+                            delta = DeltaMessage(
+                                role="assistant", reasoning_content=None
+                            )
                         else:
-                            delta = DeltaMessage(role="assistant", content="")
+                            delta = DeltaMessage(role="assistant", content=None)
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=delta,
@@ -1388,7 +1390,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         if reasoning_text:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(reasoning_content=reasoning_text),
+                                delta=DeltaMessage(
+                                    reasoning_content=(
+                                        reasoning_text if reasoning_text else None
+                                    )
+                                ),
                                 finish_reason=(
                                     None
                                     if finish_reason_type
@@ -1422,7 +1428,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         if normal_text:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(content=normal_text),
+                                delta=DeltaMessage(
+                                    content=normal_text if normal_text else None
+                                ),
                                 finish_reason=(
                                     None
                                     if finish_reason_type
@@ -1494,7 +1502,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         # No tool calls => just treat this as normal text
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta),
+                            delta=DeltaMessage(content=delta if delta else None),
                             finish_reason=(
                                 None
                                 if finish_reason_type and len(finish_reason_type) == 0
