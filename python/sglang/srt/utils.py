@@ -808,21 +808,6 @@ def get_zmq_socket(
     return socket
 
 
-# def dump_to_file(dirpath, name, value):
-#     from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-#     if get_tensor_model_parallel_rank() != 0:
-#         return
-
-#     os.makedirs(dirpath, exist_ok=True)
-#     if value.dtype is torch.bfloat16:
-#         value = value.float()
-#     value = value.cpu().numpy()
-#     output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-#     logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-#     np.save(output_filename, value)
-
-
 def dump_to_file(dirpath, name, value):
 
     from sglang.srt.distributed import get_tensor_model_parallel_rank
