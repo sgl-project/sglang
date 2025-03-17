@@ -249,7 +249,6 @@ def apply_fp8_linear(
                 )
             return output.view(*output_shape)
         except (ImportError, NameError, AttributeError):
-            # 如果 vllm 不可用或者发生其他错误，回退到下面的实现
             pass
 
     # torch.scaled_mm supports per tensor weights + activations only
