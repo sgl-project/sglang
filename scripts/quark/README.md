@@ -31,6 +31,8 @@ This model was created by applying Quark with calibration samples from Pile data
 #### INT4 Packing
 Every eight `int4` values are packed into a single int32 integeter following the sequence defined by `order_map = [0, 2, 4, 6, 1, 3, 5, 7]`.
 
+### Quick Start
+
 Run the following command, replacing placeholders with the appropriate paths:
 
 ```bash
