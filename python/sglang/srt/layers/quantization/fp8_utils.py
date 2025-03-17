@@ -6,6 +6,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
+    _enable_jit_deepgemm,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -122,9 +123,14 @@ def apply_w8a8_block_fp8_linear(
         )
         gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
     else:
-        q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False
-        )
+        if _enable_jit_deepgemm:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d, block_size[1], column_major_scales=True, scale_tma_aligned=True
+            )
+        else:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d, block_size[1], column_major_scales=False
+            )
         output = w8a8_block_fp8_matmul(
             q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
         )
