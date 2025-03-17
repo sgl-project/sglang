@@ -206,8 +206,9 @@ def per_token_group_quant_fp8(
             aligned_size = (x.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
                 x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                device=x.device, dtype=torch.float32
-            ).permute(-1, -2)[:x.shape[-2], :]
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
         else:
             x_s = torch.empty(
                 (x.shape[-1] // group_size,) + x.shape[:-1],
