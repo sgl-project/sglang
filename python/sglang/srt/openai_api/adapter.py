@@ -1653,18 +1653,19 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         elif isinstance(prompt, list) and isinstance(
             prompt[0], MultimodalEmbeddingInput
         ):
-            assert (
-                chat_template_name is not None
-            ), "chat_template_name is required for multimodal inputs"
             texts = []
             images = []
             for item in prompt:
-                texts.append(item.text if item.text is not None else None)
+                # TODO simply use padding for text, we should use a better way to handle this
+                texts.append(item.text if item.text is not None else "padding")
                 images.append(item.image if item.image is not None else None)
-            convs = generate_embedding_convs(texts, images, chat_template_name)
             generate_prompts = []
-            for conv in convs:
-                generate_prompts.append(conv.get_prompt())
+            if chat_template_name is not None:
+                convs = generate_embedding_convs(texts, images, chat_template_name)
+                for conv in convs:
+                    generate_prompts.append(conv.get_prompt())
+            else:
+                generate_prompts = texts
             if len(generate_prompts) == 1:
                 prompt_kwargs = {"text": generate_prompts[0], "image_data": images[0]}
             else:
