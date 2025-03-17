@@ -73,7 +73,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
       "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
       "int topk, int depth, int draft_token_num) -> ()");
-  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel); 
+  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
   // build_topk_softmax
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
