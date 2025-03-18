@@ -28,7 +28,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
-    dp_gather,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -428,7 +428,7 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.gathered_buffer,
                 hidden_states.clone(),
             )
-            dp_gather(hidden_states, local_hidden_states, logits_metadata, "embedding")
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
             logits = torch.matmul(
