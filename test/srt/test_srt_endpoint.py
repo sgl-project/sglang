@@ -37,7 +37,7 @@ class TestSRTEndpoint(unittest.TestCase):
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
-                "0.7",
+                "0.6",
                 "--cuda-graph-max-bs",
                 "8",
             ),
