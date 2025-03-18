@@ -15,6 +15,13 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
+
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
 _is_hip = is_hip()
@@ -27,7 +34,7 @@ if _is_cuda:
 
     from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
-    if use_vllm_cutlass_w8a8_fp8_kernel:
+    if use_vllm_cutlass_w8a8_fp8_kernel and VLLM_AVAILABLE:
         from vllm import _custom_ops as ops
     else:
         from sgl_kernel import fp8_scaled_mm
@@ -219,24 +226,32 @@ def apply_fp8_linear(
             )
 
     if cutlass_fp8_supported:
-        if use_vllm_cutlass_w8a8_fp8_kernel:
-            # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                weight,
-                out_dtype=input.dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                bias=bias,
-            )
-        else:
-            assert (
-                weight_scale.numel() == weight.shape[1]
-            ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-            output = fp8_scaled_mm(
-                qinput, weight, x_scale, weight_scale, out_dtype=input.dtype, bias=bias
-            )
-        return output.view(*output_shape)
+        try:
+            if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+                # Fall back to vllm cutlass w8a8 fp8 kernel
+                output = ops.cutlass_scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+            else:
+                assert (
+                    weight_scale.numel() == weight.shape[1]
+                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
+            return output.view(*output_shape)
+        except (ImportError, NameError, AttributeError):
+            pass
 
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token
