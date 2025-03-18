@@ -130,7 +130,7 @@ jobs:
       - name: Test lora tensor parallelism (TP=2)
         timeout-minutes: 10
         run: |
-          cd test/srt/models
+          cd test/srt/models/lora
           python3 test_lora_tp.py
 
   performance-test-1-gpu-part-1:
