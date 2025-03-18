@@ -76,6 +76,8 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-flash-attention_SOURCE_DIR}/hopper
@@ -158,6 +160,7 @@ string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE
 
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/attention/cutlass_mla_kernel.cu",
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"

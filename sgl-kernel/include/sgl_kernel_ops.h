@@ -87,7 +87,10 @@ void lightning_attention_decode(
     const torch::Tensor& slope,
     torch::Tensor output,
     torch::Tensor new_kv);
-
+torch::Tensor cutlass_mla_entry(torch::Tensor const& q_absorbed,
+                                torch::Tensor const& ckv_kpe_cache,
+                                torch::Tensor const& seq_lens,
+                                torch::Tensor const& page_table);
 /*
  * From csrc/elementwise
  */
