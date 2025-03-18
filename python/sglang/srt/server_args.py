@@ -137,9 +137,11 @@ class ServerArgs:
     hip_attention_config: Optional[HiPAttentionConfig] = None
 
     # HiP Attention Offload
-    enable_hip_offload: bool = False
-    hip_max_mask_cache_token_size: int = 64 * 1024
-    hip_max_sa_cache_token_size: int = 8 * 1024
+    enable_hip_kv_cache_offload: bool = False
+    # On-GPU cache size for sparse top-k mask estimation, in tokens
+    hip_max_mask_cache_factor: float = 1.2
+    # On-GPU cache size for sparse attention, in tokens
+    hip_max_sa_cache_factor: int = 1.2
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -960,25 +962,27 @@ class ServerArgs:
 
         # HiP Attention Offload
         parser.add_argument(
-            "--enable-hip-offload",
+            "--enable-hip-kv-cache-offload",
             action="store_true",
             help="Enable HiP KV cache offloading. This option should be set with --enable-hip-attention.",
         )
         parser.add_argument(
-            "--hip-max-mask-cache-token-size",
+            "--hip-max-mask-cache-factor",
             type=int,
-            default=128 * 1024,
+            default=1.2,
             help=(
-                "On-gpu cache size of HiP masking kernels. "
+                "On-GPU cache size factor for HiP sparse top-k mask estimation kernels. "
+                "A cache of size proportional to this value will be allocated on the GPU. "
                 "This will be a major determining factor for mask-refreshing decoding step latency."
             ),
         )
         parser.add_argument(
-            "--hip-max-sa-cache-token-size",
+            "--hip-max-sa-cache-factor",
             type=int,
-            default=16 * 1024,
+            default=1.2,
             help=(
-                "On-gpu cache size of sparse attention kernels. "
+                "On-GPU cache size for HiP sparse attention kernels, in tokens per layer. "
+                "A cache of size proportional to this value will be allocated on the GPU`. "
                 "This will be a major determining factor for mask-cached decoding step latency."
             ),
         )

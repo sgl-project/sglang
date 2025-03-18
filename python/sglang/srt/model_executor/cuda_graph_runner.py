@@ -338,15 +338,12 @@ class CudaGraphRunner:
                 else total_global_tokens <= self.max_bs
             )
         else:
-            if self.disable_padding:
-                index = bisect.bisect_left(self.capture_bs, forward_batch.batch_size)
-                if index < len(self.capture_bs):
-                    found_bs = self.capture_bs[index]
-                    is_bs_supported = found_bs == forward_batch.batch_size
-                else:
-                    is_bs_supported = False
-            else:
-                is_bs_supported = forward_batch.batch_size <= self.max_bs
+            recorded_batch_sizes = {bs for bs, *_ in self.graphs}
+            is_bs_supported = (
+                forward_batch.batch_size in recorded_batch_sizes
+                if self.disable_padding
+                else forward_batch.batch_size <= self.max_bs
+            )
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph

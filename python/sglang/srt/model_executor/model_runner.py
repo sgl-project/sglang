@@ -18,6 +18,7 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -876,7 +877,7 @@ class ModelRunner:
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."
                 )
-            if self.server_args.enable_hip_offload:
+            if self.server_args.enable_hip_kv_cache_offload:
                 self.max_total_num_tokens = max_total_tokens
             else:
                 self.max_total_num_tokens = min(
@@ -938,12 +939,12 @@ class ModelRunner:
             )
         elif (
             self.server_args.enable_hip_attention
-            and self.server_args.enable_hip_offload
+            and self.server_args.enable_hip_kv_cache_offload
         ):
             self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
                 max_token_size=self.max_total_num_tokens,
-                max_mask_cache_token_size=self.server_args.hip_max_mask_cache_token_size,
-                max_sa_cache_token_size=self.server_args.hip_max_sa_cache_token_size,
+                max_mask_cache_factor=self.server_args.hip_max_mask_cache_factor,
+                max_sa_cache_factor=self.server_args.hip_max_sa_cache_factor,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
@@ -1016,13 +1017,7 @@ class ModelRunner:
     def init_attention_backend(self):
         """Init attention kernel backend."""
 
-        if self.server_args.enable_hip_attention:
-            from sglang.srt.layers.attention.hip_radix_attention import (
-                HiPRadixAttentionBackend,
-            )
-
-            self.attn_backend = HiPRadixAttentionBackend(self)
-        elif self.server_args.attention_backend == "flashinfer":
+        if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
@@ -1089,6 +1084,12 @@ class ModelRunner:
             )
 
             self.attn_backend = CutlassMLABackend(self)
+
+        if self.server_args.enable_hip_attention:
+            from sglang.srt.layers.attention.hip_attention import HiPAttentionBackend
+
+            self.attn_backend = HiPAttentionBackend(self)
+
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"

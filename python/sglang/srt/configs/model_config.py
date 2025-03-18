@@ -122,7 +122,9 @@ class ModelConfig:
         if context_length is not None:
             if context_length > derived_context_len:
                 if is_context_extended:
-                    pass
+                    logger.info(
+                        f"Context length is extended from {derived_context_len} to {context_length}."
+                    )
                 elif get_bool_env_var(
                     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
