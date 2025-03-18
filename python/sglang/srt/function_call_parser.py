@@ -611,11 +611,8 @@ class FunctionCallParser:
                 assert name is not None
                 info = wrapper(name)
 
-                # use schema in strict mode, else accept any tool
-                if function.strict:
-                    schema = function.parameters
-                else:
-                    schema = True  # accept any valid json
+                # accept all if not strict, otherwise only accept the schema
+                schema = function.parameters if function.strict else {}
 
                 tool_structures.append(
                     StructuresResponseFormat(
