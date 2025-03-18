@@ -183,10 +183,13 @@ class Engine:
             return_hidden_states=return_hidden_states,
             stream=stream,
         )
+        print("[DEBUG] Entering generate()")
 
         generator = self.tokenizer_manager.generate_request(obj, None)
 
+        print("[DEBUG] Created generator, checking if stream mode is enabled...")
         if stream:
+            print("[DEBUG] Using streaming mode")
 
             def generator_wrapper():
                 while True:
@@ -200,7 +203,9 @@ class Engine:
 
             return generator_wrapper()
         else:
+            print("[DEBUG] Running single request, waiting for response...")
             future = asyncio.run_coroutine_threadsafe(generator.__anext__(), self.loop)
+            print("[DEBUG] Response received, returning result")
             return future.result()
 
     async def async_generate(

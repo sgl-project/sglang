@@ -104,7 +104,9 @@ class DetokenizerManager:
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
+            print("[DEBUG] Waiting for scheduler response in event_loop()")
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            print(f"[DEBUG] Received response: {recv_obj}")
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
 

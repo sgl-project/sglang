@@ -551,6 +551,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        print("[DEBUG] Waiting for tokenizer request in recv_requests()")
         if self.attn_tp_rank == 0:
             recv_reqs = []
 
@@ -605,6 +606,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
             recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        print(f"[DEBUG] Received request: {recv_req}")
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
