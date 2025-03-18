@@ -403,8 +403,9 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        recorded_batch_sizes = {bs for bs, *_ in self.graphs}
         is_bs_supported = (
-            cuda_graph_bs in self.graphs
+            cuda_graph_bs in recorded_batch_sizes
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
