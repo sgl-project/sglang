@@ -30,6 +30,7 @@ class HiRadixCache(RadixCache):
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
+        hicache_oracle: bool = False,
     ):
         if page_size != 1:
             raise ValueError(
@@ -52,9 +53,10 @@ class HiRadixCache(RadixCache):
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
-            token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            mem_pool_host=self.token_to_kv_pool_host,
             load_cache_event=self.load_cache_event,
+            oracle=hicache_oracle,
         )
 
         # record the nodes with ongoing write through

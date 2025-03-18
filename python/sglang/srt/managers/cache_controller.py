@@ -155,11 +155,13 @@ class HiCacheController:
         mem_pool_host: HostKVCache,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
+        oracle: bool = False,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
-        self.write_policy = write_policy
+        self.write_policy = write_policy if not oracle else "write_through"
+        self.oracle = oracle
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -262,20 +264,21 @@ class HiCacheController:
             while not self.stop_event.is_set():
                 try:
                     operation = self.write_queue.get(block=True, timeout=1)
-                    if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
-                        self.mem_pool_host.transfer_all_layer_kernel(
-                            self.mem_pool_device,
-                            operation.device_indices,
-                            operation.host_indices.to(self.mem_pool_device.device),
-                        )
-                        self.write_stream.synchronize()
-                    else:
-                        operation.data = self.mem_pool_device.get_flat_data(
-                            operation.device_indices
-                        )
-                        self.mem_pool_host.assign_flat_data(
-                            operation.host_indices, operation.data
-                        )
+                    if not self.oracle:
+                        if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
+                            self.mem_pool_host.transfer_all_layer_kernel(
+                                self.mem_pool_device,
+                                operation.device_indices,
+                                operation.host_indices.to(self.mem_pool_device.device),
+                            )
+                            self.write_stream.synchronize()
+                        else:
+                            operation.data = self.mem_pool_device.get_flat_data(
+                                operation.device_indices
+                            )
+                            self.mem_pool_host.assign_flat_data(
+                                operation.host_indices, operation.data
+                            )
                     self.mem_pool_host.complete_io(operation.host_indices)
                     for node_id in operation.node_ids:
                         if node_id != 0:
@@ -332,23 +335,24 @@ class HiCacheController:
 
                 self.layer_done_counter.reset()
                 for i in range(self.mem_pool_host.layer_num):
-                    if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
-                        self.mem_pool_device.transfer_per_layer_kernel(
-                            self.mem_pool_host,
-                            batch_operation.host_indices.to(
-                                self.mem_pool_device.device
-                            ),
-                            batch_operation.device_indices,
-                            i,
-                        )
-                        self.load_stream.synchronize()
-                    else:
-                        flat_data = self.mem_pool_host.get_flat_data_by_layer(
-                            batch_operation.host_indices, i
-                        )
-                        self.mem_pool_device.transfer_per_layer(
-                            batch_operation.device_indices, flat_data, i
-                        )
+                    if not self.oracle:
+                        if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
+                            self.mem_pool_device.transfer_per_layer_kernel(
+                                self.mem_pool_host,
+                                batch_operation.host_indices.to(
+                                    self.mem_pool_device.device
+                                ),
+                                batch_operation.device_indices,
+                                i,
+                            )
+                            self.load_stream.synchronize()
+                        else:
+                            flat_data = self.mem_pool_host.get_flat_data_by_layer(
+                                batch_operation.host_indices, i
+                            )
+                            self.mem_pool_device.transfer_per_layer(
+                                batch_operation.device_indices, flat_data, i
+                            )
                     self.layer_done_counter.increment()
 
                 self.mem_pool_host.complete_io(batch_operation.host_indices)

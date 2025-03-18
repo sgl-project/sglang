@@ -173,7 +173,8 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
-    hicache_ratio: float = 2.0
+    hicache_ratio: float = 4.0
+    hicache_oracle: bool = False
     enable_flashinfer_mla: bool = False
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
@@ -1014,6 +1015,11 @@ class ServerArgs:
             required=False,
             default=ServerArgs.hicache_ratio,
             help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-oracle",
+            action="store_true",
+            help="Oracle mode for hierarchical cache",
         )
 
         # Server warmups
