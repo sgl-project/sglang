@@ -1093,7 +1093,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
     def post_load_weights(self):
-        
+
         # Perform post-processing after loading weights
 
         if not global_server_args_dict["disable_mla"]:
@@ -1169,8 +1169,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if _is_hip:
                         self_attn.w_scale *= 2.0
-        
-    
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1248,10 +1247,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    
+
         self.post_load_weights()
 
-    
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
