@@ -37,6 +37,9 @@ logger.warning(
 )
 
 
+_MIN_BLOCK_KV = 32
+
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -67,7 +70,7 @@ def _fwd_kernel_stage1(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -89,7 +92,7 @@ def _fwd_kernel_stage1(
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
-    kv_len_per_split = tl.cdiv(cur_batch_seq_len, kv_splits)
+    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -228,7 +231,7 @@ def _decode_att_m_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
-        MAX_KV_SPLITS=MAX_KV_SPLITS,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=2,
@@ -264,7 +267,7 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -300,7 +303,7 @@ def _fwd_grouped_kernel_stage1(
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
 
-    kv_len_per_split = tl.cdiv(cur_batch_seq_len, kv_splits)
+    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -476,7 +479,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
-        MAX_KV_SPLITS=MAX_KV_SPLITS,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         num_warps=4,
         num_stages=num_stages,
@@ -499,6 +502,7 @@ def _fwd_kernel_stage2(
     stride_obs,
     stride_oh,
     MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
 ):
@@ -519,7 +523,7 @@ def _fwd_kernel_stage2(
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
-    kv_len_per_split = tl.cdiv(cur_batch_seq_len, kv_splits)
+    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
 
     for split_kv_id in range(0, MAX_KV_SPLITS):
         split_kv_start = kv_len_per_split * split_kv_id
@@ -582,6 +586,7 @@ def _decode_softmax_reducev_fwd(
         o.stride(0),
         o.stride(1),
         MAX_KV_SPLITS=MAX_KV_SPLITS,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
