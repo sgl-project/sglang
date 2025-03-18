@@ -1,0 +1,7 @@
+accelerate
+datasets
+evaluate>=0.4.0
+pillow
+transformers
+zstandard
+onnxruntime-genai

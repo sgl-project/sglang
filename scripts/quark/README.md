@@ -10,7 +10,7 @@ This guide explains how to use Quark to perform INT4-FP8 quantization on a shard
 
 2. Install Quark using:
 ```bash
-pip install amd-quark*.whl
+pip install amd-quark*.whl --ignore-requires-python
 ```
 
 3. Install the additional dependencies
