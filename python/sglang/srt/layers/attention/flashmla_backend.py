@@ -101,12 +101,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     device=forward_batch.seq_lens.device,
                 )
                 create_flashmla_kv_indices_triton[(bs,)](
-                    self.indices_updater_decode.req_to_token,
+                    self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
                     None,
                     block_kv_indices,
-                    self.indices_updater_decode.req_to_token.size(1),
+                    self.req_to_token.stride(0),
                     max_seqlen_pad,
                 )
                 mla_metadata, num_splits = get_mla_metadata(
@@ -145,11 +145,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.num_kv_heads,
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
-        self.forward_metadata = FlashMLADecodeMetadata(
-            self.cuda_graph_mla_metadata,
-            self.cuda_graph_num_splits,
-            self.cuda_graph_kv_indices,
-        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -166,13 +161,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
                 create_flashmla_kv_indices_triton[(bs,)](
-                    self.indices_updater_decode.req_to_token,
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
                     None,
                     self.cuda_graph_kv_indices,
-                    self.indices_updater_decode.req_to_token.size(1),
-                    max_seqlen_pad,
+                    self.req_to_token.stride(0),
+                    self.cuda_graph_kv_indices.stride(0),
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     seq_lens.to(torch.int32),
@@ -214,13 +209,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             seq_lens = seq_lens[:bs]
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
             create_flashmla_kv_indices_triton[(bs,)](
-                self.indices_updater_decode.req_to_token,
-                req_pool_indices,
+                self.req_to_token,
+                req_pool_indices[:bs],
                 seq_lens,
                 None,
                 self.cuda_graph_kv_indices,
-                self.indices_updater_decode.req_to_token.size(1),
-                max_seqlen_pad,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
             )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
@@ -229,7 +224,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata.mla_metadata = mla_metadata
+            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
             self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
