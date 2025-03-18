@@ -40,3 +40,8 @@ SGLang support LLaVA-OneVision with single-image, multi-image and video are supp
 The folder `token_in_token_out` shows how to perform inference, where we provide tokens and get tokens as response.
 
 * `token_in_token_out_{llm|vlm}_{engine|server}.py`: Shows how to perform token in, token out workflow for llm/vlm using either the engine or native API.
+
+
+## Code Fim Completion
+
+SGLang support code completion in code fim completion both in OpenAI API and offline Engine API. The folder `code_fim` shows how to do this.
