@@ -35,6 +35,8 @@ jobs:
         run: |
           cd sglang-lyra
           git remote add upstream git@github.com:sgl-project/sglang.git
+          git fetch origin remote_main
+          git checkout remote_main
           git fetch upstream main
-          git merge -X theirs upstream/main --allow-unrelated-histories
-          git push origin main
+          git merge -X theirs upstream/main remote_main --allow-unrelated-histories
+          git push origin remote_main
