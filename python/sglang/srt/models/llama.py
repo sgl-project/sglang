@@ -52,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers, make_layers_with_previous_layer
+from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,6 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
-        previous_layer: Optional["LlamaAttention"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -210,7 +209,6 @@ class LlamaDecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        previous_layer: Optional["LlamaDecoderLayer"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -242,9 +240,6 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
-            previous_layer=(
-                previous_layer.self_attn if previous_layer is not None else None
-            ),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,

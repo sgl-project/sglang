@@ -436,13 +436,6 @@ class LayerFn(Protocol):
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
 
-class LayerFnWithPreviousLayer(Protocol):
-
-    def __call__(
-        self, layer_id: int, prefix: str, previous_layer: torch.nn.Module
-    ) -> torch.nn.Module: ...
-
-
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -480,23 +473,6 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
-
-
-def make_layers_with_previous_layer(
-    num_hidden_layers: int,
-    layer_fn: LayerFnWithPreviousLayer,
-    prefix: str = "",
-) -> Tuple[int, int, torch.nn.ModuleList]:
-    lst = []
-    previous_layer = None
-    for idx in range(num_hidden_layers):
-        previous_layer = layer = layer_fn(
-            idx=idx, prefix=f"{prefix}.{idx}", previous_layer=previous_layer
-        )
-        layer = maybe_offload_to_cpu(layer)
-        lst.append(layer)
-    modules = torch.nn.ModuleList(lst)
-    return modules
 
 
 def set_random_seed(seed: int) -> None:
