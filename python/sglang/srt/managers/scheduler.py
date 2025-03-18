@@ -445,6 +445,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_worker.get_tp_cpu_group(),
                     page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1786,7 +1787,7 @@ def run_scheduler_process(
         prefix = f" DP{dp_rank} TP{tp_rank}"
 
     # Config the process
-    # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
+    kill_itself_when_parent_died()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()
