@@ -49,7 +49,6 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import make_layers_with_previous_layer
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -109,7 +108,6 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
-        previous_layer: Optional["LlamaAttention"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -154,18 +152,14 @@ class LlamaAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        if previous_layer is None:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position=max_position_embeddings,
-                base=rope_theta,
-                rope_scaling=rope_scaling,
-                is_neox_style=rope_is_neox_style,
-            )
-        else:
-            assert self.head_dim == previous_layer.head_dim
-            self.rotary_emb = previous_layer.rotary_emb
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=rope_is_neox_style,
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -207,7 +201,6 @@ class LlamaDecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        previous_layer: Optional["LlamaDecoderLayer"] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -239,9 +232,6 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
-            previous_layer=(
-                previous_layer.self_attn if previous_layer is not None else None
-            ),
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -297,14 +287,10 @@ class LlamaModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = make_layers_with_previous_layer(
+        self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix, previous_layer: LlamaDecoderLayer(
-                config=config,
-                quant_config=quant_config,
-                layer_id=idx,
-                prefix=prefix,
-                previous_layer=previous_layer,
+            lambda idx, prefix: LlamaDecoderLayer(
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             prefix="model.layers",
         )
