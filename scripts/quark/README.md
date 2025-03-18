@@ -47,7 +47,7 @@ Notes:
 
 #### Quantization Stragegy
 
-This model was created by applying Quark with calibration samples from Pile dataset.
+This model was created by applying direct min-max quantization on weights.
 
 - **Quantized Layers**: All linear layers excluding "lm_head", "*.gate"
 - **Weight**: FP8 symmetric per-tensor, additionally, INT4 symmetric per-channel for MoE linear
@@ -56,6 +56,8 @@ This model was created by applying Quark with calibration samples from Pile data
 Every eight `int4` values are packed into a single int32 integeter following the sequence defined by `order_map = [0, 2, 4, 6, 1, 3, 5, 7]`.
 
 ### INT4-FP8 Weight, FP8 Activation and FP8 KV Cache
+
+#### Quick Start
 
 Run the following command, replacing placeholders with the appropriate paths:
 
