@@ -127,8 +127,8 @@ jobs:
           cd test/srt
           python3 test_mla_tp.py
 
-      - name: Test lora tensor parallelism (TP=1,2,4)
-        timeout-minutes: 15
+      - name: Test lora tensor parallelism (TP=2)
+        timeout-minutes: 10
         run: |
           cd test/srt/models
           python3 test_lora_tp.py
