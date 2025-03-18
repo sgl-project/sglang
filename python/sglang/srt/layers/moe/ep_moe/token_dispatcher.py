@@ -271,15 +271,8 @@ class DeepEPDispatcher:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
-        reorder_topk_ids = torch.empty(
-            (0,), device=hidden_states.device, dtype=torch.int64
-        )
-        seg_indptr = torch.zeros(
-            (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-        )
         # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
-            # if not forward_mode.is_decode():
             (
                 hidden_states,
                 topk_idx,
@@ -290,16 +283,11 @@ class DeepEPDispatcher:
             ) = self.dispatch_normal(
                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
             )
-            if hidden_states.shape[0] > 0:
-                reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
-                    topk_idx,
-                    hidden_states,
-                    num_experts,
-                    self.router_topk,
-                    False,
-                    False,
-                    hidden_states.dtype,
-                )
+            self.tokens_per_expert = torch.tensor(
+                num_recv_tokens_per_expert_list,
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
         else:
             hidden_states, recv_expert_count, handle, event, hook = (
                 self.dispatch_low_latency(
@@ -310,10 +298,13 @@ class DeepEPDispatcher:
                 )
             )
             self.recv_expert_count = recv_expert_count
+        tokens_per_expert = self.get_number_of_tokens_per_expert()
         self.handle = handle
         self.topk_idx = topk_idx
         self.topk_weights = topk_weights
-        return hidden_states, reorder_topk_ids, seg_indptr
+        if hidden_states.shape[0] > 0:
+            hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
+        return hidden_states, topk_idx, topk_weights, tokens_per_expert
 
     def dispatch_normal(
         self,
@@ -429,39 +420,13 @@ class DeepEPDispatcher:
     def combine(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        reorder_topk_ids = torch.empty(
-            (0,), device=hidden_states.device, dtype=torch.int64
-        )
-        seg_indptr = torch.zeros(
-            (self.num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-        )
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
-            # if not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
-                num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.zeros(
-                    (num_tokens, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
+                hidden_states = self.get_restored_hidden_states_by_experts(
+                    hidden_states
                 )
-                deepep_post_reorder_triton_kernel[(num_tokens,)](
-                    hidden_states,
-                    output,
-                    self.src2dst,
-                    self.topk_idx,
-                    self.topk_weights,
-                    self.router_topk,
-                    hidden_states.shape[1],
-                    BLOCK_SIZE=512,
-                )
-            else:
-                output = torch.zeros(
-                    (0, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-            hidden_states, event = self.combine_normal(output, self.handle)
+            hidden_states, event = self.combine_normal(hidden_states, self.handle)
         else:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
@@ -524,6 +489,27 @@ class DeepEPDispatcher:
 
     def get_dispached_metadata(self) -> torch.Tensor:
         return self.topk_idx, self.topk_weights
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """
+        Get the number of tokens per expert.
+        """
+        return self.tokens_per_expert
+
+    def get_permuted_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
+            self.topk_idx, self.topk_weights
+        )
+        self.hidden_shape_before_permute = hidden_states.shape
+        hidden_states, self.reversed_mapping_for_combine = permute(
+            hidden_states,
+            self.dispatched_routing_map,
+            num_out_tokens=self.tokens_per_expert.sum(),
+            fused=self.permute_fusion,
+        )
+        return hidden_states
 
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor

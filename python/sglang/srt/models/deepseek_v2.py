@@ -272,15 +272,10 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
         topk_idx = torch.full(
-            (hidden_states.size(0), self.top_k),
-            -1,
-            dtype=torch.int,
-            device=hidden_states.device,
+            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
         topk_weights = torch.empty(
-            (hidden_states.size(0), self.top_k),
-            dtype=torch.float32,
-            device=hidden_states.device,
+            (0, self.top_k), dtype=torch.float32, device=hidden_states.device
         )
         if forward_mode is not None and not forward_mode.is_idle():
             # router_logits: (num_tokens, n_experts)
@@ -298,7 +293,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.tp_size > 1:
-            recv_hidden_states, reorder_topk_ids, seg_indptr = (
+            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
                 self.deepep_dispatcher.dispatch(
                     hidden_states,
                     topk_idx,
@@ -310,8 +305,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = (
             self.experts(
                 hidden_states=recv_hidden_states,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
+                tokens_per_expert=tokens_per_expert,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
