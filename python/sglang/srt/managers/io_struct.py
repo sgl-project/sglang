@@ -426,7 +426,8 @@ class TokenizedGenerateReqInput:
     # LoRA related
     lora_path: Optional[str] = None  # None means just use the base model
     # The input embeds
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    input_embeds: Optional[Union[List[List[List[float]]],
+                                 List[List[float]]]] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
@@ -464,7 +465,8 @@ class EmbeddingReqInput:
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
     # Dummy input embeds for compatibility
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    input_embeds: Optional[Union[List[List[List[float]]],
+                                 List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
@@ -479,7 +481,8 @@ class EmbeddingReqInput:
 
         # text and input_ids cannot be provided at the same time
         if self.text is not None and self.input_ids is not None:
-            raise ValueError("text and input_ids cannot be provided at the same time")
+            raise ValueError(
+                "text and input_ids cannot be provided at the same time")
 
         # Derive the batch size
         self.batch_size = 0
@@ -843,6 +846,40 @@ class ProfileReqOutput:
 
 
 @dataclass
+class PrefilledReqInput(TokenizedGenerateReqInput):
+    kv_transfer_src_addr: Optional[str] = None
+    kv_transfer_src_rank: Optional[int] = None
+    kv_cache_length: Optional[int] = None
+    output_ids: Optional[List[int]] = None
+
+
+@dataclass
+class KVTransferFetch:
+    rid: Optional[str] = None         # request id
+    # the address of the prefill node which has the kv cache
+    src_addr: Optional[str] = None
+    # the rank of the prefill node which has the kv cache
+    src_rank: Optional[int] = None
+    # the address of the decode node which needs the kv cache
+    dst_addr: Optional[str] = None
+    # the rank of the decode node which needs the kv cache
+    dst_rank: Optional[int] = None
+    # the pointer to the buffer of the decode node which needs the kv cache
+    dst_ptr: Optional[int] = None
+
+
+@dataclass
+class KVTransferAck:
+    rid: Optional[str] = None         # request id
+    # the address of the decode node which needs the kv cache
+    dst_addr: Optional[str] = None
+    # the rank of the decode node which needs the kv cache
+    dst_rank: Optional[int] = None
+    # code: 0: success, 1: failed
+    code: Optional[int] = None
+
+
+@dataclass
 class ConfigureLoggingReq:
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -892,7 +929,8 @@ class ParseFunctionCallReq:
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None
     )
 
 

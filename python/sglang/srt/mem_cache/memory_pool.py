@@ -114,7 +114,17 @@ class KVCache(abc.ABC):
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
-
+    
+    @abc.abstractmethod
+    def set_kv_buffer_by_layer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        raise NotImplementedError()
+    
     @abc.abstractmethod
     def get_flat_data(self, indices):
         raise NotImplementedError()
@@ -482,6 +492,14 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+        else:
+            self.kv_buffer[layer_id][loc] = cache_k
+
+    def set_kv_buffer_by_layer(self, layer_id, loc, cache_k, cache_v):
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:

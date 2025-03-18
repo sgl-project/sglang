@@ -17,32 +17,25 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
-import asyncio
-import atexit
-import dataclasses
-import logging
-import multiprocessing as mp
-import os
-import signal
-import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
-
-import zmq
-import zmq.asyncio
-from PIL.Image import Image
-
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
-import torch
-import uvloop
-
-from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
-from sglang.srt.entrypoints.EngineBase import EngineBase
-from sglang.srt.managers.data_parallel_controller import (
-    run_data_parallel_controller_process,
+from sglang.version import __version__
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    assert_pkg_version,
+    configure_logger,
+    get_zmq_socket,
+    kill_process_tree,
+    launch_dummy_health_check_server,
+    maybe_set_triton_cache_manager,
+    prepare_model_and_tokenizer,
+    set_prometheus_multiproc_dir,
+    set_ulimit,
 )
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.pd_disaggregation_controller import PDDisaggregationController
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -56,30 +49,35 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import (
-    MultiprocessingSerializer,
-    assert_pkg_version,
-    configure_logger,
-    get_zmq_socket,
-    kill_process_tree,
-    launch_dummy_health_check_server,
-    maybe_set_triton_cache_manager,
-    prepare_model_and_tokenizer,
-    set_prometheus_multiproc_dir,
-    set_ulimit,
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
 )
-from sglang.version import __version__
+from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
+import uvloop
+import torch
+import asyncio
+import atexit
+import dataclasses
+import logging
+import multiprocessing as mp
+import os
+import signal
+import threading
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+
+import zmq
+import zmq.asyncio
+
+# Fix a bug of Python threading
+setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class Engine(EngineBase):
+class Engine:
     """
     The entry point to the inference engine.
 
@@ -137,19 +135,9 @@ class Engine(EngineBase):
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        # The image input. It can be a file name, a url, or base64 encoded string.
+        # See also python/sglang/srt/utils.py:load_image.
+        image_data: Optional[Union[List[str], str]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -202,19 +190,9 @@ class Engine(EngineBase):
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        # The image input. It can be a file name, a url, or base64 encoded string.
+        # See also python/sglang/srt/utils.py:load_image.
+        image_data: Optional[Union[List[str], str]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -250,13 +228,7 @@ class Engine(EngineBase):
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[
-            Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
-            ]
-        ] = None,
+        image_data: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -567,13 +539,17 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Launch PD disaggregation controller
+    if server_args.kv_transfer_config is not None:
+        pd_disaggregation_controller = PDDisaggregationController(server_args, port_args, tokenizer_manager.send_to_scheduler)
+        t = threading.Thread(target=pd_disaggregation_controller.event_loop)
+        t.start()
+
     if server_args.chat_template:
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
         )
-
-    if server_args.completion_template:
-        load_completion_template_for_openai_api(server_args.completion_template)
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -593,7 +569,6 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
-
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]

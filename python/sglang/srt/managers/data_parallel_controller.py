@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    PrefilledReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -240,6 +241,7 @@ class DataParallelController:
                     (
                         TokenizedGenerateReqInput,
                         TokenizedEmbeddingReqInput,
+                        PrefilledReqInput,
                     ),
                 ):
                     self.dispatching(recv_req)

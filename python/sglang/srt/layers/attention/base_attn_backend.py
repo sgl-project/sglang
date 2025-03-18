@@ -63,6 +63,7 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        # print(f"forward q: {q.shape}, k: {k.shape}, v: {v.shape}, layer: {layer.layer_id}, forward_batch: {forward_batch}, save_kv_cache: {save_kv_cache}")
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(

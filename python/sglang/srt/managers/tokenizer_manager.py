@@ -107,6 +107,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.srt.managers.pd_disaggregation_controller import PD_DISAGGREGATION_PORT
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -149,13 +150,18 @@ class TokenizerManager:
         self.log_requests_level = server_args.log_requests_level
 
         # Init inter-process communication
-        context = zmq.asyncio.Context(2)
+        context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
+        if server_args.kv_transfer_config is not None and server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.send_to_pd_disagg_controller = get_zmq_socket(
+                context, zmq.PUSH, f"tcp://{server_args.kv_transfer_config.decode_dist_init_host}:{PD_DISAGGREGATION_PORT}", False)
+        else:
+            self.send_to_pd_disagg_controller = None
 
         # Read model args
         self.model_path = server_args.model_path
@@ -421,7 +427,8 @@ class TokenizerManager:
             top_logprobs_num = obj.top_logprobs_num
             token_ids_logprob = obj.token_ids_logprob
             session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
+                SessionParams(
+                    **obj.session_params) if obj.session_params else None
             )
 
         input_token_num = len(input_ids) if input_ids is not None else 0
@@ -489,7 +496,8 @@ class TokenizerManager:
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        state = ReqState([], False, asyncio.Event(),
+                         obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
@@ -588,7 +596,8 @@ class TokenizerManager:
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                tokenized_obj.sampling_params = copy.copy(
+                    tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
@@ -600,8 +609,10 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    self._send_one_request(
+                        tmp_obj, tokenized_obj, created_time)
+                    generators.append(
+                        self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -611,7 +622,8 @@ class TokenizerManager:
             yield outputs
         else:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            task_map = {asyncio.create_task(
+                gen.__anext__()): gen for gen in generators}
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
@@ -865,9 +877,13 @@ class TokenizerManager:
             await asyncio.sleep(1)
             if obj.is_single:
                 self.abort_request(obj.rid)
+                if self.send_to_pd_disagg_controller is not None:
+                    self.send_to_pd_disagg_controller.send_pyobj(AbortReq(obj.rid))
             else:
                 for rid in obj.rid:
                     self.abort_request(rid)
+                    if self.send_to_pd_disagg_controller is not None:
+                        self.send_to_pd_disagg_controller.send_pyobj(AbortReq(rid))
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -887,7 +903,8 @@ class TokenizerManager:
         # the main thread due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = SignalHandler(self)
-            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+            loop.add_signal_handler(
+                signal.SIGTERM, signal_handler.signal_handler)
         else:
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
@@ -971,7 +988,7 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
+                        state.last_output_offset:
                     ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
@@ -995,7 +1012,8 @@ class TokenizerManager:
                 if self.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
-                meta_info["e2e_latency"] = state.finished_time - state.created_time
+                meta_info["e2e_latency"] = state.finished_time - \
+                    state.created_time
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -1131,7 +1149,8 @@ class TokenizerManager:
                 self.dump_requests_folder,
                 datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
             )
-            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+            logger.info(
+                f"Dump {len(self.dump_request_list)} requests to {filename}")
 
             to_dump = self.dump_request_list
             self.dump_request_list = []

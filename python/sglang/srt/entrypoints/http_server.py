@@ -188,7 +188,8 @@ async def health_generate(request: Request) -> Response:
     task.cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
+        "%H:%M:%S", time.localtime(
+            _global_state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
         f"Health check failed. Server couldn't get a response from detokenizer for last "
@@ -525,7 +526,8 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     A native API endpoint to parse function calls from a text.
     """
     # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+    parser = FunctionCallParser(
+        tools=obj.tools, tool_call_parser=obj.tool_call_parser)
 
     # 2) Call the non-stream parsing method (non-stream)
     normal_text, calls = parser.parse_non_stream(obj.text)
@@ -637,7 +639,7 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 
-## SageMaker API
+# SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
     """Check the health of the http server."""
@@ -649,7 +651,7 @@ async def sagemaker_chat_completions(raw_request: Request):
     return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
 
 
-## Vertex AI API
+# Vertex AI API
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
 async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
     if not vertex_req.instances:
@@ -701,7 +703,8 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+    tokenizer_manager, scheduler_info = _launch_subprocesses(
+        server_args=server_args)
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -754,21 +757,69 @@ def _wait_and_warmup(
     image_token_text: str,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
-    headers = {}
-    url = server_args.url()
-    if server_args.api_key:
-        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    if server_args.kv_transfer_config is None or server_args.kv_transfer_config.role == "prefill":
+        headers = {}
+        url = server_args.url()
+        if server_args.api_key:
+            headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    # Wait until the server is launched
-    success = False
-    for _ in range(120):
-        time.sleep(1)
+        # Wait until the server is launched
+        success = False
+        for _ in range(120):
+            time.sleep(1)
+            try:
+                res = requests.get(url + "/get_model_info",
+                                    timeout=5, headers=headers)
+                assert res.status_code == 200, f"{res=}, {res.text=}"
+                success = True
+                break
+            except (AssertionError, requests.exceptions.RequestException):
+                last_traceback = get_exception_traceback()
+                pass
+
+        if not success:
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error(
+                f"Initialization failed. warmup error: {last_traceback}")
+            kill_process_tree(os.getpid())
+            return
+
+        model_info = res.json()
+        print(f"{model_info=}")
+
+        # Send a warmup request
+        request_name = "/generate" if model_info["is_generation"] else "/encode"
+        max_new_tokens = 8 if model_info["is_generation"] else 1
+        json_data = {
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+            },
+        }
+        if server_args.skip_tokenizer_init:
+            json_data["input_ids"] = [10, 11, 12]
+        else:
+            json_data["text"] = "The capital city of France is"
+
+        # Debug dumping
+        if server_args.debug_tensor_dump_input_file:
+            json_data.pop("text", None)
+            json_data["input_ids"] = np.load(
+                server_args.debug_tensor_dump_input_file
+            ).tolist()
+            json_data["sampling_params"]["max_new_tokens"] = 0
+
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
+            for i in range(server_args.dp_size):
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+        except Exception:
             last_traceback = get_exception_traceback()
             pass
 

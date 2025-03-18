@@ -108,12 +108,17 @@ class TritonAttnBackend(AttentionBackend):
 
         max_bs = model_runner.req_to_token_pool.size
 
+        print(f"max_bs: {max_bs}")
+
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
         else:
+            print(f"kv_indptr_buf: {kv_indptr_buf.shape}")
             self.kv_indptr = kv_indptr_buf
+
+        print(f"kv_indptr: {self.kv_indptr.shape}")
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 

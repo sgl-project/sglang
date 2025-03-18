@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import PDStep
+from sglang.srt.managers.io_struct import PrefilledReqInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -74,6 +76,11 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+
+                    if req.pd_step == PDStep.PREFILL:
+                        req.pd_step = PDStep.DISPATCHING
+                        req.kv_cache_length = self.kv_transfer_agent.set_kv_buffer(req)
+
                     req.check_finished()
 
                     if req.finished():
@@ -494,6 +501,10 @@ class SchedulerOutputProcessorMixin:
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
             if self.model_config.is_multimodal_gen and req.to_abort:
+                continue
+
+            if req.pd_step == PDStep.DISPATCHING:
+                self.kv_transfer_agent.dispatch_prefilled_req(req)
                 continue
 
             if (

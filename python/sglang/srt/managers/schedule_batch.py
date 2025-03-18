@@ -36,6 +36,7 @@ import copy
 import dataclasses
 import logging
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from enum import IntEnum
 
 import numpy as np
 import torch
@@ -367,6 +368,11 @@ class MultimodalInputs:
                 setattr(self, arg, self_arg + getattr(other, arg))
         # other args would be kept intact
 
+class PDStep(IntEnum):
+    PREFILL = 0
+    DISPATCHING = 1
+    DECODE = 2
+
 
 class Req:
     """The input and output status of a request."""
@@ -390,6 +396,9 @@ class Req:
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_room: Optional[int] = None,
+        kv_transfer_src_addr: Optional[str] = None,
+        kv_transfer_src_rank: Optional[int] = None,
+        kv_cache_length: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -406,6 +415,10 @@ class Req:
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
+        self.kv_transfer_src_addr = kv_transfer_src_addr
+        self.kv_transfer_src_rank = kv_transfer_src_rank
+        self.kv_cache_length = kv_cache_length
+        self.kv_cache_restored = False
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -464,6 +477,10 @@ class Req:
 
         # For retraction
         self.is_retracted = False
+
+        # Whether or not if it is prefilled.
+        # Only used for pd disaggregation.
+        self.pd_step: Optional[PDStep] = None
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -552,7 +569,7 @@ class Req:
 
     def finished(self) -> bool:
         # Whether request reached finished condition
-        return self.finished_reason is not None
+        return self.finished_reason is not None or self.pd_step == PDStep.DISPATCHING
 
     def init_next_round_input(
         self,
@@ -977,6 +994,168 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
+
+    def recover_for_decode(self, origin_output_ids: List[List[int]]):
+        self.forward_mode = ForwardMode.DECODE
+
+        bs = len(self.reqs)
+        reqs = self.reqs
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = []
+        pre_lens = []
+
+        # Allocate memory
+        req_pool_indices = self.alloc_req_slots(bs)
+        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+
+        input_embeds = []
+        extend_input_logprob_token_ids = []
+
+        pt = 0
+        for i, req in enumerate(reqs):
+            req.req_pool_idx = req_pool_indices[i]
+            req.output_ids = origin_output_ids[i]
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+            seq_lens.append(seq_len)
+            assert seq_len - pre_len == req.extend_input_len
+
+            if pre_len > 0:
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+                )
+
+            # If input_embeds are available, store them
+            if req.input_embeds is not None:
+                # If req.input_embeds is already a list, append its content directly
+                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+
+            req.cached_tokens += pre_len - req.already_computed
+            req.already_computed = seq_len
+            req.is_retracted = False
+            pre_lens.append(pre_len)
+            # Compute the relative logprob_start_len in an extend batch
+            if req.logprob_start_len >= pre_len:
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                    req.seqlen - 1,
+                )
+            else:
+                req.extend_logprob_start_len = 0
+
+            if self.return_logprob:
+                # Find input logprob token ids.
+                # First, find a global index within origin_input_ids and slide it by 1
+                # to compute input logprobs. It is because you need the next token
+                # to compute input logprobs. E.g., (chunk size 2)
+                #
+                # input_logprobs = [1, 2, 3, 4]
+                # fill_ids = [1, 2]
+                # extend_input_logprob_token_id = [2, 3]
+                #
+                # Note that it can also overflow. In this case, we pad it with 0.
+                # input_logprobs = [1, 2, 3, 4]
+                # fill_ids = [3, 4]
+                # extend_input_logprob_token_id = [4, 0]
+                global_start_idx, global_end_idx = (
+                    len(req.prefix_indices),
+                    len(req.fill_ids),
+                )
+                # Apply logprob_start_len
+                if global_start_idx < req.logprob_start_len:
+                    global_start_idx = req.logprob_start_len
+
+                logprob_token_ids = req.origin_input_ids[
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
+                extend_input_logprob_token_ids.extend(logprob_token_ids)
+
+                # We will need req.extend_input_len - req.extend_logprob_start_len number of
+                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                extend_input_logprob_token_ids.extend(
+                    [0]
+                    * (
+                        req.extend_input_len
+                        - req.extend_logprob_start_len
+                        - len(logprob_token_ids)
+                    )
+                )
+
+        if self.return_logprob:
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids
+            )
+        else:
+            extend_input_logprob_token_ids = None
+
+        # Set fields
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.output_ids = torch.tensor(sum(origin_output_ids, []), dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.input_embeds = (
+            torch.tensor(input_embeds).to(self.device, non_blocking=True)
+            if input_embeds
+            else None
+        )
+
+        self.out_cache_loc = out_cache_loc
+
+        self.seq_lens_sum = sum(seq_lens)
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
+        self.extend_lens = [r.extend_input_len for r in reqs]
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        # Write to req_to_token_pool
+        pre_lens = torch.tensor(pre_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        extend_lens = torch.tensor(self.extend_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        if global_server_args_dict["attention_backend"] != "torch_native":
+            write_req_to_token_pool_triton[(bs,)](
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                pre_lens,
+                self.seq_lens,
+                extend_lens,
+                self.out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+        else:
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write(
+                    (self.req_pool_indices[i], slice(pre_lens[i], self.seq_lens[i])),
+                    self.out_cache_loc[pt : pt + self.extend_lens[i]],
+                )
+                pt += self.extend_lens[i]
+        # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
+
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
