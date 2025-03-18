@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from vllm import _custom_ops as ops
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -68,12 +67,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda_available, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
-if is_cuda_available():
-    from sgl_kernel import bmm_fp8
+if _is_cuda:
+    from sgl_kernel import awq_dequantize, bmm_fp8
+else:
+    from vllm import _custom_ops as ops
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1020,6 +1022,7 @@ class DeepseekV2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
         # Gather
@@ -1034,7 +1037,11 @@ class DeepseekV2Model(nn.Module):
             )
             dp_gather(input_ids, local_input_ids, forward_batch, "embedding")
 
-        hidden_states = self.embed_tokens(input_ids)
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -1075,8 +1082,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -1174,14 +1183,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn = self.model.layers[layer_id].self_attn
                 if hasattr(self_attn.kv_b_proj, "qweight"):
                     # AWQ compatible
-                    w = ops.awq_dequantize(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
-                    ).T
+                    if _is_cuda:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        w = ops.awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                            0,
+                            0,
+                            0,
+                        ).T
                 else:
                     w = self_attn.kv_b_proj.weight
                 # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
