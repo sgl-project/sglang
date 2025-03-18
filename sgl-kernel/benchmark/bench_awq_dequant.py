@@ -21,7 +21,7 @@ def sglang_awq_dequantize(
     return awq_dequantize(qweight, scales, qzeros)
 
 
-def calculate_diff(qweight_row: int, qweight_col: int):
+def calculate_diff(qweight_row: int, qweight_col: int, q_dtype: torch.dtype = torch.float16):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
     qweight = torch.randint(
@@ -44,28 +44,31 @@ def calculate_diff(qweight_row: int, qweight_col: int):
     )
 
     vllm_out = vllm_awq_dequantize(qweight, scales, qzeros)
-    sglang_out = sglang_awq_dequantize(qweight, scales.to(torch.bfloat16), qzeros)
+    sglang_out = sglang_awq_dequantize(qweight, scales.to(q_dtype), qzeros)
 
     output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
-    print(f"Output difference: {vllm_out.float() - sglang_out.float()}")
-
-    if torch.allclose(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
-    ):
-        print("✅ All implementations match")
+    if q_dtype == torch.bfloat16:
+        rtol = 1e-2
     else:
-        print("❌ Implementations differ")
+        rtol = 1e-3
+    if torch.allclose(
+            vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=rtol, atol=1e-4
+        ):
+        print(f"✅ sglang {q_dtype} implementations match vllm torch.float16")
+    else:
+        print(f"❌ sglang {q_dtype} implementations differ from vllm torch.float16")
 
 
 qweight_row_range = [3584, 18944, 128, 256, 512, 1024]
 qweight_cols_range = [448, 576, 4736, 16, 32, 64, 128]
+q_dtype_range = [torch.float16, torch.bfloat16]
 
-configs = list(itertools.product(qweight_row_range, qweight_cols_range))
+configs = list(itertools.product(qweight_row_range, qweight_cols_range, q_dtype_range))
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["qweight_row", "qweight_col"],
+        x_names=["qweight_row", "qweight_col", "q_dtype"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["vllm", "sglang"],
@@ -76,8 +79,7 @@ configs = list(itertools.product(qweight_row_range, qweight_cols_range))
         args={},
     )
 )
-def benchmark(qweight_row, qweight_col, provider):
-    dtype = torch.float16
+def benchmark(qweight_row, qweight_col, q_dtype, provider):
     device = torch.device("cuda")
     qweight = torch.randint(
         0,
@@ -106,7 +108,7 @@ def benchmark(qweight_row, qweight_col, provider):
         )
     elif provider == "sglang":
         fn = lambda: sglang_awq_dequantize(
-            qweight.clone(), scales.clone(), qzeros.clone()
+            qweight.clone(), scales.to(q_dtype).clone(), qzeros.clone()
         )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -115,5 +117,6 @@ def benchmark(qweight_row, qweight_col, provider):
 
 
 if __name__ == "__main__":
-    calculate_diff(qweight_row=3584, qweight_col=448)
-    # benchmark.run(print_data=True)
+    calculate_diff(qweight_row=3584, qweight_col=448, q_dtype=torch.float16)
+    calculate_diff(qweight_row=3584, qweight_col=448, q_dtype=torch.bfloat16)
+    benchmark.run(print_data=True)

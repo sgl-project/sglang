@@ -20,16 +20,19 @@ def sglang_awq_dequantize(
 
 
 @pytest.mark.parametrize(
-    "qweight_row,qweight_col",
+    "qweight_row,qweight_col,q_dtype",
     list(
         itertools.product(
-            [3584, 18944, 128, 256, 512, 1024], [448, 576, 4736, 16, 32, 64, 128]
+            [3584, 18944, 128, 256, 512, 1024],
+            [448, 576, 4736, 16, 32, 64, 128],
+            [torch.bfloat16, torch.float16],
         )
     ),
 )
 def test_awq_dequant_compare_implementations(
     qweight_row: int,
     qweight_col: int,
+    q_dtype: torch.dtype,
 ):
     device = torch.device("cuda")
 
@@ -54,11 +57,15 @@ def test_awq_dequant_compare_implementations(
 
     # Run both implementations
     vllm_out = vllm_awq_dequantize(qweight, scales, qzeros)
-    sglang_out = sglang_awq_dequantize(qweight, scales, qzeros)
+    sglang_out = sglang_awq_dequantize(qweight, scales.to(q_dtype), qzeros)
 
     # Compare results
+    if q_dtype == torch.bfloat16:
+        rtol = 1e-2
+    else:
+        rtol = 1e-3
     torch.testing.assert_close(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
+        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=rtol, atol=1e-5
     )
 
 
