@@ -33,6 +33,10 @@ void grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
     at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk,
     bool renormalize, int64_t num_expert_group, int64_t topk_group);
 
+void biased_grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
+    at::Tensor& hidden_states, at::Tensor& gating_output, at::Tensor& correction_bias,
+    int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
+
 // attention
 void decode_attention_cpu(at::Tensor& query, at::Tensor& output,
     at::Tensor& k_cache, at::Tensor& v_cahce, at::Tensor& attn_logits,
@@ -76,6 +80,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // topk
   m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
+
+  // biased group topk
+  m.def("biased_grouped_topk_cpu", &biased_grouped_topk_cpu, "Biased Grouped TopK for CPU");
 
   // decode
   m.def("decode_attention_cpu", &decode_attention_cpu, "Attention decoding for CPU");
