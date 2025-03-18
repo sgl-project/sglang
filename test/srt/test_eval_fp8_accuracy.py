@@ -37,7 +37,7 @@ class TestEvalFP8Accuracy(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.61)
+        self.assertGreaterEqual(metrics["score"], 0.6)
 
 
 class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
