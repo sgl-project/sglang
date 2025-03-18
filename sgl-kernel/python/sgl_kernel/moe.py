@@ -32,3 +32,9 @@ def topk_softmax(
     torch.ops.sgl_kernel.topk_softmax.default(
         topk_weights, topk_ids, token_expert_indices, gating_output
     )
+
+
+def moe_fused_gate(input_tensor, bias, num_expert_group, topk_group, topk):
+    return torch.ops.sgl_kernel.moe_fused_gate(
+        input_tensor, bias, num_expert_group, topk_group, topk
+    )
