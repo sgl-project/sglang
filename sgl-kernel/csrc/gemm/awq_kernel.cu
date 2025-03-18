@@ -80,26 +80,24 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 #endif
 }
 
-template <typename scalar_t2, int bit>
-__device__ inline void dequantize_s4_to_bf16x2(int q, scalar_t2* res) {}
-
+__device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-template <>
-__device__ inline void dequantize_s4_to_bf16x2<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
+  uint4 result;
+  uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+  uint32_t const i4s = source;
+
+  // 定义掩码和常量
   static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t EX = 0x43004300;
-
-  int lo0 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
-  q >>= 4;
-  int hi0 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
-  q >>= 4;
-  int lo1 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
-  q >>= 4;
-  int hi1 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
-
   static constexpr uint32_t MUL = 0x3F803F80;
   static constexpr uint32_t ADD = 0xC300C300;
 
+  int lo0 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s, MASK, EX);
+  int hi0 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 4, MASK, EX);
+  int lo1 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 8, MASK, EX);
+  int hi1 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 12, MASK, EX);
+
+  nv_bfloat162* res = reinterpret_cast<nv_bfloat162*>(h);
   res[0] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo0),
                    *reinterpret_cast<const nv_bfloat162*>(&MUL),
                    *reinterpret_cast<const nv_bfloat162*>(&ADD));
@@ -112,8 +110,13 @@ __device__ inline void dequantize_s4_to_bf16x2<nv_bfloat162, 4>(int q, nv_bfloat
   res[3] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi1),
                    *reinterpret_cast<const nv_bfloat162*>(&MUL),
                    *reinterpret_cast<const nv_bfloat162*>(&ADD));
-}
+
+  return result;
+#else
+  assert(false);
+  return {};
 #endif
+}
 
 template <typename ScaleT, typename OutputT>
 __global__ void __launch_bounds__(256) dequantize_weights(
@@ -158,10 +161,9 @@ __global__ void __launch_bounds__(256) dequantize_weights(
   } else if constexpr (std::is_same<ScaleT, __nv_bfloat16>::value) {
     // BF16 path
     nv_bfloat162 weight[4];
-    dequantize_s4_to_bf16x2<nv_bfloat162, 4>(qweight[col + row * qweight_cols], weight);
-
     nv_bfloat162 zeros[4];
-    dequantize_s4_to_bf16x2<nv_bfloat162, 4>(qzeros[col + group_idx * qweight_cols], zeros);
+    weight= dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols], weight);
+    zeros = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols], zeros);
 
     nv_bfloat162* scales_bf16 = reinterpret_cast<nv_bfloat162*>(&loaded_scale);
 
