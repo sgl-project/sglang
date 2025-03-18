@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -168,7 +168,7 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
-        return batch_next_token_ids.to(torch.int32)
+        return batch_next_token_ids
 
     def _apply_custom_logit_processor(
         self, logits: torch.Tensor, sampling_batch_info: SamplingBatchInfo

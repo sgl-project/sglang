@@ -11,13 +11,16 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEvalAccuracyMini(unittest.TestCase):
+class TestPageSize(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--enable-hierarchical-cache"],
         )
 
     @classmethod
@@ -31,7 +34,6 @@ class TestEvalAccuracyMini(unittest.TestCase):
             eval_name="mmlu",
             num_examples=64,
             num_threads=32,
-            temperature=0.1,
         )
 
         metrics = run_eval(args)

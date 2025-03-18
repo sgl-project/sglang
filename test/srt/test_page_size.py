@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -11,16 +12,17 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEvalAccuracyLargeChunkedPrefill(unittest.TestCase):
+class TestPageSize(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_DEBUG_MEMORY_POOL"] = "1"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--log-level-http", "warning", "--chunked-prefill-size", "256"],
+            other_args=["--page-size", 4, "--chunked-prefill-size", 128],
         )
 
     @classmethod
@@ -32,36 +34,12 @@ class TestEvalAccuracyLargeChunkedPrefill(unittest.TestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=3000,
-            num_threads=1024,
+            num_examples=64,
+            num_threads=32,
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.705, f"{metrics}"
-
-    def test_human_eval(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="humaneval",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.64, f"{metrics}"
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.84, f"{metrics}"
+        self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":
