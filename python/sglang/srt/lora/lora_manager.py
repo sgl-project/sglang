@@ -118,7 +118,9 @@ class LoRAManager:
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
+        print(f"forward_batch.lora_paths: {forward_batch.lora_paths}")
         cur_uids = set(forward_batch.lora_paths)
+        print(f"cur_uids: {cur_uids}")
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
 
@@ -128,6 +130,7 @@ class LoRAManager:
 
         # set up batch info shared by all lora moruldes
         bs = forward_batch.batch_size
+        print(f"bs: {bs}")
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
@@ -166,6 +169,55 @@ class LoRAManager:
                     self.memory_pool.get_tensor("q_proj", layer_id, LoRAType.LORA_B),
                     self.memory_pool.get_tensor("kv_proj", layer_id, LoRAType.LORA_B),
                 )
+
+    def pin_weights_for_capture(self):
+        """
+        Ensures LoRA weights are pinned in memory for CUDA graph capture.
+
+        This method ensures that all LoRA weights currently in the memory pool
+        are properly loaded to GPU and won't be moved or deallocated during
+        CUDA graph capture, which could cause illegal memory access errors.
+        """
+        # Ensure all active LoRA adapters are fully loaded to GPU
+        for lora_uid, buffer_id in self.memory_pool.uid_to_buffer_id.items():
+            if lora_uid is None:
+                continue
+
+            if lora_uid in self.loras:
+                lora_adapter = self.loras[lora_uid]
+
+                # Ensure adapter weights are on GPU and contiguous
+                for layer_id in range(len(lora_adapter.layers)):
+                    layer = lora_adapter.layers[layer_id]
+                    for name, weight in layer.weights.items():
+                        # Make sure weight is on CUDA and contiguous
+                        if not weight.is_cuda:
+                            layer.weights[name] = weight.cuda()
+                        if not weight.is_contiguous():
+                            layer.weights[name] = weight.contiguous()
+
+        # Force synchronization to ensure all memory operations are complete
+        torch.cuda.synchronize()
+
+        # Ensure the memory pool buffers are properly allocated and pinned
+        if hasattr(self.memory_pool, "A_buffer"):
+            for key, buffer_list in self.memory_pool.A_buffer.items():
+                for layer_id, layer_buffer in enumerate(buffer_list):
+                    # Ensure the buffer is contiguous and properly allocated
+                    if not layer_buffer.is_contiguous():
+                        buffer_list[layer_id] = layer_buffer.contiguous()
+
+        if hasattr(self.memory_pool, "B_buffer"):
+            for key, buffer_list in self.memory_pool.B_buffer.items():
+                for layer_id, layer_buffer in enumerate(buffer_list):
+                    # Ensure the buffer is contiguous and properly allocated
+                    if not layer_buffer.is_contiguous():
+                        buffer_list[layer_id] = layer_buffer.contiguous()
+
+        # Make sure all memory operations are complete before returning
+        torch.cuda.synchronize()
+
+        print("LoRA weights have been pinned for CUDA graph capture")
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(

@@ -199,6 +199,7 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        self.lora_paths = [None] * self.max_bs
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
@@ -325,6 +326,7 @@ class CudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
+
             for bs in capture_range:
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -349,10 +351,11 @@ class CudaGraphRunner:
                     self.graphs[bs] = graph
                     self.output_buffers[bs] = output_buffers
 
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
+            # Save gemlite cache after each capture
+            save_gemlite_cache()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        print(f"capture one batch size: {bs}")
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -391,6 +394,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+        lora_paths = self.lora_paths[:bs]
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -412,7 +416,14 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            lora_paths=lora_paths,
         )
+
+        if self.model_runner.server_args.lora_paths is not None:
+            print(f"prepare lora batch: {self.lora_paths}")
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            # Pin LoRA weights before capture to prevent memory access issues
+            # self.model_runner.lora_manager.pin_weights_for_capture()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -430,6 +441,7 @@ class CudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
 
+            print("run once")
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
             return logits_output.next_token_logits, logits_output.hidden_states
 
@@ -451,20 +463,36 @@ class CudaGraphRunner:
         hidden_mode_from_spec_info = getattr(
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
+        need_recapture = False
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.capture_hidden_mode != CaptureHiddenMode.FULL
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
-            self.capture()
+            need_recapture = True
         elif (
             forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
             and self.capture_hidden_mode != hidden_mode_from_spec_info
         ):
             self.capture_hidden_mode = hidden_mode_from_spec_info
+            need_recapture = True
+
+        # If the lora paths change, we need to recapture the graph
+        if forward_batch.lora_paths != self.lora_paths:
+            print(
+                f"lora paths changed from {self.lora_paths} to {forward_batch.lora_paths}"
+            )
+            self.lora_paths[: forward_batch.batch_size] = forward_batch.lora_paths
+            print("lora paths changed, recapture...")
+
+            need_recapture = True
+
+        if need_recapture:
+            print("recapture...")
             self.capture()
 
     def replay_prepare(self, forward_batch: ForwardBatch):
+        print(f"replay {forward_batch.lora_paths}")
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
