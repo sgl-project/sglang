@@ -18,6 +18,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.cpu_utils import cpu_has_amx_support
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 
 def fused_topk_native(
@@ -177,14 +180,32 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
+            device = hidden_states.device
+            if device == torch.device("cpu") and cpu_has_amx_support():
+                M = hidden_states.size(0)
+                topk_weights = torch.empty(
+                    M, top_k, dtype=torch.float32, device=device
+                )
+                topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=device)
+                sgl_kernel.cpu.grouped_topk(
+                    topk_weights,
+                    topk_ids,
+                    hidden_states,
+                    router_logits,
+                    top_k,
+                    renormalize,
+                    num_expert_group,
+                    topk_group,
+                )
+            else:
+                topk_weights, topk_ids = grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,

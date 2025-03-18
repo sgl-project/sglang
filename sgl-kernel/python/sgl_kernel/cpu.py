@@ -98,3 +98,24 @@ def weight_packed_linear(
         bias,
         is_vnni,
     )
+
+def grouped_topk(
+    topk_weights,
+    topk_ids,
+    hidden_states,
+    router_logits,
+    top_k,
+    renormalize,
+    num_expert_group,
+    topk_group,
+):
+    sgl_kernel.common_ops.grouped_topk_cpu(
+        topk_weights,
+        topk_ids,
+        hidden_states,
+        router_logits,
+        top_k,
+        renormalize,
+        num_expert_group,
+        topk_group,
+    )
