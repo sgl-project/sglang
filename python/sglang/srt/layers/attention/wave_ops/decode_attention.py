@@ -666,11 +666,11 @@ def decode_attention_wave(
         head_size_kv,
         block_size,
         num_seqs,
-        None,
+        k_buffer.shape[1],
     )
 
     # Get the kernels (either compile or load from cache).
-    mfma_variant = MMAType.F32_16x16x16_F16
+    mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
     (
         phase_0,
         phase_1,
@@ -697,8 +697,6 @@ def decode_attention_wave(
         run=True,
         run_bench=False,
         run_config=config,
-        schedule=False,
-        use_scheduling_barriers=False,
     ):
         # TODO: Add scaling of QK as part of kernel.
         mb_qk = phase_0(
@@ -723,10 +721,8 @@ def decode_attention_wave(
         run=True,
         run_bench=False,
         run_config=config,
-        schedule=False,
-        use_scheduling_barriers=False,
     ):
-        mb_sv = phase_1(attn_logits, attn_logits_max, o)
+        mb_sv = phase_1(attn_logits, attn_logits_max, b_seq_len, o)
         if dump_generated_mlir:
             filename = f"wave_decode_attention_phase1_{'x'.join(map(str, shape))}.mlir"
             with open(filename, "w") as f:
