@@ -56,6 +56,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `context_length`: The number of tokens our model can process *including the input*. Note that extending the default might lead to strange behavior.
 * `device`: The device we put the model, defaults to `cuda`.
 * `chat_template`: The chat template to use. Deviating from the default might lead to unexpected responses. For multi-modal chat templates, refer to [here](https://docs.sglang.ai/backend/openai_api_vision.ipynb#Chat-Template). **Make sure the correct** `chat_template` **is passed, or performance degradation may occur!!!!**
+* `completion_template`: The completion template to use. Only for code fim completion currently. example refer to [here](https://github.com/sgl-project/sglang/blob/main/examples/runtime/code_fim/).
 * `is_embedding`: Set to true to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks.
 * `revision`: Adjust if a specific version of the model should be used.
 * `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/).
