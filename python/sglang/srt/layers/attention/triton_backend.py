@@ -21,20 +21,31 @@ if TYPE_CHECKING:
 @triton.jit
 def get_num_kv_splits_triton(
     num_kv_splits_ptr,
-    max_seq_len_ptr,
+    seq_lens_ptr,
     bs,
     num_head,
     num_kv_head,
     max_kv_splits,
     device_core_count,
+    MAX_BS: tl.constexpr,
 ):
     # TODO: this method is tunable
-    max_seq_len = tl.load(max_seq_len_ptr)
+    offs_b = tl.arange(0, MAX_BS)
+    mask_b = offs_b < bs
+
+    seq_lens = tl.load(seq_lens_ptr + offs_b, mask=mask_b, other=0)
+    max_seq_len = tl.max(seq_lens)
+    seq_lens = tl.load(seq_lens_ptr + offs_b, mask=mask_b, other=max_seq_len)
+    min_seq_len = tl.min(seq_lens)
+    if max_seq_len * 8 < min_seq_len * 10:
+        min_seq_len = max_seq_len
+    max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
+    kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
     # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
     ext_seq_len = tl.cast(tl.cdiv(max_seq_len, 256), tl.float32)
     ext_device_core_count = device_core_count * tl.maximum(
-        tl.cast(tl.log(ext_seq_len), tl.int32), 1
+        tl.cast(tl.ceil(tl.log2(ext_seq_len)), tl.int32), 1
     )
     block_h, num_kv_group = 16, num_head // num_kv_head
     if num_kv_group == 1:
@@ -43,10 +54,13 @@ def get_num_kv_splits_triton(
         # from triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
         block_h = tl.minimum(block_h, num_kv_group)
         bh_grid = bs * tl.cdiv(num_head, block_h)
+    max_kv_splits_2 = tl.minimum(tl.cdiv(ext_device_core_count, bh_grid), max_kv_splits)
+    kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
 
-    num_kv_splits = tl.minimum(tl.cdiv(ext_device_core_count, bh_grid), max_kv_splits)
-
-    tl.store(num_kv_splits_ptr, num_kv_splits)
+    num_kv_splits = tl.maximum(
+        tl.cdiv(seq_lens, kv_chunk_size_1), tl.cdiv(seq_lens, kv_chunk_size_2)
+    )
+    tl.store(num_kv_splits_ptr + offs_b, num_kv_splits, mask=mask_b)
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -117,19 +131,20 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         num_kv_head: int,
     ):
-        if self.static_kv_splits or self.device_core_count <= 0:
-            num_kv_splits[:] = self.max_kv_splits
+        MAX_SCHEDULE_BS = 4096
+        if self.static_kv_splits or self.device_core_count <= 0 or bs > MAX_SCHEDULE_BS:
+            num_kv_splits.fill_(self.max_kv_splits)
             return
 
-        max_seq_len, _ = torch.max(seq_lens, dim=0)
         get_num_kv_splits_triton[(1,)](
             num_kv_splits,
-            max_seq_len,
+            seq_lens,
             bs,
             self.num_head,
             num_kv_head,
             self.max_kv_splits,
             self.device_core_count,
+            MAX_BS=MAX_SCHEDULE_BS,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -180,7 +195,7 @@ class TritonAttnBackend(AttentionBackend):
                     device=self.device,
                 ),
             ]
-            num_kv_splits = torch.empty(1, dtype=torch.int32, device=self.device)
+            num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
             num_kv_heads = self.num_head
             if hasattr(forward_batch.token_to_kv_pool, "k_buffer"):
@@ -297,8 +312,8 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         ]
-        self.cuda_graph_num_kv_splits = torch.tensor(
-            self.max_kv_splits, dtype=torch.int32, device=self.device
+        self.cuda_graph_num_kv_splits = torch.full(
+            (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(

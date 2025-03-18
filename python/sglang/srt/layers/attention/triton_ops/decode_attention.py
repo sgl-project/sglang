@@ -88,7 +88,7 @@ def _fwd_kernel_stage1(
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
-    kv_splits = tl.load(num_kv_splits)
+    kv_splits = tl.load(num_kv_splits + cur_batch)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -294,7 +294,7 @@ def _fwd_grouped_kernel_stage1(
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
-    kv_splits = tl.load(num_kv_splits)
+    kv_splits = tl.load(num_kv_splits + cur_batch)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
@@ -516,7 +516,7 @@ def _fwd_kernel_stage2(
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
         kv_indptr + cur_batch
     )
-    kv_splits = tl.load(num_kv_splits)
+    kv_splits = tl.load(num_kv_splits + cur_batch)
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
