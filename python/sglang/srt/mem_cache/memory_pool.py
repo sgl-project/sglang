@@ -588,7 +588,7 @@ class HostKVCache(abc.ABC):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 3.0,
+        host_to_device_ratio: float,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
@@ -755,7 +755,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 3.0,
+        host_to_device_ratio: float,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
@@ -797,7 +797,7 @@ class MLATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float = 4.0,
+        host_to_device_ratio: float,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
