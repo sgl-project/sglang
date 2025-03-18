@@ -294,7 +294,10 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm == "EAGLE":
+        if (
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "EAGLE3"
+        ):
             if self.max_running_requests is None:
                 self.max_running_requests = 32
             self.disable_overlap_schedule = True
@@ -786,7 +789,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
