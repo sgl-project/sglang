@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 
 # FlashMLA only supports pagesize=64
@@ -76,9 +77,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.forward_metadata: Union[
-            PrefillMetadata, DecodeMetadata, FlashMLADecodeMetadata
-        ] = None
+        self.forward_metadata: Union[FlashMLADecodeMetadata] = None
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -111,7 +110,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     block_kv_indices,
                     self.indices_updater_decode.req_to_token.size(1),
                     max_seqlen_pad,
-                    max_seqlen_pad,
                 )
                 mla_metadata, num_splits = get_mla_metadata(
                     forward_batch.seq_lens.to(torch.int32),
@@ -136,7 +134,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if block_kv_indices is None:
             cuda_graph_kv_indices = torch.full(
                 (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
-                -1,
+                1,
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -167,7 +165,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
-
                 max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
                 create_flashmla_kv_indices_triton[(bs,)](
@@ -177,7 +174,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     None,
                     self.cuda_graph_kv_indices,
                     self.indices_updater_decode.req_to_token.size(1),
-                    max_seqlen_pad,
                     max_seqlen_pad,
                 )
                 mla_metadata, num_splits = get_mla_metadata(
@@ -226,7 +222,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 None,
                 block_kv_indices,
                 self.indices_updater_decode.req_to_token.size(1),
-                max_seqlen_pad,
                 max_seqlen_pad,
             )
             mla_metadata, num_splits = get_mla_metadata(
