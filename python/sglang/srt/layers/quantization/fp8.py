@@ -800,7 +800,7 @@ class Fp8MoEMethod:
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
                     layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                        vllm_ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
                     )
                     start += shard_size
 
