@@ -24,8 +24,11 @@ ln: submodule ## Create compilation database
 install: submodule ## Install package in development mode
 	@pip install -e .
 
-build: submodule ## Build and install wheel package
-	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel && pip3 install dist/*whl --force-reinstall --no-deps
+build: submodule ## Build and install wheel package using CMake (faster)
+	@rm -rf dist/* || true && \
+	export MAX_JOBS=$(shell nproc) && \
+	./build-cmake.sh 3.10 12.4 $(MAX_JOBS) && \
+	pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
