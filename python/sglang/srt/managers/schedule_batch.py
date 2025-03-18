@@ -159,6 +159,10 @@ class ImageInputs:
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Qwen2-VL video related
+    video_token_id: Optional[int] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
     # deepseek vl2 related
     image_seq_mask: Optional[List[torch.Tensor]] = None
