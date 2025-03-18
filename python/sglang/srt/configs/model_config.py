@@ -260,7 +260,9 @@ class ModelConfig:
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
                 )
                 if is_context_extended:
-                    pass
+                    logger.info(
+                        f"Context length is extended from {derived_context_len} to {context_length}."
+                    )
                 elif (
                     get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
                     or is_in_ci()  # FIXME: fix this special case

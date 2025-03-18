@@ -6,7 +6,7 @@ https://arxiv.org/pdf/2406.09827
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -19,12 +19,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 logger = logging.getLogger(__name__)
 
 
-class HiPRadixAttentionBackend(AttentionBackend):
+class HiPAttentionBackend(AttentionBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -36,7 +37,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
         self.hip_config: HiPAttentionConfig = (
             model_runner.server_args.hip_attention_config
         )
-        self.is_offload_enabled = model_runner.server_args.enable_hip_offload
+        self.is_kv_cache_offload_enabled = (
+            model_runner.server_args.enable_hip_kv_cache_offload
+        )
 
         self.max_context_len = model_runner.model_config.context_len
 
@@ -91,7 +94,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        if not self.is_offload_enabled:
+        if not self.is_kv_cache_offload_enabled:
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -128,7 +131,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 decoding_reqs_positions.append(start_len)
 
             else:
-                if not self.is_offload_enabled:
+                if not self.is_kv_cache_offload_enabled:
                     k_chunk = v_chunk = None
                     offloading_metadata = None
 
@@ -168,7 +171,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     v=v_chunk,
                     online_update_cache=(
                         forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                        if self.is_offload_enabled
+                        if self.is_kv_cache_offload_enabled
                         else None
                     ),
                     offloading_metadata=offloading_metadata,
@@ -208,7 +211,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             ),
         )
 
-        if not self.is_offload_enabled:
+        if not self.is_kv_cache_offload_enabled:
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -256,7 +259,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=metadata,
             online_update_cache=(
                 forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                if self.is_offload_enabled
+                if self.is_kv_cache_offload_enabled
                 else None
             ),
             is_decode=True,
@@ -269,7 +272,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
             metadata=metadata,
         )
 
-        if self.is_offload_enabled:
+        if self.is_kv_cache_offload_enabled:
             offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
