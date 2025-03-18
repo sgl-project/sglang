@@ -429,9 +429,9 @@ class Llama32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
-            _, action_text = text.split("<|python_tag|>")
+            normal_text, action_text = text.split("<|python_tag|>")
         else:
-            action_text = text
+            normal_text, action_text = "", text
 
         # Split by semicolon and process each part
         json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
