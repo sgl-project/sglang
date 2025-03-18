@@ -28,10 +28,11 @@ from sglang.srt.managers.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, cpu_has_amx_support
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -343,18 +344,29 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
+            device = hidden_states.device
+            if device == torch.device("cpu") and _is_cpu_amx:
+                topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
+                    hidden_states,
+                    router_logits,
+                    top_k,
+                    renormalize,
+                    num_expert_group,
+                    topk_group,
+                )
+            else:
+                topk_weights, topk_ids = grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
