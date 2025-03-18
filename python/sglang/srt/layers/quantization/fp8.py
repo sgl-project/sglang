@@ -799,9 +799,18 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
+                    if _is_cuda:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                    else:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = vllm_ops.scaled_fp8_quant(
+                            dq_weight, max_w13_scales[expert_id]
+                        )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
