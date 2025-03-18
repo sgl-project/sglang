@@ -19,7 +19,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 Memory pool.
 
 SGLang has two levels of memory pool.
-ReqToTokenPool maps a a request to its token locations.
+ReqToTokenPool maps a request to its token locations.
 TokenToKVPoolAllocator manages the indices to kv cache data.
 KVCache actually holds the physical kv cache.
 """
@@ -175,7 +175,7 @@ class TokenToKVPoolAllocator:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = torch.concat((self.free_slots, free_index))
+            self.free_slots = torch.cat((self.free_slots, free_index))
         else:
             self.free_group.append(free_index)
 
@@ -186,7 +186,7 @@ class TokenToKVPoolAllocator:
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.concat(self.free_group))
+            self.free(torch.cat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -230,7 +230,8 @@ class MHATokenToKVPool(KVCache):
 
         self.layer_transfer_counter = None
         self.capture_mode = False
-        self.alt_stream = torch.cuda.Stream()
+        self.device_module = torch.get_device_module(self.device)
+        self.alt_stream = self.device_module.Stream()
 
         self.layer_transfer_counter = None
 
@@ -361,11 +362,13 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.capture_mode and cache_k.shape[0] < 4:
-            self.alt_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.alt_stream):
+            # Overlap the copy of K and V cache for small batch size
+            current_stream = self.device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with self.device_module.stream(self.alt_stream):
                 self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
+            current_stream.wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
@@ -586,13 +589,20 @@ class MemoryStateInt(IntEnum):
     BACKUP = 4
 
 
-def synchronized(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        with self.lock:
-            return func(self, *args, **kwargs)
+def synchronized(debug_only=False):
+    def _decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if (not debug_only) or self.debug:
+                return func(self, *args, **kwargs)
+                with self.lock:
+                    return func(self, *args, **kwargs)
+            else:
+                return True
 
-    return wrapper
+        return wrapper
+
+    return _decorator
 
 
 class HostKVCache(abc.ABC):
@@ -600,8 +610,8 @@ class HostKVCache(abc.ABC):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 4.0,
-        pin_memory: bool = True,
+        host_to_device_ratio: float,
+        pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):
         assert (
@@ -637,13 +647,9 @@ class HostKVCache(abc.ABC):
 
         self.kv_buffer = self.init_kv_buffer()
 
-        # Initialize memory states and tracking structures.
-        self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
-        )
-
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self.debug = logger.isEnabledFor(logging.DEBUG)
         self.clear()
 
     @abc.abstractmethod
@@ -670,13 +676,38 @@ class HostKVCache(abc.ABC):
     def assign_flat_data(self, indices, flat_data):
         raise NotImplementedError()
 
-    @synchronized
+    @synchronized()
     def clear(self):
-        self.mem_state.fill_(0)
-        self.can_use_mem_size = self.size
+        # Initialize memory states and tracking structures.
+        self.mem_state = torch.zeros(
+            (self.size,), dtype=torch.uint8, device=self.device
+        )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
-    @synchronized
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized()
+    def alloc(self, need_size: int) -> torch.Tensor:
+        if need_size > self.available_size():
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        if self.debug:
+            self.mem_state[select_index] = MemoryStateInt.RESERVED
+
+        return select_index
+
+    @synchronized()
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat([self.free_slots, indices])
+        if self.debug:
+            self.mem_state[indices] = MemoryStateInt.IDLE
+        return len(indices)
+
+    @synchronized(debug_only=True)
     def get_state(self, indices: torch.Tensor) -> MemoryStateInt:
         assert len(indices) > 0, "The indices should not be empty"
         states = self.mem_state[indices]
@@ -685,89 +716,69 @@ class HostKVCache(abc.ABC):
         ).all(), "The memory slots should have the same state {}".format(states)
         return MemoryStateInt(states[0].item())
 
-    @synchronized
-    def alloc(self, need_size: int) -> torch.Tensor:
-        if need_size > self.can_use_mem_size:
-            return None
-
-        # todo: de-fragementation
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-
-        self.mem_state[select_index] = MemoryStateInt.RESERVED
-        self.can_use_mem_size -= need_size
-
-        return select_index
-
-    @synchronized
+    @synchronized(debug_only=True)
     def is_reserved(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.RESERVED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_protected(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_synced(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.SYNCED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def is_backup(self, indices: torch.Tensor) -> bool:
         return self.get_state(indices) == MemoryStateInt.BACKUP
 
-    @synchronized
+    @synchronized(debug_only=True)
     def update_backup(self, indices: torch.Tensor):
-        assert self.is_synced(indices), (
-            f"The host memory slots should be in SYNCED state before turning into BACKUP. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_synced(indices):
+            raise ValueError(
+                f"The host memory slots should be in SYNCED state before turning into BACKUP. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.BACKUP
 
-    @synchronized
+    @synchronized(debug_only=True)
     def update_synced(self, indices: torch.Tensor):
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def protect_write(self, indices: torch.Tensor):
-        assert self.is_reserved(indices), (
-            f"The host memory slots should be RESERVED before write operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_reserved(indices):
+            raise ValueError(
+                f"The host memory slots should be RESERVED before write operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def protect_load(self, indices: torch.Tensor):
-        assert self.is_backup(indices), (
-            f"The host memory slots should be in BACKUP state before load operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_backup(indices):
+            raise ValueError(
+                f"The host memory slots should be in BACKUP state before load operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.PROTECTED
 
-    @synchronized
+    @synchronized(debug_only=True)
     def complete_io(self, indices: torch.Tensor):
-        assert self.is_protected(indices), (
-            f"The host memory slots should be PROTECTED during I/O operations. "
-            f"Current state: {self.get_state(indices)}"
-        )
+        if not self.is_protected(indices):
+            raise ValueError(
+                f"The host memory slots should be PROTECTED during I/O operations. "
+                f"Current state: {self.get_state(indices)}"
+            )
         self.mem_state[indices] = MemoryStateInt.SYNCED
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    @synchronized
-    def free(self, indices: torch.Tensor) -> int:
-        self.mem_state[indices] = MemoryStateInt.IDLE
-        self.free_slots = torch.concat([self.free_slots, indices])
-        self.can_use_mem_size += len(indices)
-        return len(indices)
 
 
 class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 4.0,
-        pin_memory: bool = True,
+        host_to_device_ratio: float,
+        pin_memory: bool = True,  # to utilize CUDA kernels for fast transfer
         device: str = "cpu",
     ):
         super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
@@ -828,7 +839,7 @@ class MLATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float = 4.0,
+        host_to_device_ratio: float,
         pin_memory: bool = False,  # no need to use pin memory with the double buffering
         device: str = "cpu",
     ):

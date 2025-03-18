@@ -161,6 +161,7 @@ sources = [
     "csrc/speculative/eagle_utils.cu",
     "csrc/speculative/speculative_sampling.cu",
     "csrc/kvcacheio/transfer.cu",
+    "csrc/speculative/packbit.cu",
     "csrc/torch_extension.cc",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
