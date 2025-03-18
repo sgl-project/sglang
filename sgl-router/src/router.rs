@@ -267,19 +267,20 @@ impl Router {
                 match sync_client.get(&format!("{}/health", url)).send() {
                     Ok(res) => {
                         if !res.status().is_success() {
-                            info!(
-                                "Worker {} health check is pending with status: {}.",
-                                url,
+                            let msg = format!(
+                                "Worker heatlh check is pending with status {}",
                                 res.status()
                             );
+                            info!("{}", msg);
                             all_healthy = false;
-                            unhealthy_workers.push((url, format!("Status: {}", res.status())));
+                            unhealthy_workers.push((url, msg));
                         }
                     }
-                    Err(e) => {
-                        info!("Worker {} health check is pending with error: {}", url, e);
+                    Err(_) => {
+                        let msg = format!("Worker is not ready yet");
+                        info!("{}", msg);
                         all_healthy = false;
-                        unhealthy_workers.push((url, format!("Error: {}", e)));
+                        unhealthy_workers.push((url, msg));
                     }
                 }
             }
@@ -288,7 +289,7 @@ impl Router {
                 info!("All workers are healthy");
                 return Ok(());
             } else {
-                info!("Unhealthy workers:");
+                info!("Initializing workers:");
                 for (url, reason) in &unhealthy_workers {
                     info!("  {} - {}", url, reason);
                 }
