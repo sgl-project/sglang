@@ -49,7 +49,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import make_layers_with_previous_layer
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -109,7 +108,6 @@ class Qwen2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         previous_layer: Optional["Qwen2Attention"] = None,
         prefix: str = "",
     ) -> None:
@@ -163,7 +161,6 @@ class Qwen2Attention(nn.Module):
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                dual_chunk_attention_config=dual_chunk_attention_config,
             )
         else:
             assert self.head_dim == previous_layer.head_dim
@@ -208,7 +205,6 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-        previous_layer: Optional["Qwen2DecoderLayer"] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
@@ -238,7 +234,6 @@ class Qwen2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             previous_layer=(
                 previous_layer.self_attn if previous_layer is not None else None
             ),
