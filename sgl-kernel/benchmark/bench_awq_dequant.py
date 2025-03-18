@@ -44,9 +44,10 @@ def calculate_diff(qweight_row: int, qweight_col: int):
     )
 
     vllm_out = vllm_awq_dequantize(qweight, scales, qzeros)
-    sglang_out = sglang_awq_dequantize(qweight, scales, qzeros)
+    sglang_out = sglang_awq_dequantize(qweight, scales.to(torch.bfloat16), qzeros)
 
     output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
+    print(f"Output difference: {vllm_out.float() - sglang_out.float()}")
 
     if torch.allclose(
         vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
@@ -115,4 +116,4 @@ def benchmark(qweight_row, qweight_col, provider):
 
 if __name__ == "__main__":
     calculate_diff(qweight_row=3584, qweight_col=448)
-    benchmark.run(print_data=True)
+    # benchmark.run(print_data=True)

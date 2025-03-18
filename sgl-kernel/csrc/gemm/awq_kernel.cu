@@ -4,6 +4,66 @@
 #include <cuda_fp16.h>
 #include <torch/all.h>
 
+template<bool norm = true>
+inline __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  // 01234567 01234567
+  // SEEEEEEE EMMMMMMM
+  //          1...XXXX
+  // (1 + x/2^7) * 2^(e-127) -> e-127=7 -> e=134 -> 0100 0011 -> 0x43
+  static constexpr uint32_t I4s_TO_BF16s_MAGIC_NUM = 0x43004300;
+  static constexpr uint32_t BOTTOM_MASK = 0x000f000f;
+  static constexpr uint32_t TOP_MASK = 0x00f000f0;
+  static constexpr uint32_t immLut   = (0xf0 & 0xcc) | 0xaa;
+
+  uint4 result;
+
+  uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+
+  uint32_t const& i4s    = reinterpret_cast<uint32_t const&>(src);
+  const uint32_t  i4s_4  = i4s >> 4;
+  const uint32_t  i4s_8  = i4s >> 8;
+  const uint32_t  i4s_12 = i4s >> 12;
+
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[0])
+               : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[1])
+               : "r"(i4s_4), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[2])
+               : "r"(i4s_8), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(h[3])
+               : "r"(i4s_12), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+
+  // For bottom 4 bits, need to subtract 2 ^ 7 = 128
+  static constexpr uint32_t BF16_TOP_MAGIC_NUM = 0x43004300;
+  // For top 4 bits, need to move 4 bits to the right, 2 ^ 4 = 16
+  // This is the bf16x2 {1 / 16, 1 / 16} represented as an integer.
+  // 0011 1101 1000 0000
+  static constexpr uint32_t ONE_SIXTEENTH = 0x3d803d80;
+  // 128 / 16 = 8 we need to subtract 8 from the above.
+  // This is the bf16x2 {-8, -8} represented as an integer.
+  static constexpr uint32_t NEG_8 = 0xc100c100;
+
+  // Convert elt_01
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I4s_TO_BF16s_MAGIC_NUM));
+  // Convert elt_23
+  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[1]) : "r"(h[1]), "r"(ONE_SIXTEENTH), "r"(NEG_8));
+  // Convert elt_45
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(I4s_TO_BF16s_MAGIC_NUM));
+  // Convert elt_67
+  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTEENTH), "r"(NEG_8));
+
+  return result;
+#else
+  assert(false);
+  return {};
+#endif
+}
+
 __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
   uint4 result;
@@ -11,6 +71,8 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
   uint32_t const i4s = reinterpret_cast<uint32_t const&>(source);
 
+  // 01234567 01234567
+  // SEEEEEMM MMMMMMMM
   // First, we extract the i4s and construct an intermediate fp16 number.
   static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
   static constexpr uint32_t BOTTOM_MASK = 0x000f000f;
@@ -45,6 +107,8 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
                : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
 
   // This is the half2 {1024, 1024} represented as an integer.
+  // 01234567 01234567
+  // SEEEEEMM MMMMMMMM
   static constexpr uint32_t FP16_TOP_MAGIC_NUM = 0x64006400;
   // This is the half2 {1 / 16, 1 / 16} represented as an integer.
   static constexpr uint32_t ONE_SIXTEENTH = 0x2c002c00;
@@ -70,29 +134,40 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 
 __global__ void __launch_bounds__(256) dequantize_weights(
     int* __restrict__ qweight,
-    half* __restrict__ scales,
+    nv_bfloat16* __restrict__ scales,
     int* __restrict__ qzeros,
-    half* __restrict__ output,
+    nv_bfloat16* __restrict__ output,
     int group_size,
     int qweight_cols) {
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  uint4 zeros = dequantize_s4_to_fp16x2(qzeros[col + (row / group_size) * qweight_cols]);
+  uint4 zeros = dequantize_s4_to_bf16x2(qzeros[col + (row / group_size) * qweight_cols]);
+  // uint4 zeros = dequantize_s4_to_fp16x2(qzeros[col + (row / group_size) * qweight_cols]);
   uint4 loaded_scale = *(uint4*)(scales + 8 * col + (row / group_size) * qweight_cols * 8);
 
-  uint4 weight_fp16 = dequantize_s4_to_fp16x2(qweight[col + row * qweight_cols]);
+  uint4 weight_fp16 = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
+  // uint4 weight_fp16 = dequantize_s4_to_fp16x2(qweight[col + row * qweight_cols]);
 
-  asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(zeros.x));
-  asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(loaded_scale.x));
-  asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(zeros.y));
-  asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(loaded_scale.y));
-  asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(zeros.z));
-  asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(loaded_scale.z));
-  asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(zeros.w));
-  asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(loaded_scale.w));
-
-  half* output_ptr = output + 8 * col + 8 * row * qweight_cols;
+  // asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(zeros.x));
+  // asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(loaded_scale.x));
+  // asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(zeros.y));
+  // asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(loaded_scale.y));
+  // asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(zeros.z));
+  // asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(loaded_scale.z));
+  // asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(zeros.w));
+  // asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(loaded_scale.w));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(zeros.x));
+  asm volatile("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(loaded_scale.x));
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(zeros.y));
+  asm volatile("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(loaded_scale.y));
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(zeros.z));
+  asm volatile("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(loaded_scale.z));
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(zeros.w));
+  asm volatile("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(loaded_scale.w));
+#endif
+  nv_bfloat16* output_ptr = output + 8 * col + 8 * row * qweight_cols;
   *(uint4*)output_ptr = weight_fp16;
 }
 
@@ -112,9 +187,9 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
   at::Tensor output = torch::empty({qweight_rows, qweight_cols * 8}, output_tensor_options);
 
   auto _qweight = reinterpret_cast<int*>(qweight.data_ptr<int>());
-  auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
+  auto _scales = reinterpret_cast<__nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
   auto _zeros = reinterpret_cast<int*>(qzeros.data_ptr<int>());
-  auto _output = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+  auto _output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
 
   dim3 num_blocks(x_blocks, y_blocks);
   dim3 threads_per_block(x_num_threads, y_num_threads);
