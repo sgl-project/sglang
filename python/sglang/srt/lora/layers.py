@@ -21,14 +21,12 @@ class BaseLayerWithLoRA(nn.Module):
     def __init__(
         self,
         base_layer: nn.Module,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
-        self.scaling = scaling
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -41,10 +39,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: VocabParallelEmbedding,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
 
 
@@ -52,10 +49,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: ColumnParallelLinear,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -76,8 +72,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def forward(self, input_: torch.Tensor):
@@ -102,10 +98,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
         base_layer: MergedColumnParallelLinear,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -133,8 +128,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
 
@@ -142,10 +137,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def init__(
         self,
         base_layer: QKVParallelLinear,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(
         self,
@@ -200,8 +194,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
 
@@ -209,10 +203,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
         base_layer: RowParallelLinear,
-        scaling: float,
         lora_backend: BaseLoRABackend,
     ) -> None:
-        super().__init__(base_layer, scaling, lora_backend)
+        super().__init__(base_layer, lora_backend)
 
     def set_lora_info(self, A_buffer: torch.Tensor, B_buffer: torch.Tensor):
         self.set_lora = True
@@ -229,8 +222,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return (
             lora_output
-            if self.lora_backend.fuse_output_scaling_add
-            else base_output + lora_output * self.scaling
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_output
         )
 
     def forward(self, input_: torch.Tensor):
@@ -269,7 +262,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, scaling: float, lora_backend: BaseLoRABackend
+    layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -281,6 +274,6 @@ def get_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, scaling, lora_backend)
+            ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")

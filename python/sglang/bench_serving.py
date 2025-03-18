@@ -1356,7 +1356,7 @@ def run_benchmark(args_: argparse.Namespace):
             request_rate=args.request_rate,
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_names,
+            lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_seperated=args.pd_seperated,
@@ -1523,7 +1523,7 @@ if __name__ == "__main__":
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
-        "--lora-names",
+        "--lora-name",
         type=str,
         nargs="*",
         default=None,

@@ -98,9 +98,7 @@ class LoRAManager:
             self.loras[name] = lora_adapter
 
         # misc lora configs
-        # FIXME remove the restrictions after implementing unified paging
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
-        self.scaling: float = list(self.loras.values())[0].scaling
 
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
@@ -178,7 +176,7 @@ class LoRAManager:
                 )
 
     def set_lora_module(self, module_name, module):
-        lora_module = get_lora_layer(module, self.scaling, self.lora_backend)
+        lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
