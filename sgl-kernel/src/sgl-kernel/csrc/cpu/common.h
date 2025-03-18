@@ -2,6 +2,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <ATen/record_function.h>
 
 #if defined(_OPENMP)
 #include <omp.h>

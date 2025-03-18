@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/record_function.h>
 
 #include "shm.h"
 
@@ -50,6 +51,9 @@ void shm_allreduce(
     torch::Tensor& data,
     c10::intrusive_ptr<c10d::ProcessGroup> process_group,
     py::object op) {
+  RECORD_FUNCTION(
+      "sgl-kernel::shm_allreduce", std::vector<c10::IValue>({data}));
+
   static py::object ReduceOp =
       py::module_::import("torch.distributed").attr("ReduceOp");
   static auto ReduceOpSum = (int)py::int_(ReduceOp.attr("SUM").attr("value"));

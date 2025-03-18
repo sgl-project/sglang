@@ -57,6 +57,8 @@ void act_and_mul_kernel_impl(
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
 void silu_and_mul_cpu(at::Tensor& out, at::Tensor& input) {
+  RECORD_FUNCTION(
+    "sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({out, input}));
   int d = input.size(-1) / 2;
   int num_tokens = input.numel() / input.size(-1);
 

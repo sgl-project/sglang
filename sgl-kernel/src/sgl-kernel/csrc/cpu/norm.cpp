@@ -165,6 +165,8 @@ void fused_add_rmsnorm_kernel_impl(
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
 void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps) {
+  RECORD_FUNCTION(
+    "sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({output, input, weight}));
 
   CHECK_INPUT(input);
   CHECK_INPUT(weight);
@@ -191,7 +193,8 @@ void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, doub
 // residual: {batch_size, hidden_size}
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
-
+  RECORD_FUNCTION(
+    "sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
