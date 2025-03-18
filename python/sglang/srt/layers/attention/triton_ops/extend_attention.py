@@ -429,6 +429,7 @@ def extend_attention_aiter_bwd(
     sm_scale=None,
 ):
     import aiter
+
     o_extend, *_ = aiter.flash_attn_varlen_func(
         q_extend,
         k_extend,
@@ -439,6 +440,7 @@ def extend_attention_aiter_bwd(
         max_len_extend,
         softmax_scale=sm_scale,
     )
+
 
 def redundant_attention(
     q_extend,

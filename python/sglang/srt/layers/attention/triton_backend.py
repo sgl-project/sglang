@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -30,7 +31,8 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd, extend_attention_aiter_fwd 
+            extend_attention_aiter_fwd,
+            extend_attention_fwd,
         )
 
         super().__init__()
