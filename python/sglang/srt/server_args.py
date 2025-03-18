@@ -22,6 +22,7 @@ from typing import List, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.eagle_mab import MABConfig, MABGroupManager
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_device,
@@ -136,6 +137,9 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_eagle_mab_algorithm: Optional[str] = "EG"
+    speculative_eagle_mab_configs: Optional[List[str]] = None
+    speculative_mab_window_size: int = 300
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -313,7 +317,7 @@ class ServerArgs:
                 "eagle speculative decoding."
             )
             # The token generated from the verify step is counted.
-            # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            # If speculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
             # assert self.speculative_num_steps < self.speculative_num_draft_tokens
 
         # GGUF
@@ -851,6 +855,29 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-eagle-mab-algorithm",
+            type=str,
+            default="EG",
+            choices=list(MABGroupManager.ALGORITHM_FACTORIES.keys()),
+            help="The algorithm for multi-armed bandit in EAGLE speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-mab-configs",
+            type=lambda s: MABConfig.validate_configs(s) if s else None,
+            default=None,
+            help=(
+                "Comma-separated list of MAB configurations in format '<speculative_num_steps>_<topk>_<draft_tokens>'. "
+                "Example: '1_1_1,2_2_4,3_4_8' means three configurations with different "
+                "combinations of steps, topk, and draft tokens."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-mab-window-size",
+            type=int,
+            default=300,
+            help="Window size for multi-armed bandit algorithm",
         )
 
         # Double Sparsity
