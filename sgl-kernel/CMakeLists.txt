@@ -22,13 +22,34 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Enable ccache if available.
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message(STATUS "Found ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 # Find required packages.
-find_package(Python REQUIRED COMPONENTS Interpreter Development Development.Module Development.Embed)
+find_package(Python REQUIRED COMPONENTS 
+    Interpreter 
+    Development 
+    Development.Module 
+    Development.Embed
+)
 find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 # Find pybind11.
 find_package(pybind11 CONFIG REQUIRED)
+
+# Print build information.
+message(STATUS "Build configuration:")
+message(STATUS "  CMake version: ${CMAKE_VERSION}")
+message(STATUS "  Python version: ${Python_VERSION}")
+message(STATUS "  Torch version: ${TORCH_VERSION}")
+message(STATUS "  CUDA version: ${CUDAToolkit_VERSION}")
 
 # Define operator namespace.
 set(OPERATOR_NAMESPACE "sgl_kernel")
@@ -73,7 +94,22 @@ set(CMAKE_CUDA_ARCHITECTURES "75;80;89;90")
 
 # Set compiler flags.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -DNDEBUG -DOPERATOR_NAMESPACE=${OPERATOR_NAMESPACE} -Xcompiler -fPIC -std=c++17 -DFLASHINFER_ENABLE_F16 -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 -DCUTLASS_VERSIONS_GENERATED -DCUTE_USE_PACKED_TUPLE=1 -DCUTLASS_TEST_LEVEL=0 -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1 -DCUTLASS_DEBUG_TRACE_LEVEL=0 --ptxas-options=-v --expt-relaxed-constexpr -Xcompiler=-Wconversion -Xcompiler=-fno-strict-aliasing")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -DNDEBUG \
+    -DOPERATOR_NAMESPACE=${OPERATOR_NAMESPACE} \
+    -Xcompiler -fPIC \
+    -std=c++17 \
+    -DFLASHINFER_ENABLE_F16 \
+    -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1 \
+    -DCUTLASS_VERSIONS_GENERATED \
+    -DCUTE_USE_PACKED_TUPLE=1 \
+    -DCUTLASS_TEST_LEVEL=0 \
+    -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1 \
+    -DCUTLASS_DEBUG_TRACE_LEVEL=0 \
+    --ptxas-options=-v \
+    --expt-relaxed-constexpr \
+    -Xcompiler=-Wconversion \
+    -Xcompiler=-fno-strict-aliasing"
+)
 
 # Add architecture-specific flags.
 foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})
@@ -101,7 +137,11 @@ endif()
 # Check for FP8 support.
 if(DEFINED ENV{ENABLE_FP8})
     if("$ENV{ENABLE_FP8}" STREQUAL "ON" OR "$ENV{ENABLE_FP8}" STREQUAL "1")
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DFLASHINFER_ENABLE_FP8 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} \
+            -DFLASHINFER_ENABLE_FP8 \
+            -DFLASHINFER_ENABLE_FP8_E4M3 \
+            -DFLASHINFER_ENABLE_FP8_E5M2"
+        )
         add_compile_definitions(ENABLE_FP8)
     endif()
 endif()
