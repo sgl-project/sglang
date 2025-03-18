@@ -29,6 +29,7 @@ class HiRadixCache(RadixCache):
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
+        hicache_ratio: float,
     ):
         if page_size != 1:
             raise ValueError(
@@ -36,9 +37,13 @@ class HiRadixCache(RadixCache):
             )
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(self.kv_cache)
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache, hicache_ratio
+            )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(self.kv_cache)
+            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
+                self.kv_cache, hicache_ratio
+            )
         else:
             raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")
 
@@ -303,9 +308,9 @@ class HiRadixCache(RadixCache):
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.concat(value)
+            value = torch.cat(value)
         else:
-            value = torch.tensor([], dtype=torch.int32)
+            value = torch.tensor([], dtype=torch.int64)
 
         last_node_global = last_node
         while last_node.evicted:

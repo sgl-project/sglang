@@ -56,6 +56,7 @@ class ServerArgs:
     device: Optional[str] = None
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
+    completion_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
 
@@ -124,7 +125,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
+    grammar_backend: Optional[str] = "xgrammar"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -172,7 +173,9 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     tool_call_parser: str = None
     enable_hierarchical_cache: bool = False
+    hicache_ratio: float = 2.0
     enable_flashinfer_mla: bool = False
+    enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
 
@@ -227,6 +230,8 @@ class ServerArgs:
 
         assert self.chunked_prefill_size % self.page_size == 0
 
+        if self.enable_flashmla is True:
+            assert self.page_size == 64, "FlashMLA only support page_size=64"
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -285,7 +290,6 @@ class ServerArgs:
         if self.speculative_algorithm == "EAGLE":
             if self.max_running_requests is None:
                 self.max_running_requests = 32
-            self.disable_cuda_graph_padding = True
             self.disable_overlap_schedule = True
             logger.info(
                 "Overlap scheduler is disabled because of using "
@@ -453,6 +457,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.chat_template,
             help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        parser.add_argument(
+            "--completion-template",
+            type=str,
+            default=ServerArgs.completion_template,
+            help="The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
         )
         parser.add_argument(
             "--is-embedding",
@@ -755,6 +765,11 @@ class ServerArgs:
             help="Enable FlashInfer MLA optimization",
         )
         parser.add_argument(
+            "--enable-flashmla",
+            action="store_true",
+            help="Enable FlashMLA decode optimization",
+        )
+        parser.add_argument(
             "--flashinfer-mla-disable-ragged",
             action="store_true",
             help="Not using ragged prefill wrapper when running flashinfer mla",
@@ -992,6 +1007,13 @@ class ServerArgs:
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
+        )
+        parser.add_argument(
+            "--hicache-ratio",
+            type=float,
+            required=False,
+            default=ServerArgs.hicache_ratio,
+            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
         )
 
         # Server warmups

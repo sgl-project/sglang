@@ -25,5 +25,7 @@ pip install transformers==4.48.3 sentence_transformers accelerate==1.4.0 peft pa
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-# reinstall sgl-kernel
-pip install sgl-kernel==0.0.5.post1 --force-reinstall --no-deps
+# For DeepSeek-VL2
+pip install timm
+
+pip install sgl-kernel==0.0.5.post3 --force-reinstall
