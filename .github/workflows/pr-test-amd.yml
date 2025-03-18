@@ -21,7 +21,8 @@ concurrency:
 
 jobs:
   accuracy-test-1-gpu-amd:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
@@ -60,7 +61,8 @@ jobs:
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 models/test_qwen_models.py
 
   mla-test-1-gpu-amd:
-    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
@@ -97,6 +99,7 @@ jobs:
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_mla.py
 
   finish:
+    if: always()
     needs: [
       accuracy-test-1-gpu-amd, mla-test-1-gpu-amd
     ]
