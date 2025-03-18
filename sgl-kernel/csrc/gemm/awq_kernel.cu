@@ -81,10 +81,11 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 }
 
 template <typename scalar_t2, int bit>
-__device__ inline void dequant(int q, scalar_t2* res) {}
+__device__ inline void dequantize_s4_to_bf16x2(int q, scalar_t2* res) {}
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 template <>
-__device__ inline void dequant<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
+__device__ inline void dequantize_s4_to_bf16x2<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
   static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t EX = 0x43004300;
 
@@ -112,6 +113,7 @@ __device__ inline void dequant<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
                    *reinterpret_cast<const nv_bfloat162*>(&MUL),
                    *reinterpret_cast<const nv_bfloat162*>(&ADD));
 }
+#endif
 
 template <typename ScaleT, typename OutputT>
 __global__ void __launch_bounds__(256) dequantize_weights(
@@ -153,14 +155,13 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 
     OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
     *(uint4*)output_ptr = weight_fp16;
-  } 
-  else if constexpr (std::is_same<ScaleT, __nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<ScaleT, __nv_bfloat16>::value) {
     // BF16 path
     nv_bfloat162 weight[4];
-    dequant<nv_bfloat162, 4>(qweight[col + row * qweight_cols], weight);
+    dequantize_s4_to_bf16x2<nv_bfloat162, 4>(qweight[col + row * qweight_cols], weight);
 
     nv_bfloat162 zeros[4];
-    dequant<nv_bfloat162, 4>(qzeros[col + group_idx * qweight_cols], zeros);
+    dequantize_s4_to_bf16x2<nv_bfloat162, 4>(qzeros[col + group_idx * qweight_cols], zeros);
 
     nv_bfloat162* scales_bf16 = reinterpret_cast<nv_bfloat162*>(&loaded_scale);
 
@@ -182,7 +183,7 @@ __global__ void __launch_bounds__(256) dequantize_weights(
   }
 }
 
-torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros, bool act_bf16=false) {
+torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros) {
   int qweight_rows = qweight.size(0);
   int qweight_cols = qweight.size(1);
   int group_size = qweight_rows / scales.size(0);
@@ -204,7 +205,8 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
   dim3 threads_per_block(x_num_threads, y_num_threads);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  if (!act_bf16) {
+
+  if(scales.scalar_type() == at::ScalarType::Half) {
     auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
     auto _output = reinterpret_cast<half*>(output.data_ptr<at::Half>());
     dequantize_weights<half><<<num_blocks, threads_per_block, 0, stream>>>(

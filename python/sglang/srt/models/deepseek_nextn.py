@@ -270,7 +270,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
-                        True,
                     ).T
                 else:
                     w = ops.awq_dequantize(

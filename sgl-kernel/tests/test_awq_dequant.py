@@ -61,13 +61,13 @@ def vllm_awq_dequantize(
 
 
 def sglang_awq_dequantize(
-    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, act_bf16: bool
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> torch.Tensor:
-    return awq_dequantize(qweight, scales, qzeros, act_bf16)
+    return awq_dequantize(qweight, scales, qzeros)
 
 
 @pytest.mark.parametrize(
-    "qweight_row,qweight_col,act_bf16",
+    "qweight_row,qweight_col,is_bf16_act",
     list(
         itertools.product(
             [3584, 18944, 128, 256, 512, 1024], [448, 576, 4736, 16, 32, 64, 128],[True, False]
@@ -77,7 +77,7 @@ def sglang_awq_dequantize(
 def test_awq_dequant_compare_implementations(
     qweight_row: int,
     qweight_col: int,
-    act_bf16: bool
+    is_bf16_act: bool
 ):
     device = torch.device("cuda")
 
@@ -92,7 +92,7 @@ def test_awq_dequant_compare_implementations(
     scales_row = qweight_row // group_size
     scales_col = qweight_col * 8
     
-    if act_bf16:
+    if is_bf16_act:
         scales = torch.rand(scales_row, scales_col, dtype=torch.bfloat16, device=device)
     else:
         scales = torch.rand(scales_row, scales_col, dtype=torch.float16, device=device)
@@ -108,12 +108,16 @@ def test_awq_dequant_compare_implementations(
     # Run both implementations
     vllm_out = vllm_awq_dequantize(qweight, scales.to(torch.float16), qzeros)
     torch_out = awq_dequantize_torch(qweight, scales, qzeros, group_size)
-    sglang_out = sglang_awq_dequantize(qweight, scales, qzeros, act_bf16)
+    sglang_out = sglang_awq_dequantize(qweight, scales, qzeros)
 
     # Compare results
     torch.testing.assert_close(
         torch_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
     )
+    if not is_bf16_act:
+        torch.testing.assert_close(
+            vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
+        )
 
 
 if __name__ == "__main__":
