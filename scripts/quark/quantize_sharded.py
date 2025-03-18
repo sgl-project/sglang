@@ -177,7 +177,7 @@ def update_config_custom_model(output_path: pathlib.Path) -> None:
         "modeling_grok1_outputs.py",
     ]
     for file in files:
-        shutil.copy(pathlib.Path(".") / "grok1" / file, output_path)
+        shutil.copy(pathlib.Path(__file__).parent / "grok1" / file, output_path)
     config_dict = json.load(open(output_path / "config.json", "r"))
     config_dict["auto_map"] = {
         "AutoConfig": "configuration_grok1.Grok1Config",
