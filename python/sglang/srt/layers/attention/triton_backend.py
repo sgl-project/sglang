@@ -9,12 +9,14 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
+_is_hip = is_hip()
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(
@@ -28,13 +30,14 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd,
+            extend_attention_fwd, extend_attention_aiter_fwd 
         )
 
         super().__init__()
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
+        self.extend_attention_aiter_fwd = extend_attention_aiter_fwd
 
         self.skip_prefill = skip_prefill
 
@@ -398,22 +401,33 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr,
         ) = self.forward_metadata
 
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            custom_mask,
-            mask_indptr,
-            max_extend_len,
-            layer.scaling,
-            layer.logit_cap,
-        )
+        if _is_hip and kv_indices.shape[0] == 0 and get_bool_env_var("CK_MOE"):
+            self.extend_attention_aiter_fwd(
+                q,
+                k,
+                v,
+                o,
+                qo_indptr,
+                max_extend_len,
+                layer.scaling,
+            )
+        else:
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                mask_indptr,
+                max_extend_len,
+                layer.scaling,
+                layer.logit_cap,
+            )
         return o
 
     def forward_decode(

@@ -23,7 +23,7 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
@@ -330,21 +330,6 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if _is_hip and kv_indices.shape[0] == 0 and get_bool_env_var("CK_MOE"):
-        import aiter
-
-        aiter.flash_attn_varlen_func(
-            q_extend,
-            k_extend,
-            v_extend,
-            qo_indptr,
-            qo_indptr,
-            max_len_extend,
-            max_len_extend,
-            softmax_scale=sm_scale,
-        )
-        return
-
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
@@ -433,6 +418,27 @@ def extend_attention_fwd(
         **extra_kargs,
     )
 
+
+def extend_attention_aiter_bwd(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    qo_indptr,
+    max_len_extend,
+    sm_scale=None,
+):
+    import aiter
+    o_extend, *_ = aiter.flash_attn_varlen_func(
+        q_extend,
+        k_extend,
+        v_extend,
+        qo_indptr,
+        qo_indptr,
+        max_len_extend,
+        max_len_extend,
+        softmax_scale=sm_scale,
+    )
 
 def redundant_attention(
     q_extend,
