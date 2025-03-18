@@ -1076,7 +1076,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"] and isinstance(
                     self.mlp, DeepseekV2MoE
                 ):
-                    # print(f"rank {get_attention_tp_rank()}, hidden_states: {hidden_states.shape}, residual: {residual.shape}")
                     if hidden_states.shape[0] != 0:
                         hidden_states, residual = self.post_attention_layernorm(
                             hidden_states, residual

@@ -26,8 +26,6 @@ class TestDeepEPMoE(unittest.TestCase):
                 "8",
                 "--dp",
                 "8",
-                "--ep-size",
-                "8",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
                 "--disable-cuda-graph",
