@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter import flash_attn_varlen_func
+
 
 class TritonAttnBackend(AttentionBackend):
     def __init__(
@@ -31,7 +34,6 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_aiter_fwd,
             extend_attention_fwd,
         )
 
@@ -39,7 +41,6 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.extend_attention_aiter_fwd = extend_attention_aiter_fwd
 
         self.skip_prefill = skip_prefill
 
@@ -404,14 +405,15 @@ class TritonAttnBackend(AttentionBackend):
         ) = self.forward_metadata
 
         if _is_hip and kv_indices.shape[0] == 0 and get_bool_env_var("CK_MOE"):
-            self.extend_attention_aiter_fwd(
+            o, *_ = flash_attn_varlen_func(
                 q,
                 k,
                 v,
-                o,
+                qo_indptr,
                 qo_indptr,
                 max_extend_len,
-                layer.scaling,
+                max_extend_len,
+                softmax_scale=layer.scaling,
             )
         else:
             self.extend_attention_fwd(

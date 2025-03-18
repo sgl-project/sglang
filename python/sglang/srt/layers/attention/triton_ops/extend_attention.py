@@ -419,29 +419,6 @@ def extend_attention_fwd(
     )
 
 
-def extend_attention_aiter_bwd(
-    q_extend,
-    k_extend,
-    v_extend,
-    o_extend,
-    qo_indptr,
-    max_len_extend,
-    sm_scale=None,
-):
-    import aiter
-
-    o_extend, *_ = aiter.flash_attn_varlen_func(
-        q_extend,
-        k_extend,
-        v_extend,
-        qo_indptr,
-        qo_indptr,
-        max_len_extend,
-        max_len_extend,
-        softmax_scale=sm_scale,
-    )
-
-
 def redundant_attention(
     q_extend,
     o_extend,

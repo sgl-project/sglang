@@ -29,6 +29,9 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 
+if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter.mla import mla_decode_fwd
+
 logger = logging.getLogger(__name__)
 
 # TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
@@ -655,8 +658,7 @@ def decode_attention_fwd(
             logit_cap,
         )
     elif _is_hip and get_bool_env_var("CK_MOE"):
-        from aiter.mla import mla_decode_fwd
-
+        # ROCM MLA
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, q.shape[-1]),
