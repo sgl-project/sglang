@@ -890,7 +890,6 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -950,7 +949,7 @@ class ModelRunner:
 
             self.attn_backend = FlashAttentionBackend(self)
 
-        if self.server_args.enable_hip_attention:
+        elif self.server_args.enable_hip_attention:
             from sglang.srt.layers.attention.hip_attention import HiPAttentionBackend
 
             self.attn_backend = HiPAttentionBackend(self)
