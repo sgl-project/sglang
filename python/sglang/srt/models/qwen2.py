@@ -45,7 +45,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.utils import make_layers_with_previous_layer
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -92,7 +91,6 @@ class Qwen2MLP(nn.Module):
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -101,7 +99,6 @@ class Qwen2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
-        previous_layer: Optional["Qwen2Attention"] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -144,27 +141,19 @@ class Qwen2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        if previous_layer is None:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position=max_position_embeddings,
-                base=rope_theta,
-                rope_scaling=rope_scaling,
-            )
-        else:
-            assert self.head_dim == previous_layer.head_dim
-            self.rotary_emb = previous_layer.rotary_emb
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            orig_context_len=getattr(
-                config, "orig_context_len", max_position_embeddings
-            ),
-            rope=self.rotary_emb,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -194,7 +183,6 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
-        previous_layer: Optional["Qwen2DecoderLayer"] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -209,7 +197,6 @@ class Qwen2DecoderLayer(nn.Module):
             )
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         self.self_attn = Qwen2Attention(
-            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -218,9 +205,6 @@ class Qwen2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            previous_layer=(
-                previous_layer.self_attn if previous_layer is not None else None
-            ),
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
@@ -277,13 +261,12 @@ class Qwen2Model(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = make_layers_with_previous_layer(
+        self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix, previous_layer: Qwen2DecoderLayer(
-                config=config,
+            lambda idx, prefix: Qwen2DecoderLayer(
                 layer_id=idx,
+                config=config,
                 quant_config=quant_config,
-                previous_layer=previous_layer,
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
