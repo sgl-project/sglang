@@ -7,6 +7,15 @@
 #include <cuda_bf16.h>
 #endif
 
+template <int lut>
+__device__ inline int lop3(int a, int b, int c) {
+  int res;
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+               : "=r"(res)
+               : "r"(a), "r"(b), "r"(c), "n"(lut));
+  return res;
+}
+
 __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
   uint4 result;
@@ -71,129 +80,107 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 #endif
 }
 
-__device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  uint4 result;
-  uint32_t* h = reinterpret_cast<uint32_t*>(&result);
-  uint32_t const i4s = source;
+template <typename scalar_t2, int bit>
+__device__ inline void dequant(int q, scalar_t2* res) {}
 
-  static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
-  static constexpr uint32_t BOTTOM_MASK = 0x000f000f;
-  static constexpr uint32_t TOP_MASK = 0x00f000f0;
-  static constexpr uint32_t I4s_TO_BF16s_MAGIC_NUM = 0x44804480; // bf16(1024)
+template <>
+__device__ inline void dequant<nv_bfloat162, 4>(int q, nv_bfloat162* res) {
+  static constexpr uint32_t MASK = 0x000f000f;
+  static constexpr uint32_t EX = 0x43004300;
 
-  const uint32_t top_i4s = i4s >> 8; // hidden latency
+  int lo0 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
+  q >>= 4;
+  int hi0 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
+  q >>= 4;
+  int lo1 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
+  q >>= 4;
+  int hi1 = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
 
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" 
-               : "=r"(h[0]) 
-               : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" 
-               : "=r"(h[1]) 
-               : "r"(i4s), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" 
-               : "=r"(h[2]) 
-               : "r"(top_i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" 
-               : "=r"(h[3]) 
-               : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+  static constexpr uint32_t MUL = 0x3F803F80;
+  static constexpr uint32_t ADD = 0xC300C300;
 
-  static constexpr __nv_bfloat16 BF16_1024 = __float2bfloat16(1024.0f); // 0x4480
-  static constexpr __nv_bfloat16 BF16_1_16 = __float2bfloat16(1.0f/16.0f); // 0x3D80
-  static constexpr __nv_bfloat16 BF16_NEG64 = __float2bfloat16(-64.0f); // 0xC280
-
-  // 拆分处理packed的两个bf16
-  auto process_bf16_pair = [](uint32_t& packed_val, bool is_high_nibble) {
-    __nv_bfloat162* pair = reinterpret_cast<__nv_bfloat162*>(&packed_val);
-    
-    __nv_bfloat16 val1 = pair->x;
-    if(is_high_nibble) {
-      val1 = __hfma(val1, BF16_1_16, BF16_NEG64);
-    } else {
-      val1 = __hsub(val1, BF16_1024);
-    }
-
-    __nv_bfloat16 val2 = pair->y;
-    if(is_high_nibble) {
-      val2 = __hfma(val2, BF16_1_16, BF16_NEG64);
-    } else {
-      val2 = __hsub(val2, BF16_1024);
-    }
-
-    pair->x = val1;
-    pair->y = val2;
-  };
-
-  process_bf16_pair(h[0], false); // 0-1: low 4
-  process_bf16_pair(h[1], true);  // 2-3: high 4
-  process_bf16_pair(h[2], false);
-  process_bf16_pair(h[3], true);
-
-  return result;
-#else
-  assert(false);
-  return {};
-#endif
+  res[0] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo0),
+                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[1] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi0),
+                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[2] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo1),
+                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[3] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi1),
+                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
 }
 
-template <typename OutT>
+template <typename ScaleT, typename OutputT>
 __global__ void __launch_bounds__(256) dequantize_weights(
     int* __restrict__ qweight,
-    OutT* __restrict__ scales,
+    ScaleT* __restrict__ scales,
     int* __restrict__ qzeros,
-    OutT* __restrict__ output,
+    OutputT* __restrict__ output,
     int group_size,
     int qweight_cols) {
+  // qweights - [R     , C // 8], int32
+  // scales   - [R // G, C     ], half/bfloat16
+  // zeros    - [R // G, C // 8], int32
+
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  // 根据输出类型选择解包函数
-  uint4 zeros, loaded_scale, weight;
-  if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
-    zeros = dequantize_s4_to_bf16x2(qzeros[col + (row / group_size) * qweight_cols]);
-    weight = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
-  } else {
-    zeros = dequantize_s4_to_fp16x2(qzeros[col + (row / group_size) * qweight_cols]);
-    weight = dequantize_s4_to_fp16x2(qweight[col + row * qweight_cols]);
-  }
+//   if (col >= qweight_cols || row >= blockDim.y * gridDim.y)
+//     return;
 
-  loaded_scale = *(uint4*)(scales + 8 * col + (row / group_size) * qweight_cols * 8);
+  int group_idx = row / group_size;
+  int scale_offset = 8 * col + group_idx * qweight_cols * 8;
+  uint4 loaded_scale = *(uint4*)(scales + scale_offset);
 
-  if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
-    // 
-    float2* zeros_fp32 = reinterpret_cast<float2*>(&zeros);
-    float2* scales_fp32 = reinterpret_cast<float2*>(&loaded_scale);
-    float2* weight_fp32 = reinterpret_cast<float2*>(&weight);
-    
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      weight_fp32[i].x = __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&weight.x)[2*i]);
-      weight_fp32[i].x = (weight_fp32[i].x - __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&zeros.x)[2*i])) 
-                          * __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&loaded_scale.x)[2*i]);
-      
-      weight_fp32[i].y = __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&weight.x)[2*i+1]);
-      weight_fp32[i].y = (weight_fp32[i].y - __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&zeros.x)[2*i+1])) 
-                          * __bfloat162float(reinterpret_cast<__nv_bfloat16*>(&loaded_scale.x)[2*i+1]);
-      
-      reinterpret_cast<__nv_bfloat16*>(&weight.x)[2*i] = __float2bfloat16(weight_fp32[i].x);
-      reinterpret_cast<__nv_bfloat16*>(&weight.x)[2*i+1] = __float2bfloat16(weight_fp32[i].y);
-    }
-  } else {
-    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight.x) : "r"(weight.x), "r"(zeros.x));
-    asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight.x) : "r"(weight.x), "r"(loaded_scale.x));
+  // Handle different data types
+  if constexpr (std::is_same<ScaleT, half>::value) {
+    // FP16 path
+    uint4 zeros = dequantize_s4_to_fp16x2(qzeros[col + group_idx * qweight_cols]);
+    uint4 weight_fp16 = dequantize_s4_to_fp16x2(qweight[col + row * qweight_cols]);
+
+    // Use PTX assembly for FP16 operations
+    asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(zeros.x));
+    asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.x) : "r"(weight_fp16.x), "r"(loaded_scale.x));
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(zeros.y));
     asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.y) : "r"(weight_fp16.y), "r"(loaded_scale.y));
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(zeros.z));
     asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.z) : "r"(weight_fp16.z), "r"(loaded_scale.z));
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(zeros.w));
     asm volatile("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(weight_fp16.w) : "r"(weight_fp16.w), "r"(loaded_scale.w));
+
+    OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
+    *(uint4*)output_ptr = weight_fp16;
+  } 
+  else if constexpr (std::is_same<ScaleT, __nv_bfloat16>::value) {
+    // BF16 path
+    nv_bfloat162 weight[4];
+    dequant<nv_bfloat162, 4>(qweight[col + row * qweight_cols], weight);
+
+    nv_bfloat162 zeros[4];
+    dequant<nv_bfloat162, 4>(qzeros[col + group_idx * qweight_cols], zeros);
+
+    nv_bfloat162* scales_bf16 = reinterpret_cast<nv_bfloat162*>(&loaded_scale);
+
+    // Dequantize weights: (weight - zero) * scale
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      // Subtract zeros from weights
+      weight[i].x = __hsub(weight[i].x, zeros[i].x);
+      weight[i].y = __hsub(weight[i].y, zeros[i].y);
+      
+      // Multiply by scales
+      weight[i].x = __hmul(weight[i].x, scales_bf16[i].x);
+      weight[i].y = __hmul(weight[i].y, scales_bf16[i].y);
+    }
+
+    // Store results efficiently using uint4
+    OutputT* output_ptr = output + 8 * col + row * qweight_cols * 8;
+    *(uint4*)output_ptr = *(uint4*)weight;
   }
-
-  // 存储结果（自动适配输出类型）
-  OutT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
-  *(uint4*)output_ptr = weight;
 }
-
-
 
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros, bool act_bf16=false) {
   int qweight_rows = qweight.size(0);
@@ -213,6 +200,8 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
   auto _qweight = reinterpret_cast<int*>(qweight.data_ptr<int>());
   auto _zeros = reinterpret_cast<int*>(qzeros.data_ptr<int>());
 
+  dim3 num_blocks(x_blocks, y_blocks);
+  dim3 threads_per_block(x_num_threads, y_num_threads);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (!act_bf16) {
