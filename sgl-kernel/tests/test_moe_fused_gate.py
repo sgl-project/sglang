@@ -61,8 +61,8 @@ def test_moe_fused_gate(seq_length):
         atol=1e-05,
     )
 
-    # assert output_check, f"Output mismatch at seq_length {seq_length}"
     assert idx_check, f"Indices mismatch at seq_length {seq_length}"
+    assert output_check, f"Output mismatch at seq_length {seq_length}"
 
 
 if __name__ == "__main__":
