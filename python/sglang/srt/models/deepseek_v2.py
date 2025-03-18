@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from vllm import _custom_ops as ops
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -75,6 +74,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
+else:
+    from vllm import _custom_ops as ops
 
 
 class DeepseekV2MLP(nn.Module):
