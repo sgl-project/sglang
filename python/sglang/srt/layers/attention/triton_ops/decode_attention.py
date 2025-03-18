@@ -92,7 +92,9 @@ def _fwd_kernel_stage1(
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
-    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -303,7 +305,9 @@ def _fwd_grouped_kernel_stage1(
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
 
-    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -523,7 +527,9 @@ def _fwd_kernel_stage2(
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
-    kv_len_per_split = tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
 
     for split_kv_id in range(0, MAX_KV_SPLITS):
         split_kv_start = kv_len_per_split * split_kv_id

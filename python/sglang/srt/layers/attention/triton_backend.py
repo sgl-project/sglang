@@ -189,7 +189,9 @@ class TritonAttnBackend(AttentionBackend):
             if hasattr(forward_batch.token_to_kv_pool, "k_buffer"):
                 if isinstance(forward_batch.token_to_kv_pool.k_buffer, list):
                     num_kv_heads = forward_batch.token_to_kv_pool.k_buffer[0].shape[1]
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens, bs, num_kv_heads)
+            self.get_num_kv_splits(
+                num_kv_splits, forward_batch.seq_lens, bs, num_kv_heads
+            )
 
             qo_indptr = None
             custom_mask = None
