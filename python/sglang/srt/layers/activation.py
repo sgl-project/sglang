@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_cuda_available, is_hardware_acceleration_available
+from sglang.srt.utils import is_cuda_available, is_hardware_backend_available
 
 _is_cuda = is_cuda_available()
 
@@ -167,7 +167,7 @@ def get_act_fn(
     return act_fn
 
 
-if not is_hardware_acceleration_available():
+if not is_hardware_backend_available():
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
