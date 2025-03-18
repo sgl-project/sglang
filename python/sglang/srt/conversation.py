@@ -44,7 +44,9 @@ class SeparatorStyle(IntEnum):
     CHATGLM3 = auto()
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
+    DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
+    GEMMA3 = auto()
 
 
 @dataclasses.dataclass
@@ -74,6 +76,7 @@ class Conversation:
 
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
+    stop_token_ids: Optional[int] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -191,7 +194,7 @@ class Conversation:
 
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
-                    ret += f"[Round {i//2 + round_add_n}]{self.sep}"
+                    ret += f"[Round {i // 2 + round_add_n}]{self.sep}"
 
                 if message:
                     ret += f"{role}：{message}{self.sep}"
@@ -285,6 +288,30 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
+        elif self.sep_style == SeparatorStyle.DeepSeekVL2:
+            seps = [self.sep, self.sep2]
+            if system_prompt == "" or system_prompt is None:
+                ret = ""
+            else:
+                ret = system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ": " + message + seps[i % 2]
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.GEMMA3:
+            ret = system_prompt
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    if i == 0:
+                        ret += message + self.sep
+                    else:
+                        ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
+
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -453,7 +480,6 @@ def generate_chat_conv(
                     conv.system_message = getattr(message.content[0], "text", "")
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
-            role = conv.roles[0]
             if isinstance(message.content, str):
                 conv.append_message(conv.roles[0], message.content)
             else:
@@ -605,6 +631,37 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="deepseek-vl2",
+        system_template="{system_message}",
+        # system_message="You are a helpful assistant. Please answer truthfully and write out your "
+        # "thinking step by step to be sure you get the right answer.",
+        system_message="",
+        roles=("<|User|>", "<|Assistant|>"),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.DeepSeekVL2,
+        sep="\n\n",
+        sep2="<｜end▁of▁sentence｜>",
+        stop_str=["User:", "<｜end▁of▁sentence｜>"],
+    )
+)
+
+# Reference: https://huggingface.co/google/gemma-3-4b-it/blob/main/config.json
+register_conv_template(
+    Conversation(
+        name="gemma-it",
+        system_message="You are a helpful assistant.",
+        system_template="<bos><start_of_turn>user{system_message}\n\n",
+        roles=("<start_of_turn>user\n", "<start_of_turn>model\n"),
+        sep="<end_of_turn>\n",
+        sep_style=SeparatorStyle.GEMMA3,
+        stop_str=["<end_of_turn>"],
+        image_token="<start_of_image>",
+    )
+)
+
 # Reference: https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct#usage
 register_conv_template(
     Conversation(
@@ -630,5 +687,20 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=("<|im_end|>", "<|endoftext|>"),
         image_token="(<image>./</image>)",
+    )
+)
+
+# Reference: https://github.com/deepseek-ai/Janus?tab=readme-ov-file#janus-pro
+register_conv_template(
+    Conversation(
+        name="janus-pro",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language",
+        system_template="{system_message}.",
+        roles=("User", "Assistant"),
+        sep="\n\n",
+        sep2="<｜end▁of▁sentence｜>",
+        sep_style=SeparatorStyle.ADD_COLON_TWO,
+        stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
+        image_token="<image_placeholder>",
     )
 )

@@ -26,13 +26,11 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
 ```
-
-- To enable torch.compile acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currently. You can refer to [`Enabling cache for torch.compile`](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile) for more details.
+- To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, the cache path is located at `/tmp/torchinductor_root`, you can customize it using environment variable `TORCHINDUCTOR_CACHE_DIR`. For more details, please refer to [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html) and [Enabling cache for torch.compile](https://docs.sglang.ai/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile).
 - To enable torchao quantization, add `--torchao-config int4wo-128`. It supports other [quantization strategies (INT8/FP8)](https://github.com/sgl-project/sglang/blob/v0.3.6/python/sglang/srt/server_args.py#L671) as well.
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e5m2`.
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](custom_chat_template.md).
-
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-cuda-graph`
 
 ```bash
@@ -117,6 +115,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `log_level`: Global log verbosity.
 * `log_level_http`: Separate verbosity level for the HTTP server logs (if unset, defaults to `log_level`).
 * `log_requests`: Logs the inputs and outputs of all requests for debugging.
+* `log_requests_level`: Ranges from 0 to 2: level 0 only shows some basic metadata in requests, level 1 and 2 show request details (e.g., text, images), and level 1 limits output to 2048 characters (if unset, defaults to `0`).
 * `show_time_cost`: Prints or logs detailed timing info for internal operations (helpful for performance tuning).
 * `enable_metrics`: Exports Prometheus-like metrics for request usage and performance.
 * `decode_log_interval`: How often (in tokens) to log decode progress.
