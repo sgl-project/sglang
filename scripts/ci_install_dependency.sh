@@ -24,3 +24,6 @@ pip install transformers==4.48.3 sentence_transformers accelerate==1.4.0 peft pa
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
+
+# For DeepSeek-VL2
+pip install timm
