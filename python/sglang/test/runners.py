@@ -15,7 +15,7 @@
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -217,6 +217,14 @@ class HFRunner:
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
             ).cuda()
+        elif self.model_type == "generation_with_image":
+            self.base_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.trust_remote_code,
+                low_cpu_mem_usage=True,
+            ).cuda()
+            self.processor = AutoProcessor.from_pretrained(model_path)
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(
@@ -262,6 +270,20 @@ class HFRunner:
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
                             tokenizer=self.tokenizer,
+                            lora_paths=lora_paths,
+                            torch_dtype=torch_dtype,
+                            output_str_only=self.output_str_only,
+                            token_ids_logprob=token_ids_logprob,
+                        )
+                    )
+                elif self.model_type == "generation_with_image":
+                    out_queue.put(
+                        self.forward_generation_raw_vlm(
+                            base_model=self.base_model,
+                            prompts=prompts,
+                            image_data=image_data,
+                            max_new_tokens=max_new_tokens,
+                            procesor=self.processor,
                             lora_paths=lora_paths,
                             torch_dtype=torch_dtype,
                             output_str_only=self.output_str_only,
@@ -411,6 +433,104 @@ class HFRunner:
             token_ids_output_logprobs=token_ids_output_logprobs,
         )
 
+    @staticmethod
+    def forward_generation_raw_vlm(
+        base_model,
+        prompts: List[str],
+        image_data: List[str],
+        max_new_tokens: int,
+        processor,
+        torch_dtype: torch.dtype,
+        lora_paths: Optional[List[str]] = None,
+        output_str_only: bool = False,
+        token_ids_logprob: Optional[int] = None,
+    ) -> ModelOutput:
+        output_strs = []
+        top_input_logprobs = []
+        top_output_logprobs = []
+        if token_ids_logprob is not None:
+            token_ids_input_logprobs = []
+            token_ids_output_logprobs = []
+        else:
+            token_ids_input_logprobs = token_ids_output_logprobs = None
+
+        from sglang.srt.utils import load_image
+
+        for i, p in enumerate(prompts):
+            image = load_image(image_data[i])[0]
+            input_ids = processor(
+                image, p, add_special_tokens=False, return_tensors="pt"
+            )
+
+            if lora_paths is not None and lora_paths[i] is not None:
+                from peft import PeftModel
+
+                model = PeftModel.from_pretrained(
+                    base_model,
+                    lora_paths[i],
+                    torch_dtype=torch_dtype,
+                    is_trainable=False,
+                )
+            else:
+                model = base_model
+
+            outputs = model.generate(
+                **input_ids,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=(not output_str_only),
+            )
+
+            text = processor.decode(
+                outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
+            )
+            # Check if the text is empty or only whitespace.
+            if not text.strip():
+                raise ValueError(
+                    "Received an empty text response. Please verify your input or model configuration."
+                )
+            output_strs.append(text)
+
+            if not output_str_only:
+                # outputs.scores: (num_token, 1, vocab_size)
+                top_output_logprobs.append(
+                    [
+                        get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
+                        for logits in outputs.scores
+                    ]
+                )
+                if token_ids_logprob is not None:
+                    token_ids_output_logprobs.append(
+                        [
+                            get_token_ids_logprobs(
+                                logits[0], token_ids_logprob
+                            ).tolist()
+                            for logits in outputs.scores
+                        ]
+                    )
+                del outputs
+
+                input_logits = model.forward(input_ids).logits[0]
+                top_input_logprobs.append(
+                    get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
+                )
+                if token_ids_logprob is not None:
+                    token_ids_input_logprobs.append(
+                        get_token_ids_logprobs(input_logits, token_ids_logprob).tolist()
+                    )
+                del input_logits
+
+        return ModelOutput(
+            output_strs=output_strs,
+            top_input_logprobs=top_input_logprobs,
+            top_output_logprobs=top_output_logprobs,
+            token_ids_input_logprobs=token_ids_input_logprobs,
+            token_ids_output_logprobs=token_ids_output_logprobs,
+        )
+
 
 class SRTRunner:
     def __init__(
@@ -494,6 +614,7 @@ class SRTRunner:
             return self.forward_generation_raw(
                 engine=self.engine,
                 prompts=prompts,
+                image_data=image_data,
                 max_new_tokens=max_new_tokens,
                 lora_paths=lora_paths,
                 logprob_start_len=logprob_start_len,
@@ -552,6 +673,7 @@ class SRTRunner:
     def forward_generation_raw(
         engine: Engine,
         prompts: Union[List[str], List[torch.Tensor]],
+        image_data: Optional[List[str]] = None,
         max_new_tokens: int = 8,
         lora_paths: Optional[List[str]] = None,
         logprob_start_len: int = 0,
@@ -581,6 +703,7 @@ class SRTRunner:
         for i, prompt in enumerate(prompts):
             response = engine.generate(
                 prompt,
+                image_data=image_data[i],
                 lora_path=lora_paths[i] if lora_paths else None,
                 sampling_params=sampling_params,
                 return_logprob=True,
