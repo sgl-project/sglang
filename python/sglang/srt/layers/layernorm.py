@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import is_cuda_available, is_hardware_acceleration_available
+from sglang.srt.utils import is_cuda_available, is_hardware_backend_available
 
 _is_cuda = is_cuda_available()
 
@@ -138,7 +138,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not is_hardware_acceleration_available():
+if not is_hardware_backend_available():
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
