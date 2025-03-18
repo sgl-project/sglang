@@ -170,7 +170,14 @@ class ExaoneAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.out_proj(attn_output)
         return output
