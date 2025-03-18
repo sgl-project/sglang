@@ -58,7 +58,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     deepep_compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), num_minus_one, BLOCK_SIZE
     )
-    # src2dst -= num_minus_one
+
     reorder_topk_ids = reorder_topk_ids[num_minus_one:]
     return reorder_topk_ids, src2dst, seg_indptr
 
