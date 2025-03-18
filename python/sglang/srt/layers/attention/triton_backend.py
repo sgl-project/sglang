@@ -32,7 +32,7 @@ def get_num_kv_splits_triton(
     max_seq_len = tl.load(max_seq_len_ptr)
 
     # NOTE: this is a hack to let num_kv_split grows up with seqlen gradually
-    ext_seq_len = tl.cast((max_seq_len + 256 - 1) // 256, tl.float32)
+    ext_seq_len = tl.cast(tl.cdiv(max_seq_len, 256), tl.float32)
     ext_device_core_count = device_core_count * tl.maximum(
         tl.cast(tl.log(ext_seq_len), tl.int32), 1
     )
@@ -42,11 +42,9 @@ def get_num_kv_splits_triton(
     else:
         # from triton_ops/decode_attention.py:_decode_grouped_att_m_fwd
         block_h = tl.minimum(block_h, num_kv_group)
-        bh_grid = bs * (num_head + block_h - 1) // block_h
+        bh_grid = bs * tl.cdiv(num_head, block_h)
 
-    num_kv_splits = tl.minimum(
-        (ext_device_core_count + bh_grid - 1) // bh_grid, max_kv_splits
-    )
+    num_kv_splits = tl.minimum(tl.cdiv(ext_device_core_count, bh_grid), max_kv_splits)
 
     tl.store(num_kv_splits_ptr, num_kv_splits)
 
