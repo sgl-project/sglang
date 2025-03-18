@@ -215,12 +215,16 @@ class DeepEPDispatcher:
         self.buffer_normal = get_buffer_normal(
             self.group, self.hidden_size * self.params_bytes
         )
+        self.buffer_low_latency = None
+        # Todo: enable low latency dispatch
+        """
         self.buffer_low_latency = get_buffer_low_latency(
             self.group,
             self.num_max_dispatch_tokens_per_rank,
             self.hidden_size * self.params_bytes,
             self.num_experts,
         )
+        """
 
     def deepep_permute(
         self,
