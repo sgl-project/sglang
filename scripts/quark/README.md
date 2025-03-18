@@ -20,17 +20,6 @@ pip install -r requirements.txt
 
 ## Quantization
 
-This model was created by applying Quark with calibration samples from Pile dataset.
-
-### Quantization Stragegy
-- **Quantized Layers**: All linear layers excluding "lm_head", "*.gate"
-- **Weight**: FP8 symmetric per-tensor, additionally, INT4 symmetric per-channel for MoE linear
-- **Activation**: FP8 symmetric per-tensor
-- **KV Cache**: FP8 symmetric per-tensor
-
-#### INT4 Packing
-Every eight `int4` values are packed into a single int32 integeter following the sequence defined by `order_map = [0, 2, 4, 6, 1, 3, 5, 7]`.
-
 ### Quick Start
 
 Run the following command, replacing placeholders with the appropriate paths:
@@ -48,3 +37,15 @@ Notes:
 - To work around this, the script first merges the sharded checkpoints into a single unsharded model, stored in the path specified by `--intermediate`.
 - Input model must be stored locally. For example, download https://huggingface.co/lmzheng/grok-1 to your local directory and specify its path using the `--input` argument.
 - The final quantized and sharded checkpoint is saved at the path provided to --output.
+
+### Quantization Stragegy
+
+This model was created by applying Quark with calibration samples from Pile dataset.
+
+- **Quantized Layers**: All linear layers excluding "lm_head", "*.gate"
+- **Weight**: FP8 symmetric per-tensor, additionally, INT4 symmetric per-channel for MoE linear
+- **Activation**: FP8 symmetric per-tensor
+- **KV Cache**: FP8 symmetric per-tensor
+
+#### INT4 Packing
+Every eight `int4` values are packed into a single int32 integeter following the sequence defined by `order_map = [0, 2, 4, 6, 1, 3, 5, 7]`.
