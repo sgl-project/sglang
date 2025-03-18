@@ -16,43 +16,34 @@ inline __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   // SEEEEEEE EMMMMMMM
   // 127 + 7 = 134 -> 0100 0011 0 -> 0x43
   static constexpr uint32_t immLut   = (0xf0 & 0xcc) | 0xaa;
-  static constexpr uint32_t BOTTOM_MASK = 0x000f000f;
-  static constexpr uint32_t TOP_MASK = 0x00f000f0;
+  static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t I4s_TO_BF16s_MAGIC_NUM = 0x43004300;
 
-  const uint32_t  top_i4s = i4s >> 8;
+  const uint32_t  i4s_4  = i4s >> 4;
+  const uint32_t  i4s_8  = i4s >> 8;
+  const uint32_t  i4s_12 = i4s >> 12;
 
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(h[0])
-               : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+               : "r"(i4s), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(h[1])
-               : "r"(i4s), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+               : "r"(i4s_4), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(h[2])
-               : "r"(top_i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+               : "r"(i4s_8), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(h[3])
-               : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
-
-  // For bottom 4 bits, need to subtract 2 ^ 7 = 128
-  static constexpr uint32_t BF16_TOP_MAGIC_NUM = 0x43004300;
-  // For top 4 bits, need to move 4 bits to the right, 2 ^ 4 = 16
-  // This is the bf16x2 {1 / 16, 1 / 16} represented as an integer.
-  // 0011 1101 1000 0000
-  static constexpr uint32_t ONE_SIXTEENTH = 0x3d803d80;
-  // 128 / 16 = 8 we need to subtract 8 from the above.
-  // This is the bf16x2 {-8, -8} represented as an integer.
-  static constexpr uint32_t NEG_8 = 0xc100c100;
+               : "r"(i4s_12), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
 
   // Convert elt_01
-  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(BF16_TOP_MAGIC_NUM));
-  // Convert elt_23
-  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[1]) : "r"(h[1]), "r"(ONE_SIXTEENTH), "r"(NEG_8));
-  // Convert elt_45
-  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(BF16_TOP_MAGIC_NUM));
-  // Convert elt_67
-  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTEENTH), "r"(NEG_8));
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I4s_TO_BF16s_MAGIC_NUM));
+  // // Convert elt_23
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I4s_TO_BF16s_MAGIC_NUM));
+  // // Convert elt_45
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(I4s_TO_BF16s_MAGIC_NUM));
+  // // Convert elt_67
+  asm volatile("sub.bf16x2 %0, %1, %2;\n" : "=r"(h[3]) : "r"(h[3]), "r"(I4s_TO_BF16s_MAGIC_NUM));
 
   return result;
 #else
