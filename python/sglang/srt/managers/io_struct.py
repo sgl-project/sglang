@@ -540,7 +540,8 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    # indeed Dict[str, torch.Tensor] for each TP worker
+    serialized_named_tensors: List[bytes]
     load_format: Optional[str]
     flush_cache: bool
 
