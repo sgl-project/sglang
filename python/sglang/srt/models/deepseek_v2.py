@@ -69,7 +69,6 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
-from sgl_kernel import awq_dequantize
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
