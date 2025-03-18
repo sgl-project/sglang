@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 """
-Support attention backend for flashMLA.
+Support attention backend for FlashMLA.
 
-Current initial integration of FlashMLA shows normal accuracy, but performance is slightly lacking.
 #TODO
-Support FlashMLA decode with cudagraph
 Enable speculative sampling in FlashMLA
-Integrate FA3 prefill
 """
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
