@@ -847,6 +847,8 @@ void decode_attention_cpu(
     at::Tensor& seq_lens,
     double sm_scale,
     double logit_cap) {
+  RECORD_FUNCTION(
+    "sgl-kernel::decode_attention_cpu", std::vector<c10::IValue>({query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
 
   CHECK_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);

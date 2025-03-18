@@ -311,6 +311,8 @@ void grouped_topk_cpu(
     bool renormalize,
     int64_t num_expert_group,
     int64_t topk_group) {
+  RECORD_FUNCTION(
+    "sgl-kernel::grouped_topk_cpu", std::vector<c10::IValue>({topk_weights, topk_ids, hidden_states, gating_output}));
 
   CHECK_INPUT(gating_output);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());

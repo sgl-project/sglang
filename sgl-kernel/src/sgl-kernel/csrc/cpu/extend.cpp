@@ -515,6 +515,8 @@ void extend_attention_cpu(
     int64_t max_len_extend,
     double sm_scale,
     double logit_cap) {
+  RECORD_FUNCTION(
+    "sgl-kernel::extend_attention_cpu", std::vector<c10::IValue>({q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, req_to_token, req_pool_indices, seq_lens, extend_seq_lens, extend_start_loc}));
 
   CHECK_INPUT(q_extend);
   CHECK_INPUT(o_extend);
