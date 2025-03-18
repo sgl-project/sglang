@@ -75,7 +75,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
-  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
+  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros, bool act_bf16) -> Tensor");
   m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
   m.def(

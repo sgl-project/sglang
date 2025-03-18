@@ -195,7 +195,7 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 
 
 
-torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros) {
+torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros, bool act_bf16=false) {
   int qweight_rows = qweight.size(0);
   int qweight_cols = qweight.size(1);
   int group_size = qweight_rows / scales.size(0);
@@ -215,18 +215,16 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  if (scales.scalar_type() == at::ScalarType::Half) {
+  if (!act_bf16) {
     auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
     auto _output = reinterpret_cast<half*>(output.data_ptr<at::Half>());
     dequantize_weights<half><<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols);
-  } else if (scales.scalar_type() == at::ScalarType::BFloat16) {
+  } else {
     auto _scales = reinterpret_cast<__nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
     auto _output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     dequantize_weights<__nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols);
-  } else {
-    AT_ERROR("awq_dequantize: Unsupported scale type");
   }
 
   return output;

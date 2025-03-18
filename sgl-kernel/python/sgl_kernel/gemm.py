@@ -5,9 +5,9 @@ from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
 
 def awq_dequantize(
-    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, act_bf16: bool = False
 ) -> torch.ByteTensor:
-    return torch.ops.sgl_kernel.awq_dequantize(qweight, scales, qzeros)
+    return torch.ops.sgl_kernel.awq_dequantize(qweight, scales, qzeros, act_bf16)
 
 
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
