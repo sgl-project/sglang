@@ -596,6 +596,9 @@ class TritonMultiStepDraftBackend:
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
