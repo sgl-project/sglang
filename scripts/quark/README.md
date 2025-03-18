@@ -20,6 +20,13 @@ pip install -r requirements.txt
 
 ## Quantization
 
+This guide supports two types of quantization:
+
+1. Weight-only quantization
+2. Weight, activation, and KV cache quantization
+
+Refer to the following sections for detailed instructions on each method.
+
 ### INT4-FP8 Weight only 
 
 #### Quick Start
