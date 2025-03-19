@@ -207,6 +207,9 @@ def _run_subprocess(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
 
+        if tp_rank == 0:
+            _execute_async_generate(engine=engine)
+
         for enable_batch in [False, True]:
             if enable_batch:
                 fn = SRTRunner.batch_forward_generation_raw
@@ -233,9 +236,6 @@ def _run_subprocess(
                 check_logprobs=not enable_batch,
                 debug_text=f"{enable_batch=} {tp_rank=}",
             )
-
-        if tp_rank == 0:
-            _execute_async_generate(engine=engine)
 
         execution_ok = True
 
