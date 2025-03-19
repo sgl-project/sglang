@@ -266,7 +266,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 // Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
 #pragma unroll
   for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-    thread_max = max(thread_max, SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, thread_max, mask, THREADS_PER_ROW));
+    thread_max = max(thread_max, __shfl_xor_sync(0xffffffff, thread_max, mask, THREADS_PER_ROW));
   }
 
   // From this point, thread max in all the threads have the max within the row.
@@ -281,7 +281,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 // Now, we perform the sum reduce within each thread group. Similar to the max reduce, we use a bufferfly pattern.
 #pragma unroll
   for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-    row_sum += SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, row_sum, mask, THREADS_PER_ROW);
+    row_sum += __shfl_xor_sync(0xffffffff, row_sum, mask, THREADS_PER_ROW);
   }
 
   // From this point, all threads have the max and the sum for their rows in the thread_max and thread_sum variables
@@ -325,8 +325,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 // then blank out their max with -inf and the warp can run more iterations...
 #pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-      float other_max = SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, max_val, mask, THREADS_PER_ROW);
-      int other_expert = SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, expert, mask, THREADS_PER_ROW);
+      float other_max = __shfl_xor_sync(0xffffffff, max_val, mask, THREADS_PER_ROW);
+      int other_expert = __shfl_xor_sync(0xffffffff, expert, mask, THREADS_PER_ROW);
 
       // We want lower indices to "win" in every thread so we break ties this way
       if (other_max > max_val || (other_max == max_val && other_expert < expert)) {
