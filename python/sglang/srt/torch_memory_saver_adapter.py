@@ -28,6 +28,10 @@ class TorchMemorySaverAdapter(ABC):
     def resume(self):
         raise NotImplementedError
 
+    @property
+    def enabled(self):
+        raise NotImplementedError
+
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
@@ -41,6 +45,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
     def resume(self):
         return _primary_memory_saver.resume()
+
+    @property
+    def enabled(self):
+        return _primary_memory_saver.enabled
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
@@ -57,3 +65,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def resume(self):
         pass
+
+    @property
+    def enabled(self):
+        return False
