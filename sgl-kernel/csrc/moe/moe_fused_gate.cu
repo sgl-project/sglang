@@ -55,30 +55,6 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
   }
 }
 
-#ifndef USE_ROCM
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-template <typename T, int N>
-using AlignedArray = cutlass::AlignedArray<T, N>;
-using bfloat16_t = cutlass::bfloat16_t;
-#else
-// Define a simple aligned array template to replace cutlass::AlignedArray:
-// Define a simple aligned array template with operator[] support
-template <typename T, int N>
-struct AlignedArray {
-  T data[N];
-
-  __device__ __host__ T& operator[](int i) {
-    return data[i];
-  }
-  __device__ __host__ const T& operator[](int i) const {
-    return data[i];
-  }
-};
-using bfloat16_t = at::BFloat16;
-#endif
-
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
@@ -102,11 +78,8 @@ __device__ void moe_fused_gate_impl(
     int64_t topk,
     Params params) {
   int tidx = threadIdx.x;
-  // calculate thread row using parameters from params
-  // thread row offset: block offset + warp_offset + within_group_offset
   int64_t thread_row =
       blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP + tidx / params.THREADS_PER_ROW;
-  // out of bound threads
   if (thread_row >= num_rows) {
     return;
   }
