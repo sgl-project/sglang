@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Callable
+from typing import Callable, Union
 
 import torch
 from torch.multiprocessing import reductions
@@ -44,7 +44,7 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 
 def _rebuild_cuda_tensor_modified(*args):
-    args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_uuid)
+    args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
     return reductions._rebuild_cuda_tensor_original(*args)
 
 
@@ -52,14 +52,17 @@ def _device_to_uuid(device: int) -> str:
     return str(torch.cuda.get_device_properties(device).uuid)
 
 
-def _device_from_uuid(device_uuid: str) -> int:
-    assert isinstance(
-        device_uuid, str
-    ), "The reduction function is probably not patched"
-    for device in range(torch.cuda.device_count()):
-        if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
-            return device
-    raise Exception("Invalid device_uuid=" + device_uuid)
+def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
+    if isinstance(device_maybe_uuid, int):
+        return device_maybe_uuid
+
+    if isinstance(device_maybe_uuid, str):
+        for device in range(torch.cuda.device_count()):
+            if str(torch.cuda.get_device_properties(device).uuid) == device_maybe_uuid:
+                return device
+        raise Exception("Invalid device_uuid=" + device_maybe_uuid)
+
+    raise Exception(f'Unknown type: {device_maybe_uuid=}')
 
 
 def _modify_tuple(t, index: int, modifier: Callable):
