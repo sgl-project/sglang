@@ -14,18 +14,22 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             dict(
                 sender_info=dict(
                     visible_devices=[0, 1],
+                    tensor_device=1,
                 ),
                 receiver_info=dict(
                     visible_devices=[0, 1],
+                    tensor_device=0,
                 ),
             ),
             # Different visible devices
             dict(
                 sender_info=dict(
                     visible_devices=[0, 1],
+                    tensor_device=1,
                 ),
                 receiver_info=dict(
-                    visible_devices=[1],
+                    visible_devices=[1, 0],
+                    tensor_device=0,
                 ),
             ),
         ]:
