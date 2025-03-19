@@ -186,7 +186,12 @@ class HiCacheController:
         self.load_stream = torch.cuda.Stream()
 
         self.write_thread = threading.Thread(
-            target=self.write_thread_func_direct, daemon=True
+            target=(
+                self.write_thread_func_buffer
+                if self.page_size == 1
+                else self.write_thread_func_direct
+            ),
+            daemon=True,
         )
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
@@ -207,7 +212,12 @@ class HiCacheController:
         self.ack_load_queue.queue.clear()
 
         self.write_thread = threading.Thread(
-            target=self.write_thread_func_direct, daemon=True
+            target=(
+                self.write_thread_func_buffer
+                if self.page_size == 1
+                else self.write_thread_func_direct
+            ),
+            daemon=True,
         )
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
@@ -324,13 +334,21 @@ class HiCacheController:
 
                 self.layer_done_counter.reset()
                 for i in range(self.mem_pool_host.layer_num):
-                    self.mem_pool_host.load_page_per_layer(
-                        batch_operation.host_indices,
-                        batch_operation.device_indices,
-                        self.mem_pool_device,
-                        i,
-                    )
-                    self.load_stream.synchronize()
+                    if self.page_size == 1:
+                        flat_data = self.mem_pool_host.get_flat_data_by_layer(
+                            batch_operation.host_indices, i
+                        )
+                        self.mem_pool_device.transfer_per_layer(
+                            batch_operation.device_indices, flat_data, i
+                        )
+                    else:
+                        self.mem_pool_host.load_page_per_layer(
+                            batch_operation.host_indices,
+                            batch_operation.device_indices,
+                            self.mem_pool_device,
+                            i,
+                        )
+                        self.load_stream.synchronize()
                     self.layer_done_counter.increment()
 
                 self.mem_pool_host.complete_io(batch_operation.host_indices)
