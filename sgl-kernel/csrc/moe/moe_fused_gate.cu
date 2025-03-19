@@ -6,31 +6,31 @@
 #include <type_traits>
 
 #ifndef USE_ROCM
-  #include <cuda_runtime.h>
-  #include <cutlass/array.h>
-  #include <cutlass/cutlass.h>
-  #include <cutlass/numeric_types.h>
-  template <typename T, int N>
-  using AlignedArray = cutlass::AlignedArray<T, N>;
-  using bfloat16_t = cutlass::bfloat16_t;
-  using float16_t = cutlass::half_t;
-  using float32_t = float;
+#include <cuda_runtime.h>
+#include <cutlass/array.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+template <typename T, int N>
+using AlignedArray = cutlass::AlignedArray<T, N>;
+using bfloat16_t = cutlass::bfloat16_t;
+using float16_t = cutlass::half_t;
+using float32_t = float;
 #else
-  // Native aligned array template with operator[] support as a substitution of cutlass::AlignedArray
-  template <typename T, int N>
-  struct AlignedArray {
-    T data[N];
+// Native aligned array template with operator[] support as a substitution of cutlass::AlignedArray
+template <typename T, int N>
+struct AlignedArray {
+  T data[N];
 
-    __device__ __host__ T& operator[](int i) {
-      return data[i];
-    }
-    __device__ __host__ const T& operator[](int i) const {
-      return data[i];
-    }
-  };
-  using bfloat16_t = at::BFloat16;
-  using float16_t = at::Half;
-  using float32_t = float;
+  __device__ __host__ T& operator[](int i) {
+    return data[i];
+  }
+  __device__ __host__ const T& operator[](int i) const {
+    return data[i];
+  }
+};
+using bfloat16_t = at::BFloat16;
+using float16_t = at::Half;
+using float32_t = float;
 #endif
 
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these operands: built-in operator
