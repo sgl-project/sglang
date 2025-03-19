@@ -1,8 +1,9 @@
 import os
 import weakref
 
-from sglang.utils import execute_shell_command, reserve_port
 import nest_asyncio
+
+from sglang.utils import execute_shell_command, reserve_port
 
 nest_asyncio.apply()
 DEFAULT_MAX_RUNNING_REQUESTS = 200
