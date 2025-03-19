@@ -188,9 +188,6 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
-            self.torch_tp_applied = True
-        else:
-            self.torch_tp_applied = False
 
         # Init lora
         if server_args.lora_paths is not None:
@@ -209,6 +206,10 @@ class ModelRunner:
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
+
+        # auxiliary hidden capture mode. TODO: expose this to server args?
+        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+            self.model.set_eagle3_layers_to_capture()
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -258,10 +259,12 @@ class ModelRunner:
 
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
+            ] or self.model_config.hf_config.architectures == [
+                "Qwen2_5_VLForConditionalGeneration"
             ]:
-                # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen-vl series."
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
@@ -618,6 +621,8 @@ class ModelRunner:
             load_config=self.load_config,
             dtype=self.dtype,
             lora_backend=self.server_args.lora_backend,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         logger.info("LoRA manager ready.")
 
