@@ -18,22 +18,18 @@ import torch
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
-    import torch.multiprocessing.reductions
+    from torch.multiprocessing import reductions
 
-    if hasattr(torch.multiprocessing.reductions, "_reduce_tensor_original"):
+    if hasattr(reductions, "_reduce_tensor_original"):
         return
 
-    torch.multiprocessing.reductions._reduce_tensor_original = (
-        torch.multiprocessing.reductions.reduce_tensor
-    )
-    torch.multiprocessing.reductions._rebuild_cuda_tensor_original = (
-        torch.multiprocessing.reductions.rebuild_cuda_tensor
-    )
+    reductions._reduce_tensor_original = reductions.reduce_tensor
+    reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
 
-    torch.multiprocessing.reductions.reduce_tensor = _reduce_tensor_modified
-    torch.multiprocessing.reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+    reductions.reduce_tensor = _reduce_tensor_modified
+    reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
 
-    torch.multiprocessing.reductions.init_reductions()
+    reductions.init_reductions()
 
 
 # The signature has not been changed for years, and we will not need this when the next version is released,
