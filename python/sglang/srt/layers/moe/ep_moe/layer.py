@@ -1,12 +1,13 @@
 import logging
 from typing import Callable, List, Optional, Tuple
 
-import deep_gemm
-import torch
-from deep_gemm import (
-    get_col_major_tma_aligned_tensor,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-)
+# TODO: use deep_gemm masked kernel after low latency dispatch
+# import deep_gemm
+# import torch
+# from deep_gemm import (
+#     get_col_major_tma_aligned_tensor,
+#     m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+# )
 from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
