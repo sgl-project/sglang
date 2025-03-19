@@ -18,6 +18,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 * `lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None` Path to LoRA weights.
 * `custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None` Custom logit processor for advanced sampling control. For usage see below.
 * `return_hidden_states: bool = False` Whether to return hidden states of the model. Note that each time it changes, the cuda graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/hidden_states) for more information.
+* `use_model_length: bool = False` Generation will continue until the model's maximum context length is reached if set to true.
 
 ## Sampling params
 

@@ -418,6 +418,13 @@ class TokenizerManager:
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify()
 
+        if obj.use_model_length == True:
+            sampling_params.max_new_tokens = getattr(
+                self.model_config.hf_config,
+                "max_position_embeddings",
+                sampling_params.max_new_tokens,
+            )
+
         # Build return object
         if isinstance(obj, GenerateReqInput):
             tokenized_obj = TokenizedGenerateReqInput(
