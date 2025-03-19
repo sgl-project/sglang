@@ -59,6 +59,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                     role=role,
                     queue=queue,
                     output_writer=output_writer,
+                    tensor_device=info['tensor_device'],
                 ),
             )
             p.start()
@@ -71,17 +72,17 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(role: str, queue: mp.Queue, output_writer):
+def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: int):
     print(f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
 
     try:
         match role:
             case 'sender':
-                tensor = torch.tensor([1.0, 2.0], device=f'cuda:{TODO}')
+                tensor = torch.tensor([1.0, 2.0], device=f'cuda:{tensor_device}')
                 queue.put(tensor)
             case 'receiver':
                 tensor = queue.get()
-                assert tensor.device == f'cuda:{TODO}'
+                assert tensor.device == f'cuda:{tensor_device}'
 
         execution_ok = True
     except Exception as e:
