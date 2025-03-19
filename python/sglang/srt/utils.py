@@ -257,7 +257,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        num_gpus = cuda_device_count_stateless()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
