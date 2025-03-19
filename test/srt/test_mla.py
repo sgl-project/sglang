@@ -56,6 +56,7 @@ class TestMLA(unittest.TestCase):
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.8)
 
+
 class TestTorchNativeAttnBackendMLA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
