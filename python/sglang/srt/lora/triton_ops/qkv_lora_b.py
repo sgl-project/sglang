@@ -57,7 +57,6 @@ def _qkv_lora_b_kernel(
     n_size = tl.load(n_offs + qkv_id + 1) - n_start
     rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
-
     # Adjust K (rank) according to the specific LoRA adapter
     K = tl.minimum(K, rank)
 

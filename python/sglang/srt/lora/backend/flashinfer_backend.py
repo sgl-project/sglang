@@ -46,7 +46,7 @@ class FlashInferLoRABackend(BaseLoRABackend):
                 seg_indptr=self.batch_info.seg_indptr,
                 weight_indices=self.batch_info.weight_indices,
             )
-            * self.batch_info.lora_ranks[0]
+            * self.batch_info.scalings[0]
         )
 
     def run_qkv_lora(
@@ -93,7 +93,7 @@ class FlashInferLoRABackend(BaseLoRABackend):
             weights=kv_lora_b[1],
         )
 
-        return lora_output * self.batch_info.lora_ranks[0]
+        return lora_output * self.batch_info.scalings[0]
 
     def run_gate_up_lora(
         self,
@@ -128,4 +128,4 @@ class FlashInferLoRABackend(BaseLoRABackend):
             weights=gate_up_lora_b[1],
         )
 
-        return lora_output * self.batch_info.lora_ranks[0]
+        return lora_output * self.batch_info.scalings[0]

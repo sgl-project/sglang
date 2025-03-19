@@ -47,7 +47,7 @@ class TritonLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
-        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, self.batch_info)
+        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, self.batch_info, stack_num=3)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
             qkv_lora_b,
@@ -75,7 +75,9 @@ class TritonLoRABackend(BaseLoRABackend):
         output_dim = gate_up_lora_b.shape[-2] // 2
 
         # lora_a_output: (s, 2 * r)
-        lora_a_output = sgemm_lora_a_fwd(x, gate_up_lora_a, self.batch_info)
+        lora_a_output = sgemm_lora_a_fwd(
+            x, gate_up_lora_a, self.batch_info, stack_num=2
+        )
         lora_output = gate_up_lora_b_fwd(
             lora_a_output,
             gate_up_lora_b,

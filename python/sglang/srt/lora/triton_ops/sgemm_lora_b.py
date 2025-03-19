@@ -48,7 +48,6 @@ def _sgemm_lora_b_kernel(
     seg_start = tl.load(seg_indptr + batch_id)
     rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
-
     # Adjust K (rank) according to the specific LoRA adapter
     K = tl.minimum(K, rank)
 

@@ -138,7 +138,7 @@ class LoRAManager:
             (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
         )
         scalings = torch.empty(
-            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+            (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
         )
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
