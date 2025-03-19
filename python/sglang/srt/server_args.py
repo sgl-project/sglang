@@ -68,7 +68,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
-    schedule_conservativeness: float = 1.0
+    schedule_conservativeness: Optional[float] = None
     cpu_offload_gb: int = 0
     page_size: int = 1
 
@@ -213,12 +213,27 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        if self.schedule_conservativeness is None:
+            self.schedule_conservativeness = 0.3 if self.enable_dp_attention else 1.0
+
+        # Data parallelism attention
+        if self.enable_dp_attention:
+            assert (
+                self.dp_size > 1
+            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
+            assert self.tp_size % self.dp_size == 0
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
+            if self.enable_dp_attention:
+                self.chunked_prefill_size //= self.dp_size
+                logger.warning(
+                    f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                )
 
         assert self.chunked_prefill_size % self.page_size == 0
 
@@ -258,18 +273,6 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
-        # Data parallelism attention
-        if self.enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
-            assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
-            logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
         # Speculative Decoding
