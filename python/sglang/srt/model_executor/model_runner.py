@@ -145,6 +145,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "enable_deepep_moe": server_args.enable_deepep_moe,
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
@@ -276,6 +277,12 @@ class ModelRunner:
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
+
+        if server_args.enable_deepep_moe:
+            logger.info("DeepEP is turned on.")
+            assert (
+                server_args.enable_dp_attention == True
+            ), "Currently DeepEP is bind to Attention DP. Set '--enable-dp-attention --enable-deepep-moe'"
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
