@@ -225,7 +225,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                forward_batch.seq_lens.sum().item(),
+                dtype=torch.int32,
+                device=self.device,
             )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -268,7 +270,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
+                forward_batch.extend_prefix_lens.sum().item(),
                 dtype=torch.int32,
                 device=self.device,
             )
