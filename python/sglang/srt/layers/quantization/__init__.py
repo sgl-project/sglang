@@ -9,7 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
     from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
@@ -47,6 +46,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -60,6 +60,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq": GPTQConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
+    "moe_wna16": MoeWNA16Config,
 }
 
 # Add vllm-dependent methods if available
@@ -68,7 +69,6 @@ if VLLM_AVAILABLE:
     VLLM_QUANTIZATION_METHODS = {
         "aqlm": AQLMConfig,
         "awq": AWQConfig,
-        "moe_wna16": MoeWNA16Config,
         "deepspeedfp": DeepSpeedFPConfig,
         "tpu_int8": Int8TpuConfig,
         "fbgemm_fp8": FBGEMMFp8Config,
@@ -337,7 +337,6 @@ def monkey_patch_quant_configs():
         setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
         monkey_patch_moe_apply(AWQMoEMethod)
-        monkey_patch_moe_apply(MoeWNA16Method)
         monkey_patch_moe_apply(GPTQMarlinMoEMethod)
         monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
         monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
