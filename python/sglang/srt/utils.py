@@ -128,6 +128,10 @@ def is_cuda_available():
     return is_cuda()
 
 
+def is_hardware_backend_available():
+    return is_cuda_available() or is_xpu()
+
+
 _ENABLE_TORCH_INFERENCE_MODE = os.getenv(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 ).lower() in ("true", "1")

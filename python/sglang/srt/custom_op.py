@@ -3,10 +3,11 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 class CustomOp(nn.Module):
@@ -40,6 +41,8 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_xpu:
+            return self.forward_xpu
         else:
             return self.forward_native
 

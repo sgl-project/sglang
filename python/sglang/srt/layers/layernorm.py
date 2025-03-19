@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.utils import is_cuda_available
+from sglang.srt.utils import is_cuda_available, is_hardware_backend_available
 
 _is_cuda = is_cuda_available()
 
@@ -51,7 +51,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -139,7 +138,7 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not _is_cuda:
+if not is_hardware_backend_available():
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
