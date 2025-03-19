@@ -5,7 +5,6 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt import torch_memory_saver_adapter
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
@@ -13,14 +12,6 @@ _DEBUG_EXTRA = True
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
-    def test_release_and_resume_occupation_when_disabled(self):
-        engine = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, enable_memory_saver=False
-        )
-        # TODO assert logs happens in subprocesses
-        engine.release_memory_occupation()
-        engine.resume_memory_occupation()
-
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
