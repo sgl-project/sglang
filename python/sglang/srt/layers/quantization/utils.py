@@ -76,7 +76,6 @@ def convert_to_channelwise(
 
     # Handle scalar tensor case
     if weight_scale.dim() == 0 and weight_scale.numel() == 1:
-        # If weight_scale is a scalar, broadcast it to all channels
         weight_scale_channel.fill_(weight_scale.item())
         return weight_scale_channel
 
