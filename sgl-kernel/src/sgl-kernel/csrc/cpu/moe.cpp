@@ -232,6 +232,257 @@ inline void silu_and_mul(
   }
 }
 
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2 {
+  static inline void apply(
+      const scalar_t* __restrict__ A, const scalar_t* __restrict__ B0, const scalar_t* __restrict__ B1,
+      scalar_t* __restrict__ C, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B0, const at::BFloat16* __restrict__ B1,
+      at::BFloat16* __restrict__ C, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    static_assert(COLS % 2 == 0);
+
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 0;
+
+    __m512bh va;
+    __m512bh vb0[COLS];
+    __m512bh vb1[COLS];
+    __m512 vc0[ROWS * COLS];
+    __m512 vc1[ROWS * COLS];
+
+    auto loadc = [&](auto i) {
+      vc0[i] = _mm512_set1_ps(0.f);
+      vc1[i] = _mm512_set1_ps(0.f);
+    };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int64_t K2 = K >> 1;
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb; // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const float* b0_ptr = reinterpret_cast<const float*>(B0);
+    const float* b1_ptr = reinterpret_cast<const float*>(B1);
+
+    auto compute = [&](auto i, int64_t k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        vb0[col] = (__m512bh)(_mm512_loadu_si512(b0_ptr + k * ldb2 + col * 16));
+        vb1[col] = (__m512bh)(_mm512_loadu_si512(b1_ptr + k * ldb2 + col * 16));
+        if constexpr (PREFETCH_SIZE_K > 0) {
+          _mm_prefetch(b0_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+          _mm_prefetch(b1_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+        }
+      }
+      vc0[i] = _mm512_dpbf16_ps(vc0[i], va, vb0[col]);
+      vc1[i] = _mm512_dpbf16_ps(vc1[i], va, vb1[col]);
+    };
+    for (int64_t k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    using Vec = at::vec::Vectorized<float>;
+    const Vec one = Vec(1.f);
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        Vec x0 = vc0[row * COLS + col + 0];
+        Vec x1 = vc0[row * COLS + col + 1];
+        Vec y0 = vc1[row * COLS + col + 0];
+        Vec y1 = vc1[row * COLS + col + 1];
+        // silu
+        x0 = x0 / (one + x0.neg().exp_u20());
+        x1 = x1 / (one + x1.neg().exp_u20());
+        // mul
+        x0 = x0 * y0;
+        x1 = x1 * y1;
+
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
+            (__m512i)(_mm512_cvtne2ps_pbh(__m512(x1), __m512(x0))));
+        }
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
+    tinygemm_kernel_nn2<scalar_t, MB_SIZE, NB_SIZE>::apply(                  \
+        A + mb_start * lda, B0 + nb_start * 2, B1 + nb_start * 2,            \
+        C + mb_start * ldc + nb_start, K, lda, ldb, ldc);
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B0,
+    const scalar_t* __restrict__ B1,
+    scalar_t* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc) {
+
+  // pattern: 1-(2+2)-(8+8)
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 32;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  for (int mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch(mb_size << 4 | nb_size >> 4) {
+        // mb_size = 1
+        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
+        // mb_size = 2
+        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
+        // mb_size = 3
+        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
+        // mb_size = 4
+        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
+        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      }
+    }
+  }
+}
+
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn {
+  static inline void apply(
+      const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, float* __restrict__ C,
+      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+    TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B, float* __restrict__ C,
+      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    static_assert(COLS % 2 == 0);
+
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 0;
+
+    __m512bh va;
+    __m512bh vb[COLS];
+    __m512 vc[ROWS * COLS];
+
+    auto loadc = [&](auto i) {
+      vc[i] = _mm512_set1_ps(0.f);
+    };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int64_t K2 = K >> 1;
+    const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb; // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const float* b_ptr = reinterpret_cast<const float*>(B);
+
+    auto compute = [&](auto i, int64_t k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        vb[col] = (__m512bh)(_mm512_loadu_si512(b_ptr + k * ldb2 + col * 16));
+        if constexpr (PREFETCH_SIZE_K > 0) {
+          _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+        }
+      }
+      vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
+    };
+    for (int64_t k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      _mm512_storeu_ps(reinterpret_cast<__m512*>(C + row * ldc + col * 16), vc[i]);
+
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
+#endif
+
+#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                         \
+    tinygemm_kernel_nn<scalar_t, MB_SIZE, NB_SIZE>::apply(                   \
+        A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, \
+        K, lda, ldb, ldc);
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc) {
+
+  // pattern: 1-2-8
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 32;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+  for (int mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+      switch(mb_size << 4 | nb_size >> 4) {
+        // mb_size = 1
+        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN2(1, 32); break;
+        // mb_size = 2
+        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN2(2, 32); break;
+        // mb_size = 3
+        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN2(3, 32); break;
+        // mb_size = 4
+        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN2(4, 32); break;
+        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      }
+    }
+  }
+}
+
 template <typename scalar_t>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
@@ -275,6 +526,8 @@ void fused_experts_kernel_impl(
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
+    bool is_brgemm_used = false;
+
     for (int i = begin; i < end; ++i) {
       int mb = i / NB;
       int nb = i % NB;
@@ -292,47 +545,69 @@ void fused_experts_kernel_impl(
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int m_size = offsets[mb + 1] - offsets[mb];
 
+      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+
       for (int m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
         copy_stub(A + m * K, input + index * K, K);
       }
 
-      // 1.b gemm: C0 = A @ B0
-      at::native::cpublas::brgemm(
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ K,
-          /* lda   */ K,
-          /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N,
-          /* add_C */ false,
-          /* A     */ A,
-          /* B     */ B0,
-          /* C     */ C0);
+      if (use_brgemm) {
+        // 1.b gemm: C0 = A @ B0
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B0,
+            /* C     */ C0);
 
-      // 1.c gemm: C1 = A @ B1
-      at::native::cpublas::brgemm(
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ K,
-          /* lda   */ K,
-          /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N,
-          /* add_C */ false,
-          /* A     */ A,
-          /* B     */ B1,
-          /* C     */ C1);
+        // 1.c gemm: C1 = A @ B1
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B1,
+            /* C     */ C1);
 
-      // 1.d silu and mul
-      const int offset = offsets[mb];
-      silu_and_mul<scalar_t, BLOCK_N>(
-          ic1 + offset * N + nb * BLOCK_N,
-          C0,
-          C1,
-          m_size,
-          N);
+        // 1.d silu and mul
+        const int offset = offsets[mb];
+        silu_and_mul<scalar_t, BLOCK_N>(
+            ic1 + offset * N + nb * BLOCK_N,
+            C0,
+            C1,
+            m_size,
+            N);
+      } else {
+        // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+        const int offset = offsets[mb];
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B0    */ B0,
+            /* B1    */ B1,
+            /* C     */ ic1 + offset * N + nb * BLOCK_N,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ N);
+      }
     }
-    at::native::cpublas::brgemm_release();
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
+    }
   });
 
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
@@ -351,12 +626,17 @@ void fused_experts_kernel_impl(
     // we won't be using C1 for gemm2
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
 
+    bool is_brgemm_used = false;
+
     for (int i = begin; i < end; ++i) {
       int mb = i / NB2;
       int nb = i % NB2;
 
       int m_size = offsets[mb + 1] - offsets[mb];
       int n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
@@ -368,17 +648,30 @@ void fused_experts_kernel_impl(
       const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
 
       // 2.a gemm: C = A @ B
-      at::native::cpublas::brgemm(
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ IC,
-          /* lda   */ IC,
-          /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N,
-          /* add_C */ false,
-          /* A     */ A,
-          /* B     */ B,
-          /* C     */ C);
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C);
+      } else {
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N);
+      }
 
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
@@ -388,7 +681,10 @@ void fused_experts_kernel_impl(
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
     }
-    at::native::cpublas::brgemm_release();
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
+    }
   });
 
   // stage 3: out = intermediate_cache2.sum(dim=1)

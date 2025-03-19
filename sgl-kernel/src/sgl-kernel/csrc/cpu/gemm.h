@@ -16,6 +16,13 @@ constexpr int block_size_n() { return 2 * TILE_N; }
 //template <> constexpr int vnni_blk<at::Half>() { return 2; }
 //template <> constexpr int vnni_blk<int8_t>() { return 4; }
 
+// define threshold using brgemm (intel AMX)
+template <typename T> inline bool can_use_brgemm(int M);
+template <> inline bool can_use_brgemm<at::BFloat16>(int M) { return M > 4; }
+template <> inline bool can_use_brgemm<at::Half>(int M) { return true; }
+// TODO: add u8s8 brgemm, this requires PyTorch 2.7
+template <> inline bool can_use_brgemm<int8_t>(int M) { return false; }
+
 // work around compiler internal error
 #define BLOCK_K 128 // 4 * TILE_K
 
