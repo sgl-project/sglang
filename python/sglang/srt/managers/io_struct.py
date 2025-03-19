@@ -103,6 +103,8 @@ class GenerateReqInput:
                 self.batch_size = len(self.text)
             self.input_embeds = None
         elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
@@ -538,7 +540,8 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    # List containing one serialized Dict[str, torch.Tensor] per TP worker
+    serialized_named_tensors: List[bytes]
     load_format: Optional[str]
     flush_cache: bool
 
@@ -723,3 +726,15 @@ class SeparateReasoningReqInput:
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None
+
+
+@dataclass
+class RpcReqInput:
+    method: str
+    parameters: Optional[Dict] = None
+
+
+@dataclass
+class RpcReqOutput:
+    success: bool
+    message: str

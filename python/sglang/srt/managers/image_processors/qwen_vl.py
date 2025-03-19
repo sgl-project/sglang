@@ -25,7 +25,6 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
 
     @staticmethod
@@ -73,10 +72,10 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_images(
-            input_ids,
-            image_data,
-            image_token,
-            max_req_input_len,
+            input_ids=input_ids,
+            image_data=image_data,
+            image_token=image_token,
+            max_req_input_len=max_req_input_len,
         )
 
         def smart_resize(
