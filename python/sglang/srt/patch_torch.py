@@ -14,12 +14,11 @@
 from typing import Callable
 
 import torch
+from torch.multiprocessing import reductions
 
 
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
-
-    from torch.multiprocessing import reductions
 
     if hasattr(reductions, "_reduce_tensor_original"):
         return
@@ -39,16 +38,14 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
 def _reduce_tensor_modified(*args, **kwargs):
-    fn, args = (
-        torch.multiprocessing.reductions._reduce_tensor_original(*args, **kwargs)
-    )
+    fn, args = reductions._reduce_tensor_original(*args, **kwargs)
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
     return fn, args
 
 
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_uuid)
-    return torch.multiprocessing.reductions._rebuild_cuda_tensor_original(*args)
+    return reductions._rebuild_cuda_tensor_original(*args)
 
 
 def _device_to_uuid(device: int) -> str:
