@@ -8,16 +8,6 @@ import unittest
 from multiprocessing import Process
 
 import torch
-from sglang.srt.entrypoints.verl_engine import VerlEngine
-from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import is_port_available
-from sglang.test.runners import (
-    HFRunner,
-    SRTRunner,
-    check_close_model_outputs,
-    get_dtype_str,
-)
-from sglang.test.test_utils import is_in_ci
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -28,6 +18,17 @@ from torch.distributed.fsdp.api import (
     StateDictType,
 )
 from transformers import AutoModelForCausalLM
+
+from sglang.srt.entrypoints.verl_engine import VerlEngine
+from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils import is_port_available
+from sglang.test.runners import (
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+    get_dtype_str,
+)
+from sglang.test.test_utils import is_in_ci
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -286,11 +287,13 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
 
 def _execute_async_generate(engine):
     loop = asyncio.get_event_loop()
-    output = loop.run_until_complete(engine.async_generate(
-        prompt=_PROMPTS,
-        sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS, temperature=0.0),
-    ))
-    assert output.startswith('6'), f'{output=}'
+    output = loop.run_until_complete(
+        engine.async_generate(
+            prompt=_PROMPTS,
+            sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS, temperature=0.0),
+        )
+    )
+    assert output.startswith("6"), f"{output=}"
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code

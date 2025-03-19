@@ -12,14 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 import os
-from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DeviceMesh, DTensor
+
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.server import Engine
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
-from torch.distributed.tensor import DeviceMesh, DTensor
 
 
 class VerlEngine:
@@ -130,7 +131,7 @@ class VerlEngine:
                 stream=stream,
             )
         else:
-            raise Exception('`async_generate` should only be called from tp_rank 0')
+            raise Exception("`async_generate` should only be called from tp_rank 0")
 
     def update_weights_from_tensor(
         self,
