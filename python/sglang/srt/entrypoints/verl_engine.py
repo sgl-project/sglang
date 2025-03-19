@@ -16,11 +16,10 @@ from typing import Dict, List, Optional, Tuple, Union, AsyncIterator
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DeviceMesh, DTensor
-
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.server import Engine
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
+from torch.distributed.tensor import DeviceMesh, DTensor
 
 
 class VerlEngine:
@@ -117,7 +116,7 @@ class VerlEngine:
         Please refer to `GenerateReqInput` for the documentation.
         """
         if self._tp_rank == 0:
-            return self._engine.async_generate(
+            return await self._engine.async_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 input_ids=input_ids,
