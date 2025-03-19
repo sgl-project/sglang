@@ -38,9 +38,9 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
 def _reduce_tensor_modified(*args, **kwargs):
-    fn, args = reductions._reduce_tensor_original(*args, **kwargs)
-    args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
-    return fn, args
+    output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+    output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
+    return output_fn, output_args
 
 
 def _rebuild_cuda_tensor_modified(*args):
