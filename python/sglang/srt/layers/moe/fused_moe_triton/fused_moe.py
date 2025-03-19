@@ -97,7 +97,6 @@ def fused_moe_kernel_gptq_awq(
         stride_bze,
         stride_bzk,
         stride_bzn,
-        block_k_diviable: tl.constexpr,
         group_size: tl.constexpr,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr,
@@ -109,7 +108,9 @@ def fused_moe_kernel_gptq_awq(
         compute_type: tl.constexpr,
         has_zp: tl.constexpr,
         use_int4_w4a16: tl.constexpr,
-        use_int8_w8a16: tl.constexpr):
+        use_int8_w8a16: tl.constexpr,
+        even_Ks: tl.constexpr,
+):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -204,7 +205,7 @@ def fused_moe_kernel_gptq_awq(
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
 
-        if not block_k_diviable:
+        if not even_Ks:
             k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
             k_other = 0.0
         else:
@@ -823,7 +824,6 @@ def invoke_fused_moe_kernel(
             B_zp.stride(0) if B_zp is not None else 0,
             B_zp.stride(2) if B_zp is not None else 0,
             B_zp.stride(1) if B_zp is not None else 0,
-            block_k_diviable=A.shape[1] % config["BLOCK_SIZE_K"] == 0,
             group_size=block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
@@ -831,6 +831,7 @@ def invoke_fused_moe_kernel(
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
+            even_Ks=even_Ks,
             **config,
         )
 

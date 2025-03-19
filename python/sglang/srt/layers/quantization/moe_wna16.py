@@ -18,7 +18,6 @@ from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from sglang.srt.utils import set_weight_attrs
-from sglang.srt.utils import is_cuda
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
