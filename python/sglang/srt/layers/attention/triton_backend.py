@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -63,6 +64,19 @@ def get_num_kv_splits_triton(
     tl.store(num_kv_splits_ptr + offs_b, num_kv_splits, mask=mask_b)
 
 
+@dataclass
+class ForwardMetadata:
+    attn_logits: torch.Tensor
+    attn_lse: torch.Tensor
+    max_extend_len: int
+    num_kv_splits: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    qo_indptr: torch.Tensor
+    custom_mask: torch.Tensor
+    mask_indptr: torch.Tensor
+
+
 class TritonAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -117,7 +131,7 @@ class TritonAttnBackend(AttentionBackend):
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
-        self.forward_metadata = None
+        self.forward_metadata: ForwardMetadata = None
 
         self.max_context_len = model_runner.model_config.context_len
 
@@ -174,27 +188,16 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
-            attn_logits = [
-                torch.empty(
-                    (
-                        bs,
-                        self.num_head,
-                        self.max_kv_splits,
-                        self.v_head_dim,
-                    ),
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                torch.empty(
-                    (
-                        bs,
-                        self.num_head,
-                        self.max_kv_splits,
-                    ),
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-            ]
+            attn_logits = torch.empty(
+                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            attn_lse = torch.empty(
+                (bs, self.num_head, self.max_kv_splits),
+                dtype=torch.float32,
+                device=self.device,
+            )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
             num_kv_heads = self.num_head
@@ -244,6 +247,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
+            attn_lse = None
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -257,6 +261,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = torch.max(spec_info.accept_length).item()
             num_kv_splits = None
             attn_logits = None
+            attn_lse = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -283,11 +288,13 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             attn_logits = None
+            attn_lse = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
             num_kv_splits = None
 
-        self.forward_metadata = (
+        self.forward_metadata = ForwardMetadata(
             attn_logits,
+            attn_lse,
             max_extend_len,
             num_kv_splits,
             kv_indptr,
@@ -300,18 +307,16 @@ class TritonAttnBackend(AttentionBackend):
     def init_cuda_graph_state(
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
     ):
-        self.cuda_graph_attn_logits = [
-            torch.zeros(
-                (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            torch.zeros(
-                (max_bs, self.num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            ),
-        ]
+        self.cuda_graph_attn_logits = torch.zeros(
+            (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_attn_lse = torch.zeros(
+            (max_bs, self.num_head, self.max_kv_splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
         self.cuda_graph_num_kv_splits = torch.full(
             (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
@@ -362,6 +367,7 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             attn_logits = self.cuda_graph_attn_logits
+            attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
             qo_indptr = None
@@ -396,13 +402,15 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
+            attn_lse = None
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
             )
 
-        self.forward_metadata = (
+        self.forward_metadata = ForwardMetadata(
             attn_logits,
+            attn_lse,
             max_extend_len,
             num_kv_splits,
             kv_indptr,
@@ -502,17 +510,6 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        (
-            _,
-            max_extend_len,
-            _,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-        ) = self.forward_metadata
-
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -520,12 +517,12 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            custom_mask,
-            mask_indptr,
-            max_extend_len,
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.custom_mask,
+            self.forward_metadata.mask_indptr,
+            self.forward_metadata.max_extend_len,
             layer.scaling,
             layer.logit_cap,
         )
@@ -550,10 +547,6 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        attn_logits, _, num_kv_splits, kv_indptr, kv_indices, _, _, _ = (
-            self.forward_metadata
-        )
-
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -564,10 +557,11 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            num_kv_splits,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.attn_logits,
+            self.forward_metadata.attn_lse,
+            self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
             layer.logit_cap,
