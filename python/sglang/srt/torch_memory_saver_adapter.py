@@ -1,5 +1,8 @@
+import logging
 from abc import ABC
 from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
 
 try:
     import torch_memory_saver
@@ -15,6 +18,13 @@ class TorchMemorySaverAdapter(ABC):
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
+
+    def check_validity(self, func_name):
+        if not self.enabled:
+            logger.warning(
+                f'`{func_name}` will not save memory because torch_memory_saver is not enabled. '
+                f'Potential causes: `enable_memory_saver` is false, or torch_memory_saver has installation issues.'
+            )
 
     def configure_subprocess(self):
         raise NotImplementedError
