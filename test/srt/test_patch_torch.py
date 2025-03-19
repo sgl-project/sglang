@@ -9,7 +9,11 @@ import torch.multiprocessing as mp
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
-        self._test_monkey_patch_torch_reductions_core()
+        for params in [
+            dict(),
+        ]:
+            with self.subTest(f'{params=}'):
+                self._test_monkey_patch_torch_reductions_core(**params)
 
     def _test_monkey_patch_torch_reductions_core(self):
         print(f'test_monkey_patch_torch_reductions_core {os.environ.get("CUDA_VISIBLE_DEVICES")=}')
