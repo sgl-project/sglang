@@ -138,13 +138,12 @@ class TestEvalFP8ModelOptQuantAccuracy(unittest.TestCase):
     def test_mmlu_offline_only(self):
         """Test with offline quantization only."""
         self._run_test(
-            # model=DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
-            model="/shared/user/yudai/models/local_models/nvidia/Llama-3.1-8B-Instruct-FP8",
+            model=DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
             other_args=[
                 "--quantization",
                 "modelopt",
-                # "revision",
-                # DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION,
+                "revision",
+                DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION,
             ],
             expected_score=0.64,
         )
