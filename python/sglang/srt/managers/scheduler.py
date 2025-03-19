@@ -1783,6 +1783,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
