@@ -336,6 +336,7 @@ void grouped_topk_cpu(
       case 32:  LAUNCH_GROUPED_TOPK_KERNEL(32);  break;
       case 64:  LAUNCH_GROUPED_TOPK_KERNEL(64);  break;
       case 128: LAUNCH_GROUPED_TOPK_KERNEL(128); break;
+      case 160: LAUNCH_GROUPED_TOPK_KERNEL(160); break;
       case 256: LAUNCH_GROUPED_TOPK_KERNEL(256); break;
       default: TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
