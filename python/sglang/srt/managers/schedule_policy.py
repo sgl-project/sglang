@@ -60,6 +60,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    LGPM = "lgpm"  # longest global prefix match
 
 
 class CacheAgnosticPolicy(Enum):
@@ -110,6 +111,8 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.LGPM:
+                SchedulePolicy._sort_by_longest_global_prefix(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -208,6 +211,19 @@ class SchedulePolicy:
                 else float("inf")
             )
         )
+
+    def _sort_by_longest_global_prefix(waiting_queue: List[Req]) -> None:
+        """Sorts the waiting queue based on the longest prefix match."""
+
+        def get_global_prefix_len(r):
+            length = len(r.prefix_indices)
+            node = r.last_node_global
+            while node is not r.last_node:
+                length += len(node.host_value)
+                node = node.parent
+            return length
+
+        waiting_queue.sort(key=lambda r: -get_global_prefix_len(r))
 
     @staticmethod
     def _sort_by_dfs_weight(

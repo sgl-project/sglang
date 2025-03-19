@@ -36,6 +36,8 @@ class HiRadixCache(RadixCache):
             raise ValueError(
                 "Page size larger than 1 is not yet supported in HiRadixCache."
             )
+        if hicache_oracle:
+            hicache_ratio += 1.0
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
