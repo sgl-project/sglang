@@ -5,7 +5,6 @@
 #include <cuda_bf16.h>
 #include <torch/all.h>
 
-
 __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   uint4 result;
@@ -55,7 +54,8 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
 
   return result;
 #else
-  assert(false);
+  printf("BF16 requires arch >= sm_90");
+  asm("trap;");
   return {};
 #endif
 }
@@ -88,8 +88,8 @@ __global__ void __launch_bounds__(256) dequantize_weights_bf16(
   __nv_bfloat16* output_ptr = output + 8 * col + 8 * row * qweight_cols;
   *(uint4*)output_ptr = weight_bf16;
 #else
-  assert(false);
-  return {};
+  printf("BF16 requires arch >= sm_90");
+  asm("trap;");
 #endif
 }
 
@@ -153,7 +153,7 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 
   return result;
 #else
-  assert(false);
+  throw std::runtime_error("FP16 requires arch >= sm_75");
   return {};
 #endif
 }
@@ -215,7 +215,6 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
     dequantize_weights_fp16<<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols);
   }
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   else if(scales.scalar_type() == at::ScalarType::BFloat16){
     auto _qweight = reinterpret_cast<int*>(qweight.data_ptr<int>());
     auto _zeros = reinterpret_cast<int*>(qzeros.data_ptr<int>());
@@ -230,9 +229,8 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
     dequantize_weights_bf16<<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols);
   }
-#endif
   else{
-    assert(false);
+    throw std::runtime_error("Unsupported types");
   }
 
   return output;
