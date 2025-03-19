@@ -3,7 +3,7 @@ import unittest
 
 import sglang as sgl
 import torch
-from sglang.python.sglang.srt import torch_memory_saver_adapter
+from sglang.srt import torch_memory_saver_adapter
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 from transformers import AutoModelForCausalLM
 
@@ -12,6 +12,17 @@ _DEBUG_EXTRA = True
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
+    def test_release_and_resume_occupation_when_disabled(self):
+        engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, enable_memory_saver=False)
+
+        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
+            engine.release_memory_occupation()
+            self.assertEqual(cm.output, ['TODO'])
+
+        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
+            engine.resume_memory_occupation()
+            self.assertEqual(cm.output, ['TODO'])
+
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
@@ -83,17 +94,6 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             time.sleep(4)
 
         engine.shutdown()
-
-    def test_release_and_resume_occupation_when_disabled(self):
-        engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, enable_memory_saver=False)
-
-        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
-            engine.release_memory_occupation()
-            self.assertEqual(cm.output, ['TODO'])
-
-        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
-            engine.resume_memory_occupation()
-            self.assertEqual(cm.output, ['TODO'])
 
 
 def _try_allocate_big_tensor(size: int = 20_000_000_000):
