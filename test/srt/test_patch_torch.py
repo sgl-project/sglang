@@ -106,17 +106,18 @@ def _run_subprocess(
         monkey_patch_torch_reductions()
 
     try:
-        match role:
-            case "sender":
-                tensor = torch.tensor([1.0, 2.0], device=f"cuda:{tensor_device}")
-                print(f"sender queue.put {tensor=} {tensor.device=}")
-                queue.put(tensor)
-                assert queue.get() == "done"
-            case "receiver":
-                tensor = queue.get()
-                print(f"receiver queue.get {tensor=} {tensor.device=}")
-                assert str(tensor.device) == f"cuda:{tensor_device}"
-                queue.put("done")
+        if role == "sender":
+            tensor = torch.tensor([1.0, 2.0], device=f"cuda:{tensor_device}")
+            print(f"sender queue.put {tensor=} {tensor.device=}")
+            queue.put(tensor)
+            assert queue.get() == "done"
+        elif role == "receiver":
+            tensor = queue.get()
+            print(f"receiver queue.get {tensor=} {tensor.device=}")
+            assert str(tensor.device) == f"cuda:{tensor_device}"
+            queue.put("done")
+        else:
+            raise NotImplementedError
 
         execution_ok = True
     except Exception as e:
