@@ -207,8 +207,9 @@ class LoRAMemoryPool:
                         temp_B_buffer[weight_name] = module.slice_lora_b_weights(
                             temp_B_buffer[weight_name], self.tp_rank
                         )
-            c = get_stacked_multiply(lora_weight_name)
+
             for name, weights in temp_A_buffer.items():
+                c = get_stacked_multiply(name)
                 self.A_buffer[name][layer_id][buffer_id][: lora_rank * c, :].copy_(
                     weights
                 )
