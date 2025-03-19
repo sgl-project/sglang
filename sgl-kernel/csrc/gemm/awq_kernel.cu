@@ -10,9 +10,7 @@
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;
-  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-               : "=r"(res)
-               : "r"(a), "r"(b), "r"(c), "n"(lut));
+  asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n" : "=r"(res) : "r"(a), "r"(b), "r"(c), "n"(lut));
   return res;
 }
 
@@ -86,7 +84,7 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
   uint32_t const i4s = source;
 
-  // 定义掩码和常量
+  // Define masks and constants
   static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t EX = 0x43004300;
   static constexpr uint32_t MUL = 0x3F803F80;
@@ -98,18 +96,22 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   int hi1 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 12, MASK, EX);
 
   nv_bfloat162* res = reinterpret_cast<nv_bfloat162*>(h);
-  res[0] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo0),
-                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
-                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
-  res[1] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi0),
-                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
-                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
-  res[2] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo1),
-                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
-                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
-  res[3] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi1),
-                   *reinterpret_cast<const nv_bfloat162*>(&MUL),
-                   *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[0] = __hfma2(
+      *reinterpret_cast<nv_bfloat162*>(&lo0),
+      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[1] = __hfma2(
+      *reinterpret_cast<nv_bfloat162*>(&hi0),
+      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[2] = __hfma2(
+      *reinterpret_cast<nv_bfloat162*>(&lo1),
+      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  res[3] = __hfma2(
+      *reinterpret_cast<nv_bfloat162*>(&hi1),
+      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+      *reinterpret_cast<const nv_bfloat162*>(&ADD));
 
   return result;
 #else
@@ -118,30 +120,23 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
 #endif
 }
 
-template <typename ScaleT, typename OutputT>
+template <typename OutputT>
 __global__ void __launch_bounds__(256) dequantize_weights(
     int* __restrict__ qweight,
-    ScaleT* __restrict__ scales,
+    OutputT* __restrict__ scales,
     int* __restrict__ qzeros,
     OutputT* __restrict__ output,
     int group_size,
     int qweight_cols) {
-  // qweights - [R     , C // 8], int32
-  // scales   - [R // G, C     ], half/bfloat16
-  // zeros    - [R // G, C // 8], int32
-
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
-
-//   if (col >= qweight_cols || row >= blockDim.y * gridDim.y)
-//     return;
 
   int group_idx = row / group_size;
   int scale_offset = 8 * col + group_idx * qweight_cols * 8;
   uint4 loaded_scale = *(uint4*)(scales + scale_offset);
 
   // Handle different data types
-  if constexpr (std::is_same<ScaleT, half>::value) {
+  if constexpr (std::is_same<OutputT, half>::value) {
     // FP16 path
     uint4 zeros = dequantize_s4_to_fp16x2(qzeros[col + group_idx * qweight_cols]);
     uint4 weight_fp16 = dequantize_s4_to_fp16x2(qweight[col + row * qweight_cols]);
@@ -158,30 +153,26 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 
     OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
     *(uint4*)output_ptr = weight_fp16;
-  } else if constexpr (std::is_same<ScaleT, __nv_bfloat16>::value) {
-    // BF16 path
-    nv_bfloat162 weight[4];
-    nv_bfloat162 zeros[4];
-    weight= dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols], weight);
-    zeros = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols], zeros);
+  } else if constexpr (std::is_same<OutputT, __nv_bfloat16>::value) {
+    uint4 weight_raw = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
+    uint4 zero_raw = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols]);
+    uint4 scale_raw = *reinterpret_cast<uint4*>(scales + scale_offset);
 
-    nv_bfloat162* scales_bf16 = reinterpret_cast<nv_bfloat162*>(&loaded_scale);
+    // Vectorized processing (each uint4 contains 4 nv_bfloat162)
+    nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_raw);
+    nv_bfloat162* zero_vec = reinterpret_cast<nv_bfloat162*>(&zero_raw);
+    nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale_raw);
 
-    // Dequantize weights: (weight - zero) * scale
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      // Subtract zeros from weights
-      weight[i].x = __hsub(weight[i].x, zeros[i].x);
-      weight[i].y = __hsub(weight[i].y, zeros[i].y);
-      
-      // Multiply by scales
-      weight[i].x = __hmul(weight[i].x, scales_bf16[i].x);
-      weight[i].y = __hmul(weight[i].y, scales_bf16[i].y);
+// Single instruction dual-channel operation
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
+      weight_vec[i] = __hmul2(__hsub2(weight_vec[i], zero_vec[i]), scale_vec[i]);
     }
 
-    // Store results efficiently using uint4
+    // Directly store to OutputT array (guaranteed contiguous memory)
     OutputT* output_ptr = output + 8 * col + row * qweight_cols * 8;
-    *(uint4*)output_ptr = *(uint4*)weight;
+    static_assert(sizeof(uint4) == 8 * sizeof(OutputT), "Memory layout mismatch");
+    *reinterpret_cast<uint4*>(output_ptr) = weight_raw;
   }
 }
 
@@ -207,17 +198,16 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
   dim3 threads_per_block(x_num_threads, y_num_threads);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-
-  if(scales.scalar_type() == at::ScalarType::Half) {
+  if (scales.scalar_type() == at::ScalarType::Half) {
     auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
     auto _output = reinterpret_cast<half*>(output.data_ptr<at::Half>());
-    dequantize_weights<half><<<num_blocks, threads_per_block, 0, stream>>>(
-        _qweight, _scales, _zeros, _output, group_size, qweight_cols);
+    dequantize_weights<half>
+        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols);
   } else {
     auto _scales = reinterpret_cast<__nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
     auto _output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
-    dequantize_weights<__nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
-        _qweight, _scales, _zeros, _output, group_size, qweight_cols);
+    dequantize_weights<__nv_bfloat16>
+        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols);
   }
 
   return output;
