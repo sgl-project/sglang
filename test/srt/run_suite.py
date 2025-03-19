@@ -176,7 +176,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin: args.range_end]
+        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 

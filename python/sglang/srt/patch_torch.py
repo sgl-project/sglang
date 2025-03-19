@@ -39,7 +39,9 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
+    output_args = _modify_tuple(
+        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+    )
     return output_fn, output_args
 
 
@@ -62,8 +64,8 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
                 return device
         raise Exception("Invalid device_uuid=" + device_maybe_uuid)
 
-    raise Exception(f'Unknown type: {device_maybe_uuid=}')
+    raise Exception(f"Unknown type: {device_maybe_uuid=}")
 
 
 def _modify_tuple(t, index: int, modifier: Callable):
-    return *t[:index], modifier(t[index]), *t[index + 1:]
+    return *t[:index], modifier(t[index]), *t[index + 1 :]
