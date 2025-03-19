@@ -19,8 +19,8 @@ class TorchMemorySaverAdapter(ABC):
     def check_validity(self, caller_name):
         if not self.enabled:
             print(
-                f'`{caller_name}` will not save memory because torch_memory_saver is not enabled. '
-                f'Potential causes: `enable_memory_saver` is false, or torch_memory_saver has installation issues.'
+                f"`{caller_name}` will not save memory because torch_memory_saver is not enabled. "
+                f"Potential causes: `enable_memory_saver` is false, or torch_memory_saver has installation issues."
             )
 
     def configure_subprocess(self):
