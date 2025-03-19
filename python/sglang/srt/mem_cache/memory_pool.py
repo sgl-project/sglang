@@ -582,8 +582,9 @@ class HostKVCache(abc.ABC):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
-        device: str = "cpu",
+        pin_memory: bool,
+        device: str,
+        page_size: int,
     ):
         assert (
             host_to_device_ratio >= 1
@@ -594,8 +595,11 @@ class HostKVCache(abc.ABC):
         self.host_to_device_ratio = host_to_device_ratio
         self.pin_memory = pin_memory
         self.device = device
+        self.page_size = page_size
 
         self.size = int(device_pool.size * host_to_device_ratio)
+        # Align the host memory pool size to the page size
+        self.size = self.size - (self.size % self.page_size)
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
 
@@ -748,10 +752,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        pin_memory: bool = True,
         device: str = "cpu",
+        page_size: int = 32,
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -784,16 +791,50 @@ class MHATokenToKVPoolHost(HostKVCache):
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, :, indices] = flat_data
 
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        for i in range(0, len(host_indices), self.page_size):
+            h_index = host_indices[i]
+            d_index = device_indices[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.get_key_buffer(j)[d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.get_value_buffer(j)[d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        for i in range(0, len(host_indices), self.page_size):
+            h_index = host_indices[i]
+            d_index = device_indices[i]
+            device_pool.get_key_buffer(layer_id)[
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[0, layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )
+            device_pool.get_value_buffer(layer_id)[
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[1, layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )
+
 
 class MLATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
-        pin_memory: bool = False,  # no need to use pin memory with the double buffering
+        pin_memory: bool = True,
         device: str = "cpu",
+        page_size: int = 32,
     ):
-        super().__init__(device_pool, host_to_device_ratio, pin_memory, device)
+        super().__init__(
+            device_pool, host_to_device_ratio, pin_memory, device, page_size
+        )
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
@@ -830,3 +871,24 @@ class MLATokenToKVPoolHost(HostKVCache):
 
     def assign_flat_data(self, indices, flat_data):
         self.kv_buffer[:, indices] = flat_data
+
+    def write_page_all_layers(self, host_indices, device_indices, device_pool):
+        for i in range(0, len(host_indices), self.page_size):
+            h_index = host_indices[i]
+            d_index = device_indices[i]
+            for j in range(self.layer_num):
+                self.kv_buffer[j, h_index : h_index + self.page_size].copy_(
+                    device_pool.get_key_buffer(j)[d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
+
+    def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
+        for i in range(0, len(host_indices), self.page_size):
+            h_index = host_indices[i]
+            d_index = device_indices[i]
+            device_pool.get_key_buffer(layer_id)[
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[layer_id, h_index : h_index + self.page_size],
+                non_blocking=True,
+            )
