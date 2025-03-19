@@ -15,7 +15,10 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             with self.subTest(f'{params=}'):
                 self._test_monkey_patch_torch_reductions_core(**params)
 
-    def _test_monkey_patch_torch_reductions_core(self):
+    def _test_monkey_patch_torch_reductions_core(
+        self,
+
+    ):
         print(f'test_monkey_patch_torch_reductions_core {os.environ.get("CUDA_VISIBLE_DEVICES")=}')
         cuda_visible_devices_list: List[int] = \
             [int(x) for x in os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3,4,5,6,7').split(',')]
@@ -23,11 +26,15 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         queue = mp.Queue()
-        for rank in range(2):
+        for role in ['sender', 'receiver']:
             os.environ['CUDA_VISIBLE_DEVICES'] = TODO
             p = mp.Process(
                 target=_run_subprocess,
-                kwargs=dict(rank=rank, queue=queue, output_writer=output_writer),
+                kwargs=dict(
+                    role=role,
+                    queue=queue,
+                    output_writer=output_writer
+                ),
             )
             p.start()
             processes.append(p)
@@ -39,20 +46,21 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(rank: int, queue: mp.Queue, output_writer):
-    print(f'subprocess[{rank}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
+def _run_subprocess(role: str, queue: mp.Queue, output_writer):
+    print(f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
 
     try:
-        if rank == 0:
-            tensor = torch.tensor([1.0, 2.0], device=f'cuda:{TODO}')
-            queue.put(tensor)
-        else:
-            tensor = queue.get()
-            assert tensor.device == f'cuda:{TODO}'
+        match role:
+            case 'sender':
+                tensor = torch.tensor([1.0, 2.0], device=f'cuda:{TODO}')
+                queue.put(tensor)
+            case 'receiver':
+                tensor = queue.get()
+                assert tensor.device == f'cuda:{TODO}'
 
         execution_ok = True
     except Exception as e:
-        print(f"subprocess[{rank}] has error: {e}", flush=True)
+        print(f"subprocess[{role}] has error: {e}", flush=True)
         traceback.print_exc()
         execution_ok = False
 
