@@ -5,8 +5,7 @@ from typing import List, Dict
 
 import torch
 import torch.multiprocessing as mp
-
-from synced_gitignored.sglang.python.sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.python.sglang.srt.patch_torch import monkey_patch_torch_reductions
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
