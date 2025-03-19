@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Callable
 
 import torch
 
@@ -68,3 +69,7 @@ def _device_from_uuid(device_uuid: str) -> int:
         if str(torch.cuda.get_device_properties(device).uuid) == device_uuid:
             return device
     raise Exception("Invalid device_uuid=" + device_uuid)
+
+
+def _modify_tuple(t, index: int, modifier: Callable):
+    return *t[:index], modifier(t[index]), *t[index:]
