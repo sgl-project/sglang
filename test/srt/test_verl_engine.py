@@ -7,17 +7,6 @@ import unittest
 from multiprocessing import Process
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import CPUOffload
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.api import (
-    ShardedStateDictConfig,
-    ShardingStrategy,
-    StateDictType,
-)
-from transformers import AutoModelForCausalLM
-
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import is_port_available
@@ -28,6 +17,16 @@ from sglang.test.runners import (
     get_dtype_str,
 )
 from sglang.test.test_utils import is_in_ci
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.fsdp.api import (
+    ShardedStateDictConfig,
+    ShardingStrategy,
+    StateDictType,
+)
+from transformers import AutoModelForCausalLM
 
 _MAX_NEW_TOKENS = 8
 _PROMPTS = ["1+1=2, 1+2=3, 1+3=4, 1+4=5, 1+5=", "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="]
@@ -234,6 +233,9 @@ def _run_subprocess(
                 debug_text=f"{enable_batch=} {tp_rank=}",
             )
 
+        if tp_rank == 0:
+            _execute_async_generate(engine=engine)
+
         execution_ok = True
 
     except Exception as e:
@@ -279,6 +281,13 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
+
+
+def _execute_async_generate(engine):
+    output = engine.async_generate(
+        prompt=_PROMPTS,
+        sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS),
+    )
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
