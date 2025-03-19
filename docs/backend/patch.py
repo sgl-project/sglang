@@ -3,9 +3,10 @@ import weakref
 
 import nest_asyncio
 
+nest_asyncio.apply()
+
 from sglang.utils import execute_shell_command, reserve_port
 
-nest_asyncio.apply()
 DEFAULT_MAX_RUNNING_REQUESTS = 200
 DEFAULT_MAX_TOTAL_TOKENS = 20480
 
