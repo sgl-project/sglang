@@ -229,7 +229,7 @@ class TestTritonAttention(unittest.TestCase):
         total_tokens = B * seq_len
         sm_scale = 1.0 / (D**0.5)
         max_kv_splits = 8
-        num_kv_splits = torch.tensor(4, dtype=torch.int32, device="cuda")
+        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device="cuda")
 
         # q represents the new token being generated, one per batch
         q = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
@@ -292,7 +292,7 @@ class TestTritonAttention(unittest.TestCase):
         total_tokens = B * seq_len
         sm_scale = 1.0 / (D**0.5)
         max_kv_splits = 8
-        num_kv_splits = torch.tensor(4, dtype=torch.int32, device="cuda")
+        num_kv_splits = torch.full((B,), 4, dtype=torch.int32, device="cuda")
 
         # q represents the new token being generated, one per batch
         q = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
