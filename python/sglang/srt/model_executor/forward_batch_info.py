@@ -402,9 +402,16 @@ class ForwardBatch:
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
                             image_grid_thw=image_inputs.image_grid_thws,
+                            video_grid_thw=image_inputs.video_grid_thws,
+                            image_token_id=image_inputs.im_token_id,
+                            video_token_id=image_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
+                            vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
+                            seq_len=len(self.input_ids),
+                            second_per_grid_ts=image_inputs.second_per_grid_ts,
+                            tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta

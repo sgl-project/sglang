@@ -1008,7 +1008,7 @@ class FlashInferMultiStepDraftBackend:
         global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        kv_indices = torch.zeros(
+        kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
                 forward_batch.batch_size * self.topk * self.max_context_len,
