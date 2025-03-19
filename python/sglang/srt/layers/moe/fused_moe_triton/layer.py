@@ -18,7 +18,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    _process_weight_after_loading,
+    get_bool_env_var,
+    is_hip,
+    set_weight_attrs,
+)
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -115,6 +120,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+
+        _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
         return
 
     def apply(
@@ -236,18 +244,58 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
     ) -> torch.Tensor:
-        return moe_forward_native(
-            layer,
-            x,
-            use_grouped_topk,
-            top_k,
-            router_logits,
-            renormalize,
-            topk_group,
-            num_expert_group,
-            custom_routing_function,
-            correction_bias,
-        )
+        assert activation == "silu", f"activation = {activation} is not supported."
+
+        # TODO: rebase after #6441 lands
+        if layer.use_intel_amx_backend:
+        # if cpu_has_amx_support(): ---> #6441
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                True,  # inplace
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                None,  # w1_scale
+                None,  # w2_scale
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+        else:
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                apply_router_weight_on_input,
+                inplace,
+                no_combine,
+                routed_scaling_factor,
+            )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")

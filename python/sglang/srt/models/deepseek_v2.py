@@ -90,6 +90,7 @@ from sglang.srt.two_batch_overlap import (
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
+    PackWeightMethod,
     add_prefix,
     get_bool_env_var,
     get_int_env_var,
@@ -201,8 +202,17 @@ class MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
+        if self.use_intel_amx_backend:
+            return torch.ops.sgl_kernel.weight_packed_linear(
+                hidden_states,
+                self.weight,
+                None,  # bias
+                True,  # is_vnni
+            )
+
         logits = F.linear(hidden_states, self.weight, None)
         return logits
 
