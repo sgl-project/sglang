@@ -25,7 +25,7 @@ from sglang.test.test_utils import get_similarities
 TEXTS = "two Subway Series sandwiches with meats, cheese, lettuce, tomatoes, and onions on a black background, accompanied by the Subway Series logo, highlighting a new sandwich series."
 IMAGES = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild/resolve/main/images/023.jpg"
 MODELS = [
-    ("openai/clip-vit-large-patch14-336", 1, 1e-5),
+    ("openai/clip-vit-large-patch14-336", 1e-5),
 ]
 TORCH_DTYPES = [torch.float16]
 
