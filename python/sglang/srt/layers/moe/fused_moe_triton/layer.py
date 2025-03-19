@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import (
+    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_hip,
@@ -124,14 +125,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
-        layer.w13_weight = torch.nn.Parameter(
-            prepack_weight_if_needed(layer.w13_weight.data),
-            requires_grad=False,
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            prepack_weight_if_needed(layer.w2_weight.data),
-            requires_grad=False,
-        )
+        _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         return
 
@@ -265,7 +259,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if cpu_has_amx_support():
+        if layer.use_intel_amx_backend:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,

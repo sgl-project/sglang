@@ -2268,6 +2268,35 @@ def prepack_weight_if_needed(weight):
     return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
 
+def _process_weight_after_loading(module, weight_names) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    for weight_name in weight_names:
+        setattr(
+            module,
+            weight_name,
+            torch.nn.Parameter(
+                prepack_weight_if_needed(getattr(module, weight_name)),
+                requires_grad=False,
+            ),
+        )
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
+    )
+
+
+class PackWeightMethod:
+    def __init__(self, weight_names):
+        self.weight_names = weight_names
+
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names)
+
+
 class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator
