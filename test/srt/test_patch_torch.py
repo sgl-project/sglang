@@ -92,10 +92,12 @@ def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: in
                 tensor = torch.tensor([1.0, 2.0], device=f'cuda:{tensor_device}')
                 print(f'sender queue.put {tensor=} {tensor.device=}')
                 queue.put(tensor)
+                assert queue.get() == 'done'
             case 'receiver':
                 tensor = queue.get()
                 print(f'receiver queue.get {tensor=} {tensor.device=}')
                 assert tensor.device == f'cuda:{tensor_device}'
+                queue.put('done')
 
         execution_ok = True
     except Exception as e:
