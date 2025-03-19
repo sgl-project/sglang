@@ -23,7 +23,7 @@ class TestDataParallelism(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dp", "2"],
+            other_args=["--dp", 2],
         )
 
     @classmethod
@@ -52,7 +52,7 @@ class TestDataParallelism(unittest.TestCase):
         assert response.status_code == 200
 
         # pause a few seconds then send again
-        time.sleep(5)
+        time.sleep(1)
 
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
@@ -67,7 +67,7 @@ class TestDataParallelism(unittest.TestCase):
         response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200
 
-        time.sleep(5)
+        time.sleep(1)
 
         response = requests.get(self.base_url + "/get_server_info")
         assert response.status_code == 200

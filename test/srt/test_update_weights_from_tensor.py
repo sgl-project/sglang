@@ -44,6 +44,9 @@ class TestUpdateWeightsFromTensor(unittest.TestCase):
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:
+            if torch.cuda.device_count() < tp_size:
+                continue
+
             with self.subTest(tp_size=tp_size):
                 test_update_weights_from_tensor(tp_size)
 

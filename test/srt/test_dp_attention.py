@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDPAttention(unittest.TestCase):
+class TestDPAttentionDP2TP2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -59,7 +59,3 @@ class TestDPAttention(unittest.TestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
-
-
-if __name__ == "__main__":
-    unittest.main()
