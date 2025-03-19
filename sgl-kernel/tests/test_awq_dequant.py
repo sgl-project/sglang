@@ -6,6 +6,7 @@ import torch
 from sgl_kernel import awq_dequantize
 from vllm import _custom_ops as ops
 
+
 def reverse_awq_order(t: torch.Tensor):
     bits = 4
     AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
@@ -25,9 +26,9 @@ def reverse_awq_order(t: torch.Tensor):
 # qweights - [R     , C // 8], int32
 # scales   - [R // G, C     ], float16
 # zeros    - [R // G, C // 8], int32
-def awq_dequantize_torch(qweight: torch.Tensor, scales: torch.Tensor,
-                         qzeros: torch.Tensor,
-                         group_size: int) -> torch.Tensor:
+def awq_dequantize_torch(
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, group_size: int
+) -> torch.Tensor:
 
     if group_size == -1:
         group_size = qweight.shape[0]
@@ -35,13 +36,15 @@ def awq_dequantize_torch(qweight: torch.Tensor, scales: torch.Tensor,
     bits = 4
     shifts = torch.arange(0, 32, bits, device=qzeros.device)
 
-    iweights = torch.bitwise_right_shift(qweight[:, :, None],
-                                         shifts[None, None, :]).to(torch.int8)
+    iweights = torch.bitwise_right_shift(qweight[:, :, None], shifts[None, None, :]).to(
+        torch.int8
+    )
 
     iweights = iweights.view(iweights.shape[0], -1)
 
-    zeros = torch.bitwise_right_shift(qzeros[:, :, None],
-                                      shifts[None, None, :]).to(torch.int8)
+    zeros = torch.bitwise_right_shift(qzeros[:, :, None], shifts[None, None, :]).to(
+        torch.int8
+    )
     zeros = zeros.view(qzeros.shape[0], -1)
     zeros = reverse_awq_order(zeros)
 
@@ -53,6 +56,7 @@ def awq_dequantize_torch(qweight: torch.Tensor, scales: torch.Tensor,
     scales = scales.repeat_interleave(group_size, dim=0)
     zeros = zeros.repeat_interleave(group_size, dim=0)
     return (iweights - zeros) * scales
+
 
 def vllm_awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
@@ -70,14 +74,14 @@ def sglang_awq_dequantize(
     "qweight_row,qweight_col,is_bf16_act",
     list(
         itertools.product(
-            [3584, 18944, 128, 256, 512, 1024], [448, 576, 4736, 16, 32, 64, 128],[True, False]
+            [3584, 18944, 128, 256, 512, 1024],
+            [448, 576, 4736, 16, 32, 64, 128],
+            [True, False],
         )
     ),
 )
 def test_awq_dequant_compare_implementations(
-    qweight_row: int,
-    qweight_col: int,
-    is_bf16_act: bool
+    qweight_row: int, qweight_col: int, is_bf16_act: bool
 ):
     device = torch.device("cuda")
 
@@ -91,7 +95,7 @@ def test_awq_dequant_compare_implementations(
     group_size = qweight_row
     scales_row = qweight_row // group_size
     scales_col = qweight_col * 8
-    
+
     if is_bf16_act:
         scales = torch.rand(scales_row, scales_col, dtype=torch.bfloat16, device=device)
     else:
@@ -116,7 +120,10 @@ def test_awq_dequant_compare_implementations(
     )
     if not is_bf16_act:
         torch.testing.assert_close(
-            vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
+            vllm_out.to(torch.float32),
+            sglang_out.to(torch.float32),
+            rtol=1e-3,
+            atol=1e-5,
         )
 
 

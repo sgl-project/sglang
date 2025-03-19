@@ -90,10 +90,10 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   static constexpr uint32_t MUL = 0x3F803F80;
   static constexpr uint32_t ADD = 0xC300C300;
 
-  int lo0 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s, MASK, EX);
-  int hi0 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 4, MASK, EX);
-  int lo1 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 8, MASK, EX);
-  int hi1 = lop3 < (0xf0 & 0xcc) | 0xaa > (i4s >> 12, MASK, EX);
+  int lo0 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s, MASK, EX);
+  int hi0 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 4, MASK, EX);
+  int lo1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 8, MASK, EX);
+  int hi1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 12, MASK, EX);
 
   nv_bfloat162* res = reinterpret_cast<nv_bfloat162*>(h);
   res[0] = __hfma2(
