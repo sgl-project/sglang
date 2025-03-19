@@ -15,13 +15,13 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_release_and_resume_occupation_when_disabled(self):
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, enable_memory_saver=False)
 
-        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
-            engine.release_memory_occupation()
-            self.assertEqual(cm.output, ['TODO'])
-
-        with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
-            engine.resume_memory_occupation()
-            self.assertEqual(cm.output, ['TODO'])
+        for fn in [
+            engine.release_memory_occupation,
+            engine.resume_memory_occupation,
+        ]:
+            with self.assertLogs(torch_memory_saver_adapter.__name__, level='WARNING') as cm:
+                fn()
+                self.assertIn('will not save memory', cm.output[0])
 
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
