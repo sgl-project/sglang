@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.srt.cpu_utils import cpu_has_amx_support
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -40,6 +41,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.utils import dump_to_file
+
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 logger = logging.getLogger(__name__)
 
@@ -412,11 +416,17 @@ class LogitsProcessor(nn.Module):
             dp_gather(hidden_states, local_hidden_states, logits_metadata, "embedding")
 
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if lm_head.use_intel_amx_backend:
+                logits = sgl_kernel.cpu.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight, None
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
+            # TODO: use weight_packed_linear for GGUF models
             logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:
