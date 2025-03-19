@@ -1,7 +1,8 @@
 import logging
 from typing import Callable, List, Optional, Tuple
 
-# import torch
+import torch
+
 # TODO: use deep_gemm masked kernel after low latency dispatch
 # import deep_gemm
 # from deep_gemm import (
