@@ -83,15 +83,18 @@ def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: in
     print(f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
 
     if enable_patch:
+        print(f'subprocess[{role}] execute monkey_patch_torch_reductions', flush=True)
         monkey_patch_torch_reductions()
 
     try:
         match role:
             case 'sender':
                 tensor = torch.tensor([1.0, 2.0], device=f'cuda:{tensor_device}')
+                print(f'sender queue.put {tensor=} {tensor.device=}')
                 queue.put(tensor)
             case 'receiver':
                 tensor = queue.get()
+                print(f'receiver queue.get {tensor=} {tensor.device=}')
                 assert tensor.device == f'cuda:{tensor_device}'
 
         execution_ok = True
