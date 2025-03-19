@@ -257,7 +257,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        num_gpus = cuda_device_count_stateless()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -531,7 +531,10 @@ def load_image(image_file: Union[str, bytes]):
 
 
 def suppress_other_loggers():
-    from vllm.logger import logger as vllm_default_logger
+    try:
+        from vllm.logger import logger as vllm_default_logger
+    except ImportError:
+        return
 
     vllm_default_logger.setLevel(logging.WARN)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
@@ -620,11 +623,14 @@ def monkey_patch_p2p_access_check():
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.quantization.gguf import (
-        GGUFConfig,
-        GGUFEmbeddingMethod,
-        GGUFLinearMethod,
-    )
+    try:
+        from vllm.model_executor.layers.quantization.gguf import (
+            GGUFConfig,
+            GGUFEmbeddingMethod,
+            GGUFLinearMethod,
+        )
+    except ImportError:
+        return
 
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
