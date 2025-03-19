@@ -655,28 +655,3 @@ def vptq_gemm(
         bias,
     )
 
-
-def vptq_dequant(
-    indices: torch.Tensor,
-    codebooks: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_bias: torch.Tensor,
-    g_i_o: List[int],
-    res: torch.Tensor,
-    res_codebooks: torch.Tensor,
-    oi: torch.Tensor,
-    oc: torch.Tensor,
-    invperm: torch.Tensor,
-) -> torch.Tensor:
-    return torch.ops.sgl_kernels.vptq_dequant(
-        indices,
-        codebooks,
-        weight_scale,
-        weight_bias,
-        g_i_o,
-        res,
-        res_codebooks,
-        oi,
-        oc,
-        invperm,
-    )

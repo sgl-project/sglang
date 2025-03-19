@@ -3,7 +3,7 @@
 SGLang supports various quantization methods, including offline quantization and online dynamic quantization.
 
 Offline quantization loads pre-quantized model weights directly during inference. This is required for quantization methods
-such as GPTQ and AWQ, which collect and pre-compute various statistics from the original weights using the calibration dataset.
+such as GPTQ, AWQ and VPTQ, which collect and pre-compute various statistics from the original weights using the calibration dataset.
 
 Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime.
 Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors

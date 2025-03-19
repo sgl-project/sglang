@@ -58,6 +58,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt": ModelOptFp8Config,
     "gptq_marlin": GPTQMarlinConfig,
     "gptq": GPTQConfig,
+    "vptq": VPTQConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
 }
