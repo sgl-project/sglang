@@ -14,6 +14,7 @@
 """Fused operators for activation layers."""
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -22,7 +23,9 @@ import torch.nn.functional as F
 
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+_is_cuda = is_cuda_available()
+
+if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from sglang.srt.custom_op import CustomOp
@@ -70,6 +73,16 @@ class GeluAndMul(CustomOp):
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
+
+
+class NewGELU(CustomOp):
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
+        return self.forward_native(x)
 
 
 class QuickGELU(CustomOp):
@@ -154,7 +167,7 @@ def get_act_fn(
     return act_fn
 
 
-if not is_cuda_available():
+if not _is_cuda:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
+    BlockQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
@@ -27,7 +28,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -426,13 +426,14 @@ class ColumnParallelLinear(LinearBase):
         from sglang.srt.layers.parameter import _ColumnvLLMParameter
 
         if isinstance(param, _ColumnvLLMParameter):
-            # FIXME: why would we need this special case?
             param.load_column_parallel_weight(
                 loaded_weight,
                 tp_rank=self.tp_rank,
                 use_presharded_weights=self.use_presharded_weights,
             )
         else:
+            # FIXME: This branch is needed to load deepseek v3 awq.
+            # However, we should fix this and avoid the branching here.
             param.load_column_parallel_weight(loaded_weight)
 
     def forward(self, input_):
@@ -781,6 +782,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+        self.q_proj_shard_size = self.num_heads * self.head_size
+        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         input_size = self.hidden_size
         output_size = (
             (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size

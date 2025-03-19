@@ -40,22 +40,29 @@ class ModelConfig:
         trust_remote_code: bool = True,
         revision: Optional[str] = None,
         context_length: Optional[int] = None,
-        model_override_args: Optional[dict] = None,
+        model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        override_config_file: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
 
         # Parse args
+        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
         self.hf_config = get_config(
-            model_path,
+            self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
@@ -64,6 +71,9 @@ class ModelConfig:
             self.hf_config.architectures, is_embedding
         )
         self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
+        self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
+        self.is_audio_model = is_audio_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -71,7 +81,9 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"):
+                if get_bool_env_var(
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
@@ -123,6 +135,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -226,6 +243,7 @@ class ModelConfig:
             "compressed_tensors",
             "compressed-tensors",
             "fbgemm_fp8",
+            "w8a8_fp8",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -239,9 +257,11 @@ class ModelConfig:
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
+            "w8a8_fp8",
         ]
         compatible_quantization_methods = {
-            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
+            "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -304,6 +324,29 @@ class ModelConfig:
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         return eos_ids
 
+    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+        """
+        Pull the model config files to a temporary
+        directory in case of remote.
+
+        Args:
+            model: The model name or path.
+
+        """
+        from sglang.srt.connector import create_remote_connector
+        from sglang.srt.utils import is_remote_url
+
+        if is_remote_url(self.model_path):
+            logger.info("Pulling model configs from remote...")
+            # BaseConnector implements __del__() to clean up the local dir.
+            # Since config files need to exist all the time, so we DO NOT use
+            # with statement to avoid closing the client.
+            client = create_remote_connector(self.model_path)
+            if is_remote_url(self.model_path):
+                client.pull_files(allow_pattern=["*config.json"])
+                self.model_weights = self.model_path
+                self.model_path = client.get_local_dir()
+
 
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
@@ -324,6 +367,8 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+    if hasattr(config, "language_config"):
+        return config.language_config
     else:
         return config
 
@@ -353,9 +398,13 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type == "gemma2":
+                if config.model_type.startswith("gemma"):
+                    if config.model_type == "gemma":
+                        gemma_version = ""
+                    else:
+                        gemma_version = config.model_type[5]
                     logger.info(
-                        "For Gemma 2, we downcast float32 to bfloat16 instead "
+                        f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
                         "want to use float16."
                     )
@@ -394,7 +443,7 @@ def _get_and_verify_dtype(
 
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
-    # 1. Check the model architectue
+    # 1. Check the model architecture
     # 2. check the `is_embedding` server args
 
     if (
@@ -410,20 +459,43 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         return not is_embedding
 
 
+multimodal_model_archs = [
+    "LlavaLlamaForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaMistralForCausalLM",
+    "LlavaVidForCausalLM",
+    "Gemma3ForConditionalGeneration",
+    "Grok1VForCausalLM",
+    "Grok1AForCausalLM",
+    "MllamaForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
+    "DeepseekVL2ForCausalLM",
+]
+
+
 def is_multimodal_model(model_architectures: List[str]):
-    if (
-        "LlavaLlamaForCausalLM" in model_architectures
-        or "LlavaQwenForCausalLM" in model_architectures
-        or "LlavaMistralForCausalLM" in model_architectures
-        or "LlavaVidForCausalLM" in model_architectures
-        or "MllamaForConditionalGeneration" in model_architectures
-        or "Qwen2VLForConditionalGeneration" in model_architectures
-        or "Qwen2_5_VLForConditionalGeneration" in model_architectures
-        or "MiniCPMV" in model_architectures
+    if any(
+        multi_model_arch in model_architectures
+        for multi_model_arch in multimodal_model_archs
     ):
         return True
     else:
         return False
+
+
+def is_multimodal_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_image_gen_model(model_architectures: List[str]):
+    return False
+
+
+def is_audio_model(model_architectures: List[str]):
+    return False
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):

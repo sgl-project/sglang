@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
 class TestRetractDecode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_TEST_RETRACT"] = "1"
+
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -35,6 +38,21 @@ class TestRetractDecode(unittest.TestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
+
+
+class TestRetractDecodeChunkCache(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SGLANG_TEST_RETRACT"] = "1"
+
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--disable-radix-cache", "--chunked-prefill-size", 128],
+        )
 
 
 if __name__ == "__main__":

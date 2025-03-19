@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class TpModelWorkerClient:
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
         self.future_token_ids_map = torch.empty(
-            (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
+            (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
         )
 
         # Launch threads
@@ -100,8 +100,11 @@ class TpModelWorkerClient:
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
-            self.worker.model_runner.token_to_kv_pool,
+            self.worker.model_runner.token_to_kv_pool_allocator,
         )
+
+    def get_kv_cache(self):
+        return self.worker.model_runner.token_to_kv_pool
 
     def forward_thread_func(self):
         try:
@@ -112,7 +115,7 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGQUIT)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2
@@ -175,7 +178,7 @@ class TpModelWorkerClient:
                 logits_output.next_token_logprobs.tolist()
             )
             if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = (
+                logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
@@ -188,8 +191,7 @@ class TpModelWorkerClient:
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
-            scaling_penalties=sampling_info.scaling_penalties,
-            linear_penalties=sampling_info.linear_penalties,
+            penalizer_orchestrator=None,
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
@@ -204,7 +206,7 @@ class TpModelWorkerClient:
             -(self.future_token_ids_ct + 1),
             -(self.future_token_ids_ct + 1 + bs),
             -1,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.future_token_ids_ct = (

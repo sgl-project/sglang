@@ -16,6 +16,7 @@
 | [**Documentation**](https://docs.sglang.ai/)
 | [**Join Slack**](https://slack.sglang.ai/)
 | [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
+| [**Roadmap**](https://github.com/sgl-project/sglang/issues/4042)
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
 ## News
@@ -39,7 +40,7 @@ SGLang is a fast serving framework for large language models and vision language
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 The core features include:
 
-- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, jump-forward constrained decoding, overhead-free CPU scheduler, continuous batching, token attention (paged attention), tensor parallelism, FlashInfer kernels, chunked prefill, and quantization (FP8/INT4/AWQ/GPTQ).
+- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, continuous batching, token attention (paged attention), speculative decoding, tensor parallelism, chunked prefill, structured outputs, and quantization (FP8/INT4/AWQ/GPTQ).
 - **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
 - **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
@@ -55,11 +56,11 @@ The core features include:
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)
 
 ## Roadmap
-[Development Roadmap (2024 Q4)](https://github.com/sgl-project/sglang/issues/1487)
+[Development Roadmap (2025 H1)](https://github.com/sgl-project/sglang/issues/4042)
 
 ## Adoption and Sponsorship
 The project has been deployed to large-scale production, generating trillions of tokens every day.
-It is supported by the following institutions: AMD, Atlas Cloud, Baseten, Cursor, DataCrunch, Etched, Hyperbolic, Jam & Tea Studios, LinkedIn, LMSYS, Meituan, Nebius, Novita AI, NVIDIA, RunPod, Stanford, UC Berkeley, UCLA, xAI, and 01.AI.
+It is supported by the following institutions: AMD, Atlas Cloud, Baseten, Cursor, DataCrunch, Etched, Hyperbolic, Iflytek, Jam & Tea Studios, LinkedIn, LMSYS, Meituan, Nebius, Novita AI, NVIDIA, RunPod, Stanford, UC Berkeley, UCLA, xAI, and 01.AI.
 
 <img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
 
