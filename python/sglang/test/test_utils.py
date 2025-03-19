@@ -36,7 +36,7 @@ DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
 DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
     "nvidia/Llama-3.1-8B-Instruct-FP8"
 )
-# TODO(yundai424): right now specifing to an older revision since the latest one
+# TODO(yundai424): right now specifying to an older revision since the latest one
 #  carries kv cache quantization which doesn't work yet
 DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION = (
     "13858565416dbdc0b4e7a4a677fadfbd5b9e5bb9"
