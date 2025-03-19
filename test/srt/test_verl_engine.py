@@ -1,3 +1,4 @@
+import asyncio
 import multiprocessing
 import multiprocessing as mp
 import os
@@ -284,10 +285,13 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
 
 
 def _execute_async_generate(engine):
-    output = engine.async_generate(
+    loop = asyncio.get_event_loop()
+    output = loop.run_until_complete(engine.async_generate(
         prompt=_PROMPTS,
-        sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS),
-    )
+        sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS, temperature=0.0),
+    ))
+    print(f'{output=}', flush=True)
+    TODO
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
