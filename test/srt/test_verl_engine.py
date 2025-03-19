@@ -290,8 +290,7 @@ def _execute_async_generate(engine):
         prompt=_PROMPTS,
         sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS, temperature=0.0),
     ))
-    print(f'{output=}', flush=True)
-    TODO
+    assert output.startswith('6'), f'{output=}'
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
