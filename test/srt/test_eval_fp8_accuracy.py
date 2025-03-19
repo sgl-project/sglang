@@ -142,7 +142,7 @@ class TestEvalFP8ModelOptQuantAccuracy(unittest.TestCase):
             other_args=[
                 "--quantization",
                 "modelopt",
-                "revision",
+                "--revision",
                 DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION,
             ],
             expected_score=0.64,
