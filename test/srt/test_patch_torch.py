@@ -10,6 +10,8 @@ from sglang.srt.patch_torch import monkey_patch_torch_reductions
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
+        mp.set_start_method("spawn", force=True)
+
         for enable_patch in [False, True]:
             for params in [
                 # Same visible devices
