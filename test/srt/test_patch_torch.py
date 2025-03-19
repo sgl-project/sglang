@@ -3,6 +3,7 @@ import traceback
 import unittest
 from typing import List
 
+import torch
 import torch.multiprocessing as mp
 
 
@@ -36,8 +37,15 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
 def _run_subprocess(rank: int, queue: mp.Queue, output_writer):
     print(f'subprocess[{rank}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
+
     try:
-        TODO
+        if rank == 0:
+            tensor = torch.tensor([1.0, 2.0], device=f'cuda:{TODO}')
+            queue.put(tensor)
+        else:
+            tensor = queue.get()
+            assert tensor.device == f'cuda:{TODO}'
+
         execution_ok = True
     except Exception as e:
         print(f"subprocess[{rank}] has error: {e}", flush=True)
