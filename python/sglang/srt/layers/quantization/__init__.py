@@ -9,6 +9,7 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
+    from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
     from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
@@ -67,6 +68,7 @@ if VLLM_AVAILABLE:
     VLLM_QUANTIZATION_METHODS = {
         "aqlm": AQLMConfig,
         "awq": AWQConfig,
+        "moe_wna16": MoeWNA16Config,
         "deepspeedfp": DeepSpeedFPConfig,
         "tpu_int8": Int8TpuConfig,
         "fbgemm_fp8": FBGEMMFp8Config,
@@ -329,11 +331,13 @@ def monkey_patch_quant_configs():
         from vllm.model_executor.layers.quantization.gptq_marlin import (
             GPTQMarlinMoEMethod,
         )
+        from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
 
         setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
         setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
 
         monkey_patch_moe_apply(AWQMoEMethod)
+        monkey_patch_moe_apply(MoeWNA16Method)
         monkey_patch_moe_apply(GPTQMarlinMoEMethod)
         monkey_patch_moe_apply(CompressedTensorsW8A8Fp8MoEMethod)
         monkey_patch_moe_apply(CompressedTensorsWNA16MoEMethod)
