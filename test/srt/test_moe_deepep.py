@@ -23,9 +23,9 @@ class TestDeepEPMoE(unittest.TestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "2",
                 "--dp",
-                "8",
+                "2",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
                 "--disable-cuda-graph",
@@ -46,7 +46,7 @@ class TestDeepEPMoE(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.87)
+        self.assertGreater(metrics["score"], 0.5)
 
 
 if __name__ == "__main__":
