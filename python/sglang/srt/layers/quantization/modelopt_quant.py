@@ -5,12 +5,6 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    convert_to_channelwise,
-    cutlass_fp8_supported,
-    requantize_with_max_scale,
-)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase
@@ -19,7 +13,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    cutlass_fp8_supported,
+)
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    requantize_with_max_scale,
+)
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
