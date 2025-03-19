@@ -11,32 +11,34 @@ from synced_gitignored.sglang.python.sglang.srt.patch_torch import monkey_patch_
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
-        for params in [
-            # Same visible devices
-            dict(
-                sender_info=dict(
-                    visible_devices=[0, 1],
-                    tensor_device=1,
+        for enable_patch in [False, True]:
+            for params in [
+                # Same visible devices
+                dict(
+                    sender_info=dict(
+                        visible_devices=[0, 1],
+                        tensor_device=1,
+                    ),
+                    receiver_info=dict(
+                        visible_devices=[0, 1],
+                        tensor_device=1,
+                    ),
                 ),
-                receiver_info=dict(
-                    visible_devices=[0, 1],
-                    tensor_device=0,
+                # Different visible devices
+                dict(
+                    sender_info=dict(
+                        visible_devices=[0, 1],
+                        tensor_device=1,
+                    ),
+                    receiver_info=dict(
+                        visible_devices=[1, 0],
+                        # If enable patch, this should be fixed, and cuda:1 becomes cuda:0
+                        tensor_device=0 if enable_patch else 1,
+                    ),
                 ),
-            ),
-            # Different visible devices
-            dict(
-                sender_info=dict(
-                    visible_devices=[0, 1],
-                    tensor_device=1,
-                ),
-                receiver_info=dict(
-                    visible_devices=[1, 0],
-                    tensor_device=0,
-                ),
-            ),
-        ]:
-            with self.subTest(f'{params=}'):
-                self._test_monkey_patch_torch_reductions_core(**params)
+            ]:
+                with self.subTest(f'{enable_patch=} {params=}'):
+                    self._test_monkey_patch_torch_reductions_core(enable_patch=enable_patch, **params)
 
     def _test_monkey_patch_torch_reductions_core(
         self,
