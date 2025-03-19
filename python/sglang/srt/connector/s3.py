@@ -50,7 +50,9 @@ def list_files(
               disallowed by pattern
     """
     parts = path.removeprefix("s3://").split("/")
-    prefix = "/".join(parts[1:])
+    # Compatible with input path that do not end with a '/', or end with consecutive '/'.
+    # e.g. s3://bucket/dirname, s3://bucket/dirname//
+    prefix = "/".join(parts[1:]).rstrip("/") + "/"
     bucket_name = parts[0]
 
     objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
