@@ -16,6 +16,8 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
+dummy_text
+
 
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
@@ -68,4 +70,4 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
 
 
 def _modify_tuple(t, index: int, modifier: Callable):
-    return *t[:index], modifier(t[index]), *t[index + 1 :]
+    return *t[:index], modifier(t[index]), *t[index + 1:]
