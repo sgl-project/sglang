@@ -10,7 +10,24 @@ import torch.multiprocessing as mp
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
         for params in [
-            dict(),
+            # Same visible devices
+            dict(
+                sender_info=dict(
+                    visible_devices=[0, 1],
+                ),
+                receiver_info=dict(
+                    visible_devices=[0, 1],
+                ),
+            ),
+            # Different visible devices
+            dict(
+                sender_info=dict(
+                    visible_devices=[0, 1],
+                ),
+                receiver_info=dict(
+                    visible_devices=[1],
+                ),
+            ),
         ]:
             with self.subTest(f'{params=}'):
                 self._test_monkey_patch_torch_reductions_core(**params)
