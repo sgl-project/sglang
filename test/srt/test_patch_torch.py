@@ -96,7 +96,7 @@ def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: in
             case 'receiver':
                 tensor = queue.get()
                 print(f'receiver queue.get {tensor=} {tensor.device=}')
-                assert tensor.device == f'cuda:{tensor_device}'
+                assert str(tensor.device) == f'cuda:{tensor_device}'
                 queue.put('done')
 
         execution_ok = True
