@@ -331,7 +331,6 @@ def monkey_patch_quant_configs():
         from vllm.model_executor.layers.quantization.gptq_marlin import (
             GPTQMarlinMoEMethod,
         )
-        from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
 
         setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
         setattr(GPTQConfig, "get_quant_method", gptq_get_quant_method)
