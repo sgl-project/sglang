@@ -146,4 +146,5 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
 class LlamaForCausalLMHass(LlamaForCausalLMEagle):
     pass
 
+
 EntryClass = [LlamaForCausalLMEagle, LlamaForCausalLMHass]
