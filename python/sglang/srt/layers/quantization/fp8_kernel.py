@@ -168,6 +168,7 @@ def per_token_group_quant_fp8(
     eps: float = 1e-10,
     dtype: torch.dtype = fp8_type_,
     column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -200,11 +201,20 @@ def per_token_group_quant_fp8(
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
-        x_s = torch.empty(
-            (x.shape[-1] // group_size,) + x.shape[:-1],
-            device=x.device,
-            dtype=torch.float32,
-        ).permute(-1, -2)
+        if scale_tma_aligned:
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x.shape[-2] + 3) // 4 * 4
+            x_s = torch.empty(
+                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
+        else:
+            x_s = torch.empty(
+                (x.shape[-1] // group_size,) + x.shape[:-1],
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
     else:
         x_s = torch.empty(
             x.shape[:-1] + (x.shape[-1] // group_size,),

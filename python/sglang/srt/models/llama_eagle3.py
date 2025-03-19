@@ -25,6 +25,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -32,7 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -45,11 +47,46 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        # Skip the input_layernorm
-        # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
-        if layer_id == 0:
-            del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x: x)
+        # override qkv
+        self.self_attn.qkv_proj = QKVParallelLinear(
+            2 * self.hidden_size,
+            self.self_attn.head_dim,
+            self.self_attn.total_num_heads,
+            self.self_attn.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        residual = hidden_states
+        embeds = self.input_layernorm(embeds)
+        hidden_states = self.hidden_norm(hidden_states)
+
+        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        # Self Attention
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # Fully Connected
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual
 
 
 class LlamaModel(nn.Module):
@@ -67,18 +104,10 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.layers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(
-                    config,
-                    i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        self.fc = torch.nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+        self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -88,27 +117,32 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            embeds = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds
+            embeds = input_embeds
 
-        hidden_states = self.fc(
-            torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
-        )
+        hidden_states = forward_batch.spec_info.hidden_states
+        if hidden_states.shape[-1] != embeds.shape[-1]:
+            hidden_states = self.fc(hidden_states)
 
         residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
-        return hidden_states + residual
+        hidden_states, residual = self.midlayer(
+            positions,
+            embeds,
+            hidden_states,
+            forward_batch,
+            residual,
+        )
+
+        hidden_states_to_logits, hidden_states_to_aux = self.norm(
+            hidden_states, residual
+        )
+
+        # For draft decode, we capture the hidden state before norm
+        return hidden_states_to_logits, [hidden_states_to_aux]
 
 
-class LlamaForCausalLMEagle(LlamaForCausalLM):
+class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def __init__(
         self,
         config: LlamaConfig,
@@ -118,6 +152,10 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
+
+        if self.config.num_hidden_layers != 1:
+            raise ValueError("EAGLE3 currently only supports 1 layer")
+
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
@@ -127,20 +165,29 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                getattr(config, "hot_vocab_size", config.vocab_size),
+                config.draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
 
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
+        self.capture_aux_hidden_states = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
-            if "lm_head" not in name:
-                name = "model." + name
+            if "d2t" in name:
+                # d2t stores diffs between draft id and target id
+                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+
+            if "d2t" not in name and "t2d" not in name and "lm_head" not in name:
+                new_name = f"model.{name}"
+                super().load_weights([(new_name, loaded_weight)])
+            elif "lm_head" in name:
                 super().load_weights([(name, loaded_weight)])
 
+    def get_hot_token_id(self):
+        return self.hot_token_id
 
-EntryClass = [LlamaForCausalLMEagle]
+
+EntryClass = [LlamaForCausalLMEagle3]

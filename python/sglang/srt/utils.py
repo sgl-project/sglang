@@ -78,6 +78,11 @@ time_infos = {}
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
     return torch.version.hip is not None
@@ -128,9 +133,9 @@ def is_cuda_available():
     return is_cuda()
 
 
-_ENABLE_TORCH_INFERENCE_MODE = os.getenv(
+_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-).lower() in ("true", "1")
+)
 
 
 class DynamicGradMode(_DecoratorContextManager):
@@ -257,7 +262,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        num_gpus = cuda_device_count_stateless()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -1325,11 +1330,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 @lru_cache(maxsize=2)
