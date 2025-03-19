@@ -18,7 +18,7 @@ import unittest
 from typing import List
 
 import torch
-from utils import BACKENDS, TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
+from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
@@ -66,37 +66,39 @@ PROMPTS = [
     """,
 ]
 
+BACKEND = "triton"
 
-class TestLoRABackend(unittest.TestCase):
-    def run_backend(
+
+class TestLoRATP(unittest.TestCase):
+    def run_tp(
         self,
         prompt: str,
         model_case: LoRAModelCase,
         torch_dtype: torch.dtype,
         max_new_tokens: int,
-        backend: str,
     ):
         """
-        Run backend tests for a single prompt and model case.
+        Run triton backend tests with specified TP size for a single prompt and model case.
         """
         base_path = model_case.base
         adaptor = model_case.adaptors[0]
+        tp_size = model_case.tp_size
         print(
-            f"\n========== Testing backend '{backend}' for base '{base_path}' --- "
+            f"\n========== Testing triton backend with TP size {tp_size} for base '{base_path}' --- "
             f"Prompt '{prompt[:50]}...' using adaptor '{adaptor.name}' ---"
         )
         with SRTRunner(
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
-            tp_size=model_case.tp_size,
+            tp_size=tp_size,
             lora_paths=[adaptor.name for adaptor in model_case.adaptors],
             max_loras_per_batch=model_case.max_loras_per_batch,
-            lora_backend=backend,
+            lora_backend=BACKEND,
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.88,
-            disable_custom_all_reduce=False,
+            disable_custom_all_reduce=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 [prompt], max_new_tokens=max_new_tokens, lora_paths=[adaptor.name]
@@ -113,9 +115,9 @@ class TestLoRABackend(unittest.TestCase):
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
-            tp_size=model_case.tp_size,
+            tp_size=tp_size,
             mem_fraction_static=0.88,
-            disable_custom_all_reduce=False,
+            disable_custom_all_reduce=True,
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
                 [prompt], max_new_tokens=max_new_tokens
@@ -181,36 +183,36 @@ class TestLoRABackend(unittest.TestCase):
         if hf_prefill.shape[0] <= 100:
             assert torch.all(torch.abs(hf_prefill - srt_prefill) < prefill_tol), (
                 f"Prefill logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
-                f"backend '{backend}', prompt: '{prompt[:50]}...'"
+                f"triton backend with TP {tp_size}, prompt: '{prompt[:50]}...'"
             )
 
         if hf_decode.shape[0] <= 100:
             assert torch.all(torch.abs(hf_decode - srt_decode) < decode_tol), (
                 f"Decode logprobs mismatch for base '{base_path}', adaptor '{adaptor.name}', "
-                f"backend '{backend}', prompt: '{prompt[:50]}...'"
+                f"triton backend with TP {tp_size}, prompt: '{prompt[:50]}...'"
             )
 
         if rouge_score < rouge_tol:
-
             raise AssertionError(
                 f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                f"for base '{base_path}', adaptor '{adaptor.name}', backend '{backend}', prompt: '{prompt[:50]}...'"
+                f"for base '{base_path}', adaptor '{adaptor.name}', triton backend with TP {tp_size}, prompt: '{prompt[:50]}...'"
             )
 
-    def run_backend_batch(
+    def run_tp_batch(
         self,
         prompts: List[str],
         model_case: LoRAModelCase,
         torch_dtype: torch.dtype,
         max_new_tokens: int,
-        backend: str,
+        tp_size: int,
     ):
-        # TODO: Implement batch processing version of run_backend
+        # TODO: Implement batch processing version of run_tp
         raise NotImplementedError(
-            "Batch processing version of run_backend is not implemented yet."
+            "Batch processing version of run_tp is not implemented yet."
         )
 
-    def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        tp_list = [2]  # Define TP sizes to iterate over
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
             prompts = (
@@ -218,19 +220,19 @@ class TestLoRABackend(unittest.TestCase):
                 if not model_case.skip_long_prompt
                 else [p for p in PROMPTS if len(p) < 1000]
             )
-            for torch_dtype in TORCH_DTYPES:
-                for backend in BACKENDS:
+            for tp_size in tp_list:
+                model_case.tp_size = tp_size
+                for torch_dtype in TORCH_DTYPES:
                     for prompt in prompts:
-                        self.run_backend(
+                        self.run_tp(
                             prompt,
                             model_case,
                             torch_dtype,
                             max_new_tokens=32,
-                            backend=backend,
                         )
 
     def test_ci_lora_models(self):
-        self._run_backend_on_model_cases(CI_LORA_MODELS)
+        self._run_tp_on_model_cases(CI_LORA_MODELS)
 
     def test_all_lora_models(self):
         if is_in_ci():
@@ -243,7 +245,7 @@ class TestLoRABackend(unittest.TestCase):
                 continue
             filtered_models.append(model_case)
 
-        self._run_backend_on_model_cases(filtered_models)
+        self._run_tp_on_model_cases(filtered_models)
 
 
 if __name__ == "__main__":

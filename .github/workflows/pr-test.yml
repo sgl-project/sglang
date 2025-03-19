@@ -127,6 +127,12 @@ jobs:
           cd test/srt
           python3 test_mla_tp.py
 
+      - name: Test lora tensor parallelism (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt/models/lora
+          python3 test_lora_tp.py
+
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
         github.event.pull_request.draft == false
@@ -221,9 +227,9 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
-          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+          USE_VLLM_CUSTOM_ALLREDUCE=1 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
-          USE_VLLM_CUSTOM_ALLREDUCE=0 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+          python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
         timeout-minutes: 10
