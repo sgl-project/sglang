@@ -6,6 +6,8 @@ from typing import List, Dict
 import torch
 import torch.multiprocessing as mp
 
+from synced_gitignored.sglang.python.sglang.srt.patch_torch import monkey_patch_torch_reductions
+
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
@@ -39,6 +41,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
     def _test_monkey_patch_torch_reductions_core(
         self,
         sender_info: Dict, receiver_info: Dict,
+        enable_patch: bool,
     ):
         print(f'test_monkey_patch_torch_reductions_core {os.environ.get("CUDA_VISIBLE_DEVICES")=}')
         cuda_visible_devices_list: List[int] = \
@@ -60,6 +63,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                     queue=queue,
                     output_writer=output_writer,
                     tensor_device=info['tensor_device'],
+                    enable_patch=enable_patch,
                 ),
             )
             p.start()
@@ -72,8 +76,11 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             p.join()
 
 
-def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: int):
+def _run_subprocess(role: str, queue: mp.Queue, output_writer, tensor_device: int, enable_patch: bool):
     print(f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}', flush=True)
+
+    if enable_patch:
+        monkey_patch_torch_reductions()
 
     try:
         match role:
