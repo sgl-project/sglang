@@ -24,6 +24,8 @@ class TestTritonAttentionMLA(unittest.TestCase):
         torch.backends.cudnn.benchmark = False
 
     def setUp(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
         # Set seeds before each test method
         self._set_all_seeds(42)
 

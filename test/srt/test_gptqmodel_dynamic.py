@@ -4,7 +4,7 @@ import unittest
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -28,8 +28,17 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.server_args import PortArgs, ServerArgs
 
     try:
+        device = get_device()
+        if device == "cuda":
+            backend = "nccl"
+        elif device == "xpu":
+            backend = "xccl"
+        elif device == "hpu":
+            backend = "hccl"
+        elif device == "cpu":
+            backend = "gloo"
         init_distributed_environment(
-            backend="nccl",
+            backend=backend,
             world_size=1,
             rank=0,
             local_rank=0,
@@ -54,7 +63,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
     )
 
     load_config = LoadConfig()
-    device_config = DeviceConfig("cuda")
+    device_config = DeviceConfig(device)
     model = get_model(
         model_config=model_config, load_config=load_config, device_config=device_config
     )

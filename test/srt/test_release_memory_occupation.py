@@ -13,6 +13,8 @@ _DEBUG_EXTRA = True
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_release_and_resume_occupation(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
