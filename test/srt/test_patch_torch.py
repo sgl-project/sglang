@@ -1,7 +1,7 @@
 import os
 import traceback
 import unittest
-from typing import List
+from typing import List, Dict
 
 import torch
 import torch.multiprocessing as mp
@@ -17,7 +17,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
     def _test_monkey_patch_torch_reductions_core(
         self,
-
+        sender_info: Dict, receiver_info: Dict,
     ):
         print(f'test_monkey_patch_torch_reductions_core {os.environ.get("CUDA_VISIBLE_DEVICES")=}')
         cuda_visible_devices_list: List[int] = \
@@ -26,14 +26,18 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
         queue = mp.Queue()
-        for role in ['sender', 'receiver']:
-            os.environ['CUDA_VISIBLE_DEVICES'] = TODO
+        for role, info in [
+            ('sender', sender_info),
+            ('receiver', receiver_info),
+        ]:
+            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(
+                str(cuda_visible_devices_list[device]) for device in info['visible_devices'])
             p = mp.Process(
                 target=_run_subprocess,
                 kwargs=dict(
                     role=role,
                     queue=queue,
-                    output_writer=output_writer
+                    output_writer=output_writer,
                 ),
             )
             p.start()
