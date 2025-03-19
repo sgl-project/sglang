@@ -19,10 +19,10 @@ class TorchMemorySaverAdapter(ABC):
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )
 
-    def check_validity(self, func_name):
+    def check_validity(self, caller_name):
         if not self.enabled:
             logger.warning(
-                f'`{func_name}` will not save memory because torch_memory_saver is not enabled. '
+                f'`{caller_name}` will not save memory because torch_memory_saver is not enabled. '
                 f'Potential causes: `enable_memory_saver` is false, or torch_memory_saver has installation issues.'
             )
 

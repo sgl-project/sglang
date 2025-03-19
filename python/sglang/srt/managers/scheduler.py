@@ -32,8 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -114,6 +112,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -1622,6 +1621,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(caller_name='release_memory_occupation')
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
@@ -1630,6 +1630,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(caller_name='resume_memory_occupation')
         self.memory_saver_adapter.resume()
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
