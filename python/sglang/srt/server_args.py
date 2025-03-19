@@ -287,6 +287,10 @@ class ServerArgs:
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "HASS":
+            # HASS shares the same implementation of EAGLE
+            self.speculative_algorithm = "EAGLE"
+
         if (
             self.speculative_algorithm == "EAGLE"
             or self.speculative_algorithm == "EAGLE3"
@@ -782,7 +786,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "HASS"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
