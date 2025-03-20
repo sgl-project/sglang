@@ -26,7 +26,7 @@ python -m sglang_router.launch_server --model-path Qwen/QwQ-32B --dp-size 4 --ho
 
 ### Run Inference
 
-After starting the vLLM service, run the inference script to generate responses.
+After starting the SGLang service, run the inference script to generate responses.
 
 ```bash
 cd QwQ/eval
@@ -50,7 +50,7 @@ python ./generate_api_answers/infer_multithread.py --input_file "./data/ifeval.j
 
 #### Parameter Description
 
-- `--base_url`: Base URL of the vLLM service
+- `--base_url`: Base URL of the SGLang service
 - `--model_name`: Must match the model name used in Step 1
 - `--n_samples`: Number of samples per prompt
   - AIME24 / AIME 25: Recommended 64 samples
