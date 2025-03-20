@@ -112,28 +112,21 @@ def model_forward_execute_two_batch(
 
 
 def execute_two_batch_raw(inputs_a, inputs_b, fn, delta_stages: int):
-    generator_a = _WrappedGenerator("a", fn(**inputs_a))
-    generator_b = _WrappedGenerator("b", fn(**inputs_b))
-
-    # print('hack: run generator_a to the end, this is NOT OVERLAP')
-    # while not generator_a.done:
-    #     generator_a.next()
-    # print('hack: run generator_b to the end, this is NOT OVERLAP')
-    # while not generator_b.done:
-    #     generator_b.next()
+    executor_a = _StageExecutor("a", fn(**inputs_a))
+    executor_b = _StageExecutor("b", fn(**inputs_b))
 
     for _ in range(delta_stages):
-        generator_a.next()
+        executor_a.next()
 
-    while not generator_a.done:
-        generator_a.next()
-        generator_b.next()
+    for _ in range(executor_a.num_stages - delta_stages):
+        executor_a.next()
+        executor_b.next()
 
     for _ in range(delta_stages):
-        generator_b.next()
+        executor_b.next()
 
-    assert generator_a.done and generator_b.done
-    return generator_a.output, generator_b.output
+    assert executor_a.done and executor_b.done
+    return executor_a.output, executor_b.output
 
 
 class _StageExecutor:
@@ -164,4 +157,8 @@ class _StageExecutor:
 
     @property
     def done(self):
-        return self._index >= len(self._stages)
+        return self._index >= self.num_stages
+
+    @property
+    def num_stages(self):
+        return len(self._stages)
