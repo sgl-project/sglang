@@ -374,9 +374,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_stage_prefill_shared_and_combine_wait(self, state):
         self._forward_tbo_substage_shared(state)
         self._forward_tbo_substage_combine_wait(state)
-        output = self._forward_tbo_substage_compute_layer_output(state)
-        state.clear()
-        return output
+        return self._forward_tbo_substage_compute_layer_output(state)
 
     def _forward_tbo_stage_decode_shared(self, state):
         self._forward_tbo_substage_dispatch_start(state)
@@ -389,9 +387,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_stage_decode_extra(self, state):
         self._forward_tbo_substage_combine_wait(state)
-        output = self._forward_tbo_substage_compute_layer_output(state)
-        state.clear()
-        return output
+        return self._forward_tbo_substage_compute_layer_output(state)
 
     def _forward_tbo_substage_mlp(self, state):
         state['expert_output_hidden_states'] = self._forward_deepep_expert(
@@ -435,13 +431,15 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_substage_compute_layer_output(self, state):
-        return dict(
+        output = dict(
             positions=state["positions"],
             hidden_states=state["hidden_states_from_combine"] + state["shared_output"],
             forward_batch=state["forward_batch"],
             residual=state["residual_after_post_attn_ln"],
             tbo_subbatch_index=state["tbo_subbatch_index"],
         )
+        state.clear()
+        return output
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
