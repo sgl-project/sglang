@@ -425,7 +425,7 @@ class DeepEPDispatcher:
         return recv_hidden_states, recv_expert_count, handle, event, hook
 
     def combine(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+        self, hidden_states: torch.Tensor, forward_mode: ForwardMode, previous_event=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
@@ -433,7 +433,7 @@ class DeepEPDispatcher:
                 hidden_states = self.get_restored_hidden_states_by_experts(
                     hidden_states
                 )
-            hidden_states, event = self.combine_normal(hidden_states, self.handle)
+            hidden_states, event = self.combine_normal(hidden_states, self.handle, previous_event=previous_event)
         else:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
