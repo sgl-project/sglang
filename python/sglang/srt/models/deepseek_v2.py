@@ -430,7 +430,7 @@ class DeepseekV2MoE(nn.Module):
             _topk_idx,
             _topk_weights,
             tokens_per_expert_from_dispatch,
-        ) = self._forward_deepep_dispatch_stage_wait(state['state_dispatch'])
+        ) = self.tbo_deepep_dispatchers[state["tbo_subbatch_index"]].dispatch_stage_wait(state['state_dispatch'])
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
