@@ -384,7 +384,9 @@ class DeepseekV2MoE(nn.Module):
         state['dispatch_event'].current_stream_wait()
 
         expert_output_hidden_states = self._forward_deepep_expert(
-            state['common']['forward_batch'].forward_mode, recv_hidden_states, tokens_per_expert
+            state['common']['forward_batch'].forward_mode,
+            state['recv_hidden_states_from_dispatch'],
+            state['tokens_per_expert_from_dispatch']
         )
 
         if start_combine:
