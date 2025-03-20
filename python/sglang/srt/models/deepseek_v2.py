@@ -1130,6 +1130,33 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f'Unsupported {forward_mode=}')
 
+    def _forward_stage_prefill_attn_full(self, state):
+        return TODO, TODO
+
+    def _forward_stage_prefill_extra(self, state):
+        return TODO, TODO
+
+    def _forward_stage_prefill_mlp(self, state):
+        return TODO, TODO
+
+    def _forward_stage_prefill_shared(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_attn_0(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_attn_1(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_shared(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_mlp(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_extra(self, state):
+        return TODO, TODO
+
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
