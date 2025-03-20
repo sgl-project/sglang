@@ -1364,9 +1364,12 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        stages = []
-        for i in range(start_layer, end_layer):
-            stages += self.layers[i].get_forward_stages(forward_batch.forward_mode)
+        def get_forward_tbo_stages():
+            for i in range(start_layer, end_layer):
+                yield from self.layers[i].get_forward_stages(forward_batch.forward_mode)
+
+        stages_a = list(get_forward_tbo_stages())
+        stages_b = list(get_forward_tbo_stages())
 
         # TODO do not hardcode
         chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
