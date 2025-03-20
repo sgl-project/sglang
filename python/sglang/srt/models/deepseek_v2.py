@@ -276,9 +276,10 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        recv_hidden_states, tokens_per_expert = self._forward_deepep_dispatch(
+        recv_hidden_states, tokens_per_expert, event = self._forward_deepep_dispatch(
             forward_mode, hidden_states, router_logits
         )
+        event.current_stream_wait()  # TODO
 
         final_hidden_states = self._forward_deepep_expert(
             forward_mode, recv_hidden_states, tokens_per_expert
@@ -332,8 +333,7 @@ class DeepseekV2MoE(nn.Module):
                     forward_mode,
                 )
             )
-            event.current_stream_wait()  # TODO
-        return recv_hidden_states, tokens_per_expert
+        return recv_hidden_states, tokens_per_expert, event
 
     def _forward_deepep_expert(
         self, forward_mode, recv_hidden_states, tokens_per_expert
@@ -348,7 +348,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_prefill_extra(self, state):
-        recv_hidden_states, tokens_per_expert = self._forward_deepep_dispatch(
+        recv_hidden_states, tokens_per_expert, dispatch_event = self._forward_deepep_dispatch(
             state['forward_mode'], state['hidden_states'], state['router_logits']
         )
         return TODO, None
