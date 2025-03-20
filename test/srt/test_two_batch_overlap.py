@@ -48,21 +48,20 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "sampling_params": {"temperature": 0, "max_new_tokens": 8},
             },
         )
-        print(f"{response=}")
-        TODO_assert_response
+        print(f"{response.json()=}")
+        self.assertEquals(response.json()['text'], '5, 1+5=6')
 
-    # TODO
-    # def test_02_mmlu(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=64,
-    #         num_threads=32,
-    #     )
-    #
-    #     metrics = run_eval(args)
-    #     self.assertGreater(metrics["score"], 0.5)
+    def test_02_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.5)
 
 
 if __name__ == "__main__":
