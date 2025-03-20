@@ -4,7 +4,7 @@ numpy
 tqdm
 
 # math_eval
-sympy==1.12
+sympy==1.13.1
 word2number
 Pebble
 timeout-decorator
