@@ -1201,9 +1201,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ):
-        return TODO, TODO
+        hidden_states, residual = self._forward_input_layernorm(
+            hidden_states, residual
+        )
+        self_attn_state = self.self_attn.forward_absorb_stage_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return dict(self_attn_state=self_attn_state), None
 
     def _forward_stage_decode_attn_1(self, state):
+        hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
         return TODO, TODO
 
     def _forward_stage_decode_shared(self, state):
