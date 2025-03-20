@@ -62,7 +62,10 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& sc
 
 // fused moe
 at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
-    at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool is_vnni);
+    at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool use_int8_w8a8,
+    std::optional<at::Tensor>& w1_scale, std::optional<at::Tensor>& w2_scale,
+    std::optional<at::Tensor>& a1_scale, std::optional<at::Tensor>& a2_scale,
+    bool is_vnni);
 
 // shared memory init
 void initialize(int size, int rank);

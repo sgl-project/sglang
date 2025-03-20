@@ -28,13 +28,17 @@ template <> inline bool can_use_brgemm<int8_t>(int M) { return false; }
 
 // adjust leading dimension size for K
 template <typename T>
-inline int get_row_size(int K) {
+inline int64_t get_row_size(int64_t K) {
   return K;
 }
 
 template <>
-inline int get_row_size<int8_t>(int K) {
+inline int64_t get_row_size<int8_t>(int64_t K) {
   return K + sizeof(int32_t);
+}
+
+inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
+  return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
 // pack weight to vnni format
