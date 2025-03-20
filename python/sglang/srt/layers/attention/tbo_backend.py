@@ -31,6 +31,16 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        self.primary.init_forward_metadata_capture_cuda_graph(
+            bs=bs,
+            num_tokens=num_tokens,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
+
         TODO
 
     def init_forward_metadata_replay_cuda_graph(
@@ -45,6 +55,18 @@ class TboAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        self.primary.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            num_kv_heads=num_kv_heads,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
         TODO
 
     def get_cuda_graph_seq_len_fill_value(self):
