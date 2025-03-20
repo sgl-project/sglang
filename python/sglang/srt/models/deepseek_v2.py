@@ -348,19 +348,22 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_prefill_extra(self, state):
-        return TODO, TODO
+        recv_hidden_states, tokens_per_expert = self._forward_deepep_dispatch(
+            state['forward_mode'], state['hidden_states'], state['router_logits']
+        )
+        return TODO, None
 
     def _forward_stage_prefill_mlp(self, state):
-        return TODO, TODO
+        return TODO, None
 
     def _forward_stage_prefill_shared(self, state):
         return TODO, TODO
 
     def _forward_stage_decode_shared(self, state):
-        return TODO, TODO
+        return TODO, None
 
     def _forward_stage_decode_mlp(self, state):
-        return TODO, TODO
+        return TODO, None
 
     def _forward_stage_decode_extra(self, state):
         return TODO, TODO
