@@ -1438,11 +1438,11 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        def get_forward_tbo_stages():
-            for i in range(start_layer, end_layer):
-                yield from self.layers[i].get_forward_tbo_stages(
-                    forward_batch.forward_mode
-                )
+        stages = [
+            stage
+            for i in range(start_layer, end_layer)
+            for stage in self.layers[i].get_forward_tbo_stages(forward_batch.forward_mode)
+        ]
 
         # TODO do not hardcode
         chosen_num_sms = (
@@ -1460,8 +1460,8 @@ class DeepseekV2Model(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                 ),
-                stages_a=list(get_forward_tbo_stages(subbatch_index=0)),
-                stages_b=list(get_forward_tbo_stages(subbatch_index=1)),
+                stages_a=stages,
+                stages_b=stages,
                 delta_stages={
                     ForwardMode.EXTEND: 1,
                     ForwardMode.DECODE: 2,
