@@ -557,6 +557,7 @@ class ForwardBatch:
                 extend_num_tokens=extend_num_tokens,
                 # TODO test this can be removed
                 global_num_tokens=None,
+                global_num_tokens_cpu=None,
                 gathered_buffer=None,
                 # global_num_tokens=output_global_num_tokens,
                 # gathered_buffer=gathered_buffer,
