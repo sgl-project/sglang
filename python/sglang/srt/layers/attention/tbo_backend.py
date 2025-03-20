@@ -124,17 +124,22 @@ class TboAttnBackend(AttentionBackend):
 
         num_tokens_child_left = tbo_split_token_index
         num_tokens_child_right = num_tokens - tbo_split_token_index
-
-        # not yet support `num_tokens_per_bs>1`
-        assert num_tokens == bs
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
 
         seq_slice_left = slice(None, tbo_split_seq_index)
         seq_slice_right = slice(tbo_split_seq_index, None)
 
-        args_left = _init_forward_metadata_cuda_graph_split(TODO)
-        args_right = _init_forward_metadata_cuda_graph_split(TODO)
+        args_left = _init_forward_metadata_cuda_graph_split(
+            output_bs=bs_child_left,
+            seq_slice=seq_slice_left,
+            TODO,
+        )
+        args_right = _init_forward_metadata_cuda_graph_split(
+            output_bs=bs_child_right,
+            seq_slice=seq_slice_right,
+            TODO,
+        )
 
         child_left, child_right = self.children
         getattr(child_left, fn_name)(**args_left)
@@ -161,6 +166,8 @@ class TboAttnBackend(AttentionBackend):
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,
     seq_slice: slice,
+    output_bs: int,
+
     # common args
     bs: int,
     req_pool_indices: torch.Tensor,
@@ -187,7 +194,7 @@ def _init_forward_metadata_cuda_graph_split(
     )
 
     ans.update(dict(
-        bs=bs_child,
+        bs=output_bs,
         req_pool_indices=req_pool_indices[seq_slice],
         seq_lens=seq_lens[seq_slice],
     ))
@@ -195,7 +202,7 @@ def _init_forward_metadata_cuda_graph_split(
     if fn_name == 'init_forward_metadata_capture_cuda_graph':
         assert capture_num_tokens == bs, 'Only support num_tokens==bs currently'
         ans.update(dict(
-            num_tokens=bs_child,
+            num_tokens=output_bs,
         ))
     elif fn_name == 'init_forward_metadata_replay_cuda_graph':
         ans.update(dict(
