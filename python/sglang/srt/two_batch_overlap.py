@@ -29,6 +29,10 @@ def compute_middle_split_token_and_seq_index(self):
     return split_token_index, split_seq_index
 
 
+def compute_split_seq_index() -> int:
+    return TODO
+
+
 def compute_split_token_index(split_seq_index: int) -> int:
     return TODO
 
