@@ -141,6 +141,7 @@ class _StageExecutor:
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
+        self._stage_state = None
         self.output = None
 
     def next(self):
@@ -152,7 +153,8 @@ class _StageExecutor:
             ctx = null_context()
 
         with ctx:
-            TODO
+            stage = self._stages[self._index]
+            self._stage_state = stage(self._stage_state)
 
         self._index += 1
 
