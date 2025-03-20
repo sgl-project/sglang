@@ -11,13 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 from flash_attn_interface import (
-    flash_attn_func,
-    flash_attn_kvpacked_func,
-    flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_kvpacked_func,
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_with_kvcache,
 )
 
 class FlashAttentionBackend(ABC):
@@ -100,9 +94,44 @@ class FlashAttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-    ):
-        """Run a forward for decode."""
-        raise NotImplementedError()
+    ) -> torch.Tensor:
+        """Run forward for decode mode using FlashAttention.
+        
+        Args:
+            q: Query tensor [num_tokens, num_heads, head_size]
+            k: Key tensor [num_tokens, num_kv_heads, head_size]
+            v: Value tensor [num_tokens, num_kv_heads, head_size]
+            layer: RadixAttention layer
+            forward_batch: Batch information for the forward pass
+            save_kv_cache: Whether to save the KV cache
+        
+        Returns:
+            Output tensor [num_tokens, num_heads * head_size]
+        """
+        # Save new KV to cache if requested
+        if save_kv_cache:
+            # Update the key/value cache for the new tokens
+            layer.key_cache[forward_batch.slot_mapping] = k
+            layer.value_cache[forward_batch.slot_mapping] = v
+
+        # Run flash attention with variable length sequences
+        output = flash_attn_varlen_func(
+            q=q,
+            k=layer.key_cache,
+            v=layer.value_cache,
+            cu_seqlens_q=forward_batch.query_start_loc,
+            max_seqlen_q=forward_batch.max_query_len,
+            seqused_k=forward_batch.seq_lens,
+            max_seqlen_k=forward_batch.max_seq_len,
+            softmax_scale=layer.scale,
+            causal=True,
+            # Optional parameters
+            alibi_slopes=layer.alibi_slopes if hasattr(layer, 'alibi_slopes') else None,
+            window_size=(-1, -1),  # No sliding window by default
+            block_table=forward_batch.block_table,
+        )
+
+        return output
 
     def forward_extend(
         self,
@@ -112,26 +141,44 @@ class FlashAttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-    ):
-        """Run a forward for extend."""
-        raise NotImplementedError()
+    ) -> torch.Tensor:
+        """Run a forward for extend mode using FlashAttention.
+        
+        Args:
+            q: Query tensor [num_tokens, num_heads, head_size]
+            k: Key tensor [num_tokens, num_kv_heads, head_size]
+            v: Value tensor [num_tokens, num_kv_heads, head_size]
+            layer: RadixAttention layer
+            forward_batch: Batch information for the forward pass
+            save_kv_cache: Whether to save the KV cache
+        
+        Returns:
+            Output tensor [num_tokens, num_heads * head_size]
+        """
+        # Get batch metadata
+        num_tokens = q.shape[0]
+        
+        # Run flash attention with variable length sequences
+        output = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=forward_batch.query_start_loc,
+            max_seqlen_q=forward_batch.max_query_len,
+            seqused_k=forward_batch.seq_lens,
+            max_seqlen_k=forward_batch.max_seq_len,
+            softmax_scale=layer.scale,
+            causal=True,
+            # Optional parameters
+            alibi_slopes=layer.alibi_slopes if hasattr(layer, 'alibi_slopes') else None,
+            window_size=(-1, -1),  # No sliding window by default
+        )
 
-"""
+        # Save KV cache if requested
+        if save_kv_cache and hasattr(layer, 'key_cache') and hasattr(layer, 'value_cache'):
+            # Update the key/value cache
+            # Note: This assumes the cache tensors are already properly initialized
+            layer.key_cache[forward_batch.slot_mapping] = k
+            layer.value_cache[forward_batch.slot_mapping] = v
 
-## Temp README for Collaborator
- 
-
-1. Setup Flash Attention v3 by isntalling source
-```bash
-https://github.com/Dao-AILab/flash-attention.git
-cd hopper
-python setup.py install
-
-python
-
-import flash_attn_interface
-
-```
-
-2. Editing the `flashattnetion_backend`
-"""
+        return output
