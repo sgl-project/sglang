@@ -442,7 +442,7 @@ class ForwardBatch:
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=self.tbo_split_seq_index,
             forward_mode=self.forward_mode,
-            extend_lens=self.extend_seq_lens,
+            extend_seq_lens=self.extend_seq_lens,
         )
 
         child_a = self.filter_batch(

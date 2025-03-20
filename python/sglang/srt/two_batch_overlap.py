@@ -41,11 +41,11 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 def compute_split_token_index(
         split_seq_index: int,
         forward_mode: 'ForwardMode',
-        extend_lens: Optional[Sequence[int]],
+        extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
-        assert extend_lens is not None
-        return sum(extend_lens[:split_seq_index])
+        assert extend_seq_lens is not None
+        return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_decode():
         return split_seq_index
     else:

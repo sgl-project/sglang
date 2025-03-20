@@ -119,7 +119,7 @@ class TboAttnBackend(AttentionBackend):
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=tbo_split_seq_index,
             forward_mode=forward_mode,
-            extend_lens=None,
+            extend_seq_lens=None,
         )
 
         num_tokens_child_left = tbo_split_token_index
