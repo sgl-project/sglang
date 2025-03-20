@@ -1275,24 +1275,12 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def get_forward_tbo_stages(self, forward_mode: ForwardMode, subbatch_index: int):
         if forward_mode == ForwardMode.EXTEND:
-            assert subbatch_index in [0, 1]
             return [
                 self._forward_tbo_stage_prefill_attn_full,
-                *(
-                    [
-                        self.mlp._forward_tbo_stage_prefill_dispatch_start,
-                        self.mlp._forward_tbo_stage_prefill_pre_mlp,
-                        self.mlp._forward_tbo_stage_prefill_mlp,
-                        self.mlp._forward_tbo_stage_prefill_combine_start,
-                    ]
-                    if subbatch_index == 0
-                    else [
-                        self._forward_tbo_stage_prefill_dispatch_start,
-                        self.mlp._forward_tbo_stage_prefill_pre_mlp,
-                        self.mlp._forward_tbo_stage_prefill_mlp,
-                        self.mlp._forward_tbo_stage_prefill_combine_start,
-                    ]
-                ),
+                self.mlp._forward_tbo_stage_prefill_dispatch_start,
+                self.mlp._forward_tbo_stage_prefill_pre_mlp,
+                self.mlp._forward_tbo_stage_prefill_mlp,
+                self.mlp._forward_tbo_stage_prefill_combine_start,
                 self.mlp._forward_tbo_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
