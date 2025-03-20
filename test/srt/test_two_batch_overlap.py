@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -36,6 +37,18 @@ class TestTwoBatchOverlap(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def test_generate_single_prompt(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            # we use an uncommon start to minimise the chance that the cache is hit by chance
+            json={
+                "text": "_ The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+            },
+        )
+        print(f'{response=}')
+        TODO_assert_response
 
     def test_mmlu(self):
         args = SimpleNamespace(
