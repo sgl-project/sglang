@@ -1,9 +1,10 @@
 import os
 
 import torch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch._dynamo.eval_frame import null_context
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+# ------------------------------------------ TODO ------------------------------------------
 
 _ENABLE_PROFILE = bool(
     int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
@@ -11,12 +12,12 @@ _ENABLE_PROFILE = bool(
 
 
 def execute_maybe_two_batch(
-    inputs,
-    fn,
-    delta_stages: int,
-    enable_two_batch_overlap: bool,
-    split_inputs,
-    merge_outputs,
+        inputs,
+        fn,
+        delta_stages: int,
+        enable_two_batch_overlap: bool,
+        split_inputs,
+        merge_outputs,
 ):
     # TODO maybe optimize these nested `if`s
     if enable_two_batch_overlap:
