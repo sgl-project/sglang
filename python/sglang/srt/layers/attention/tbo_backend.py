@@ -1,10 +1,12 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Union, TYPE_CHECKING
 
 import torch
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -13,7 +15,7 @@ class TboAttnBackend(AttentionBackend):
         self.primary = primary
         self.children = children
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(self, forward_batch: 'ForwardBatch'):
         for item in self._primary_and_children:
             item.init_forward_metadata(forward_batch=forward_batch)
 
@@ -29,7 +31,7 @@ class TboAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
+        forward_mode: 'ForwardMode',
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         self.primary.init_forward_metadata_capture_cuda_graph(
@@ -61,7 +63,7 @@ class TboAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
+        forward_mode: 'ForwardMode',
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
@@ -98,7 +100,7 @@ class TboAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
+        forward_mode: 'ForwardMode',
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         # capture args
         capture_num_tokens: int = None,
@@ -183,7 +185,7 @@ def _init_forward_metadata_cuda_graph_split(
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     encoder_lens: Optional[torch.Tensor],
-    forward_mode: ForwardMode,
+    forward_mode: 'ForwardMode',
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     # capture args
     capture_num_tokens: int = None,
