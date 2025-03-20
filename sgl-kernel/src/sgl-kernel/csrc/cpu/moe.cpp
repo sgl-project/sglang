@@ -26,30 +26,30 @@ namespace {
 //
 
 template <typename scalar_t>
-inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int size) {
+inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
   const Vec data_vec(val);
   at::vec::map<scalar_t>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
 }
 
 template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int size) {
+inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
   // no remainder
   #pragma GCC unroll 4
-  for (int d = 0; d < size; d += Vec::size()) {
+  for (int64_t d = 0; d < size; d += Vec::size()) {
     Vec data = Vec::loadu(input + d);
     data.store(out + d);
   }
 }
 
 template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int size) {
+inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
-  int d;
+  int64_t d;
   #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d) * weight_vec;
@@ -64,7 +64,7 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
 
 // acc from [topk, K] to [K]
 template <typename scalar_t>
-inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int topk, int K) {
+inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
@@ -73,7 +73,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
     copy_stub(out, input, K);
   } else {
     // do sum for topk != 1
-    int d;
+    int64_t d;
     #pragma GCC unroll 4
     for (d = 0; d <= K - kVecSize; d += kVecSize) {
       fVec sum_fvec0 = fVec(0.f);
@@ -200,8 +200,8 @@ inline void silu_and_mul(
     scalar_t* __restrict__ output,
     const float* __restrict__ input0,  // x: x0, x1
     const float* __restrict__ input1,  // y: y0, y1
-    int m_size,
-    int N) {
+    int64_t m_size,
+    int64_t N) {
 
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -209,12 +209,12 @@ inline void silu_and_mul(
   const fVec one = fVec(1.f);
 
   // no remainder
-  for (int m = 0; m < m_size; ++m) {
+  for (int64_t m = 0; m < m_size; ++m) {
     scalar_t* __restrict__ out = output + m * N;
     const float* __restrict__ x = input0 + m * BLOCK_N;
     const float* __restrict__ y = input1 + m * BLOCK_N;
 
-    for (int d = 0; d < BLOCK_N; d += bVec::size()) {
+    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
       fVec x0 = fVec::loadu(x + d);
       fVec x1 = fVec::loadu(x + d + fVec::size());
       fVec y0 = fVec::loadu(y + d);
@@ -483,7 +483,7 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename packed_t>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -491,35 +491,39 @@ void fused_experts_kernel_impl(
     scalar_t* __restrict__ A_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ packed_w1,
-    const scalar_t* __restrict__ packed_w2,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ expert_ids,
     const int32_t* __restrict__ offsets,
-    int M,
-    int N,
-    int K,
-    int E,
-    int topk,
-    int num_tokens_post_pad) {
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad) {
 
   // handle 2 tiles per block
-  constexpr int BLOCK_M = block_size_m();
-  constexpr int BLOCK_N = block_size_n();
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
 
   // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
-  const int MB = div_up(num_tokens_post_pad, BLOCK_M);
-  const int NB = div_up(N, BLOCK_N);
+  const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
 
   // strides for w1: [E, 2N, K]
   TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
 
-  const int stride_e = 2 * N * K;
-  const int stride_n = K;
+  // K and N are packed for int8
+  const int64_t packed_K = get_row_size<packed_t>(K);
+  const int64_t packed_N = get_row_size<packed_t>(N);
+
+  const int64_t stride_e = 2 * N * packed_K;
+  const int64_t stride_n = packed_K;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  at::parallel_for(0, MB * NB, 0, [&](int begin, int end) {
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
@@ -528,27 +532,27 @@ void fused_experts_kernel_impl(
 
     bool is_brgemm_used = false;
 
-    for (int i = begin; i < end; ++i) {
-      int mb = i / NB;
-      int nb = i % NB;
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB;
+      int64_t nb = i % NB;
 
       // nb0 from top half and nb1 from bottom half
-      int nb0 = nb, nb1 = nb + NB;
-      int n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      int64_t nb0 = nb, nb1 = nb + NB;
+      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
 
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
-      const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
+      const packed_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
+      const packed_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
-      int m_size = offsets[mb + 1] - offsets[mb];
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
 
       const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
       is_brgemm_used = is_brgemm_used || use_brgemm;
 
-      for (int m = 0; m < m_size; ++m) {
+      for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
         copy_stub(A + m * K, input + index * K, K);
       }
@@ -581,7 +585,7 @@ void fused_experts_kernel_impl(
             /* C     */ C1);
 
         // 1.d silu and mul
-        const int offset = offsets[mb];
+        const int64_t offset = offsets[mb];
         silu_and_mul<scalar_t, BLOCK_N>(
             ic1 + offset * N + nb * BLOCK_N,
             C0,
@@ -590,7 +594,7 @@ void fused_experts_kernel_impl(
             N);
       } else {
         // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
-        const int offset = offsets[mb];
+        const int64_t offset = offsets[mb];
         tinygemm_kernel(
             /* A     */ A,
             /* B0    */ B0,
@@ -612,15 +616,15 @@ void fused_experts_kernel_impl(
 
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [E, K, N] as [E, OC, IC]
-  const int OC = K;  // rename K as OC
-  const int IC = N;  // rename N as IC
-  const int MB2 = MB;
-  const int NB2 = div_up(OC, BLOCK_N);
-  const int stride_e2 = OC * IC;
-  const int stride_oc = IC;
+  const int64_t OC = K;  // rename K as OC
+  const int64_t IC = N;  // rename N as IC
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  const int64_t stride_e2 = OC * packed_N;
+  const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  at::parallel_for(0, MB2 * NB2, 0, [&](int begin, int end) {
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
     // we won't be using C1 for gemm2
@@ -628,24 +632,24 @@ void fused_experts_kernel_impl(
 
     bool is_brgemm_used = false;
 
-    for (int i = begin; i < end; ++i) {
-      int mb = i / NB2;
-      int nb = i % NB2;
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB2;
+      int64_t nb = i % NB2;
 
-      int m_size = offsets[mb + 1] - offsets[mb];
-      int n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
       const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
       is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
-      const scalar_t* __restrict__ A = ic1 + offsets[mb] * N; // + nb * BLOCK_N;
+      const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
 
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const packed_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
 
       // 2.a gemm: C = A @ B
       if (use_brgemm) {
@@ -675,7 +679,7 @@ void fused_experts_kernel_impl(
 
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
-      for (int m = 0; m < m_size; ++m) {
+      for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
         float weight = topk_weights[index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
@@ -689,8 +693,8 @@ void fused_experts_kernel_impl(
 
   // stage 3: out = intermediate_cache2.sum(dim=1)
   //   from [M, topk, K] to [M, K]
-  at::parallel_for(0, M, 0, [&](int begin, int end) {
-    for (int m = begin; m < end; ++m) {
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
       sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
     }
   });
@@ -711,6 +715,11 @@ at::Tensor fused_experts_cpu(
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     bool inplace,
+    bool use_int8_w8a8,
+    std::optional<at::Tensor>& w1_scale,
+    std::optional<at::Tensor>& w2_scale,
+    std::optional<at::Tensor>& a1_scale,
+    std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
   RECORD_FUNCTION(
     "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
@@ -718,8 +727,8 @@ at::Tensor fused_experts_cpu(
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
 
-  constexpr int BLOCK_M = block_size_m();
-  constexpr int BLOCK_N = block_size_n();
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
 
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
@@ -735,17 +744,28 @@ at::Tensor fused_experts_cpu(
   CHECK_EQ(topk_ids.scalar_type(), at::kInt);
   CHECK_EQ(topk_weights.scalar_type(), at::kFloat);
 
-  int M = hidden_states.size(0);
-  int K = hidden_states.size(1);
-  int N = w2.size(2);
-  int E = w1.size(0);
-  int topk = topk_weights.size(1);
+  int64_t M = hidden_states.size(0);
+  int64_t K = hidden_states.size(1);
+  int64_t N = w1.size(1) / 2;
+  int64_t E = w1.size(0);
+  int64_t topk = topk_weights.size(1);
+
+  // we use int32_t compensation for int8 w8a8
+  int64_t packed_K = get_row_size(K, use_int8_w8a8);
+  int64_t packed_N = get_row_size(N, use_int8_w8a8);
 
   // check weight shapes
-  CHECK_EQ(w1.size(1), 2 * N);
-  CHECK_EQ(w1.size(2), K);
   CHECK_EQ(w2.size(0), E);
   CHECK_EQ(w2.size(1), K);
+  CHECK_EQ(w1.size(2), packed_K);
+  CHECK_EQ(w2.size(2), packed_N);
+
+  if (use_int8_w8a8) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
+    TORCH_CHECK(!a1_scale.has_value(), "static quantization for activation not supported.");
+    TORCH_CHECK(!a2_scale.has_value(), "static quantization for activation not supported.");
+  }
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -757,8 +777,8 @@ at::Tensor fused_experts_cpu(
   //   5. offsets    : [max_num_blocks + 1]
   //
   int num_threads = at::get_num_threads();
-  int max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
-  int max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
+  int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
+  int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
   auto buffer = at::empty(
       {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
       topk_ids.options());
@@ -771,20 +791,20 @@ at::Tensor fused_experts_cpu(
 
   // init sorted_ids with `numel` as the padding number
   // init expert_ids with `num_experts`
-  int numel = M * topk;
-  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int begin, int end) {
-    int m_start = begin * BLOCK_M;
-    int m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
-    fill_stub(sorted_ids + m_start, numel, m_size);
-    fill_stub(expert_ids + begin, E, end - begin);
+  int64_t numel = M * topk;
+  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+    int64_t m_start = begin * BLOCK_M;
+    int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
+    fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
+    fill_stub(expert_ids + begin, (int32_t)E, end - begin);
   });
   // zero total_cnts and cumsums
-  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int begin, int end) {
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
     fill_stub(total_cnts + begin, 0, end - begin);
   });
 
   // align experts index
-  int num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
+  int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
       sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
@@ -803,7 +823,7 @@ at::Tensor fused_experts_cpu(
     scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
     float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
 
-    fused_experts_kernel_impl<scalar_t>(
+    fused_experts_kernel_impl<scalar_t, scalar_t>(
         out_hidden_states.data_ptr<scalar_t>(),
         intermediate_cache1,
         intermediate_cache2,
