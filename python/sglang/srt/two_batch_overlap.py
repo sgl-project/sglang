@@ -35,8 +35,17 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     return split_index
 
 
-def compute_split_token_index(split_seq_index: int) -> int:
-    return TODO
+def compute_split_token_index(
+    split_seq_index: int,
+    forward_mode: ForwardMode,
+    extend_lens: Sequence[int],
+) -> int:
+    if forward_mode.is_extend():
+        return sum(extend_lens[:split_seq_index])
+    elif forward_mode.is_decode():
+        return split_seq_index
+    else:
+        raise NotImplementedError
 
 
 # ------------------------------------------ TODO ------------------------------------------
