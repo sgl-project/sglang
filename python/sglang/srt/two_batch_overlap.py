@@ -59,27 +59,13 @@ def split_inputs(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Optional[Tuple[Dict, Dict]]:
-    output_a = _filter_inputs(
-        hidden_states=hidden_states,
-        residual=residual,
-        positions=positions,
-        forward_batch=forward_batch,
-        child_mode="a",
-    )
-    output_b = _filter_inputs(
-        hidden_states=hidden_states,
-        residual=residual,
-        positions=positions,
-        forward_batch=forward_batch,
-        child_mode="b",
-    )
-
-    # _log(
-    #     f'split_inputs {forward_batch.input_ids.tolist()=} {output_a["forward_batch"].input_ids.tolist()=} {output_b["forward_batch"].input_ids.tolist()=}')
-    # _log(
-    #     f'split_inputs (input){forward_batch=} {output_a=} {output_b=}')
-
-    return output_a, output_b
+    return [
+        _filter_inputs(
+            child_index=child_index,
+            TODO=TODO,
+        )
+        for child_index in range(len(forward_batch.tbo_children))
+    ]
 
 
 def _filter_inputs(
@@ -89,9 +75,6 @@ def _filter_inputs(
     forward_batch: ForwardBatch,
     child_index: int,
 ) -> Dict:
-    # _log(
-    #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
-    # TODO improve, e.g. make it `children`?
     output_forward_batch = forward_batch.tbo_children[child_index]
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
