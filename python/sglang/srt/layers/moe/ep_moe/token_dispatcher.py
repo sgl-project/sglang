@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.layers.moe.ep_moe.kernels import (
     compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
@@ -104,8 +103,8 @@ def permute(
         assert not routing_map.requires_grad
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
+                         :, :capacity
+                         ].contiguous()
         sorted_indices = sorted_indices.view(-1)
     else:
         routing_map = routing_map.bool().T.contiguous()
@@ -330,7 +329,7 @@ class DeepEPDispatcher:
             num_experts,
             previous_event=previous_event,
             async_finish=self.async_finish,
-            allocate_on_comm_stream=False,
+            allocate_on_comm_stream=previous_event is not None,
         )
 
         (
@@ -350,7 +349,8 @@ class DeepEPDispatcher:
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
             async_finish=self.async_finish,
-            allocate_on_comm_stream=False,
+            # NOTE MODIFIED !!!
+            allocate_on_comm_stream=True,
         )
 
         return (
@@ -369,6 +369,8 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
     ):
+        raise Exception('this branch is not used')
+
         """
         # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'
         # Please please make sure to change DeepEP code in internode_ll.cu dispatch / combine first and then reinstall!
@@ -445,7 +447,9 @@ class DeepEPDispatcher:
             handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
-            allocate_on_comm_stream=False,
+            # NOTE MODIFIED
+            # allocate_on_comm_stream=False,
+            allocate_on_comm_stream=previous_event is not None,
         )
         return combined_x, event
 
@@ -456,6 +460,8 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         handle: Tuple,
     ):
+        raise Exception('this branch is not used')
+
         combined_hidden_states, event_overlap, hook = (
             self.buffer_low_latency.low_latency_combine(
                 hidden_states,
