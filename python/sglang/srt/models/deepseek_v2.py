@@ -349,7 +349,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_prefill_extra_a(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
-        return dict(**state_dispatch), None
+        return state | state_dispatch, None
 
     def _forward_stage_prefill_mlp_a(self, state):
         return self._forward_stage_mlp_raw(state)
@@ -359,14 +359,14 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_prefill_extra_b(self, state):
         state_combine = self._forward_substage_combine(state)
-        return dict(**state_combine), None
+        return state | state_combine, None
 
     def _forward_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(
             state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
         state['combine_event'].current_stream_wait()
         output_hidden_states = state['hidden_states_from_combine'] + shared_output
-        return None, output_hidden_states
+        return None, TODO(output_hidden_states)
 
     def _forward_stage_decode_shared(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
@@ -380,7 +380,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
         output_hidden_states = state['hidden_states_from_combine'] + state['shared_output']
-        return None, output_hidden_states
+        return None, TODO(output_hidden_states)
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
         state['dispatch_event'].current_stream_wait()
@@ -1290,6 +1290,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self_attn_state=self_attn_state,
             residual_after_input_ln=residual,
             forward_batch=forward_batch,
+            positions=positions,
         ), None
 
     def _forward_stage_decode_attn_1(self, state):
@@ -1302,7 +1303,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual_after_input_ln'])
         router_logits = self.mlp.gate(hidden_states)
-        return dict(
+        return state | dict(
             hidden_states_for_moe_input=hidden_states,
             residual_after_post_attn_ln=residual,
             router_logits=router_logits,
