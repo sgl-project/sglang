@@ -413,15 +413,16 @@ class DeepseekV2MoE(nn.Module):
         return state | state_combine, None
 
     def _forward_substage_dispatch(self, state):
-        (
-            recv_hidden_states_from_dispatch,
-            tokens_per_expert_from_dispatch,
-            dispatch_event,
-        ) = self._forward_deepep_dispatch(
+        state_dispatch = self._forward_deepep_dispatch_stage_start(
             state["forward_batch"].forward_mode,
             state["hidden_states_for_moe_input"],
             state["router_logits"],
         )
+        (
+            recv_hidden_states_from_dispatch,
+            tokens_per_expert_from_dispatch,
+            dispatch_event,
+        ) = self._forward_deepep_dispatch_stage_wait(state_dispatch)
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
