@@ -245,7 +245,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                async_finish=True,  # TODO
+                async_finish=global_server_args_dict["enable_two_batch_overlap"],
             )
 
     def forward(
