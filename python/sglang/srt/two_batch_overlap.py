@@ -97,21 +97,15 @@ _ENABLE_PROFILE = bool(
 )
 
 
-def execute_two_batch(
+def model_forward_execute_two_batch(
     inputs,
     fn,
     delta_stages: int,
-    enable_two_batch_overlap: bool,
-    split_inputs,
-    merge_outputs,
 ):
-    splitted_inputs = split_inputs(**inputs)
-    if splitted_inputs is not None:
-        inputs_a, inputs_b = splitted_inputs
-        output_a, output_b = execute_two_batch(
-            inputs_a, inputs_b, fn, delta_stages=delta_stages
-        )
-        return merge_outputs(output_a, output_b)
+    splitted_inputs = model_forward_split_inputs(**inputs)
+    inputs_a, inputs_b = splitted_inputs
+    output_a, output_b = execute_two_batch_raw(inputs_a, inputs_b, fn, delta_stages=delta_stages)
+    return model_forward_merge_outputs(output_a, output_b)
 
 
 # ------------------------------------------ TODO ------------------------------------------
