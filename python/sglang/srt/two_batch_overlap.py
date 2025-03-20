@@ -59,7 +59,7 @@ def split_inputs(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Tuple[Dict, Dict]:
-    return [
+    return tuple(*[
         _filter_inputs(
             hidden_states=hidden_states,
             residual=residual,
@@ -67,7 +67,7 @@ def split_inputs(
             output_forward_batch=output_forward_batch,
         )
         for output_forward_batch in forward_batch.tbo_children
-    ]
+    ])
 
 
 def _filter_inputs(
