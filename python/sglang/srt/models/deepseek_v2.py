@@ -1157,21 +1157,38 @@ class DeepseekV2Model(nn.Module):
         else:
             hidden_states = input_embeds
 
-        normal_num_layers = self.first_k_dense_replace if forward_batch.can_run_tbo else len(self.layers)
-
         residual = None
+
+        normal_num_layers = self.first_k_dense_replace if forward_batch.can_run_tbo else len(self.layers)
         for i in range(normal_num_layers):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
 
-        for i in range(normal_num_layers, len(self.layers)):
-            TODO
+        hidden_states, residual = self._forward_tbo_layers(
+            positions=positions,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+            residual=residual,
+            start_layer=normal_num_layers,
+        )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def _forward_tbo_layers(
+        self,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        start_layer: int,
+    ):
+        for i in range(start_layer, len(self.layers)):
+            TODO
+        return hidden_states, residual
 
 
 class DeepseekV2ForCausalLM(nn.Module):
