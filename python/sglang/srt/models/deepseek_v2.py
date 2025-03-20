@@ -1340,6 +1340,8 @@ class DeepseekV2Model(nn.Module):
         for i in range(start_layer, end_layer):
             stages += self.layers[i].get_forward_stages(forward_batch.forward_mode)
 
+        # TODO do not hardcode
+        chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
         with configure_deep_gemm_num_sm(enable_space_for_deepep=True):
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
