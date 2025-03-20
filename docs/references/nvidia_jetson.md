@@ -33,7 +33,6 @@ Or you can also manually run a container with this command:
 docker run --runtime nvidia -it --rm --network=host IMAGE_NAME
 ```
 * * * * *
-Prebuilt docker container images of SGLang can be found [here](https://hub.docker.com/r/dustynv/sglang/tags).
 
 Running Inference
 -----------------------------------------
