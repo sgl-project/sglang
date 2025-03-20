@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+import traceback
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -1499,12 +1500,16 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        try:
+            hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        except Exception as e:
+            # TODO adhoc
+            print(f'hi!!! forward has error {e=}', flush=True)
+            traceback.print_exc()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
