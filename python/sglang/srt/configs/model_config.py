@@ -239,12 +239,6 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        from sglang.srt.layers.quantization import (
-            BASE_QUANTIZATION_METHODS,
-            QUANTIZATION_METHODS,
-            VLLM_AVAILABLE,
-        )
-
         # Select supported quantization methods based on vllm availability
         if VLLM_AVAILABLE:
             supported_quantization = [*QUANTIZATION_METHODS]
