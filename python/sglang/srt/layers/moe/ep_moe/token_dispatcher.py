@@ -215,6 +215,8 @@ class DeepEPDispatcher:
         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         self.num_max_dispatch_tokens_per_rank = 128
 
+        self.current_stage = None
+
         if not use_deepep:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
@@ -299,7 +301,8 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        assert getattr(self, 'hidden_shape', None) is None
+        assert self.current_stage is None
+        self.current_stage = 'dispatch_start'
 
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
@@ -332,6 +335,9 @@ class DeepEPDispatcher:
         return event, handle, topk_idx, topk_weights, hidden_states
 
     def dispatch_stage_wait(self, state):
+        assert self.current_stage == 'dispatch_start'
+        self.current_stage = 'dispatch_wait'
+
         event, handle, topk_idx, topk_weights, hidden_states = state
 
         if self.async_finish:
@@ -466,6 +472,9 @@ class DeepEPDispatcher:
     def combine_stage_start(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ):
+        assert self.current_stage == 'dispatch_wait'
+        self.current_stage = 'combine_start'
+
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
@@ -481,6 +490,9 @@ class DeepEPDispatcher:
         return event, hidden_states
 
     def combine_stage_wait(self, state):
+        assert self.current_stage == 'combine_start'
+        self.current_stage = None
+       
         event, hidden_states = state
 
         if self.async_finish:
