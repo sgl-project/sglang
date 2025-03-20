@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union, Tuple
@@ -37,6 +38,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
