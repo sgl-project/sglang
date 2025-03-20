@@ -299,7 +299,7 @@ class DeepseekV2MoE(nn.Module):
                     forward_mode,
                 )
             )
-            TODO
+            event.current_stream_wait()
         final_hidden_states = (
             self.experts(
                 hidden_states=recv_hidden_states,
@@ -312,7 +312,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states, event = self.deepep_dispatcher.combine(
                 final_hidden_states, forward_mode
             )
-            TODO
+            event.current_stream_wait()
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
