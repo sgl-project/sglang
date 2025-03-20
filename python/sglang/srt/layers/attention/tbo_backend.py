@@ -87,10 +87,17 @@ class TboAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
+            # TODO
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
         )
+        common_args = dict(
+            num_kv_heads=num_kv_heads,
+        )
+
         child_left, child_right = self.children
-        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
-        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
+        child_left.init_forward_metadata_capture_cuda_graph(**args_left, **common_args)
+        child_right.init_forward_metadata_capture_cuda_graph(**args_right, **common_args)
 
     @staticmethod
     def _compute_cuda_graph_children_args(
