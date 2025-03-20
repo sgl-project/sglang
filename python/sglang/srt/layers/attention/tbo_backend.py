@@ -42,7 +42,7 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
-        self._init_forward_metadata_cuda_graph(
+        self._init_forward_metadata_cuda_graph_children(
             fn_name='init_forward_metadata_capture_cuda_graph',
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -77,7 +77,7 @@ class TboAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        self._init_forward_metadata_cuda_graph(
+        self._init_forward_metadata_cuda_graph_children(
             fn_name='init_forward_metadata_replay_cuda_graph',
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -90,7 +90,7 @@ class TboAttnBackend(AttentionBackend):
             replay_seq_lens_cpu=seq_lens_cpu,
         )
 
-    def _init_forward_metadata_cuda_graph(
+    def _init_forward_metadata_cuda_graph_children(
         self,
         fn_name: str,
         # common args
