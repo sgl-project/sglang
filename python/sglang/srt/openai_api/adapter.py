@@ -314,6 +314,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             )
 
         try:
+            created = int(time.time())
             ret = await tokenizer_manager.generate_request(adapted_request).__anext__()
             if not isinstance(ret, list):
                 ret = [ret]
@@ -321,13 +322,14 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 responses = v1_chat_generate_response(
                     request,
                     ret,
+                    created,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
                 )
             else:
                 responses = v1_generate_response(
-                    request, ret, tokenizer_manager, to_file=True,
+                    request, ret, tokenizer_manager, created, to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                 )
 
@@ -578,7 +580,7 @@ def v1_generate_request(
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_generate_response(request, ret, tokenizer_manager, to_file=False, cache_report=False):
+def v1_generate_response(request, ret, tokenizer_manager, created, to_file=False, cache_report=False):
     choices = []
     echo = False
 
@@ -676,7 +678,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False, cache_r
                     # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "text_completion",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": request[i].model,
                     "choices": choice,
                     "usage": {
@@ -699,6 +701,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False, cache_r
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
+            created=created,
             choices=choices,
             usage=UsageInfo(
                 prompt_tokens=prompt_tokens,
@@ -879,7 +882,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_generate_response(request, ret, tokenizer_manager,
+    response = v1_generate_response(request, ret, tokenizer_manager, created,
                                     cache_report=tokenizer_manager.server_args.enable_cache_report)
     return response
 
@@ -1066,6 +1069,7 @@ def v1_chat_generate_request(
 def v1_chat_generate_response(
     request,
     ret,
+    created,
     to_file=False,
     cache_report=False,
     tool_call_parser=None,
@@ -1217,7 +1221,7 @@ def v1_chat_generate_response(
                     # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "chat.completion",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": request[i].model,
                     "choices": choice,
                     "usage": {
@@ -1239,6 +1243,7 @@ def v1_chat_generate_response(
         cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
+            created=created,
             model=request.model,
             choices=choices,
             usage=UsageInfo(
@@ -1585,6 +1590,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request, cache_rep
     response = v1_chat_generate_response(
         request,
         ret,
+        created,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
