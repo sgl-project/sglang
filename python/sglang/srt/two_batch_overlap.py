@@ -156,8 +156,10 @@ class _StageExecutor:
             stage = self._stages[self._index]
             self._stage_state = stage(self._stage_state)
 
+        self.output = TODO
+
         self._index += 1
 
     @property
     def done(self):
-        return self.output is not None
+        return self._index >= len(self._stages)
