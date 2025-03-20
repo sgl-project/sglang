@@ -267,9 +267,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        shared_output = None
-        if forward_mode is not None and not forward_mode.is_idle() and self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+        shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
 
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -290,7 +288,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-            
+
         if self.tp_size > 1:
             recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, event = (
                 self.deepep_dispatcher.dispatch(
@@ -319,6 +317,11 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
+
+    def _forward_deepep_shared_output(self, forward_mode, hidden_states):
+        if forward_mode is not None and not forward_mode.is_idle() and self.n_shared_experts is not None:
+            return self.shared_experts(hidden_states)
+        return None
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
