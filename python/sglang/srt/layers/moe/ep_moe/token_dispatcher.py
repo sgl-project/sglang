@@ -19,10 +19,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-
-# TODO try disable global variable
-# _buffer_normal = None
-# _buffer_low_latency = None
+_buffer_normal = None
+_buffer_low_latency = None
 
 
 def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
@@ -31,8 +29,7 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-model-training-or-inference-prefilling
     """
 
-    # TODO try disable global variable
-    # global _buffer_normal
+    global _buffer_normal
 
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
@@ -46,9 +43,6 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
         )
 
-    # TODO try disable global variable
-    _buffer_normal = None
-
     if (
         _buffer_normal is None
         or _buffer_normal.group != group
@@ -60,39 +54,38 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     return _buffer_normal
 
 
-# TODO temp disable
-# def get_buffer_low_latency(
-#     group: dist.ProcessGroup,
-#     num_max_dispatch_tokens_per_rank: int,
-#     hidden: int,
-#     num_experts: int,
-# ):
-#     """
-#     Copy from DeepEP example usage in model inference decoding.
-#     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
-#     """
-#
-#     global _buffer_low_latency
-#     num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
-#         num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
-#     )
-#
-#     if (
-#         _buffer_low_latency is None
-#         or _buffer_low_latency.group != group
-#         or not _buffer_low_latency.low_latency_mode
-#         or _buffer_low_latency.num_rdma_bytes < num_rdma_bytes
-#     ):
-#         assert num_experts % group.size() == 0
-#         _buffer_low_latency = Buffer(
-#             group,
-#             0,
-#             num_rdma_bytes,
-#             low_latency_mode=True,
-#             num_qps_per_rank=num_experts // group.size(),
-#         )
-#     return _buffer_low_latency
-#
+def get_buffer_low_latency(
+    group: dist.ProcessGroup,
+    num_max_dispatch_tokens_per_rank: int,
+    hidden: int,
+    num_experts: int,
+):
+    """
+    Copy from DeepEP example usage in model inference decoding.
+    https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
+    """
+
+    global _buffer_low_latency
+    num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
+        num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
+    )
+
+    if (
+        _buffer_low_latency is None
+        or _buffer_low_latency.group != group
+        or not _buffer_low_latency.low_latency_mode
+        or _buffer_low_latency.num_rdma_bytes < num_rdma_bytes
+    ):
+        assert num_experts % group.size() == 0
+        _buffer_low_latency = Buffer(
+            group,
+            0,
+            num_rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=num_experts // group.size(),
+        )
+    return _buffer_low_latency
+
 
 def permute(
     tokens,
@@ -305,7 +298,8 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_start BEGIN',
+        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_start BEGIN '
+              f'{hidden_states.shape=} {topk_idx.shape=} {topk_weights.shape=} {num_experts=} {forward_mode=}',
               flush=True)
         assert self.current_stage is None
         self.current_stage = 'dispatch_start'
