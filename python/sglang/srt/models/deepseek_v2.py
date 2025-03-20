@@ -290,7 +290,8 @@ class DeepseekV2MoE(nn.Module):
             router_logits = None
 
         dispatch_state = self._forward_deepep_dispatch_stage_start(forward_mode, hidden_states, router_logits)
-        recv_hidden_states, tokens_per_expert = self._forward_deepep_dispatch_stage_wait(dispatch_state)
+        recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = \
+            self.deepep_dispatcher.dispatch_stage_wait(dispatch_state)
 
         final_hidden_states = self._forward_deepep_expert(
             forward_mode, recv_hidden_states, tokens_per_expert
@@ -340,11 +341,6 @@ class DeepseekV2MoE(nn.Module):
             self.num_experts,
             forward_mode,
         )
-
-    def _forward_deepep_dispatch_stage_wait(self, state):
-        recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = \
-            self.deepep_dispatcher.dispatch_stage_wait(state)
-        return recv_hidden_states, tokens_per_expert
 
     def _forward_deepep_expert(
         self, forward_mode, recv_hidden_states, tokens_per_expert
@@ -428,6 +424,8 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_substage_dispatch_wait(self, state):
         (
             recv_hidden_states_from_dispatch,
+            _topk_idx,
+            _topk_weights,
             tokens_per_expert_from_dispatch,
         ) = self._forward_deepep_dispatch_stage_wait(state['state_dispatch'])
         return dict(
