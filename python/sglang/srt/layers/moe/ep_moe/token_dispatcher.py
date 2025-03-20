@@ -273,7 +273,7 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        state = self.dispatch_stage_start(
+        self.dispatch_stage_start(
             hidden_states,
             topk_idx,
             topk_weights,
@@ -281,7 +281,7 @@ class DeepEPDispatcher:
             forward_mode,
             num_max_dispatch_tokens_per_rank,
         )
-        return self.dispatch_stage_wait(state)
+        return self.dispatch_stage_wait()
 
     def dispatch_stage_start(
         self,
@@ -320,10 +320,19 @@ class DeepEPDispatcher:
             )
             self.recv_expert_count = recv_expert_count
 
-        return event, handle, topk_idx, topk_weights, hidden_states
+        self.dispatch_intermediate_state = (
+            event,
+            handle,
+            topk_idx,
+            topk_weights,
+            hidden_states,
+        )
 
-    def dispatch_stage_wait(self, state):
-        event, handle, topk_idx, topk_weights, hidden_states = state
+    def dispatch_stage_wait(self):
+        event, handle, topk_idx, topk_weights, hidden_states = (
+            self.dispatch_intermediate_state
+        )
+        del self.dispatch_intermediate_state
 
         if self.async_finish:
             event.current_stream_wait()
@@ -451,8 +460,8 @@ class DeepEPDispatcher:
     def combine(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        state = self.combine_stage_start(hidden_states, forward_mode)
-        return self.combine_stage_wait(state)
+        self.combine_stage_start(hidden_states, forward_mode)
+        return self.combine_stage_wait()
 
     def combine_stage_start(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
@@ -469,10 +478,11 @@ class DeepEPDispatcher:
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
             )
 
-        return event, hidden_states
+        self.combine_intermediate_state = event, hidden_states
 
-    def combine_stage_wait(self, state):
-        event, hidden_states = state
+    def combine_stage_wait(self):
+        event, hidden_states = self.combine_intermediate_state
+        del self.combine_intermediate_state
 
         if self.async_finish:
             event.current_stream_wait()
