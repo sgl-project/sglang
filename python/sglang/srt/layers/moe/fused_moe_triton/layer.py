@@ -18,16 +18,25 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_xpu,
+    permute_weight,
+    set_weight_attrs,
+)
 
-if torch.cuda.is_available():
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
+_is_hip = is_hip()
+
+if _is_cuda or _is_xpu:
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 else:
     fused_experts = None  # type: ignore
 
 import logging
-
-_is_hip = is_hip()
 
 if _is_hip:
     from aiter import ck_moe

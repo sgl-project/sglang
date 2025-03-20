@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     init_custom_process_group,
     is_cuda,
     is_hip,
+    is_xpu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -664,7 +665,7 @@ class ModelRunner:
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if is_cuda():
+            if is_cuda() or is_xpu():
                 self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             raise ValueError(

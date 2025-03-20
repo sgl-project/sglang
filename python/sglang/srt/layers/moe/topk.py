@@ -17,9 +17,10 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_xpu
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 
 def fused_topk_native(
@@ -201,7 +202,9 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
             )
-    elif torch_native and custom_routing_function is None:
+    elif (torch_native and custom_routing_function is None) or (
+        "xpu" in hidden_states.device.type
+    ):
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,

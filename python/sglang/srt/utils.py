@@ -1283,6 +1283,7 @@ def direct_register_custom_op(
     my_lib = target_lib or sglang_lib
     my_lib.define(op_name + schema_str)
     my_lib.impl(op_name, op_func, "CUDA")
+    my_lib.impl(op_name, op_func, "XPU")
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
 

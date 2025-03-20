@@ -7,6 +7,7 @@ from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.test.test_utils import valid_devices
 
 
 class TestFusedMOE(unittest.TestCase):
@@ -14,7 +15,7 @@ class TestFusedMOE(unittest.TestCase):
     TOP_KS = [2, 6]
 
     @staticmethod
-    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
+    def create_random_cuda_tensor(shape, dtype, device, mean=0, std=0.01):
         """Create a random CUDA tensor
 
         Args:
@@ -26,7 +27,7 @@ class TestFusedMOE(unittest.TestCase):
         Returns:
             torch.Tensor: Randomly initialized CUDA tensor
         """
-        return torch.empty(shape, dtype=dtype, device="cuda").normal_(mean, std)
+        return torch.empty(shape, dtype=dtype, device=device).normal_(mean, std)
 
     def get_tolerance(self, dtype):
         """Get tolerance values for different data types
@@ -62,26 +63,27 @@ class TestFusedMOE(unittest.TestCase):
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
         ).sum(dim=1)
 
-    def _test_case(self, m, n, k, e, topk, dtype, use_fp8_w8a8=False):
+    def _test_case(self, device, m, n, k, e, topk, dtype, use_fp8_w8a8=False):
         rtol, atol = self.get_tolerance(dtype)
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = torch.cuda.get_device_capability()
-            if not (capability[0] >= 9 or capability == (8, 9)):
-                return
+            if "cuda" in device:
+                capability = torch.cuda.get_device_capability()
+                if not (capability[0] >= 9 or capability == (8, 9)):
+                    return
 
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
+            a = self.create_random_cuda_tensor((m, k), dtype, device)
+            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype, device)
+            w2 = self.create_random_cuda_tensor((e, k, n), dtype, device)
             w1 = w1.to(torch.float8_e4m3fn)
             w2 = w2.to(torch.float8_e4m3fn)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            score = self.create_random_cuda_tensor((m, e), dtype, device)
 
-            w1_scale = self.create_random_cuda_tensor(e, torch.float32)
-            w2_scale = self.create_random_cuda_tensor(e, torch.float32)
-            a1_scale = self.create_random_cuda_tensor(1, torch.float32)
-            a2_scale = self.create_random_cuda_tensor(1, torch.float32)
+            w1_scale = self.create_random_cuda_tensor(e, torch.float32, device)
+            w2_scale = self.create_random_cuda_tensor(e, torch.float32, device)
+            a1_scale = self.create_random_cuda_tensor(1, torch.float32, device)
+            a2_scale = self.create_random_cuda_tensor(1, torch.float32, device)
 
             sglang_output = fused_moe(
                 a,
@@ -97,27 +99,30 @@ class TestFusedMOE(unittest.TestCase):
                 a2_scale=a2_scale,
             )
 
-            vllm_output = fused_moe_vllm(
-                a,
-                w1,
-                w2,
-                score,
-                topk,
-                renormalize=False,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-            )
+            if "cuda" in device:
+                vllm_output = fused_moe_vllm(
+                    a,
+                    w1,
+                    w2,
+                    score,
+                    topk,
+                    renormalize=False,
+                    use_fp8_w8a8=True,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                )
 
-            torch.testing.assert_close(sglang_output, vllm_output, rtol=rtol, atol=atol)
+                torch.testing.assert_close(
+                    sglang_output, vllm_output, rtol=rtol, atol=atol
+                )
 
         else:
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            a = self.create_random_cuda_tensor((m, k), dtype, device)
+            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype, device)
+            w2 = self.create_random_cuda_tensor((e, k, n), dtype, device)
+            score = self.create_random_cuda_tensor((m, e), dtype, device)
 
             triton_output = fused_moe(a, w1, w2, score, topk, renormalize=False)
             torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
@@ -126,6 +131,7 @@ class TestFusedMOE(unittest.TestCase):
             )
 
     def test_various_configurations(self):
+        devices = valid_devices(include_cpu=False)
         m_values = [1, 33, 64, 222, 1024 * 128]
         n_values = [128, 1024, 2048]
         k_values = [128, 511, 1024]
@@ -145,32 +151,38 @@ class TestFusedMOE(unittest.TestCase):
 
         # Create progress bar
         with tqdm(total=total_tests, desc="Running MoE tests") as pbar:
-            for m in m_values:
-                for n in n_values:
-                    for k in k_values:
-                        for e in self.NUM_EXPERTS:
-                            for topk in self.TOP_KS:
-                                for dtype in dtypes:
-                                    for use_fp8_w8a8 in fp8_modes:
-                                        with self.subTest(
-                                            m=m,
-                                            n=n,
-                                            k=k,
-                                            e=e,
-                                            topk=topk,
-                                            dtype=dtype,
-                                            fp8=use_fp8_w8a8,
-                                        ):
-                                            self._test_case(
-                                                m,
-                                                n,
-                                                k,
-                                                e,
-                                                topk,
-                                                dtype,
-                                                use_fp8_w8a8=use_fp8_w8a8,
-                                            )
-                                        pbar.update(1)
+            for device in devices:
+                for m in m_values:
+                    for n in n_values:
+                        for k in k_values:
+                            for e in self.NUM_EXPERTS:
+                                for topk in self.TOP_KS:
+                                    for dtype in dtypes:
+                                        for use_fp8_w8a8 in fp8_modes:
+                                            with self.subTest(
+                                                device=device,
+                                                m=m,
+                                                n=n,
+                                                k=k,
+                                                e=e,
+                                                topk=topk,
+                                                dtype=dtype,
+                                                fp8=use_fp8_w8a8,
+                                            ):
+                                                # triton error occurs on xpu when k equal to 511.
+                                                if "xpu" in device and k == 511:
+                                                    continue
+                                                self._test_case(
+                                                    device,
+                                                    m,
+                                                    n,
+                                                    k,
+                                                    e,
+                                                    topk,
+                                                    dtype,
+                                                    use_fp8_w8a8=use_fp8_w8a8,
+                                                )
+                                            pbar.update(1)
 
 
 if __name__ == "__main__":

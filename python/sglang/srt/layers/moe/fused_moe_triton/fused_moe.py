@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cuda,
     is_hip,
+    is_xpu,
 )
 
 _is_hip = is_hip()
@@ -37,6 +38,7 @@ enable_moe_align_block_size_triton = bool(
 )
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
@@ -50,6 +52,10 @@ else:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+if _is_xpu:
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.quantization.fp8_utils import scaled_fp8_quant_native
 
 
 @triton.jit
@@ -457,7 +463,7 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    if enable_moe_align_block_size_triton:
+    if enable_moe_align_block_size_triton or _is_xpu:
         moe_align_block_size_triton(
             topk_ids,
             num_experts,
@@ -521,6 +527,8 @@ def invoke_fused_moe_kernel(
             padded_size = padding_size
             if _is_cuda:
                 A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+            if _is_xpu:
+                A, A_scale = scaled_fp8_quant_native(A, A_scale)
             else:
                 A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
         else:
@@ -1015,11 +1023,12 @@ def fused_experts_impl(
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if _is_xpu:
+        intermediate_cache2 = torch.empty(
+            (M * topk_ids.shape[1], N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
     )
@@ -1055,9 +1064,10 @@ def fused_experts_impl(
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.shape[1]
-            ]
+            if _is_xpu:
+                intermediate_cache2 = intermediate_cache2[
+                    : tokens_in_chunk * topk_ids.shape[1]
+                ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
             config = get_config_func(tokens_in_chunk)
 
@@ -1091,6 +1101,8 @@ def fused_experts_impl(
         if activation == "silu":
             if _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            if _is_xpu:
+                intermediate_cache2 = SiluAndMul()(intermediate_cache1.view(-1, N))
             else:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)

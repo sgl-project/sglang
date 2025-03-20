@@ -56,6 +56,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    requantize_with_max_scale_native,
+    scaled_fp8_quant_native,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -379,11 +381,18 @@ class Fp8LinearMethod(LinearMethodBase):
                     if input_scale is not None:
                         layer.input_scale = Parameter(input_scale, requires_grad=False)
 
-                weight_scale, weight = requantize_with_max_scale(
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    logical_widths=layer.logical_widths,
-                )
+                if "xpu" in weight.device.type:
+                    weight_scale, weight = requantize_with_max_scale_native(
+                        weight=weight,
+                        weight_scale=weight_scale,
+                        logical_widths=layer.logical_widths,
+                    )
+                else:
+                    weight_scale, weight = requantize_with_max_scale(
+                        weight=weight,
+                        weight_scale=weight_scale,
+                        logical_widths=layer.logical_widths,
+                    )
 
             # Update layer with new values.
             layer.weight = Parameter(weight.t(), requires_grad=False)
@@ -438,7 +447,9 @@ class Fp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            cutlass_fp8_supported=(
+                self.cutlass_fp8_supported if "xpu" not in x.device.type else False
+            ),
             use_per_token_if_dynamic=False,
         )
 

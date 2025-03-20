@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -13,6 +13,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_cuda,
     is_hip,
+    is_xpu,
 )
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
@@ -36,6 +37,10 @@ if _is_cuda:
             VLLM_AVAILABLE = False
     else:
         from sgl_kernel import fp8_scaled_mm
+
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sglang.srt.layers.quantization.triton_scaled_mm import triton_scaled_mm
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -137,6 +142,97 @@ def apply_w8a8_block_fp8_linear(
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
+
+
+def per_tensor_dequantize(
+    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
+) -> torch.Tensor:
+    fake_qweight = tensor.to(torch.float16)
+    dq_weight = fake_qweight * inv_scale
+    return dq_weight
+
+
+def requantize_with_max_scale_native(
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Max scale to be used for requanitzation.
+    max_w_scale = weight_scale.max()
+
+    # QKV / MLP is fused in the on disk checkpoint if any of the
+    # weight scales are still set to the default since we initialize
+    # N weight scales for N shards but we only load 1 weight scale
+    # from disk in this case. Skip requantization in this case (since)
+    # we already are quantized with the single scale.
+    # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
+    unfused_module_in_checkpoint = (
+        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    )
+
+    # If unfused checkpoint, need requanize with the single scale.
+    if unfused_module_in_checkpoint:
+        start = 0
+        for idx, logical_width in enumerate(logical_widths):
+            end = start + logical_width
+            weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            weight[start:end, :], _ = scaled_fp8_quant_native(weight_dq, max_w_scale)
+            start = end
+
+    return max_w_scale, weight
+
+
+# fp8
+def scaled_fp8_quant_native(
+    input: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    num_token_padding: Optional[int] = None,
+    use_per_token_if_dynamic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize input tensor to FP8 and return quantized tensor and scale.
+
+    This function supports both static and dynamic quantization: If you
+    provide the scale, it will use static scaling and if you omit it,
+    the scale will be determined dynamically. The function also allows
+    optional padding of the output tensors for downstream kernels that
+    will benefit from padding.
+
+    Args:
+        input: The input tensor to be quantized to FP8
+        scale: Optional scaling factor for the FP8 quantization
+        num_token_padding: If specified, pad the first dimension
+            of the output to at least this value.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: The output tensor in FP8 and
+            scaling factor.
+    """
+    # This code assumes batch_dim and num_tokens are flattened
+    assert input.ndim == 2
+    shape: Union[tuple[int, int], torch.Size] = input.shape
+    # For rocm, the output fp8 dtype is torch.float_e3m3fnuz
+    out_dtype = torch.float8_e4m3fn
+    if num_token_padding:
+        shape = (max(num_token_padding, input.shape[0]), shape[1])
+    output = torch.empty(shape, device=input.device, dtype=out_dtype)
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    if use_per_token_if_dynamic:
+        if scale is None:
+            scale = (
+                input.abs().max(dim=-1).reshape([input.shape[0], 1]).to(torch.float)
+                / finfo.max
+            )
+    else:
+        # The reference implementation that fully aligns to
+        # the kernel being tested.
+        if scale is None:
+            scale = input.abs().max().reshape([1]).to(torch.float) / finfo.max
+    scale_reciprocal = scale.reciprocal()
+    input_scl_sat = (input.to(torch.float32) * scale_reciprocal).clamp(
+        min=finfo.min, max=finfo.max
+    )
+    input_scl_sat = input_scl_sat.to(torch.float8_e4m3fn).contiguous()
+    output[: input.shape[0], :] = input_scl_sat
+    return output, scale
 
 
 def input_to_float8(
@@ -258,14 +354,24 @@ def apply_fp8_linear(
 
     if per_tensor_weights and per_tensor_activations:
         # Fused GEMM_DQ
-        output = torch._scaled_mm(
-            qinput,
-            weight,
-            out_dtype=input.dtype,
-            scale_a=x_scale,
-            scale_b=weight_scale,
-            bias=bias,
-        )
+        if "xpu" in input.device.type:
+            output = triton_scaled_mm(
+                qinput,
+                weight,
+                out_dtype=input.dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+                bias=bias,
+            )
+        else:
+            output = torch._scaled_mm(
+                qinput,
+                weight,
+                out_dtype=input.dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+                bias=bias,
+            )
         # A fix for discrepancy in scaled_mm which returns tuple
         # for torch < 2.5 and a single value in torch >= 2.5
         if type(output) is tuple and len(output) == 2:
@@ -297,13 +403,22 @@ def apply_fp8_linear(
         # GEMM
         # This computes C = (X * W).
         # Output in fp32 to allow subsequent ops to happen in-place
-        output = torch._scaled_mm(
-            qinput,
-            weight,
-            scale_a=TORCH_DEVICE_IDENTITY,
-            scale_b=TORCH_DEVICE_IDENTITY,
-            out_dtype=torch.float32,
-        )
+        if "xpu" in input.device.type:
+            output = triton_scaled_mm(
+                qinput,
+                weight,
+                scale_a=TORCH_DEVICE_IDENTITY,
+                scale_b=TORCH_DEVICE_IDENTITY,
+                out_dtype=torch.float32,
+            )
+        else:
+            output = torch._scaled_mm(
+                qinput,
+                weight,
+                scale_a=TORCH_DEVICE_IDENTITY,
+                scale_b=TORCH_DEVICE_IDENTITY,
+                out_dtype=torch.float32,
+            )
         # A fix for discrepancy in scaled_mm which returns tuple
         # for torch < 2.5 and a single value in torch >= 2.5
         if type(output) is tuple and len(output) == 2:

@@ -454,6 +454,19 @@ def run_with_timeout(
     return ret_value[0]
 
 
+def valid_devices(include_cpu: bool):
+    devices = []
+    if include_cpu:
+        devices.append("cpu")
+
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        devices.append("cuda")
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        devices.append("xpu")
+    return devices
+
+
 @dataclass
 class TestFile:
     name: str

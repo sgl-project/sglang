@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    valid_devices,
 )
 
 
@@ -26,17 +27,19 @@ class TestFp8KvcacheBase(unittest.TestCase):
         dirpath = os.path.dirname(__file__)
         config_file = os.path.join(dirpath, cls.model_config["config_filename"])
 
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--kv-cache-dtype",
-                "fp8_e4m3",
-                "--quantization-param-path",
-                config_file,
-            ],
-        )
+        devices = valid_devices(include_cpu=False)
+        for device in devices:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--kv-cache-dtype",
+                    "fp8_e4m3",
+                    "--quantization-param-path",
+                    config_file,
+                ],
+            )
 
 
 class TestFp8KvcacheLlama(TestFp8KvcacheBase):

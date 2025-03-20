@@ -500,6 +500,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:

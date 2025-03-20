@@ -7,6 +7,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    valid_devices,
 )
 
 
@@ -46,12 +47,14 @@ class TestQwen2FP8(unittest.TestCase):
     def setUpClass(cls):
         cls.model = "neuralmagic/Qwen2-7B-Instruct-FP8"
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
-        )
+        devices = valid_devices(include_cpu=False)
+        for device in devices:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[],
+            )
 
     @classmethod
     def tearDownClass(cls):
