@@ -324,9 +324,6 @@ class DeepEPDispatcher:
         # NOTE cannot be too early
         previous_event = Buffer.capture()
 
-        assert previous_event is not None  # temp hack
-        assert self.async_finish
-
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -378,8 +375,6 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
     ):
-        raise Exception('this branch is not used')
-
         """
         # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'
         # Please please make sure to change DeepEP code in internode_ll.cu dispatch / combine first and then reinstall!
@@ -454,9 +449,6 @@ class DeepEPDispatcher:
         # NOTE cannot be too early
         previous_event = Buffer.capture()
 
-        assert previous_event is not None  # temp hack
-        assert self.async_finish
-
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
@@ -478,8 +470,6 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         handle: Tuple,
     ):
-        raise Exception('this branch is not used')
-
         combined_hidden_states, event_overlap, hook = (
             self.buffer_low_latency.low_latency_combine(
                 hidden_states,
