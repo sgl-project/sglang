@@ -13,34 +13,35 @@ class TboAttnBackend(AttentionBackend):
         self.children = children
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        TODO
+        for item in self._primary_and_children:
+            item.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
         TODO
 
     def init_forward_metadata_capture_cuda_graph(
-            self,
-            bs: int,
-            num_tokens: int,
-            req_pool_indices: torch.Tensor,
-            seq_lens: torch.Tensor,
-            encoder_lens: Optional[torch.Tensor],
-            forward_mode: ForwardMode,
-            spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         TODO
 
     def init_forward_metadata_replay_cuda_graph(
-            self,
-            bs: int,
-            num_kv_heads: int,
-            req_pool_indices: torch.Tensor,
-            seq_lens: torch.Tensor,
-            seq_lens_sum: int,
-            encoder_lens: Optional[torch.Tensor],
-            forward_mode: ForwardMode,
-            spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-            seq_lens_cpu: Optional[torch.Tensor],
+        self,
+        bs: int,
+        num_kv_heads: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         TODO
 
@@ -52,3 +53,8 @@ class TboAttnBackend(AttentionBackend):
 
     def forward_decode(self, *args, **kwargs):
         TODO
+
+    @property
+    def _primary_and_children(self):
+        yield self.primary
+        yield from self.children
