@@ -1,8 +1,9 @@
 import os
 from contextlib import nullcontext
-from typing import Sequence, Optional, Tuple, Dict, Callable, List
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -56,15 +57,17 @@ def model_forward_split_inputs(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Tuple[Dict, Dict]:
-    return tuple(*[
-        _model_forward_filter_inputs(
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-            output_forward_batch=output_forward_batch,
-        )
-        for output_forward_batch in forward_batch.tbo_children
-    ])
+    return tuple(
+        *[
+            _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                output_forward_batch=output_forward_batch,
+            )
+            for output_forward_batch in forward_batch.tbo_children
+        ]
+    )
 
 
 def _model_forward_filter_inputs(
@@ -104,7 +107,9 @@ def model_forward_execute_two_batch(
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
-    output_a, output_b = _execute_two_batch_raw(inputs_a, inputs_b, stages, delta_stages=delta_stages)
+    output_a, output_b = _execute_two_batch_raw(
+        inputs_a, inputs_b, stages, delta_stages=delta_stages
+    )
     return model_forward_merge_outputs(output_a, output_b)
 
 
@@ -138,13 +143,17 @@ class _StageExecutor:
         assert not self.done
 
         if _ENABLE_PROFILE:
-            ctx = torch.profiler.record_function(f"Stage-{self._debug_name}{self._index}")
+            ctx = torch.profiler.record_function(
+                f"Stage-{self._debug_name}{self._index}"
+            )
         else:
             ctx = nullcontext()
 
         with ctx:
             stage = self._stages[self._index]
-            self._stage_state, self._stage_output = stage(state=self._stage_state, **(self._stage_output or {}))
+            self._stage_state, self._stage_output = stage(
+                state=self._stage_state, **(self._stage_output or {})
+            )
 
         self._index += 1
 

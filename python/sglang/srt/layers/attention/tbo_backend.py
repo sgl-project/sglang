@@ -1,6 +1,7 @@
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 import torch
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -43,7 +44,7 @@ class TboAttnBackend(AttentionBackend):
         )
 
         self._init_forward_metadata_cuda_graph_children(
-            fn_name='init_forward_metadata_capture_cuda_graph',
+            fn_name="init_forward_metadata_capture_cuda_graph",
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -78,7 +79,7 @@ class TboAttnBackend(AttentionBackend):
         )
 
         self._init_forward_metadata_cuda_graph_children(
-            fn_name='init_forward_metadata_replay_cuda_graph',
+            fn_name="init_forward_metadata_replay_cuda_graph",
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -107,8 +108,8 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
-        if fn_name == 'init_forward_metadata_capture_cuda_graph':
-            assert capture_num_tokens == bs, 'Only support num_tokens==bs currently'
+        if fn_name == "init_forward_metadata_capture_cuda_graph":
+            assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
         num_tokens = bs
 
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
@@ -178,7 +179,6 @@ def _init_forward_metadata_cuda_graph_split(
     fn_name: str,
     seq_slice: slice,
     output_bs: int,
-
     # common args
     bs: int,
     req_pool_indices: torch.Tensor,
@@ -193,8 +193,8 @@ def _init_forward_metadata_cuda_graph_split(
     replay_seq_lens_sum: int = None,
     replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
-    assert encoder_lens is None, 'encoder_lens is not supported yet'
-    assert spec_info is None, 'spec_info is not supported yet'
+    assert encoder_lens is None, "encoder_lens is not supported yet"
+    assert spec_info is None, "spec_info is not supported yet"
 
     ans = dict(
         # directly forward
@@ -204,24 +204,30 @@ def _init_forward_metadata_cuda_graph_split(
         spec_info=None,
     )
 
-    ans.update(dict(
-        bs=output_bs,
-        req_pool_indices=req_pool_indices[seq_slice],
-        seq_lens=seq_lens[seq_slice],
-    ))
+    ans.update(
+        dict(
+            bs=output_bs,
+            req_pool_indices=req_pool_indices[seq_slice],
+            seq_lens=seq_lens[seq_slice],
+        )
+    )
 
-    if fn_name == 'init_forward_metadata_capture_cuda_graph':
-        assert capture_num_tokens == bs, 'Only support num_tokens==bs currently'
-        ans.update(dict(
-            num_tokens=output_bs,
-        ))
-    elif fn_name == 'init_forward_metadata_replay_cuda_graph':
+    if fn_name == "init_forward_metadata_capture_cuda_graph":
+        assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
+        ans.update(
+            dict(
+                num_tokens=output_bs,
+            )
+        )
+    elif fn_name == "init_forward_metadata_replay_cuda_graph":
         output_seq_lens_cpu = replay_seq_lens_cpu[seq_slice]
-        ans.update(dict(
-            num_kv_heads=replay_num_kv_heads,
-            seq_lens_sum=output_seq_lens_cpu.sum().item(),
-            seq_lens_cpu=output_seq_lens_cpu,
-        ))
+        ans.update(
+            dict(
+                num_kv_heads=replay_num_kv_heads,
+                seq_lens_sum=output_seq_lens_cpu.sum().item(),
+                seq_lens_cpu=output_seq_lens_cpu,
+            )
+        )
     else:
         raise NotImplementedError
 

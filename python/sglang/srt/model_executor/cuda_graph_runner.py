@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -140,7 +141,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         bs
         for bs in capture_bs
         if bs <= model_runner.req_to_token_pool.size
-           and bs <= server_args.cuda_graph_max_bs
+        and bs <= server_args.cuda_graph_max_bs
     ]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
