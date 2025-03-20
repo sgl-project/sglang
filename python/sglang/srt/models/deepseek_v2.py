@@ -1285,7 +1285,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_tbo_stage_prefill_attn(self, state, **kwargs):
         state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_tbo_stage_decode_attn_1(state)
-        return state, None
 
     def _forward_tbo_stage_decode_attn_0(
         self,
