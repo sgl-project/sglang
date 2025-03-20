@@ -137,19 +137,22 @@ class TboAttnBackend(AttentionBackend):
 
         args_left = dict(
             bs=bs_child_left,
-            num_tokens=num_tokens_child_left,
             req_pool_indices=req_pool_indices[:tbo_split_seq_index],
             seq_lens=seq_lens[:tbo_split_seq_index],
         )
         args_right = dict(
             bs=bs_child_right,
-            num_tokens=num_tokens_child_right,
             req_pool_indices=req_pool_indices[tbo_split_seq_index:],
             seq_lens=seq_lens[tbo_split_seq_index:],
         )
 
         if fn_name == 'init_forward_metadata_capture_cuda_graph':
-            TODO
+            args_left.update(dict(
+                num_tokens=num_tokens_child_left,
+            ))
+            args_right.update(dict(
+                num_tokens=num_tokens_child_right,
+            ))
         elif fn_name == 'init_forward_metadata_replay_cuda_graph':
             args_common.update(dict(
                 num_kv_heads=replay_num_kv_heads,
