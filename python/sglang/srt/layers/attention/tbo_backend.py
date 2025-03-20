@@ -105,11 +105,11 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         # capture args
-        capture_num_tokens: int,
+        capture_num_tokens: int = None,
         # replay args
-        replay_num_kv_heads: int,
-        replay_seq_lens_sum: int,
-        replay_seq_lens_cpu: Optional[torch.Tensor],
+        replay_num_kv_heads: int = None,
+        replay_seq_lens_sum: int = None,
+        replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode,
