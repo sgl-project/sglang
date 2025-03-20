@@ -1111,14 +1111,18 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    @property
-    def forward_stages(self):
-        return [
-            self._forward_stage_prefill_attn_full,
-            self._forward_stage_prefill_extra,
-            self._forward_stage_prefill_mlp,
-            self._forward_stage_prefill_shared,
-        ]
+    def get_forward_stages(self, forward_mode: ForwardMode):
+        if forward_mode == ForwardMode.EXTEND:
+            return [
+                self._forward_stage_prefill_attn_full,
+                self._forward_stage_prefill_extra,
+                self._forward_stage_prefill_mlp,
+                self._forward_stage_prefill_shared,
+            ]
+        elif forward_mode == ForwardMode.DECODE:
+            return TODO
+        else:
+            raise NotImplementedError(f'Unsupported {forward_mode=}')
 
 
 class DeepseekV2Model(nn.Module):
@@ -1202,7 +1206,7 @@ class DeepseekV2Model(nn.Module):
 
         stages = []
         for i in range(start_layer, end_layer):
-            stages += self.layers[i].forward_stages
+            stages += self.layers[i].get_forward_stages(forward_batch.forward_mode)
 
         return two_batch_overlap.model_forward_execute_two_batch(
             inputs=dict(
