@@ -1246,7 +1246,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_stage_decode_attn_1(state)
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['forward_mode'], state['hidden_states'], state['router_logits']
+            state['forward_mode'], state['hidden_states_after_post_attn_ln'], state['router_logits']
         )
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
