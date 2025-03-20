@@ -127,15 +127,29 @@ class TboAttnBackend(AttentionBackend):
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
 
+        common_pre_split_args = dict(
+            fn_name=fn_name,
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            capture_num_tokens=capture_num_tokens,
+            replay_num_kv_heads=replay_num_kv_heads,
+            replay_seq_lens_sum=replay_seq_lens_sum,
+            replay_seq_lens_cpu=replay_seq_lens_cpu,
+        )
+
         args_left = _init_forward_metadata_cuda_graph_split(
             output_bs=bs_child_left,
             seq_slice=slice(None, tbo_split_seq_index),
-            TODO,
+            **common_pre_split_args,
         )
         args_right = _init_forward_metadata_cuda_graph_split(
             output_bs=bs_child_right,
             seq_slice=slice(tbo_split_seq_index, None),
-            TODO,
+            **common_pre_split_args,
         )
 
         child_left, child_right = self.children
