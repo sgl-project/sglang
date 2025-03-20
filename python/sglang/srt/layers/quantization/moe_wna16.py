@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
+
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
