@@ -101,15 +101,18 @@ class TboAttnBackend(AttentionBackend):
 
     @staticmethod
     def _compute_cuda_graph_children_args(
+        # common args
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_sum: int,
-        seq_lens_cpu: Optional[torch.Tensor],
+        # capture args
+        capture_num_tokens: int,
+        # replay args
+        replay_seq_lens_sum: int,
+        replay_seq_lens_cpu: Optional[torch.Tensor],
     ):
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode,
@@ -154,11 +157,9 @@ class TboAttnBackend(AttentionBackend):
             **args_common,
         )
 
-        if seq_lens_sum is not None:
-            TODO
-        if seq_lens_cpu is not None:
-            TODO
-       
+        TODO_capture_args
+        TODO_replay_args
+
         return args_left, args_right
 
     def get_cuda_graph_seq_len_fill_value(self):
