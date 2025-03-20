@@ -289,7 +289,8 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        dispatch_state = self._forward_deepep_dispatch_stage_start(self.deepep_dispatcher, forward_mode, hidden_states, router_logits)
+        dispatch_state = self._forward_deepep_dispatch_stage_start(self.deepep_dispatcher, forward_mode, hidden_states,
+                                                                   router_logits)
         recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = \
             self.deepep_dispatcher.dispatch_stage_wait(dispatch_state)
 
@@ -316,7 +317,8 @@ class DeepseekV2MoE(nn.Module):
             return self.shared_experts(hidden_states)
         return None
 
-    def _forward_deepep_dispatch_stage_start(self, chosen_deepep_dispatcher, forward_mode, hidden_states, router_logits):
+    def _forward_deepep_dispatch_stage_start(self, chosen_deepep_dispatcher, forward_mode, hidden_states,
+                                             router_logits):
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
@@ -435,13 +437,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_substage_combine_start(self, state):
-        state_combine = self.deepep_dispatcher.combine_stage_start(
+        state_combine = self.tbo_deepep_dispatchers[TODO].combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
         return dict(state_combine=state_combine)
 
     def _forward_tbo_substage_combine_wait(self, state):
-        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine_stage_wait(state['state_combine'])
+        hidden_states_from_combine, combine_event = self.tbo_deepep_dispatchers[TODO].combine_stage_wait(state['state_combine'])
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
             combine_event=combine_event,
