@@ -362,14 +362,16 @@ class DeepseekV2MoE(nn.Module):
         return dict(**state_combine, common=state['common']), None
 
     def _forward_stage_prefill_shared(self, state):
-        shared_output = self._forward_deepep_shared_output(state['common']['forward_batch'].forward_mode, hidden_states)
+        shared_output = self._forward_deepep_shared_output(
+            state['common']['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
         state['combine_event'].current_stream_wait()
         output_hidden_states = state['hidden_states_from_combine'] + shared_output
         return None, output_hidden_states
 
     def _forward_stage_decode_shared(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
-        shared_output = self._forward_deepep_shared_output(state['common']['forward_batch'].forward_mode, hidden_states)
+        shared_output = self._forward_deepep_shared_output(
+            state['common']['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
         return dict(**state_dispatch, shared_output=shared_output, common=state['common']), None
 
     def _forward_stage_decode_mlp(self, state):
@@ -399,7 +401,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_substage_dispatch(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'],
+            state['common']['forward_batch'].forward_mode, state['hidden_states_for_moe_input'],
             state['router_logits']
         )
         return dict(
@@ -1301,7 +1303,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual_after_input_ln'])
         router_logits = self.mlp.gate(hidden_states)
         return dict(
-            hidden_states_after_post_attn_ln=hidden_states,
+            hidden_states_for_moe_input=hidden_states,
             residual_after_post_attn_ln=residual,
             router_logits=router_logits,
             common=state['common'],
