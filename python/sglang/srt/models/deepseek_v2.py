@@ -359,6 +359,8 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
+    # ----------------------------------------- TBO-related --------------------------------------------
+
     def _forward_tbo_stage_prefill_dispatch_start(self, state):
         self._forward_tbo_substage_dispatch_start(state)
 
@@ -1255,6 +1257,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
+
+    # ----------------------------------------- TBO-related --------------------------------------------
 
     def get_forward_tbo_stages(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
