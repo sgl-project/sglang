@@ -231,7 +231,7 @@ def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
-        token_to_kv_pool=model_runner.token_to_kv_pool,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
         tree_cache=None,
         model_config=model_runner.model_config,
         enable_overlap=False,
@@ -340,7 +340,7 @@ def latency_test_run_once(
 
     # Clear the pools.
     model_runner.req_to_token_pool.clear()
-    model_runner.token_to_kv_pool.clear()
+    model_runner.token_to_kv_pool_allocator.clear()
 
     measurement_results = {
         "run_name": run_name,

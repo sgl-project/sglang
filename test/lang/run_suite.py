@@ -1,11 +1,11 @@
 import argparse
 import glob
 
-from sglang.test.test_utils import run_unittest_files
+from sglang.test.test_utils import TestFile, run_unittest_files
 
 suites = {
     "per-commit": [
-        "test_srt_backend.py",
+        TestFile("test_srt_backend.py"),
         # Skip this due to some OPENAI_API_KEY issues
         # "test_openai_backend.py",
     ],

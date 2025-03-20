@@ -17,14 +17,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple, Type
 
 import torch
 from torch import nn
 from transformers import GPT2Config
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.activation import NewGELU
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -36,6 +36,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 
 
 class GPT2Attention(nn.Module):
@@ -62,14 +63,14 @@ class GPT2Attention(nn.Module):
             total_num_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_attn",
+            prefix=add_prefix("c_attn", prefix),
         )
         self.c_proj = RowParallelLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -97,6 +98,7 @@ class GPT2MLP(nn.Module):
         self,
         intermediate_size: int,
         config: GPT2Config,
+        act_layer: Type[nn.Module] = NewGELU,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -107,18 +109,16 @@ class GPT2MLP(nn.Module):
             intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_fc",
+            prefix=add_prefix("c_fc", prefix),
         )
         self.c_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
+            prefix=add_prefix("c_proj", prefix),
         )
-        self.act = get_act_fn(
-            config.activation_function, quant_config, intermediate_size
-        )
+        self.act = act_layer()
 
     def forward(
         self,
@@ -136,6 +136,7 @@ class GPT2Block(nn.Module):
         self,
         layer_id: int,
         config: GPT2Config,
+        act_layer: Type[nn.Module] = NewGELU,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -145,10 +146,16 @@ class GPT2Block(nn.Module):
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(
-            layer_id, config, quant_config, prefix=f"{prefix}.attn"
+            layer_id, config, quant_config, prefix=add_prefix("attn", prefix)
         )
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPT2MLP(inner_dim, config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = GPT2MLP(
+            inner_dim,
+            config,
+            act_layer=act_layer,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
     def forward(
         self,
@@ -190,7 +197,12 @@ class GPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList(
             [
-                GPT2Block(i, config, quant_config)
+                GPT2Block(
+                    i,
+                    config,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"h.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -221,11 +233,14 @@ class GPT2LMHeadModel(nn.Module):
         self,
         config: GPT2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GPT2Model(config, quant_config, prefix="transformer")
+        self.transformer = GPT2Model(
+            config, quant_config, prefix=add_prefix("transformer", prefix)
+        )
         self.lm_head = self.transformer.wte
 
         self.logits_processor = LogitsProcessor(config)

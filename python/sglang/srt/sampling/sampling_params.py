@@ -22,7 +22,7 @@ class SamplingParams:
     """
     The sampling parameters.
 
-    See docs/references/sampling_params.md or
+    See docs/backend/sampling_params.md or
     https://docs.sglang.ai/backend/sampling_params.html
     for the documentation.
     """
@@ -40,17 +40,23 @@ class SamplingParams:
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         min_new_tokens: int = 0,
-        spaces_between_special_tokens: bool = True,
         n: int = 1,
         json_schema: Optional[str] = None,
         regex: Optional[str] = None,
         ebnf: Optional[str] = None,
         structural_tag: Optional[str] = None,
-        no_stop_trim: bool = False,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
+        spaces_between_special_tokens: bool = True,
+        no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self.max_new_tokens = max_new_tokens
+        self.stop_strs = stop
+        if stop_token_ids:
+            self.stop_token_ids = set(stop_token_ids)
+        else:
+            self.stop_token_ids = None
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -58,26 +64,21 @@ class SamplingParams:
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.repetition_penalty = repetition_penalty
-        self.stop_strs = stop
-        if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
-        else:
-            self.stop_token_ids = None
-        self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
-        self.ignore_eos = ignore_eos
-        self.skip_special_tokens = skip_special_tokens
-        self.spaces_between_special_tokens = spaces_between_special_tokens
         self.regex = regex
         self.n = n
         self.json_schema = json_schema
         self.ebnf = ebnf
         self.structural_tag = structural_tag
+        self.ignore_eos = ignore_eos
+        self.skip_special_tokens = skip_special_tokens
+        self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
 
         # Process some special cases
-        if self.temperature < _SAMPLING_EPS:
+        if 0 <= self.temperature < _SAMPLING_EPS:
+            # top_k = 1 means greedy sampling
             self.temperature = 1.0
             self.top_k = 1
         if self.top_k == -1:
@@ -92,9 +93,9 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k < -1 or self.top_k == 0:
+        if self.top_k < 1 or self.top_k == -1:
             raise ValueError(
-                f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}."
+                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
@@ -107,12 +108,12 @@ class SamplingParams:
             )
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in (0, 2], got "
+                "repetition_penalty must be in [0, 2], got "
                 f"{self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
-                f"min_new_tokens must be in (0, max_new_tokens], got "
+                f"min_new_tokens must be in [0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
             )
         if self.max_new_tokens is not None:
@@ -122,7 +123,7 @@ class SamplingParams:
                 )
             if not self.min_new_tokens <= self.max_new_tokens:
                 raise ValueError(
-                    f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
+                    f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
         grammars = [

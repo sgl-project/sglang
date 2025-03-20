@@ -12,7 +12,9 @@ from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 
@@ -49,6 +51,9 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.62)
 
+        if is_in_ci():
+            write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+
     def test_human_eval(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -61,6 +66,11 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.40)
 
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
+            )
+
     def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -72,6 +82,11 @@ class TestMoEEvalAccuracyLarge(unittest.TestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.61)
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
+            )
 
 
 if __name__ == "__main__":

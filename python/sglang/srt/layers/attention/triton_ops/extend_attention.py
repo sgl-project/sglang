@@ -29,7 +29,7 @@ is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -330,7 +330,7 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_hip_:
+    if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
@@ -341,12 +341,21 @@ def extend_attention_fwd(
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-            if Lq <= 128:
-                BLOCK_M, BLOCK_N = (128, 128)
-            elif Lq <= 256:
-                BLOCK_M, BLOCK_N = (64, 64)
+            # 8.9 has a much smaller shared memory size (100K) than 8.0 (160K)
+            if CUDA_CAPABILITY[1] == 9:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
             else:
-                BLOCK_M, BLOCK_N = (32, 64)
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
@@ -364,7 +373,7 @@ def extend_attention_fwd(
     num_stages = 1
 
     extra_kargs = {}
-    if is_hip_:
+    if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
@@ -403,7 +412,7 @@ def extend_attention_fwd(
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=is_hip_,
+        STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
