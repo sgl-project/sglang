@@ -240,7 +240,8 @@ class DeepseekV2MoE(nn.Module):
             self.deepep_dispatcher = self._create_deepep_dispatcher(config)
 
         if global_server_args_dict["enable_two_batch_overlap"]:
-            self.deepep_dispatcher_secondary = self._create_deepep_dispatcher(config)
+            # TODO maybe we do not need to create 2+1 dispatchers, but can reuse the one above
+            self.tbo_deepep_dispatchers = [self._create_deepep_dispatcher(config) for _ in range(2)]
 
     def _create_deepep_dispatcher(self, config):
         return DeepEPDispatcher(
