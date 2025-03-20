@@ -371,13 +371,9 @@ class DeepseekV2MoE(nn.Module):
         state |= self._forward_tbo_substage_mlp(state)
         return state, None
 
-    def _forward_tbo_stage_prefill_post_mlp_a(self, state):
+    def _forward_tbo_stage_prefill_combine_start(self, state):
         state |= self._forward_tbo_substage_combine_start(state)
         return state, None
-
-    def _forward_tbo_stage_prefill_extra_b(self, state):
-        state |= self._forward_tbo_substage_combine_start(state)
-        return state , None
 
     def _forward_tbo_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(
@@ -1287,14 +1283,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                         self.mlp._forward_tbo_stage_prefill_extra_a,
                         self.mlp._forward_tbo_stage_prefill_pre_mlp,
                         self.mlp._forward_tbo_stage_prefill_mlp,
-                        self.mlp._forward_tbo_stage_prefill_post_mlp_a,
+                        self.mlp._forward_tbo_stage_prefill_combine_start,
                     ]
                     if subbatch_index == 0
                     else [
                         self._forward_tbo_stage_prefill_post_attn_full_b,
                         self.mlp._forward_tbo_stage_prefill_pre_mlp,
                         self.mlp._forward_tbo_stage_prefill_mlp,
-                        self.mlp._forward_tbo_stage_prefill_extra_b,
+                        self.mlp._forward_tbo_stage_prefill_combine_start,
                     ]
                 ),
                 self.mlp._forward_tbo_stage_prefill_shared,
