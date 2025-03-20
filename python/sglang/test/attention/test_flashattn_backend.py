@@ -28,9 +28,9 @@ class TestFlashAttentionBackend(unittest.TestCase):
 
         # Common test parameters
         self.batch_size = 2
-        self.seq_len = 16
-        self.num_heads = 8
-        self.head_dim = 64
+        self.seq_len = 4
+        self.num_heads = 2
+        self.head_dim = 8
 
     def test_forward_extend(self):
         # Create mock inputs with correct shapes
@@ -75,9 +75,7 @@ class TestFlashAttentionBackend(unittest.TestCase):
             out_cache_loc=torch.arange(self.batch_size * self.seq_len, device="cuda"),
             seq_lens_sum=self.batch_size * self.seq_len,
             forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.zeros(
-                self.batch_size, dtype=torch.long, device="cuda"
-            ),
+            req_pool_indices=torch.arange(self.batch_size, device="cuda"),
             seq_lens=torch.tensor([self.seq_len] * self.batch_size, device="cuda"),
             extend_prefix_lens=torch.tensor([2] * self.batch_size, device="cuda"),
             extend_seq_lens=torch.tensor([2] * self.batch_size, device="cuda"),
@@ -88,11 +86,11 @@ class TestFlashAttentionBackend(unittest.TestCase):
         kv_cache_size = self.batch_size * self.seq_len
         forward_batch.token_to_kv_pool = MHATokenToKVPool(
             size=kv_cache_size,
-            page_size=self.seq_len,  # Changed to match seq_len
+            page_size=1,  # only consider page=1 for unit test
             dtype=torch.float16,
             head_num=self.num_heads,
             head_dim=self.head_dim,
-            layer_num=1,
+            layer_num=1,  # only consider layer=1 for unit test
             device="cuda",
             enable_memory_saver=False,
         )
