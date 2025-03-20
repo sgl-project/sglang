@@ -421,15 +421,17 @@ class Llama32Detector(BaseFormatDetector):
         # prefix the output with the <|python_tag|> token
         return "<|python_tag|>" in text or text.startswith("{")
 
-    def detect_and_parse(self, text: str, tools: List[Function]) -> List[ToolCallItem]:
+    def detect_and_parse(
+        self, text: str, tools: List[Function]
+    ) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
             return StreamingParseResult(normal_text=text, calls=[])
 
         if "<|python_tag|>" in text:
-            _, action_text = text.split("<|python_tag|>")
+            normal_text, action_text = text.split("<|python_tag|>")
         else:
-            action_text = text
+            normal_text, action_text = "", text
 
         # Split by semicolon and process each part
         json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
