@@ -402,7 +402,7 @@ class DeepseekV2MoE(nn.Module):
         state |= self._forward_tbo_substage_dispatch_wait(state)
         state |= self._forward_tbo_substage_mlp(state)
         state |= self._forward_tbo_substage_combine_start(state)
-        return state
+        return state, None
 
     def _forward_tbo_stage_decode_extra(self, state):
         self._forward_tbo_substage_combine_wait(state)
