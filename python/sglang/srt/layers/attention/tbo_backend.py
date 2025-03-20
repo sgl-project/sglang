@@ -135,15 +135,18 @@ class TboAttnBackend(AttentionBackend):
             spec_info=None,
         )
 
+        seq_slice_left = slice(None, tbo_split_seq_index)
+        seq_slice_right = slice(tbo_split_seq_index, None)
+
         args_left = dict(
             bs=bs_child_left,
-            req_pool_indices=req_pool_indices[:tbo_split_seq_index],
-            seq_lens=seq_lens[:tbo_split_seq_index],
+            req_pool_indices=req_pool_indices[seq_slice_left],
+            seq_lens=seq_lens[seq_slice_left],
         )
         args_right = dict(
             bs=bs_child_right,
-            req_pool_indices=req_pool_indices[tbo_split_seq_index:],
-            seq_lens=seq_lens[tbo_split_seq_index:],
+            req_pool_indices=req_pool_indices[seq_slice_right],
+            seq_lens=seq_lens[seq_slice_right],
         )
 
         if fn_name == 'init_forward_metadata_capture_cuda_graph':
@@ -159,11 +162,11 @@ class TboAttnBackend(AttentionBackend):
             ))
             args_left.update(dict(
                 seq_lens_sum=TODO,
-                seq_lens_cpu=replay_seq_lens_cpu[:tbo_split_seq_index],
+                seq_lens_cpu=replay_seq_lens_cpu[seq_slice_left],
             ))
             args_right.update(dict(
                 seq_lens_sum=TODO,
-                seq_lens_cpu=replay_seq_lens_cpu[tbo_split_seq_index:],
+                seq_lens_cpu=replay_seq_lens_cpu[seq_slice_right],
             ))
         else:
             raise NotImplementedError
