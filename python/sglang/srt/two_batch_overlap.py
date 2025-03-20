@@ -58,13 +58,15 @@ def split_inputs(
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
-) -> Optional[Tuple[Dict, Dict]]:
+) -> Tuple[Dict, Dict]:
     return [
         _filter_inputs(
-            child_index=child_index,
-            TODO=TODO,
+            hidden_states=hidden_states,
+            residual=residual,
+            positions=positions,
+            output_forward_batch=output_forward_batch,
         )
-        for child_index in range(len(forward_batch.tbo_children))
+        for output_forward_batch in forward_batch.tbo_children
     ]
 
 
@@ -72,10 +74,8 @@ def _filter_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
-    forward_batch: ForwardBatch,
-    child_index: int,
+    output_forward_batch: ForwardBatch,
 ) -> Dict:
-    output_forward_batch = forward_batch.tbo_children[child_index]
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
         hidden_states=hidden_states[token_slice],
