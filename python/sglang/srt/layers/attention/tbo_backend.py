@@ -1,7 +1,6 @@
 from typing import List, Optional, Union
 
 import torch
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -164,10 +163,10 @@ class TboAttnBackend(AttentionBackend):
         return ans
 
     def forward_extend(self, *args, **kwargs):
-        return self.forward_extend(*args, **kwargs)
+        return self.primary.forward_extend(*args, **kwargs)
 
     def forward_decode(self, *args, **kwargs):
-        return self.forward_decode(*args, **kwargs)
+        return self.primary.forward_decode(*args, **kwargs)
 
     @property
     def _primary_and_children(self):
