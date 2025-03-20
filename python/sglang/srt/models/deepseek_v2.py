@@ -363,7 +363,7 @@ class DeepseekV2MoE(nn.Module):
         state |= self._forward_tbo_substage_dispatch_start(state)
         return state, None
 
-    def _forward_tbo_stage_prefill_pre_mlp(self, state):
+    def _forward_tbo_stage_prefill_dispatch_wait(self, state):
         state |= self._forward_tbo_substage_dispatch_wait(state)
         return state, None
 
@@ -375,7 +375,7 @@ class DeepseekV2MoE(nn.Module):
         state |= self._forward_tbo_substage_combine_start(state)
         return state, None
 
-    def _forward_tbo_stage_prefill_shared(self, state):
+    def _forward_tbo_stage_prefill_shared_and_combine_wait(self, state):
         shared_output = self._forward_deepep_shared_output(
             state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
         )
@@ -1276,12 +1276,12 @@ class DeepseekV2DecoderLayer(nn.Module):
     def get_forward_tbo_stages(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
             return [
-                self._forward_tbo_stage_prefill_attn_full,
+                self._forward_tbo_stage_prefill_attn,
                 self.mlp._forward_tbo_stage_prefill_dispatch_start,
-                self.mlp._forward_tbo_stage_prefill_pre_mlp,
+                self.mlp._forward_tbo_stage_prefill_dispatch_wait,
                 self.mlp._forward_tbo_stage_prefill_mlp,
                 self.mlp._forward_tbo_stage_prefill_combine_start,
-                self.mlp._forward_tbo_stage_prefill_shared,
+                self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
@@ -1294,7 +1294,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_tbo_stage_prefill_attn_full(self, state, **kwargs):
+    def _forward_tbo_stage_prefill_attn(self, state, **kwargs):
         state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_tbo_stage_decode_attn_1(state)
         return state, None
