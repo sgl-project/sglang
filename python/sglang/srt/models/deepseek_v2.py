@@ -1191,8 +1191,10 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
+        stages = []
         for i in range(start_layer, end_layer):
-            TODO
+            layer = self.layers[i]
+            stages += TODO
 
         return two_batch_overlap.model_forward_execute_two_batch(
             inputs=dict(
@@ -1201,7 +1203,7 @@ class DeepseekV2Model(nn.Module):
                 forward_batch=forward_batch,
                 residual=residual,
             ),
-            stages=TODO,
+            stages=stages,
             delta_stages=TODO,
         )
 
