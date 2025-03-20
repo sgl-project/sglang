@@ -44,12 +44,12 @@ class TboAttnBackend(AttentionBackend):
 
         args_left, args_right = self._compute_cuda_graph_children_args(
             bs=bs,
-            num_tokens=num_tokens,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
+            capture_num_tokens=num_tokens,
         )
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(**args_left)
@@ -81,23 +81,19 @@ class TboAttnBackend(AttentionBackend):
 
         args_left, args_right = self._compute_cuda_graph_children_args(
             bs=bs,
-            num_tokens=num_tokens,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
-            # args only in `replay`
-            seq_lens_sum=seq_lens_sum,
-            seq_lens_cpu=seq_lens_cpu,
-        )
-        common_args = dict(
-            num_kv_heads=num_kv_heads,
+            replay_num_kv_heads=num_kv_heads,
+            replay_seq_lens_sum=seq_lens_sum,
+            replay_seq_lens_cpu=seq_lens_cpu,
         )
 
         child_left, child_right = self.children
-        child_left.init_forward_metadata_capture_cuda_graph(**args_left, **common_args)
-        child_right.init_forward_metadata_capture_cuda_graph(**args_right, **common_args)
+        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
+        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
 
     @staticmethod
     def _compute_cuda_graph_children_args(
@@ -111,6 +107,7 @@ class TboAttnBackend(AttentionBackend):
         # capture args
         capture_num_tokens: int,
         # replay args
+        replay_num_kv_heads: int,
         replay_seq_lens_sum: int,
         replay_seq_lens_cpu: Optional[torch.Tensor],
     ):
