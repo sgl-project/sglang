@@ -302,6 +302,9 @@ class DeepEPDispatcher:
                 )
             )
             self.recv_expert_count = recv_expert_count
+
+        event.current_stream_wait()  # TODO
+
         tokens_per_expert = self.get_number_of_tokens_per_expert()
         self.handle = handle
         self.topk_idx = topk_idx
@@ -457,6 +460,9 @@ class DeepEPDispatcher:
             # allocate_on_comm_stream=False,
             allocate_on_comm_stream=previous_event is not None,
         )
+
+        event.current_stream_wait()  # TODO
+
         return combined_x, event
 
     def combine_low_latency(
