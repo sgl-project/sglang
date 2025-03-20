@@ -299,7 +299,7 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        assert getattr(self, 'hidden_shape') is None
+        assert getattr(self, 'hidden_shape', None) is None
 
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
