@@ -237,16 +237,22 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=config.n_routed_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                async_finish=global_server_args_dict["enable_two_batch_overlap"],
-            )
+            self.deepep_dispatcher = self._create_deepep_dispatcher()
+
+        if global_server_args_dict["enable_two_batch_overlap"]:
+            self.deepep_dispatcher_secondary = self._create_deepep_dispatcher()
+
+    def _create_deepep_dispatcher(self):
+        return DeepEPDispatcher(
+            group=parallel_state.get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=config.n_routed_experts,
+            num_local_experts=config.n_routed_experts // self.tp_size,
+            hidden_size=config.hidden_size,
+            params_dtype=config.torch_dtype,
+            async_finish=global_server_args_dict["enable_two_batch_overlap"],
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
