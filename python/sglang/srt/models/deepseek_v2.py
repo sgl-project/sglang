@@ -273,6 +273,35 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
 
+        recv_hidden_states, tokens_per_expert = (
+            self._forward_deepep_dispatch(forward_mode, hidden_states, router_logits))
+
+        final_hidden_states = (
+            self.experts(
+                hidden_states=recv_hidden_states,
+                tokens_per_expert=tokens_per_expert,
+                forward_mode=forward_mode,
+            )
+            * self.routed_scaling_factor
+        )
+
+        if self.tp_size > 1:
+            final_hidden_states, event = self.deepep_dispatcher.combine(
+                final_hidden_states, forward_mode
+            )
+            event.current_stream_wait()  # TODO
+
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+
+        return final_hidden_states
+
+    def _forward_deepep_shared_output(self, forward_mode, hidden_states):
+        if forward_mode is not None and not forward_mode.is_idle() and self.n_shared_experts is not None:
+            return self.shared_experts(hidden_states)
+        return None
+
+    def _forward_deepep_dispatch(self, forward_mode, hidden_states, router_logits):
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
@@ -290,7 +319,6 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-
         if self.tp_size > 1:
             recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, event = (
                 self.deepep_dispatcher.dispatch(
@@ -302,28 +330,7 @@ class DeepseekV2MoE(nn.Module):
                 )
             )
             event.current_stream_wait()  # TODO
-        final_hidden_states = (
-            self.experts(
-                hidden_states=recv_hidden_states,
-                tokens_per_expert=tokens_per_expert,
-                forward_mode=forward_mode,
-            )
-            * self.routed_scaling_factor
-        )
-        if self.tp_size > 1:
-            final_hidden_states, event = self.deepep_dispatcher.combine(
-                final_hidden_states, forward_mode
-            )
-            event.current_stream_wait()  # TODO
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
-
-        return final_hidden_states
-
-    def _forward_deepep_shared_output(self, forward_mode, hidden_states):
-        if forward_mode is not None and not forward_mode.is_idle() and self.n_shared_experts is not None:
-            return self.shared_experts(hidden_states)
-        return None
+        return recv_hidden_states, tokens_per_expert
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
