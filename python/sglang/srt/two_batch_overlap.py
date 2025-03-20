@@ -79,6 +79,7 @@ def _model_forward_filter_inputs(
         residual: torch.Tensor,
         positions: torch.Tensor,
         output_forward_batch: 'ForwardBatch',
+        tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
@@ -86,6 +87,7 @@ def _model_forward_filter_inputs(
         residual=residual[token_slice],
         positions=positions[token_slice],
         forward_batch=output_forward_batch,
+        tbo_subbatch_index=tbo_subbatch_index,
     )
 
 
