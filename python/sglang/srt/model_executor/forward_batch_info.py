@@ -38,7 +38,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -335,7 +335,7 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        ret.prepare_tbo()
+        ret.prepare_tbo(tbo_split_seq_index=batch.tbo_split_seq_index)
 
         return ret
 
@@ -430,22 +430,17 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    def prepare_tbo(self):
-        enable_tbo = all(x != -1 for x in ret.global_split_token_index)
-        tp_rank = get_tensor_model_parallel_rank()
-        if enable_tbo:
-            split_token_index = ret.global_split_token_index[tp_rank]
-            split_seq_index = ret.global_split_seq_index[tp_rank]
-
-            ret.tbo_child_a = ret.filter_batch(
+    def prepare_tbo(self, tbo_split_seq_index: Optional[int]):
+        if tbo_split_seq_index is not None:
+            child_a = self.filter_batch(
                 start_token_index=0,
                 end_token_index=split_token_index,
                 start_seq_index=0,
                 end_seq_index=split_seq_index,
                 output_attn_backend=model_runner.attn_backend_child_a,
-                output_global_num_tokens=ret.global_split_token_index,
+                output_global_num_tokens=self.global_split_token_index,
             )
-            ret.tbo_child_b = ret.filter_batch(
+            child_b = self.filter_batch(
                 start_token_index=split_token_index,
                 end_token_index=ret.input_ids.shape[0],
                 start_seq_index=split_seq_index,
@@ -460,6 +455,9 @@ class ForwardBatch:
                     )
                 ],
             )
+
+            assert self.tbo_children is None
+            self.tbo_children = [child_a, child_b]
 
     def filter_batch(
         self,
