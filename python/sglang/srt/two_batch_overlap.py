@@ -154,17 +154,19 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
+        debug_name = f"Stage-{self._debug_name}-{self._index}-{stage.__name__}"
         if _ENABLE_PROFILE:
-            ctx = torch.profiler.record_function(
-                f"Stage-{self._debug_name}-{self._index}-{stage.__name__}"
-            )
+            ctx = torch.profiler.record_function(debug_name)
         else:
             ctx = nullcontext()
 
         with ctx:
-            self._stage_state, self._stage_output = stage(
-                state=self._stage_state, **(self._stage_output or {})
-            )
+            try:
+                self._stage_state, self._stage_output = stage(
+                    state=self._stage_state, **(self._stage_output or {})
+                )
+            except Exception as e:
+                raise Exception(f'Error when handling stage {debug_name} {e=}')
 
         self._index += 1
 
