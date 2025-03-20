@@ -62,6 +62,7 @@ suites = {
         TestFile("test_torch_compile_moe.py", 85),
         TestFile("test_torch_native_attention_backend.py", 149),
         TestFile("test_torchao.py", 70),
+        TestFile("test_two_batch_overlap.py", 60),
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 134),
         TestFile("test_update_weights_from_disk.py", 114),
@@ -175,7 +176,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin : args.range_end]
+        files = files[args.range_begin: args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
