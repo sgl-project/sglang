@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -7,8 +7,10 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 
 class ComposedAttnBackend(AttentionBackend):
-    def __init__(self):
+    def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
         super().__init__()
+        self.primary = primary
+        self.children = children
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         TODO

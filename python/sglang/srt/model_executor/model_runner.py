@@ -825,7 +825,10 @@ class ModelRunner:
 
     def init_attention_backend(self):
         if TODO:
-            self.attn_backend = ComposedAttnBackend()
+            self.attn_backend = ComposedAttnBackend(
+                primary=self._create_attention_backend(),
+                children=[self._create_attention_backend() for _ in range(2)],
+            )
         else:
             self.attn_backend = self._create_attention_backend()
 
