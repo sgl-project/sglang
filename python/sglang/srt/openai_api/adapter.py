@@ -329,7 +329,11 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 )
             else:
                 responses = v1_generate_response(
-                    request, ret, tokenizer_manager, created, to_file=True,
+                    request,
+                    ret,
+                    tokenizer_manager,
+                    created,
+                    to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                 )
 
@@ -580,7 +584,9 @@ def v1_generate_request(
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_generate_response(request, ret, tokenizer_manager, created, to_file=False, cache_report=False):
+def v1_generate_response(
+    request, ret, tokenizer_manager, created, to_file=False, cache_report=False
+):
     choices = []
     echo = False
 
@@ -846,7 +852,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=total_completion_tokens,
                         total_tokens=total_prompt_tokens + total_completion_tokens,
-                        prompt_tokens_details=prompt_tokens_details
+                        prompt_tokens_details=prompt_tokens_details,
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
@@ -882,8 +888,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_generate_response(request, ret, tokenizer_manager, created,
-                                    cache_report=tokenizer_manager.server_args.enable_cache_report)
+    response = v1_generate_response(
+        request,
+        ret,
+        tokenizer_manager,
+        created,
+        cache_report=tokenizer_manager.server_args.enable_cache_report,
+    )
     return response
 
 
@@ -1258,7 +1269,9 @@ def v1_chat_generate_response(
         return response
 
 
-async def v1_chat_completions(tokenizer_manager, raw_request: Request, cache_report=False):
+async def v1_chat_completions(
+    tokenizer_manager, raw_request: Request, cache_report=False
+):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
