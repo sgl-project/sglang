@@ -366,14 +366,16 @@ class DeepseekV2MoE(nn.Module):
         return state, None
 
     def _forward_tbo_stage_prefill_mlp_a(self, state):
-        return self._forward_tbo_substage_mlp(state)
+        state |= self._forward_tbo_substage_mlp(state)
+        return state, None
 
     def _forward_tbo_stage_prefill_post_mlp_a(self, state):
         state |= self._forward_tbo_substage_combine_start(state)
         return state, None
 
     def _forward_tbo_stage_prefill_mlp_b(self, state):
-        return self._forward_tbo_substage_mlp(state)
+        state |= self._forward_tbo_substage_mlp(state)
+        return state, None
 
     def _forward_tbo_stage_prefill_extra_b(self, state):
         state_combine = self._forward_tbo_substage_combine_start(state)
@@ -417,7 +419,7 @@ class DeepseekV2MoE(nn.Module):
             state["recv_hidden_states_from_dispatch"],
             state["tokens_per_expert_from_dispatch"],
         )
-        return state | dict(expert_output_hidden_states=expert_output_hidden_states), None
+        return state | dict(expert_output_hidden_states=expert_output_hidden_states)
 
     def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
