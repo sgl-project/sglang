@@ -87,7 +87,7 @@ class TboAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
-            # TODO
+            # args only in `replay`
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
         )
@@ -131,23 +131,25 @@ class TboAttnBackend(AttentionBackend):
         assert encoder_lens is None, 'encoder_lens is not supported yet'
         assert spec_info is None, 'spec_info is not supported yet'
 
+        args_common = dict(
+            encoder_lens=None,
+            forward_mode=forward_mode,
+            spec_info=None,
+        )
+
         args_left = dict(
             bs=bs_child_left,
             num_tokens=num_tokens_child_left,
             req_pool_indices=req_pool_indices[:tbo_split_seq_index],
             seq_lens=seq_lens[:tbo_split_seq_index],
-            encoder_lens=None,
-            forward_mode=forward_mode,
-            spec_info=None,
+            **args_common,
         )
         args_right = dict(
             bs=bs_child_right,
             num_tokens=num_tokens_child_right,
             req_pool_indices=req_pool_indices[tbo_split_seq_index:],
             seq_lens=seq_lens[tbo_split_seq_index:],
-            encoder_lens=None,
-            forward_mode=forward_mode,
-            spec_info=None,
+            **args_common,
         )
         return args_left, args_right
 
