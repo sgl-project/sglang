@@ -302,7 +302,8 @@ class DeepEPDispatcher:
             )
             self.recv_expert_count = recv_expert_count
 
-        event.current_stream_wait()  # TODO
+        if self.async_finish:
+            event.current_stream_wait()
 
         tokens_per_expert = self.get_number_of_tokens_per_expert()
         self.handle = handle
@@ -439,6 +440,10 @@ class DeepEPDispatcher:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
             )
+
+        if self.async_finish:
+            event.current_stream_wait()
+
         self.handle = None
         return hidden_states.view(self.hidden_shape), event
 
@@ -454,9 +459,6 @@ class DeepEPDispatcher:
             # allocate_on_comm_stream=False,
             allocate_on_comm_stream=previous_event is not None,
         )
-
-        event.current_stream_wait()  # TODO
-
         return combined_x, event
 
     def combine_low_latency(
