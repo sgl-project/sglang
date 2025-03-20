@@ -25,12 +25,12 @@ def compute_split_seq_index(
 
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
-    arr_sum = sum(arr)
-    cum_sum, split_index = 0, 0
+    overall_sum = sum(arr)
+    accumulator, split_index = 0, 0
     for value in arr[:-1]:
-        cum_sum += value
+        accumulator += value
         split_index += 1
-        if cum_sum >= arr_sum // 2:
+        if accumulator >= overall_sum // 2:
             break
     return split_index
 
