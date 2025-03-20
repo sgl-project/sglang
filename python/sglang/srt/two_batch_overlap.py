@@ -1,9 +1,9 @@
 import os
+from contextlib import nullcontext
 from typing import Sequence, Optional, Tuple, Dict, Callable, List
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from torch._dynamo.eval_frame import null_context
 
 
 def compute_split_seq_index(
@@ -140,7 +140,7 @@ class _StageExecutor:
         if _ENABLE_PROFILE:
             ctx = torch.profiler.record_function(f"Stage-{self._debug_name}{self._index}")
         else:
-            ctx = null_context()
+            ctx = nullcontext()
 
         with ctx:
             stage = self._stages[self._index]
