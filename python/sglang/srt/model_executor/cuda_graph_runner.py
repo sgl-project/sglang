@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -140,7 +139,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         bs
         for bs in capture_bs
         if bs <= model_runner.req_to_token_pool.size
-        and bs <= server_args.cuda_graph_max_bs
+           and bs <= server_args.cuda_graph_max_bs
     ]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
@@ -417,6 +416,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
         )
+        forward_batch.prepare_tbo(tbo_split_seq_index=TODO)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
