@@ -372,7 +372,7 @@ class DeepseekV2MoE(nn.Module):
         state_dispatch = self._forward_substage_dispatch(state)
         shared_output = self._forward_deepep_shared_output(
             state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
-        return dict(**state_dispatch, shared_output=shared_output), None
+        return state | state_dispatch | dict(shared_output=shared_output), None
 
     def _forward_stage_decode_mlp(self, state):
         return self._forward_stage_mlp_raw(state)
@@ -397,7 +397,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             state_combine = {}
 
-        return dict(**state_combine), None
+        return state | state_combine, None
 
     def _forward_substage_dispatch(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
