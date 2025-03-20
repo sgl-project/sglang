@@ -1186,8 +1186,13 @@ class DeepseekV2Model(nn.Module):
         residual: torch.Tensor,
         start_layer: int,
     ):
-        for i in range(start_layer, len(self.layers)):
+        end_layer = len(self.layers)
+        if start_layer == end_layer:
+            return hidden_states, residual
+
+        for i in range(start_layer, end_layer):
             TODO
+
         return hidden_states, residual
 
 
