@@ -348,9 +348,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_prefill_extra_a(self, state):
-        recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
-        )
+        state_dispatch = self._forward_substage_dispatch(state)
         return TODO, None
 
     def _forward_stage_prefill_mlp_a(self, state):
@@ -372,9 +370,7 @@ class DeepseekV2MoE(nn.Module):
         return None, final_hidden_states
 
     def _forward_stage_decode_shared(self, state):
-        recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
-        )
+        state_dispatch = self._forward_substage_dispatch(state)
         shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
         return TODO, None
 
@@ -396,6 +392,17 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states, forward_mode
             )
         return TODO, None
+
+    def _forward_substage_dispatch(self, state):
+        recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
+            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'],
+            state['router_logits']
+        )
+        return dict(
+            recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
+            tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
+            dispatch_event=dispatch_event,
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1245,15 +1252,8 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_stage_prefill_attn_full_b(self, state, **kwargs):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_stage_decode_attn_1(state)
-        recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
-        )
-        return dict(
-            recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
-            tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
-            dispatch_event=dispatch_event,
-            common=state['common'],
-        ), None
+        state_dispatch = self.mlp._forward_substage_dispatch(state)
+        return dict(**state_dispatch, common=state['common']), None
 
     def _forward_stage_decode_attn_0(
         self,
