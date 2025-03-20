@@ -16,8 +16,9 @@ class TboAttnBackend(AttentionBackend):
         self.children = children
 
     def init_forward_metadata(self, forward_batch: 'ForwardBatch'):
-        for item in self._primary_and_children:
-            item.init_forward_metadata(forward_batch=forward_batch)
+        self.primary.init_forward_metadata(forward_batch=forward_batch)
+        for child, forward_batch_child in zip(self.children, forward_batch.tbo_children, strict=True):
+            child.init_forward_metadata(forward_batch=forward_batch_child)
 
     def init_cuda_graph_state(self, max_bs: int):
         for item in self._primary_and_children:
@@ -25,14 +26,14 @@ class TboAttnBackend(AttentionBackend):
             item.init_cuda_graph_state(max_bs=max_bs)
 
     def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: 'ForwardMode',
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+            self,
+            bs: int,
+            num_tokens: int,
+            req_pool_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            encoder_lens: Optional[torch.Tensor],
+            forward_mode: 'ForwardMode',
+            spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         self.primary.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -56,16 +57,16 @@ class TboAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        num_kv_heads: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: 'ForwardMode',
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
+            self,
+            bs: int,
+            num_kv_heads: int,
+            req_pool_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            seq_lens_sum: int,
+            encoder_lens: Optional[torch.Tensor],
+            forward_mode: 'ForwardMode',
+            spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+            seq_lens_cpu: Optional[torch.Tensor],
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -93,21 +94,21 @@ class TboAttnBackend(AttentionBackend):
         )
 
     def _init_forward_metadata_cuda_graph_children(
-        self,
-        fn_name: str,
-        # common args
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: 'ForwardMode',
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        # capture args
-        capture_num_tokens: int = None,
-        # replay args
-        replay_num_kv_heads: int = None,
-        replay_seq_lens_sum: int = None,
-        replay_seq_lens_cpu: Optional[torch.Tensor] = None,
+            self,
+            fn_name: str,
+            # common args
+            bs: int,
+            req_pool_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            encoder_lens: Optional[torch.Tensor],
+            forward_mode: 'ForwardMode',
+            spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+            # capture args
+            capture_num_tokens: int = None,
+            # replay args
+            replay_num_kv_heads: int = None,
+            replay_seq_lens_sum: int = None,
+            replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         if fn_name == "init_forward_metadata_capture_cuda_graph":
             assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
@@ -170,29 +171,24 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
-    @property
-    def _primary_and_children(self):
-        yield self.primary
-        yield from self.children
-
 
 def _init_forward_metadata_cuda_graph_split(
-    fn_name: str,
-    seq_slice: slice,
-    output_bs: int,
-    # common args
-    bs: int,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    encoder_lens: Optional[torch.Tensor],
-    forward_mode: 'ForwardMode',
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    # capture args
-    capture_num_tokens: int = None,
-    # replay args
-    replay_num_kv_heads: int = None,
-    replay_seq_lens_sum: int = None,
-    replay_seq_lens_cpu: Optional[torch.Tensor] = None,
+        fn_name: str,
+        seq_slice: slice,
+        output_bs: int,
+        # common args
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: 'ForwardMode',
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        # capture args
+        capture_num_tokens: int = None,
+        # replay args
+        replay_num_kv_heads: int = None,
+        replay_seq_lens_sum: int = None,
+        replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     assert encoder_lens is None, "encoder_lens is not supported yet"
     assert spec_info is None, "spec_info is not supported yet"
