@@ -127,17 +127,14 @@ class TboAttnBackend(AttentionBackend):
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
 
-        seq_slice_left = slice(None, tbo_split_seq_index)
-        seq_slice_right = slice(tbo_split_seq_index, None)
-
         args_left = _init_forward_metadata_cuda_graph_split(
             output_bs=bs_child_left,
-            seq_slice=seq_slice_left,
+            seq_slice=slice(None, tbo_split_seq_index),
             TODO,
         )
         args_right = _init_forward_metadata_cuda_graph_split(
             output_bs=bs_child_right,
-            seq_slice=seq_slice_right,
+            seq_slice=slice(tbo_split_seq_index, None),
             TODO,
         )
 
