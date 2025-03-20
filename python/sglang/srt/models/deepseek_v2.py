@@ -430,9 +430,10 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_substage_combine(self, state):
-        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine(
+        state_combine = self.deepep_dispatcher.combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
+        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine_stage_wait(state_combine)
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
             combine_event=combine_event,
