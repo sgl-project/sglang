@@ -419,6 +419,14 @@ class DeepseekV2MoE(nn.Module):
             combine_event=combine_event,
         )
 
+    def _forward_substage_compute_layer_output(self):
+        return dict(
+            positions=TODO,
+            hidden_states=TODO,
+            forward_batch=TODO,
+            residual=TODO,
+        )
+
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     import math
