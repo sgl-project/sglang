@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 
 def compute_split_seq_index(
-        forward_mode: ForwardMode,
+        forward_mode: 'ForwardMode',
         num_tokens: int,
         extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
@@ -40,7 +40,7 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 def compute_split_token_index(
         split_seq_index: int,
-        forward_mode: ForwardMode,
+        forward_mode: 'ForwardMode',
         extend_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
@@ -56,7 +56,7 @@ def model_forward_split_inputs(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch: 'ForwardBatch',
 ) -> Tuple[Dict, Dict]:
     return tuple(
         *[
@@ -75,7 +75,7 @@ def _model_forward_filter_inputs(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         positions: torch.Tensor,
-        output_forward_batch: ForwardBatch,
+        output_forward_batch: 'ForwardBatch',
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
