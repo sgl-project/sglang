@@ -526,6 +526,7 @@ class ForwardBatch:
             "padded_static_len",
             # TODO only used by qwen2-vl, thus not checked
             "mrope_positions",
+            "temp_scaled_logprobs",
         ]:
             output_dict[key] = getattr(self, key)
 
