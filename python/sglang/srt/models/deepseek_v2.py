@@ -1063,11 +1063,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self._forward_input_layernorm(hidden_states, residual)
 
             # Self Attention
             hidden_states = self.self_attn(
@@ -1122,6 +1118,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
+        return hidden_states, residual
+
+    def _forward_input_layernorm(self, hidden_states, residual):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
