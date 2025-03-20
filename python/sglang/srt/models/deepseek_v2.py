@@ -1211,14 +1211,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
 
-    def get_forward_stages(self, forward_mode: ForwardMode):
+    def get_forward_stages(self, forward_mode: ForwardMode, subbatch_index: int):
         if forward_mode == ForwardMode.EXTEND:
+            assert subbatch_index in [0, 1]
             return [
                 *([
                       self._forward_stage_prefill_attn_full_a,
                       self.mlp._forward_stage_prefill_extra_a,
                       self.mlp._forward_stage_prefill_mlp_a,
-                  ] if TODO else [
+                  ] if subbatch_index == 0 else [
                     self._forward_stage_prefill_attn_full_b,
                     self.mlp._forward_stage_prefill_mlp_b,
                     self.mlp._forward_stage_prefill_extra_b,
@@ -1364,12 +1365,9 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        def get_forward_tbo_stages():
+        def get_forward_tbo_stages(subbatch_index: int):
             for i in range(start_layer, end_layer):
-                yield from self.layers[i].get_forward_stages(forward_batch.forward_mode)
-
-        stages_a = list(get_forward_tbo_stages())
-        stages_b = list(get_forward_tbo_stages())
+                yield from self.layers[i].get_forward_stages(forward_batch.forward_mode, subbatch_index)
 
         # TODO do not hardcode
         chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
@@ -1381,8 +1379,8 @@ class DeepseekV2Model(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                 ),
-                stages_a=stages_a,
-                stages_b=stages_b,
+                stages_a=list(get_forward_tbo_stages(subbatch_index=0)),
+                stages_b=list(get_forward_tbo_stages(subbatch_index=1)),
                 delta_stages={
                     ForwardMode.EXTEND: 1,
                     ForwardMode.DECODE: 2,
