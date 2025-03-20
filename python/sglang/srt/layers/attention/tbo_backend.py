@@ -51,16 +51,23 @@ class TboAttnBackend(AttentionBackend):
         assert encoder_lens is None, 'encoder_lens is not supported yet'
         assert spec_info is None, 'spec_info is not supported yet'
 
-        num_tokens_child = TODO
+        tbo_split_token_index = two_batch_overlap.compute_split_token_index(
+            split_seq_index=tbo_split_seq_index,
+            forward_mode=forward_mode,
+            extend_lens=None,
+        )
+        num_tokens_child_left = tbo_split_token_index
+        num_tokens_child_right = num_tokens - tbo_split_token_index
 
         # not yet support `num_tokens_per_bs>1`
         assert num_tokens == bs
-        bs_child = num_tokens_child
+        bs_child_left = num_tokens_child_left
+        bs_child_right = num_tokens_child_right
 
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(
-            bs=bs_child,
-            num_tokens=num_tokens_child,
+            bs=bs_child_left,
+            num_tokens=num_tokens_child_left,
             req_pool_indices=req_pool_indices[:tbo_split_seq_index],
             seq_lens=seq_lens[:tbo_split_seq_index],
             encoder_lens=None,
@@ -68,8 +75,8 @@ class TboAttnBackend(AttentionBackend):
             spec_info=None,
         )
         child_right.init_forward_metadata_capture_cuda_graph(
-            bs=bs_child,
-            num_tokens=num_tokens_child,
+            bs=bs_child_right,
+            num_tokens=num_tokens_child_right,
             req_pool_indices=req_pool_indices[tbo_split_seq_index:],
             seq_lens=seq_lens[tbo_split_seq_index:],
             encoder_lens=None,
