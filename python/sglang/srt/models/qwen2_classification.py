@@ -52,7 +52,9 @@ class Qwen2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert get_embedding, "Qwen2ForSequenceClassification is only used for embedding"
+        assert (
+            get_embedding
+        ), "Qwen2ForSequenceClassification is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)
