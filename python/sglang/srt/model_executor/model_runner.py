@@ -824,7 +824,7 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
-        if TODO:
+        if self.server_args.enable_two_batch_overlap:
             self.attn_backend = TboAttnBackend(
                 primary=self._create_attention_backend_core(),
                 children=[self._create_attention_backend_core() for _ in range(2)],
