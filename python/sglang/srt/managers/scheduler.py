@@ -481,6 +481,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.cum_cache_hit_tokens = 0
+        self.cum_prefill_tokens = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
@@ -854,6 +856,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        cache_hit_rate = adder.log_hit_tokens / (
+            adder.log_input_tokens + adder.log_hit_tokens
+        )
+
         f = (
             f"Prefill batch. "
             f"#new-seq: {len(can_run_list)}, "
@@ -862,18 +868,20 @@ class Scheduler(SchedulerOutputProcessorMixin):
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
+            f"cache hit rate: {cache_hit_rate:.2f}, "
         )
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / (
-                adder.log_input_tokens + adder.log_hit_tokens
-            )
+            self.cum_cache_hit_tokens += adder.log_hit_tokens
+            self.cum_prefill_tokens += adder.log_input_tokens + adder.log_hit_tokens
+            cum_cache_hit_rate = self.cum_cache_hit_tokens / self.cum_prefill_tokens
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.cum_cache_hit_rate = cum_cache_hit_rate
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -1459,6 +1467,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
             self.spec_num_total_forward_ct = 0
             self.cum_spec_accept_length = 0
             self.cum_spec_accept_count = 0
+            self.cum_cache_hit_tokens = 0
+            self.cum_prefill_tokens = 0
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             if_success = True

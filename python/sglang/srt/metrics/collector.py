@@ -26,6 +26,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
+    cum_cache_hit_rate: float = 0.0
     spec_accept_length: float = 0.0
 
 
@@ -80,6 +81,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.cum_cache_hit_rate = Gauge(
+            name="sglang:cum_cache_hit_rate",
+            documentation="The cumulative prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
@@ -98,6 +106,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.cum_cache_hit_rate, stats.cum_cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self.last_log_time = time.time()
 

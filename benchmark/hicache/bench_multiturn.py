@@ -3,6 +3,7 @@ import asyncio
 import json
 import queue
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -381,7 +382,35 @@ class WorkloadGenerator:
         print(
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
+
+        metrics = get_metrics()
+        print("Metrics:", metrics)
+        performance_data["metrics"] = metrics
         log_to_jsonl_file(performance_data, args.log_file)
+
+
+def get_metrics():
+    metrics_url = f"http://{args.host}:{args.port}/metrics"
+    metrics_response = requests.get(metrics_url)
+    metrics_content = metrics_response.text
+
+    metrics = {}
+    metric_keys = {
+        "cum_cache_hit_rate",
+    }
+
+    # Regex pattern to match lines like: sglang:metric_name{...} value
+    pattern = re.compile(r"sglang:(\w+)\{([^}]*)\}\s+([0-9.eE+-]+)")
+
+    for line in metrics_content.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            metric_name, raw_labels, value = match.groups()
+
+            if metric_name in metric_keys:
+                metrics[metric_name] = float(value)
+
+    return metrics
 
 
 if __name__ == "__main__":
