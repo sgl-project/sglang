@@ -54,10 +54,10 @@ class TboAttnBackend(AttentionBackend):
         return ans
 
     def forward_extend(self, *args, **kwargs):
-        TODO
+        return self.forward_extend(*args, **kwargs)
 
     def forward_decode(self, *args, **kwargs):
-        TODO
+        return self.forward_decode(*args, **kwargs)
 
     @property
     def _primary_and_children(self):
