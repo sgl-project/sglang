@@ -354,14 +354,19 @@ class DeepseekV2MoE(nn.Module):
         return TODO, None
 
     def _forward_stage_prefill_mlp(self, state):
-        return _forward_stage_decode_mlp(state)
+        return self._forward_stage_decode_mlp(state)
 
     def _forward_stage_prefill_shared(self, state):
-        TODO_shared
+        shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
         state['combine_event'].current_stream_wait()
-        return None, TODO
+        final_hidden_states = final_hidden_states + shared_output
+        return None, final_hidden_states
 
     def _forward_stage_decode_shared(self, state):
+        recv_hidden_states, tokens_per_expert, dispatch_event = self._forward_deepep_dispatch(
+            state['forward_mode'], state['hidden_states'], state['router_logits']
+        )
+        shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
         return TODO, None
 
     def _forward_stage_decode_mlp(self, state):
@@ -376,7 +381,8 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
-        return None, TODO
+        final_hidden_states = final_hidden_states + shared_output
+        return None, final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
