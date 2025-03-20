@@ -1223,8 +1223,8 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_stage_decode_attn_1(self, state):
         hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual'])
-        TODO_mlp_gate
-        return dict(TODO=TODO), None
+        router_logits = self.mlp.gate(hidden_states)
+        return dict(hidden_states=hidden_states, residual=residual, router_logits=router_logits), None
 
 
 class DeepseekV2Model(nn.Module):
