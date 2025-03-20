@@ -567,6 +567,10 @@ class ForwardBatch:
 
         return ForwardBatch(**output_dict)
 
+    @property
+    def enable_tbo(self):
+        return self.tbo_split_seq_index is not None
+
 
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
     if forward_mode.is_extend():
