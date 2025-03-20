@@ -1,36 +1,32 @@
 import os
+from typing import Sequence, Optional
 
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from torch._dynamo.eval_frame import null_context
 
 
-# TODO refactor
-def compute_middle_split_token_and_seq_index(self):
-    num_tokens = self.input_ids.shape[0]
-
-    if self.forward_mode.is_extend():
+def compute_split_seq_index(
+    forward_mode: ForwardMode,
+    num_tokens: int,
+    extend_lens: Sequence[int],
+) -> Optional[int]:
+    if forward_mode.is_extend():
         split_token_index, split_seq_index = 0, 0
-        for extend_seq_len in self.extend_lens[:-1]:
+        for extend_seq_len in extend_lens[:-1]:
             split_token_index += extend_seq_len
             split_seq_index += 1
             if split_token_index >= num_tokens // 2:
                 break
-    elif self.forward_mode.is_decode():
-        split_token_index = split_seq_index = num_tokens // 2
+    elif forward_mode.is_decode():
+        split_seq_index = num_tokens // 2
     else:
         raise NotImplementedError
 
-    # print(
-    #     f'[TP{get_tensor_model_parallel_rank()}] compute_middle_split_token_and_seq_index {num_tokens=} {split_token_index=} {self.input_ids.tolist()=} {self.forward_mode=}')
-    if split_token_index == 0 or split_token_index == num_tokens:
-        return -1, -1
+    if split_seq_index == 0 or split_seq_index == num_tokens:
+        return None
 
-    return split_token_index, split_seq_index
-
-
-def compute_split_seq_index() -> int:
-    return TODO
+    return split_seq_index
 
 
 def compute_split_token_index(split_seq_index: int) -> int:
