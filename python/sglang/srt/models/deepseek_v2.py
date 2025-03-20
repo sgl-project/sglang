@@ -351,51 +351,51 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-    def _forward_stage_prefill_extra_a(self, state):
-        state_dispatch = self._forward_substage_dispatch_start(state)
+    def _forward_tbo_stage_prefill_extra_a(self, state):
+        state_dispatch = self._forward_tbo_substage_dispatch_start(state)
         return state | state_dispatch, None
 
-    def _forward_stage_prefill_mlp_a(self, state):
-        return self._forward_stage_mlp_raw(state)
+    def _forward_tbo_stage_prefill_mlp_a(self, state):
+        return self._forward_tbo_stage_mlp_raw(state)
 
-    def _forward_stage_prefill_mlp_b(self, state):
-        return self._forward_stage_mlp_raw(state, start_combine=False)
+    def _forward_tbo_stage_prefill_mlp_b(self, state):
+        return self._forward_tbo_stage_mlp_raw(state, start_combine=False)
 
-    def _forward_stage_prefill_extra_b(self, state):
-        state_combine = self._forward_substage_combine_start(state)
+    def _forward_tbo_stage_prefill_extra_b(self, state):
+        state_combine = self._forward_tbo_substage_combine_start(state)
         return state | state_combine, None
 
-    def _forward_stage_prefill_shared(self, state):
+    def _forward_tbo_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(
             state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
         )
-        self._forward_substage_combine_wait(state)
+        self._forward_tbo_substage_combine_wait(state)
         output_hidden_states = state["hidden_states_from_combine"] + shared_output
-        return None, self._forward_substage_compute_layer_output(
+        return None, self._forward_tbo_substage_compute_layer_output(
             state, output_hidden_states
         )
 
-    def _forward_stage_decode_shared(self, state):
-        state_dispatch = self._forward_substage_dispatch_start(state)
+    def _forward_tbo_stage_decode_shared(self, state):
+        state_dispatch = self._forward_tbo_substage_dispatch_start(state)
         shared_output = self._forward_deepep_shared_output(
             state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
         )
         return state | state_dispatch | dict(shared_output=shared_output), None
 
-    def _forward_stage_decode_mlp(self, state):
-        return self._forward_stage_mlp_raw(state)
+    def _forward_tbo_stage_decode_mlp(self, state):
+        return self._forward_tbo_stage_mlp_raw(state)
 
-    def _forward_stage_decode_extra(self, state):
-        self._forward_substage_combine_wait(state)
+    def _forward_tbo_stage_decode_extra(self, state):
+        self._forward_tbo_substage_combine_wait(state)
         output_hidden_states = (
             state["hidden_states_from_combine"] + state["shared_output"]
         )
-        return None, self._forward_substage_compute_layer_output(
+        return None, self._forward_tbo_substage_compute_layer_output(
             state, output_hidden_states
         )
 
-    def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
-        self._forward_substage_dispatch_wait(state)
+    def _forward_tbo_stage_mlp_raw(self, state, start_combine: bool = True):
+        self._forward_tbo_substage_dispatch_wait(state)
 
         expert_output_hidden_states = self._forward_deepep_expert(
             state["forward_batch"].forward_mode,
@@ -404,7 +404,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if start_combine:
-            state_combine = self._forward_substage_combine_start(
+            state_combine = self._forward_tbo_substage_combine_start(
                 state | dict(expert_output_hidden_states=expert_output_hidden_states)
             )
         else:
@@ -412,7 +412,7 @@ class DeepseekV2MoE(nn.Module):
 
         return state | state_combine, None
 
-    def _forward_substage_dispatch_start(self, state):
+    def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
             state["forward_batch"].forward_mode,
             state["hidden_states_for_moe_input"],
@@ -420,7 +420,7 @@ class DeepseekV2MoE(nn.Module):
         )
         return dict(state_dispatch=state_dispatch)
 
-    def _forward_substage_dispatch_wait(self, state):
+    def _forward_tbo_substage_dispatch_wait(self, state):
         (
             recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch,
@@ -430,20 +430,20 @@ class DeepseekV2MoE(nn.Module):
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
         )
 
-    def _forward_substage_combine_start(self, state):
+    def _forward_tbo_substage_combine_start(self, state):
         state_combine = self.deepep_dispatcher.combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
         return dict(state_combine=state_combine)
 
-    def _forward_substage_combine_wait(self, state):
+    def _forward_tbo_substage_combine_wait(self, state):
         hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine_stage_wait(state['state_combine'])
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
             combine_event=combine_event,
         )
 
-    def _forward_substage_compute_layer_output(self, state, output_hidden_states):
+    def _forward_tbo_substage_compute_layer_output(self, state, output_hidden_states):
         return dict(
             positions=state["positions"],
             hidden_states=output_hidden_states,
@@ -1265,48 +1265,48 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
 
-    def get_forward_stages(self, forward_mode: ForwardMode, subbatch_index: int):
+    def get_forward_tbo_stages(self, forward_mode: ForwardMode, subbatch_index: int):
         if forward_mode == ForwardMode.EXTEND:
             assert subbatch_index in [0, 1]
             return [
                 *(
                     [
-                        self._forward_stage_prefill_attn_full_a,
-                        self.mlp._forward_stage_prefill_extra_a,
-                        self.mlp._forward_stage_prefill_mlp_a,
+                        self._forward_tbo_stage_prefill_attn_full_a,
+                        self.mlp._forward_tbo_stage_prefill_extra_a,
+                        self.mlp._forward_tbo_stage_prefill_mlp_a,
                     ]
                     if subbatch_index == 0
                     else [
-                        self._forward_stage_prefill_attn_full_b,
-                        self.mlp._forward_stage_prefill_mlp_b,
-                        self.mlp._forward_stage_prefill_extra_b,
+                        self._forward_tbo_stage_prefill_attn_full_b,
+                        self.mlp._forward_tbo_stage_prefill_mlp_b,
+                        self.mlp._forward_tbo_stage_prefill_extra_b,
                     ]
                 ),
-                self.mlp._forward_stage_prefill_shared,
+                self.mlp._forward_tbo_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
-                self._forward_stage_decode_attn_0,
-                self._forward_stage_decode_attn_1,
-                self.mlp._forward_stage_decode_shared,
-                self.mlp._forward_stage_decode_mlp,
-                self.mlp._forward_stage_decode_extra,
+                self._forward_tbo_stage_decode_attn_0,
+                self._forward_tbo_stage_decode_attn_1,
+                self.mlp._forward_tbo_stage_decode_shared,
+                self.mlp._forward_tbo_stage_decode_mlp,
+                self.mlp._forward_tbo_stage_decode_extra,
             ]
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_stage_prefill_attn_full_a(self, state, **kwargs):
-        state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
-        state, _ = self._forward_stage_decode_attn_1(state)
+    def _forward_tbo_stage_prefill_attn_full_a(self, state, **kwargs):
+        state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
+        state, _ = self._forward_tbo_stage_decode_attn_1(state)
         return state, None
 
-    def _forward_stage_prefill_attn_full_b(self, state, **kwargs):
-        state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
-        state, _ = self._forward_stage_decode_attn_1(state)
-        state_dispatch = self.mlp._forward_substage_dispatch(state)
+    def _forward_tbo_stage_prefill_attn_full_b(self, state, **kwargs):
+        state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
+        state, _ = self._forward_tbo_stage_decode_attn_1(state)
+        state_dispatch = self.mlp._forward_tbo_substage_dispatch(state)
         return state | state_dispatch, None
 
-    def _forward_stage_decode_attn_0(
+    def _forward_tbo_stage_decode_attn_0(
         self,
         state,
         positions: torch.Tensor,
@@ -1331,7 +1331,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             None,
         )
 
-    def _forward_stage_decode_attn_1(self, state):
+    def _forward_tbo_stage_decode_attn_1(self, state):
         assert (
             (get_tensor_model_parallel_world_size() > 1)
             and global_server_args_dict["enable_dp_attention"]
@@ -1441,7 +1441,7 @@ class DeepseekV2Model(nn.Module):
 
         def get_forward_tbo_stages(subbatch_index: int):
             for i in range(start_layer, end_layer):
-                yield from self.layers[i].get_forward_stages(
+                yield from self.layers[i].get_forward_tbo_stages(
                     forward_batch.forward_mode, subbatch_index
                 )
 
