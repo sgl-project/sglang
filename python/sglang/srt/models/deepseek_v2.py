@@ -417,7 +417,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
-            self.tbo_deepep_dispatchers[TODO],
+            self.tbo_deepep_dispatchers[state["tbo_subbatch_index"]],
             state["forward_batch"].forward_mode,
             state["hidden_states_for_moe_input"],
             state["router_logits"],
@@ -437,13 +437,14 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_substage_combine_start(self, state):
-        state_combine = self.tbo_deepep_dispatchers[TODO].combine_stage_start(
+        state_combine = self.tbo_deepep_dispatchers[state["tbo_subbatch_index"]].combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
         return dict(state_combine=state_combine)
 
     def _forward_tbo_substage_combine_wait(self, state):
-        hidden_states_from_combine, combine_event = self.tbo_deepep_dispatchers[TODO].combine_stage_wait(state['state_combine'])
+        hidden_states_from_combine, combine_event = self.tbo_deepep_dispatchers[
+            state["tbo_subbatch_index"]].combine_stage_wait(state['state_combine'])
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
             combine_event=combine_event,
@@ -455,6 +456,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=output_hidden_states,
             forward_batch=state["forward_batch"],
             residual=state["residual_after_post_attn_ln"],
+            tbo_subbatch_index=state["tbo_subbatch_index"],
         )
 
 
@@ -1319,6 +1321,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        tbo_subbatch_index: int,
     ):
         hidden_states, residual = self._forward_input_layernorm(hidden_states, residual)
         self_attn_state = self.self_attn.forward_absorb_stage_prepare(
@@ -1333,6 +1336,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual_after_input_ln=residual,
                 forward_batch=forward_batch,
                 positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
             ),
             None,
         )

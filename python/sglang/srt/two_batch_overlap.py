@@ -67,8 +67,9 @@ def model_forward_split_inputs(
                 residual=residual,
                 positions=positions,
                 output_forward_batch=output_forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
             )
-            for output_forward_batch in forward_batch.tbo_children
+            for tbo_subbatch_index, output_forward_batch in enumerate(forward_batch.tbo_children)
         ]
     )
 
