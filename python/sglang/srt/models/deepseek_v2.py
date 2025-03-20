@@ -68,8 +68,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.two_batch_overlap import configure_deep_gemm_num_sm
-from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip, configure_deep_gemm_num_sms
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1342,7 +1341,7 @@ class DeepseekV2Model(nn.Module):
 
         # TODO do not hardcode
         chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
-        with configure_deep_gemm_num_sm(enable_space_for_deepep=True):
+        with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
                     positions=positions,
