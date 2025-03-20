@@ -7,19 +7,11 @@ import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 
-
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
-
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from sglang.srt.utils import set_weight_attrs
-from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.quantization.utils import check_marlin_supports_layer
 
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
@@ -29,8 +21,6 @@ from vllm.model_executor.layers.quantization.gptq_marlin import (
     GPTQMarlinConfig)
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.platforms import current_platform
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    check_marlin_supports_layer)
 
 
 logger = logging.getLogger(__name__)
@@ -147,6 +137,9 @@ class MoeWNA16Config(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuantizeMethodBase"]:
+        # avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
@@ -177,12 +170,30 @@ def is_layer_skipped_quant(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
-class MoeWNA16Method(FusedMoEMethodBase):
+class MoeWNA16Method:
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
     Args:
         quant_config: The MOE WNA16 (W8A16/W4A16) quantization config.
     """
+    def __new__(cls, *args, **kwargs):
+        # avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
 
     def __init__(self, quant_config: MoeWNA16Config):
         self.quant_config = quant_config
@@ -190,6 +201,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         layer.quant_config = self.quant_config
         bit8_pack_factor = self.quant_config.bit8_pack_factor
@@ -305,6 +317,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
+        # avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
         assert activation == "silu", "Only SiLU activation is supported."
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
