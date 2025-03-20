@@ -92,14 +92,12 @@ def model_forward_merge_outputs(output_a, output_b):
     return hidden_states, residual
 
 
-# ------------------------------------------ TODO ------------------------------------------
-
 _ENABLE_PROFILE = bool(
     int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
 )
 
 
-def execute_maybe_two_batch(
+def execute_two_batch(
     inputs,
     fn,
     delta_stages: int,
@@ -107,26 +105,16 @@ def execute_maybe_two_batch(
     split_inputs,
     merge_outputs,
 ):
-    # TODO maybe optimize these nested `if`s
-    if enable_two_batch_overlap:
-        splitted_inputs = split_inputs(**inputs)
-        if splitted_inputs is not None:
-            inputs_a, inputs_b = splitted_inputs
-            output_a, output_b = execute_two_batch(
-                inputs_a, inputs_b, fn, delta_stages=delta_stages
-            )
-            return merge_outputs(output_a, output_b)
-
-    return execute_single_batch(inputs, fn)
+    splitted_inputs = split_inputs(**inputs)
+    if splitted_inputs is not None:
+        inputs_a, inputs_b = splitted_inputs
+        output_a, output_b = execute_two_batch(
+            inputs_a, inputs_b, fn, delta_stages=delta_stages
+        )
+        return merge_outputs(output_a, output_b)
 
 
-def execute_single_batch(inputs, fn):
-    generator = fn(**inputs)
-    while True:
-        try:
-            next(generator)
-        except StopIteration as e:
-            return e.value
+# ------------------------------------------ TODO ------------------------------------------
 
 
 def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
