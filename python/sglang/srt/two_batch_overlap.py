@@ -50,17 +50,14 @@ def compute_split_token_index(
         raise NotImplementedError
 
 
-# ------------------------------------------ TODO ------------------------------------------
-
-
-def split_inputs(
+def model_forward_split_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Tuple[Dict, Dict]:
     return tuple(*[
-        _filter_inputs(
+        _model_forward_filter_inputs(
             hidden_states=hidden_states,
             residual=residual,
             positions=positions,
@@ -70,7 +67,7 @@ def split_inputs(
     ])
 
 
-def _filter_inputs(
+def _model_forward_filter_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
@@ -85,7 +82,7 @@ def _filter_inputs(
     )
 
 
-def _merge_outputs(output_a, output_b):
+def model_forward_merge_outputs(output_a, output_b):
     hidden_states_a, residual_a = output_a
     hidden_states_b, residual_b = output_b
 
