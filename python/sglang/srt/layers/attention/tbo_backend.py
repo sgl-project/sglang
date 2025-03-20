@@ -48,7 +48,27 @@ class TboAttnBackend(AttentionBackend):
             extend_lens=None,
         )
 
-        TODO
+        assert encoder_lens is None, 'encoder_lens is not supported yet'
+        assert spec_info is None, 'spec_info is not supported yet'
+        child_left, child_right = self.children
+        child_left.init_forward_metadata_capture_cuda_graph(
+            bs=TODO,
+            num_tokens=TODO,
+            req_pool_indices=TODO,
+            seq_lens=TODO,
+            encoder_lens=None,
+            forward_mode=forward_mode,
+            spec_info=None,
+        )
+        child_right.init_forward_metadata_capture_cuda_graph(
+            bs=TODO,
+            num_tokens=TODO,
+            req_pool_indices=TODO,
+            seq_lens=TODO,
+            encoder_lens=None,
+            forward_mode=forward_mode,
+            spec_info=None,
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
