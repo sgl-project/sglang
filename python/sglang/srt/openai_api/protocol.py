@@ -307,7 +307,12 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
+    # The maximum number of tokens that can be generated in the chat completion.
+    # Only available for non-chat-completion models
     max_tokens: Optional[int] = None
+    # The maximum number of completion tokens for a chat completion request, including visible output tokens and reasoning tokens. But input tokens are not included.
+    # Almost the same as `max_tokens`, but for chat-completion models only
+    max_completion_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
@@ -347,6 +352,10 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+
+    def get_max_output_tokens(self) -> Optional[int]:
+        # just being defensive
+        return self.max_completion_tokens or self.max_tokens
 
 
 class FunctionResponse(BaseModel):

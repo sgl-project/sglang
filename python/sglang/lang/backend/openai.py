@@ -2,7 +2,7 @@ import dataclasses
 import logging
 import time
 import warnings
-from typing import Callable, List, Optional, Union
+from typing import List, Optional
 
 import numpy as np
 
@@ -17,7 +17,6 @@ try:
     import tiktoken
 except ImportError as e:
     openai = tiktoken = e
-
 
 logger = logging.getLogger(__name__)
 
@@ -112,18 +111,19 @@ class OpenAI(BaseBackend):
         num_api_spec_tokens: int,
         spec_var_name: str,
     ):
-        if "max_tokens" not in self.spec_kwargs:
-            self.spec_kwargs["max_tokens"] = num_api_spec_tokens
+        max_token_key = "max_completion_tokens" if self.is_chat_model else "max_tokens"
+        if max_token_key not in self.spec_kwargs:
+            self.spec_kwargs[max_token_key] = num_api_spec_tokens
         else:
-            assert self.spec_kwargs["max_tokens"] == num_api_spec_tokens
+            assert self.spec_kwargs[max_token_key] == num_api_spec_tokens
 
-        params = sampling_params.to_openai_kwargs()
+        params = sampling_params.to_openai_kwargs(self.is_chat_model)
         for key, value in params.items():
             if key in ["stop"]:
                 continue
-            if key in ["max_tokens"]:
+            if key in [max_token_key]:
                 warnings.warn(
-                    "The parameter max_tokens will be overwritten by speculated number of tokens."
+                    f"The parameter {max_token_key} will be overwritten by speculated number of tokens."
                 )
                 continue
             if key not in self.spec_kwargs:
@@ -160,7 +160,7 @@ class OpenAI(BaseBackend):
             else:
                 prompt = s.text_
 
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = sampling_params.to_openai_kwargs(self.is_chat_model)
             if self.model_name.startswith("o1") or self.model_name.startswith("o3"):
                 kwargs.pop("max_tokens", None)
             else:
@@ -177,7 +177,7 @@ class OpenAI(BaseBackend):
             assert (
                 not self.is_chat_model
             ), "constrained type not supported on chat model"
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = sampling_params.to_openai_kwargs(self.is_chat_model)
             kwargs.pop("stop")
 
             comp = openai_completion(
@@ -194,7 +194,7 @@ class OpenAI(BaseBackend):
             assert (
                 not self.is_chat_model
             ), "constrained type not supported on chat model"
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = sampling_params.to_openai_kwargs(self.is_chat_model)
             kwargs.pop("stop")
             comp = openai_completion(
                 client=self.client,
@@ -284,7 +284,7 @@ class OpenAI(BaseBackend):
             else:
                 prompt = s.text_
 
-            kwargs = sampling_params.to_openai_kwargs()
+            kwargs = sampling_params.to_openai_kwargs(self.is_chat_model)
             generator = openai_completion_stream(
                 client=self.client,
                 token_usage=self.token_usage,
