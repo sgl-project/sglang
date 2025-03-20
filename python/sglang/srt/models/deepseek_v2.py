@@ -1273,7 +1273,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         return hidden_states, residual
 
-    def get_forward_tbo_stages(self, forward_mode: ForwardMode, subbatch_index: int):
+    def get_forward_tbo_stages(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
             return [
                 self._forward_tbo_stage_prefill_attn_full,
@@ -1438,10 +1438,10 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        def get_forward_tbo_stages(subbatch_index: int):
+        def get_forward_tbo_stages():
             for i in range(start_layer, end_layer):
                 yield from self.layers[i].get_forward_tbo_stages(
-                    forward_batch.forward_mode, subbatch_index
+                    forward_batch.forward_mode
                 )
 
         # TODO do not hardcode
