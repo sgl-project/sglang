@@ -285,10 +285,9 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if self.tp_size > 1:
-            final_hidden_states, event = self.deepep_dispatcher.combine(
+            final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states, forward_mode
             )
-            event.current_stream_wait()  # TODO
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -323,7 +322,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.tp_size > 1:
-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, event = (
+            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
                 self.deepep_dispatcher.dispatch(
                     hidden_states,
                     topk_idx,
@@ -332,7 +331,6 @@ class DeepseekV2MoE(nn.Module):
                     forward_mode,
                 )
             )
-            event.current_stream_wait()  # TODO
         return recv_hidden_states, tokens_per_expert
 
     def _forward_deepep_expert(
