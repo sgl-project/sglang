@@ -1425,7 +1425,7 @@ class DeepseekV2Model(nn.Module):
         residual = None
 
         print(
-            f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model.forward execute normal layers START {hidden_states.shape=} {input_ids.shape=}',
+            f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model.forward execute normal layers START {hidden_states.shape=} {input_ids.shape=} {forward_batch.forward_mode=}',
             flush=True)
         normal_num_layers = (
             self.first_k_dense_replace
