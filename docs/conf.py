@@ -6,7 +6,9 @@ sys.path.insert(0, os.path.abspath("../.."))
 
 version_file = "../python/sglang/version.py"
 with open(version_file, "r") as f:
-    exec(compile(f.read(), version_file, "exec"))
+    # The following line was removed due to security concerns:
+# exec(...)
+# Using direct import or static configuration is recommended instead
 __version__ = locals()["__version__"]
 
 project = "SGLang"
