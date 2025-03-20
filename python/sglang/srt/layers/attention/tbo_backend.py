@@ -1,6 +1,8 @@
 from typing import Optional, Union, List
 
 import torch
+
+from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -39,6 +41,12 @@ class TboAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
+        )
+
+        two_batch_overlap.compute_split_seq_index(
+            forward_mode=forward_mode,
+            num_tokens=num_tokens,
+            extend_lens=None,
         )
 
         TODO

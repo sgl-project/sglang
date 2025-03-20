@@ -9,9 +9,10 @@ from torch._dynamo.eval_frame import null_context
 def compute_split_seq_index(
     forward_mode: ForwardMode,
     num_tokens: int,
-    extend_lens: Sequence[int],
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
+        assert extend_lens is not None
         split_seq_index = _split_array_by_half_sum(extend_lens)
     elif forward_mode.is_decode():
         split_seq_index = num_tokens // 2
@@ -38,9 +39,10 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 def compute_split_token_index(
     split_seq_index: int,
     forward_mode: ForwardMode,
-    extend_lens: Sequence[int],
+    extend_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
+        assert extend_lens is not None
         return sum(extend_lens[:split_seq_index])
     elif forward_mode.is_decode():
         return split_seq_index
