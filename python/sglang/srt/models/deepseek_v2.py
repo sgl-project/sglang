@@ -269,6 +269,10 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
 
+        if forward_mode is not None and not forward_mode.is_idle():
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
@@ -276,8 +280,6 @@ class DeepseekV2MoE(nn.Module):
             (0, self.top_k), dtype=torch.float32, device=hidden_states.device
         )
         if forward_mode is not None and not forward_mode.is_idle():
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
