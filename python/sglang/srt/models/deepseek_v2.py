@@ -25,7 +25,7 @@ from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
-    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce, get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
@@ -161,6 +161,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_id: int = -999,
         prefix: str = "",
     ):
         super().__init__()
@@ -237,11 +238,12 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = self._create_deepep_dispatcher(config, 'primary')
+            self.deepep_dispatcher = self._create_deepep_dispatcher(config, f'layer{layer_id}-primary')
 
         if global_server_args_dict["enable_two_batch_overlap"]:
             # TODO maybe we do not need to create 2+1 dispatchers, but can reuse the one above
-            self.tbo_deepep_dispatchers = [self._create_deepep_dispatcher(config, f'child_{i}') for i in range(2)]
+            self.tbo_deepep_dispatchers = [
+                self._create_deepep_dispatcher(config, f'layer{layer_id}-child_{i}') for i in range(2)]
 
     def _create_deepep_dispatcher(self, config, debug_name):
         return DeepEPDispatcher(
@@ -1187,6 +1189,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=layer_id,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -1421,6 +1424,9 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
+        print(
+            f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model.forward execute normal layers START {hidden_states.shape=} {input_ids.shape=}',
+            flush=True)
         normal_num_layers = (
             self.first_k_dense_replace
             if forward_batch.can_run_tbo
@@ -1468,6 +1474,9 @@ class DeepseekV2Model(nn.Module):
             - 20
         )
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
+            print(
+                f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model._forward_tbo_layers START {hidden_states.shape=}',
+                flush=True)
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
                     positions=positions,
