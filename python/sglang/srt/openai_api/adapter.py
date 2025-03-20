@@ -1061,7 +1061,9 @@ def v1_chat_generate_response(
         if logprobs:
             logprobs = to_openai_style_logprobs(
                 output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-                output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
+                output_top_logprobs=ret_item["meta_info"].get(
+                    "output_top_logprobs", None
+                ),
             )
             token_logprobs = []
             for token_idx, (token, logprob) in enumerate(
@@ -1265,9 +1267,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             output_token_logprobs=content["meta_info"][
                                 "output_token_logprobs"
                             ][n_prev_token:],
-                            output_top_logprobs=content["meta_info"][
-                                "output_top_logprobs"
-                            ][n_prev_token:],
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
                         )
 
                         n_prev_token = len(
