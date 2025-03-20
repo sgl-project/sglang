@@ -17,7 +17,7 @@ else:
     from sglang.utils import launch_server_cmd
 
 
-MODEL_PATH = "/home/aiscuser/.cache/huggingface/hub/models--VPTQ-community--Meta-Llama-3.3-70B-Instruct-v16-k65536-65536-woft/snapshots/3e52a340101533327a8f8c7b6e9a0f0429bb5ebb"
+MODEL_PATH = "VPTQ-community/Qwen2.5-32B-Instruct-v8-k256-256-woft"
 
 
 def main():

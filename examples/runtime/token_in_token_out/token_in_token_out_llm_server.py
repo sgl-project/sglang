@@ -17,8 +17,7 @@ else:
     from sglang.utils import launch_server_cmd
 
 
-MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
-
+MODEL_PATH = "Qwen/Qwen2.5-32B-Instruct"
 
 def main():
     # Launch the server

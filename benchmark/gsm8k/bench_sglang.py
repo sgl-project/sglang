@@ -48,7 +48,7 @@ def main(args):
 
     # Read data
     data_path = args.data_path
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+    url = "https://raw.githubusercontent.com/openai/grade-school-math/refs/heads/master/grade_school_math/data/test.jsonl"
     if not os.path.isfile(data_path):
         data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
@@ -76,7 +76,7 @@ def main(args):
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer", max_tokens=4096, stop=["Question", "Assistant:", "<|separator|>"]
         )
 
     #####################################
@@ -97,8 +97,8 @@ def main(args):
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
 
-    # print(f"{preds=}")
-    # print(f"{labels=}")
+    print(f"{preds=}")
+    print(f"{labels=}")
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))

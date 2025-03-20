@@ -578,62 +578,36 @@ def optimized_dequantize_gemm(
     in_features = input.shape[-1]
     out_features = metadata.output_size
     
-    weight = vptq_ops.dequant(
-        indices,
-        codebooks,
-        residual_indices,
-        res_codebooks_,
-        outlier_indices,
-        outlier_centroids_,
-        invert_perm,
-        weight_scale,
-        weight_bias,
-        metadata.vector_len,
-        in_features,
-        out_features) 
+    if (input.numel() // input.shape[-1] < 3):
+        out = vptq_ops.quant_gemv(
+            input,
+            indices,
+            codebooks,
+            residual_indices,
+            res_codebooks_,
+            outlier_indices,
+            outlier_centroids_,
+            perm,
+            weight_scale,
+            weight_bias,
+            bias,
+            in_features,
+            out_features,
+        )
+        return out
+    else: 
+        weight = vptq_ops.dequant(
+            indices,
+            codebooks,
+            residual_indices,
+            res_codebooks_,
+            outlier_indices,
+            outlier_centroids_,
+            invert_perm,
+            weight_scale,
+            weight_bias,
+            metadata.vector_len,
+            in_features,
+            out_features) 
     
-    return F.linear(input, weight, bias)
-
-    # codebooks = codebooks.view(
-    #     metadata.num_codebooks, metadata.num_centroids, metadata.vector_len
-    # )
-    # res_codebooks = (
-    #     res_codebooks.view(
-    #         metadata.num_codebooks, metadata.num_res_centroids, metadata.vector_len
-    #     )
-    #     if metadata.num_res_centroids > 0
-    #     else None
-    # )
-    # if input.numel() // input.shape[-1] < 3:
-    #     return sgl_kernel.ops.vptq_gemm(
-    #         input,
-    #         indices,
-    #         codebooks,
-    #         weight_scale,
-    #         weight_bias,
-    #         [metadata.vector_len, weight_scale.shape[0], metadata.output_size],
-    #         None,
-    #         res_codebooks,
-    #         None,
-    #         None,
-    #         perm,
-    #         bias,
-    #     )
-    # if perm is None:
-    #     invert_perm = None
-    # else:
-    #     invert_perm = (
-    #         torch.argsort(perm.view(torch.uint16).to(torch.int64))
-    #         .to(torch.uint16)
-    #         .view(torch.int16)
-    #     )
-    
-    # dequantized_weight = vptq_ops.vptq_dequant(
-    #     indices,
-    #     codebooks,
-    #     weight_scale,
-    #     weight_bias,
-    #     [metadata.vector_len, weight_scale.shape[0], metadata.output_size],
-    # )
-    
-    # return F.linear(input, dequantized_weight, bias)
+        return F.linear(input, weight, bias)
