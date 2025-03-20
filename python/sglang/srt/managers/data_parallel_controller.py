@@ -30,7 +30,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket, kill_itself_when_parent_died
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -254,6 +254,8 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+
+    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::data_parallel_controller")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
