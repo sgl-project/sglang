@@ -319,7 +319,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         num_experts: int,
     ):
-        previous_event = Buffer.capture()
+        previous_event = Buffer.capture() if self.async_finish else None
 
         (
             num_tokens_per_rank,
@@ -352,7 +352,6 @@ class DeepEPDispatcher:
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
             async_finish=self.async_finish,
-            # NOTE MODIFIED !!!
             allocate_on_comm_stream=True,
         )
 
@@ -447,15 +446,13 @@ class DeepEPDispatcher:
         return hidden_states.view(self.hidden_shape)
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple):
-        previous_event = Buffer.capture()
+        previous_event = Buffer.capture() if self.async_finish else None
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
-            # NOTE MODIFIED
-            # allocate_on_comm_stream=False,
             allocate_on_comm_stream=previous_event is not None,
         )
         return combined_x, event
