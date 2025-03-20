@@ -1167,6 +1167,16 @@ def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
 
+@lru_cache(maxsize=1)
+def get_distributed_backend() -> str:
+    device = get_device().lower()
+
+    backend_map = {"cuda": "nccl", "xpu": "xccl", "hpu": "hccl", "cpu": "gloo"}
+
+    backend = backend_map.get(device, "nccl")
+    return backend
+
+
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
