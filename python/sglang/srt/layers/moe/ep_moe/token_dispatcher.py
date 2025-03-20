@@ -5,12 +5,10 @@ try:
 except ImportError:
     use_deepep = False
 
-import os
 from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.layers.moe.ep_moe.kernels import (
     compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
@@ -105,8 +103,8 @@ def permute(
         assert not routing_map.requires_grad
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
+                         :, :capacity
+                         ].contiguous()
         sorted_indices = sorted_indices.view(-1)
     else:
         routing_map = routing_map.bool().T.contiguous()
@@ -308,7 +306,7 @@ class DeepEPDispatcher:
         self.topk_weights = topk_weights
         if hidden_states.shape[0] > 0:
             hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
-        return hidden_states, topk_idx, topk_weights, tokens_per_expert
+        return hidden_states, topk_idx, topk_weights, tokens_per_expert, event
 
     def dispatch_normal(
         self,
@@ -436,7 +434,7 @@ class DeepEPDispatcher:
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
             )
         self.handle = None
-        return hidden_states.view(self.hidden_shape)
+        return hidden_states.view(self.hidden_shape), event
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
         combined_x, _, event = self.buffer_normal.combine(
