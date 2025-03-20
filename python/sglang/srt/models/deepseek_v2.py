@@ -404,13 +404,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if start_combine:
-            state_combine = self._forward_tbo_substage_combine_start(
+            state |= self._forward_tbo_substage_combine_start(
                 state | dict(expert_output_hidden_states=expert_output_hidden_states)
             )
-        else:
-            state_combine = {}
 
-        return state | state_combine, None
+        return state, None
 
     def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
