@@ -34,7 +34,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.layers.attention.composed_backend import ComposedAttnBackend
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -825,7 +825,7 @@ class ModelRunner:
 
     def init_attention_backend(self):
         if TODO:
-            self.attn_backend = ComposedAttnBackend(
+            self.attn_backend = TboAttnBackend(
                 primary=self._create_attention_backend_core(),
                 children=[self._create_attention_backend_core() for _ in range(2)],
             )
