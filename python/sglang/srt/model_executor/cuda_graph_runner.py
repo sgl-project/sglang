@@ -408,6 +408,7 @@ class CudaGraphRunner:
             num_tokens=num_tokens,
             extend_lens=None,
         )
+        assert tbo_split_seq_index is not None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
