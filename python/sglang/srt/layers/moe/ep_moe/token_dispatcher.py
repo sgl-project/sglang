@@ -184,6 +184,7 @@ class DeepEPDispatcher:
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
+        async_finish: bool = False,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -200,6 +201,7 @@ class DeepEPDispatcher:
         self.token_probs = None
         # Handle used for combine operation
         self.handle = None
+        self.async_finish = async_finish
 
         # `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -326,7 +328,7 @@ class DeepEPDispatcher:
             topk_idx,
             num_experts,
             previous_event=previous_event,
-            async_finish=False,
+            async_finish=self.async_finish,
             allocate_on_comm_stream=False,
         )
 
@@ -346,7 +348,7 @@ class DeepEPDispatcher:
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
-            async_finish=False,
+            async_finish=self.async_finish,
             allocate_on_comm_stream=False,
         )
 
@@ -412,7 +414,7 @@ class DeepEPDispatcher:
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
-                async_finish=False,
+                async_finish=self.async_finish,
                 return_recv_hook=False,  # True for double-batch overlapping, need call hook()
             )
         )
@@ -440,7 +442,7 @@ class DeepEPDispatcher:
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
-            async_finish=False,
+            async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=False,
         )
@@ -459,7 +461,7 @@ class DeepEPDispatcher:
                 topk_idx,
                 topk_weights,
                 handle,
-                async_finish=False,
+                async_finish=self.async_finish,
                 return_recv_hook=False,  # True for double-batch overlapping, need call hook()
             )
         )
