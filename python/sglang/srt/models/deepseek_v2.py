@@ -309,7 +309,7 @@ class DeepseekV2MoE(nn.Module):
             return self.shared_experts(hidden_states)
         return None
 
-    def _forward_deepep_dispatch(self, forward_mode, hidden_states, router_logits):
+    def _forward_deepep_dispatch_stage_start(self, forward_mode, hidden_states, router_logits):
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
@@ -327,16 +327,17 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        if self.tp_size > 1:
-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
-                self.deepep_dispatcher.dispatch(
-                    hidden_states,
-                    topk_idx,
-                    topk_weights,
-                    self.num_experts,
-                    forward_mode,
-                )
-            )
+        return self.deepep_dispatcher.dispatch_stage_start(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.num_experts,
+            forward_mode,
+        )
+
+    def _forward_deepep_dispatch_stage_wait(self, state):
+        recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = \
+            self.deepep_dispatcher.dispatch_stage_wait(state)
         return recv_hidden_states, tokens_per_expert
 
     def _forward_deepep_expert(
