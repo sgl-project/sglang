@@ -203,14 +203,13 @@ class ForwardBatch:
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    global_split_token_index: Optional[List[int]] = None
-    global_split_seq_index: Optional[List[int]] = None
     # for extend, local start pos and num tokens is different in logits processor
     # this will be computed in get_dp_local_info
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
+    tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
 
     # Speculative decoding
