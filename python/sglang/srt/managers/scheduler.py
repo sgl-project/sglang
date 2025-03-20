@@ -1342,17 +1342,20 @@ class Scheduler(SchedulerOutputProcessorMixin):
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+        enable_tbo = TODO
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
+                enable_tbo,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 4),
+            (dp_size, attn_tp_size, 5),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1364,6 +1367,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        enable_tbo = min(global_info[:, 0, 4].tolist())
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1371,7 +1375,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-            local_batch.tbo_split_seq_index = TODO
+            local_batch.tbo_split_seq_index = TODO if enable_tbo else None
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
