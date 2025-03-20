@@ -26,12 +26,13 @@ def compute_split_seq_index(
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     arr_sum = sum(arr)
-    cum_sum = 0
-    for index, value in enumerate(arr):
+    cum_sum, split_index = 0, 0
+    for value in arr[:-1]:
         cum_sum += value
+        split_index += 1
         if cum_sum >= arr_sum // 2:
-            return index + 1
-    return len(arr)
+            break
+    return split_index
 
 
 def compute_split_token_index(split_seq_index: int) -> int:
