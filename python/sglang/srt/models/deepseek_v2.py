@@ -273,6 +273,8 @@ class DeepseekV2MoE(nn.Module):
         if forward_mode is not None and not forward_mode.is_idle():
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
+        else:
+            router_logits = None
 
         recv_hidden_states, tokens_per_expert = self._forward_deepep_dispatch(
             forward_mode, hidden_states, router_logits
