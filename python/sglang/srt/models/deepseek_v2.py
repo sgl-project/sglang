@@ -1448,7 +1448,7 @@ class DeepseekV2Model(nn.Module):
 
         # TODO do not hardcode
         chosen_num_sms = (
-            torch.cuda.get_device_properties(device="cuda").multi_processor_countnum_sms
+            torch.cuda.get_device_properties(device="cuda").multi_processor_count
             - 20
         )
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
