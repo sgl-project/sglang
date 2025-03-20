@@ -50,9 +50,11 @@ class TboAttnBackend(AttentionBackend):
 
         assert encoder_lens is None, 'encoder_lens is not supported yet'
         assert spec_info is None, 'spec_info is not supported yet'
+        bs_child = bs // 2  # not yet support `num_tokens_per_bs>1`
+
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(
-            bs=TODO,
+            bs=bs_child,
             num_tokens=TODO,
             req_pool_indices=TODO,
             seq_lens=TODO,
@@ -61,7 +63,7 @@ class TboAttnBackend(AttentionBackend):
             spec_info=None,
         )
         child_right.init_forward_metadata_capture_cuda_graph(
-            bs=TODO,
+            bs=bs_child,
             num_tokens=TODO,
             req_pool_indices=TODO,
             seq_lens=TODO,
