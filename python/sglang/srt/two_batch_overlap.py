@@ -99,7 +99,7 @@ def model_forward_merge_outputs(output_a, output_b):
 
 
 _ENABLE_PROFILE = bool(
-    int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
+    int(os.environ.get("SGLANG_TBO_ENABLE_PROFILE", "0"))
 )
 
 
