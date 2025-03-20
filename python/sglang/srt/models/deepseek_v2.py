@@ -1157,14 +1157,17 @@ class DeepseekV2Model(nn.Module):
         else:
             hidden_states = input_embeds
 
-        std_num_layers = TODO if forward_batch.can_run_tbo else len(self.layers)
+        normal_num_layers = self.first_k_dense_replace if forward_batch.can_run_tbo else len(self.layers)
 
         residual = None
-        for i in range(std_num_layers):
+        for i in range(normal_num_layers):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+
+        for i in range(normal_num_layers, len(self.layers)):
+            TODO
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
