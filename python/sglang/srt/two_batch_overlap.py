@@ -1,16 +1,17 @@
 import os
 from contextlib import nullcontext
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 def compute_split_seq_index(
-    forward_mode: ForwardMode,
-    num_tokens: int,
-    extend_lens: Optional[Sequence[int]],
+        forward_mode: ForwardMode,
+        num_tokens: int,
+        extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -38,9 +39,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-    split_seq_index: int,
-    forward_mode: ForwardMode,
-    extend_lens: Optional[Sequence[int]],
+        split_seq_index: int,
+        forward_mode: ForwardMode,
+        extend_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -52,10 +53,10 @@ def compute_split_token_index(
 
 
 def model_forward_split_inputs(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    positions: torch.Tensor,
-    forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
 ) -> Tuple[Dict, Dict]:
     return tuple(
         *[
@@ -71,10 +72,10 @@ def model_forward_split_inputs(
 
 
 def _model_forward_filter_inputs(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    positions: torch.Tensor,
-    output_forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        positions: torch.Tensor,
+        output_forward_batch: ForwardBatch,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
@@ -98,10 +99,10 @@ _ENABLE_PROFILE = bool(
 
 
 def model_forward_execute_two_batch(
-    inputs,
-    stages_a: List[Callable],
-    stages_b: List[Callable],
-    delta_stages: int,
+        inputs,
+        stages_a: List[Callable],
+        stages_b: List[Callable],
+        delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
