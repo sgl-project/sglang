@@ -359,11 +359,7 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-    def _forward_tbo_stage_prefill_extra_a(self, state):
-        state |= self._forward_tbo_substage_dispatch_start(state)
-        return state , None
-
-    def _forward_tbo_stage_prefill_post_attn_full_b(self, state):
+    def _forward_tbo_stage_prefill_dispatch_start(self, state):
         state |= self._forward_tbo_substage_dispatch_start(state)
         return state, None
 
@@ -1284,14 +1280,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_stage_prefill_attn_full,
                 *(
                     [
-                        self.mlp._forward_tbo_stage_prefill_extra_a,
+                        self.mlp._forward_tbo_stage_prefill_dispatch_start,
                         self.mlp._forward_tbo_stage_prefill_pre_mlp,
                         self.mlp._forward_tbo_stage_prefill_mlp,
                         self.mlp._forward_tbo_stage_prefill_combine_start,
                     ]
                     if subbatch_index == 0
                     else [
-                        self._forward_tbo_stage_prefill_post_attn_full_b,
+                        self._forward_tbo_stage_prefill_dispatch_start,
                         self.mlp._forward_tbo_stage_prefill_pre_mlp,
                         self.mlp._forward_tbo_stage_prefill_mlp,
                         self.mlp._forward_tbo_stage_prefill_combine_start,
