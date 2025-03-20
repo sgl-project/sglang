@@ -24,9 +24,7 @@ if is_cuda_available():
         verify_tree_greedy,
     )
 elif is_hip():
-    from sgl_kernel import (
-        verify_tree_greedy
-    )
+    from sgl_kernel import verify_tree_greedy
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
