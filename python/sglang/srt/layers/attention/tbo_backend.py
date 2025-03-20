@@ -140,26 +140,34 @@ class TboAttnBackend(AttentionBackend):
             num_tokens=num_tokens_child_left,
             req_pool_indices=req_pool_indices[:tbo_split_seq_index],
             seq_lens=seq_lens[:tbo_split_seq_index],
-            **args_common,
         )
         args_right = dict(
             bs=bs_child_right,
             num_tokens=num_tokens_child_right,
             req_pool_indices=req_pool_indices[tbo_split_seq_index:],
             seq_lens=seq_lens[tbo_split_seq_index:],
-            **args_common,
         )
 
         if fn_name == 'init_forward_metadata_capture_cuda_graph':
             TODO
         elif fn_name == 'init_forward_metadata_replay_cuda_graph':
-            TODO
+            args_common.update(dict(
+                num_kv_heads=replay_num_kv_heads,
+            ))
+            args_left.update(dict(
+                seq_lens_sum=TODO,
+                seq_lens_cpu=TODO,
+            ))
+            args_right.update(dict(
+                seq_lens_sum=TODO,
+                seq_lens_cpu=TODO,
+            ))
         else:
             raise NotImplementedError
 
         child_left, child_right = self.children
-        getattr(child_left, fn_name)(**args_left)
-        getattr(child_right, fn_name)(**args_right)
+        getattr(child_left, fn_name)(**args_left, **args_common)
+        getattr(child_right, fn_name)(**args_right, **args_common)
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
