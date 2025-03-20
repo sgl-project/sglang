@@ -1687,3 +1687,14 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    import deep_gemm
+    original_num_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(original_num_sms)

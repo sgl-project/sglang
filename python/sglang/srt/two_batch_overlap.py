@@ -1,5 +1,5 @@
 import os
-from contextlib import nullcontext, contextmanager
+from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -168,14 +168,3 @@ class _StageExecutor:
     @property
     def num_stages(self):
         return len(self._stages)
-
-
-@contextmanager
-def configure_deep_gemm_num_sm(num_sms):
-    import deep_gemm
-    original_num_sms = deep_gemm.get_num_sms()
-    deep_gemm.set_num_sms(num_sms)
-    try:
-        yield
-    finally:
-        deep_gemm.set_num_sms(original_num_sms)
