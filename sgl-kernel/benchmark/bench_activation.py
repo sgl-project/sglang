@@ -35,7 +35,7 @@ def calculate_diff(
 
 
 kernels = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
-dtypes = [torch.float16]
+dtypes = [torch.float16, torch.bfloat16]
 batch_sizes = [2**i for i in range(0, 5, 2)]
 seq_lens = [2**i for i in range(0, 8, 2)]
 dims = [2**i for i in range(7, 15)]

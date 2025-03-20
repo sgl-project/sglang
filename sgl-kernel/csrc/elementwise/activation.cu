@@ -34,26 +34,44 @@ namespace activation {
 
 template <typename T>
 __device__ __forceinline__ T silu(const T& x) {
+#if USE_ROCM
   float f32_val = castToFloat(x);
-  return castFrom<T>(f32_val / (1.0f + expf(-f32_val)));
+  return castFromFloat<T>(f32_val / (1.0f + expf(-f32_val)));
+#else
+  float f32_val = static_cast<float>(x);
+  return static_cast<T>(f32_val / (1.0f + expf(-f32_val)));
+#endif
 }
 
 template <typename T>
 __device__ __forceinline__ T gelu(const T& x) {
   constexpr float kAlpha = M_SQRT1_2;
+#if USE_ROCM
   float f32_val = castToFloat(x);
-  return castFrom<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
+  return castFromFloat<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
+#else
+  float f32_val = static_cast<float>(x);
+  return static_cast<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
+#endif
 }
 
 template <typename T>
 __device__ __forceinline__ T gelu_tanh(const T& x) {
   constexpr float kAlpha = 0.044715f;
   constexpr float kBeta = 0.7978845608028654f;
+#if USE_ROCM
   const float f32_val = castToFloat(x);
+#else
+  const float f32_val = static_cast<float>(x);
+#endif
 
   const float cdf = 0.5f * (1.0f + tanhf((kBeta * (f32_val + kAlpha * f32_val * f32_val * f32_val))));
 
-  return castFrom<T>(f32_val * cdf);
+#if USE_ROCM
+  return castFromFloat<T>(f32_val * cdf);
+#else
+  return static_cast<T>(f32_val * cdf);
+#endif
 }
 
 }  // namespace activation

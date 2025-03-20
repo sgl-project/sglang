@@ -137,7 +137,7 @@ __device__ __forceinline__ float castToFloat(srcDtype val) {
 }
 
 template <typename dstDtype>
-__device__ __forceinline__ dstDtype castFrom(float val) {
+__device__ __forceinline__ dstDtype castFromFloat(float val) {
   return static_cast<dstDtype>(val);
 }
 

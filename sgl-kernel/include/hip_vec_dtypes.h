@@ -22,7 +22,7 @@ limitations under the License.
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 
-// Adapted from flashinfer
+// Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)d
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 

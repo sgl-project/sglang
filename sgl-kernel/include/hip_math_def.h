@@ -95,12 +95,11 @@ __device__ __forceinline__ uint8_t castToFP8Storage(srcDtype val) {
 }
 
 template <typename dstDtype>
-__device__ __forceinline__ dstDtype castFrom(float val) {
+__device__ __forceinline__ dstDtype castFromFloat(float val) {
   return amdgpu::cast<float, dstDtype>(val);
 }
 
-// operator overlaod to support flashinfer
-
+// operator overload to support flashinfer
 __host__ __device__ __forceinline__ __half operator*(const __half& x, const __half& y) {
   __half h_x = x;
   __half h_y = y;
