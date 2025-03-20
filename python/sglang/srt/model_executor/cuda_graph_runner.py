@@ -415,8 +415,9 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            tbo_split_seq_index=TODO,
         )
-        forward_batch.prepare_tbo(tbo_split_seq_index=TODO)
+        forward_batch.prepare_tbo()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
