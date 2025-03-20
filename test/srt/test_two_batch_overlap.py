@@ -38,8 +38,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_01_generate_single_prompt(self):
-        print('test_01_generate_single_prompt start')
+    def test_generate_single_prompt(self):
         response = requests.post(
             self.base_url + "/generate",
             # we use an uncommon start to minimise the chance that the cache is hit by chance
@@ -51,7 +50,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
         print(f"{response.json()=}")
         self.assertEquals(response.json()['text'], '5, 1+5=6')
 
-    def test_02_mmlu(self):
+    def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
