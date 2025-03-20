@@ -59,7 +59,7 @@ def model_forward_split_inputs(
         forward_batch: 'ForwardBatch',
 ) -> Tuple[Dict, Dict]:
     return tuple(
-        *[
+        [
             _model_forward_filter_inputs(
                 hidden_states=hidden_states,
                 residual=residual,
