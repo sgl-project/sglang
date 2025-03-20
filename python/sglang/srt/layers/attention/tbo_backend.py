@@ -47,15 +47,12 @@ class TboAttnBackend(AttentionBackend):
             num_tokens=num_tokens,
             extend_lens=None,
         )
-
-        assert encoder_lens is None, 'encoder_lens is not supported yet'
-        assert spec_info is None, 'spec_info is not supported yet'
-
         tbo_split_token_index = two_batch_overlap.compute_split_token_index(
             split_seq_index=tbo_split_seq_index,
             forward_mode=forward_mode,
             extend_lens=None,
         )
+       
         num_tokens_child_left = tbo_split_token_index
         num_tokens_child_right = num_tokens - tbo_split_token_index
 
@@ -63,6 +60,9 @@ class TboAttnBackend(AttentionBackend):
         assert num_tokens == bs
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
+
+        assert encoder_lens is None, 'encoder_lens is not supported yet'
+        assert spec_info is None, 'spec_info is not supported yet'
 
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(
