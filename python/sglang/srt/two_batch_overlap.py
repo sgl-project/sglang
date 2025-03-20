@@ -1,5 +1,5 @@
 import os
-from typing import Sequence, Optional, Tuple, Dict
+from typing import Sequence, Optional, Tuple, Dict, Callable, List
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -111,7 +111,7 @@ def model_forward_execute_two_batch(
 # ------------------------------------------ TODO ------------------------------------------
 
 
-def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
+def execute_two_batch_raw(inputs_a, inputs_b, fn, delta_stages: int):
     generator_a = _WrappedGenerator("a", fn(**inputs_a))
     generator_b = _WrappedGenerator("b", fn(**inputs_b))
 
@@ -136,29 +136,25 @@ def execute_two_batch(inputs_a, inputs_b, fn, delta_stages: int):
     return generator_a.output, generator_b.output
 
 
-class _WrappedGenerator:
-    def __init__(self, debug_name: str, generator):
+class _StageExecutor:
+    def __init__(self, debug_name: str, stages: List[Callable]):
         self._debug_name = debug_name
-        self._generator = generator
-        self._count = 0
+        self._stages = stages
+        self._index = 0
         self.output = None
 
     def next(self):
         assert not self.done
 
         if _ENABLE_PROFILE:
-            ctx = torch.profiler.record_function(f"Gen-{self._debug_name}{self._count}")
+            ctx = torch.profiler.record_function(f"Stage-{self._debug_name}{self._index}")
         else:
             ctx = null_context()
 
-        try:
-            with ctx:
-                next(self._generator)
-        except StopIteration as e:
-            assert e.value is not None
-            self.output = e.value
+        with ctx:
+            TODO
 
-        self._count += 1
+        self._index += 1
 
     @property
     def done(self):
