@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -223,11 +223,8 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    # TODO beautify
-    tbo_parent_start_token_index: Optional[int] = None
-    tbo_parent_end_token_index: Optional[int] = None
-    tbo_child_a: Optional["ForwardBatch"] = None
-    tbo_child_b: Optional["ForwardBatch"] = None
+    tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     @classmethod
     def init_new(
