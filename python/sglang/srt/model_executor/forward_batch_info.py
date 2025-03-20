@@ -257,6 +257,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
+            tbo_split_seq_index=batch.tbo_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
@@ -336,7 +337,7 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        ret.prepare_tbo(tbo_split_seq_index=batch.tbo_split_seq_index)
+        ret.prepare_tbo()
 
         return ret
 
@@ -431,23 +432,23 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    def prepare_tbo(self, tbo_split_seq_index: Optional[int]):
-        if tbo_split_seq_index is None:
+    def prepare_tbo(self):
+        if self.tbo_split_seq_index is None:
             return
 
-        tbo_split_token_index = two_batch_overlap.compute_split_token_index(split_seq_index=tbo_split_seq_index)
+        tbo_split_token_index = two_batch_overlap.compute_split_token_index(split_seq_index=self.tbo_split_seq_index)
 
         child_a = self.filter_batch(
             start_token_index=0,
             end_token_index=tbo_split_token_index,
             start_seq_index=0,
-            end_seq_index=tbo_split_seq_index,
+            end_seq_index=self.tbo_split_seq_index,
             output_attn_backend=model_runner.attn_backend_child_a,
         )
         child_b = self.filter_batch(
             start_token_index=tbo_split_token_index,
             end_token_index=self.input_ids.shape[0],
-            start_seq_index=tbo_split_seq_index,
+            start_seq_index=self.tbo_split_seq_index,
             end_seq_index=self.batch_size,
             output_attn_backend=model_runner.attn_backend_child_b,
         )
