@@ -549,13 +549,15 @@ class ForwardBatch:
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
-                global_num_tokens=output_global_num_tokens,
+                # TODO test this can be removed
+                global_num_tokens=None,
+                gathered_buffer=None,
+                # global_num_tokens=output_global_num_tokens,
                 # gathered_buffer=gathered_buffer,
                 attn_backend=output_attn_backend,
                 tbo_parent_start_token_index=start_token_index,
                 tbo_parent_end_token_index=end_token_index,
-                tbo_child_a=None,
-                tbo_child_b=None,
+                tbo_children=None,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
                 # No longer used
