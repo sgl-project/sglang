@@ -1371,8 +1371,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-            local_batch.global_split_token_index = global_split_token_index.tolist()
-            local_batch.global_split_seq_index = global_split_seq_index.tolist()
+            local_batch.tbo_split_seq_index = TODO
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
