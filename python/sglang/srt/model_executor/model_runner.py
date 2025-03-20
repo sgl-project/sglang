@@ -24,7 +24,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -161,7 +160,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -174,6 +173,13 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+
+        # TODO probably move it
+        if server_args.enable_two_batch_overlap:
+            deep_gemm_num_sms = TODO
+            import deep_gemm
+            print(f'Call deep_gemm.set_num_sms({deep_gemm_num_sms}) because enable_two_batch_overlap')
+            deep_gemm.set_num_sms(deep_gemm_num_sms)
 
         # Load the model
         self.sampler = Sampler()
@@ -895,7 +901,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
