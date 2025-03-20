@@ -52,6 +52,77 @@ def compute_split_token_index(
 
 # ------------------------------------------ TODO ------------------------------------------
 
+
+# TODO maybe optimize these
+@staticmethod
+def _split_inputs(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> Optional[Tuple[Dict, Dict]]:
+    output_a = DeepseekV2Model._filter_inputs(
+        hidden_states=hidden_states,
+        residual=residual,
+        positions=positions,
+        forward_batch=forward_batch,
+        child_mode="a",
+    )
+    output_b = DeepseekV2Model._filter_inputs(
+        hidden_states=hidden_states,
+        residual=residual,
+        positions=positions,
+        forward_batch=forward_batch,
+        child_mode="b",
+    )
+
+    # _log(
+    #     f'split_inputs {forward_batch.input_ids.tolist()=} {output_a["forward_batch"].input_ids.tolist()=} {output_b["forward_batch"].input_ids.tolist()=}')
+    # _log(
+    #     f'split_inputs (input){forward_batch=} {output_a=} {output_b=}')
+
+    return output_a, output_b
+
+
+@staticmethod
+def _filter_inputs(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    child_mode: str,
+) -> Dict:
+    # _log(
+    #     f'filter_inputs {start_token_index=} {end_token_index=} {start_seq_index=} {end_seq_index=} {output_global_num_tokens=}')
+    # TODO improve, e.g. make it `children`?
+    output_forward_batch = {
+        "a": forward_batch.tbo_child_a,
+        "b": forward_batch.tbo_child_b,
+    }[child_mode]
+    start_token_index = output_forward_batch.tbo_parent_start_token_index
+    end_token_index = output_forward_batch.tbo_parent_end_token_index
+    return dict(
+        hidden_states=hidden_states[start_token_index:end_token_index],
+        residual=residual[start_token_index:end_token_index],
+        positions=positions[start_token_index:end_token_index],
+        forward_batch=output_forward_batch,
+    )
+
+
+@staticmethod
+def _merge_outputs(output_a, output_b):
+    hidden_states_a, residual_a = output_a
+    hidden_states_b, residual_b = output_b
+
+    hidden_states = torch.concat([hidden_states_a, hidden_states_b], dim=0)
+    residual = torch.concat([residual_a, residual_b], dim=0)
+
+    return hidden_states, residual
+
+
+# ------------------------------------------ TODO ------------------------------------------
+
 _ENABLE_PROFILE = bool(
     int(os.environ.get("SGLANG_MULTI_BATCH_EXECUTOR_ENABLE_PROFILE", "0"))
 )
