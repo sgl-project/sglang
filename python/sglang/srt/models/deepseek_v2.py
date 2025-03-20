@@ -365,14 +365,14 @@ class DeepseekV2MoE(nn.Module):
         return state, None
 
     def _forward_tbo_stage_prefill_mlp_a(self, state):
-        return self._forward_tbo_stage_mlp_raw(state, start_combine=False)
+        return self._forward_tbo_substage_mlp(state, start_combine=False)
 
     def _forward_tbo_stage_prefill_post_mlp_a(self, state):
         state |= self._forward_tbo_substage_combine_start(state)
         return state, None
 
     def _forward_tbo_stage_prefill_mlp_b(self, state):
-        return self._forward_tbo_stage_mlp_raw(state, start_combine=False)
+        return self._forward_tbo_substage_mlp(state, start_combine=False)
 
     def _forward_tbo_stage_prefill_extra_b(self, state):
         state_combine = self._forward_tbo_substage_combine_start(state)
@@ -397,7 +397,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_stage_decode_mlp(self, state):
         state |= self._forward_tbo_substage_dispatch_wait(state)
-        return self._forward_tbo_stage_mlp_raw(state)
+        return self._forward_tbo_substage_mlp(state)
 
     def _forward_tbo_stage_decode_extra(self, state):
         self._forward_tbo_substage_combine_wait(state)
@@ -408,19 +408,13 @@ class DeepseekV2MoE(nn.Module):
             state, output_hidden_states
         )
 
-    def _forward_tbo_stage_mlp_raw(self, state, start_combine: bool = True):
+    def _forward_tbo_substage_mlp(self, state, start_combine: bool = True):
         expert_output_hidden_states = self._forward_deepep_expert(
             state["forward_batch"].forward_mode,
             state["recv_hidden_states_from_dispatch"],
             state["tokens_per_expert_from_dispatch"],
         )
-
-        if start_combine:
-            state |= self._forward_tbo_substage_combine_start(
-                state | dict(expert_output_hidden_states=expert_output_hidden_states)
-            )
-
-        return state, None
+        return state | dict(expert_output_hidden_states=expert_output_hidden_states), None
 
     def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
