@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import tqdm
+from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -402,6 +403,12 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+            forward_mode=self.capture_forward_mode,
+            num_tokens=num_tokens,
+            extend_lens=None,
+        )
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -422,7 +429,7 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            tbo_split_seq_index=TODO,
+            tbo_split_seq_index=tbo_split_seq_index,
         )
         forward_batch.prepare_tbo()
 
