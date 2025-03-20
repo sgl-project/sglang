@@ -826,13 +826,13 @@ class ModelRunner:
     def init_attention_backend(self):
         if TODO:
             self.attn_backend = ComposedAttnBackend(
-                primary=self._create_attention_backend(),
-                children=[self._create_attention_backend() for _ in range(2)],
+                primary=self._create_attention_backend_core(),
+                children=[self._create_attention_backend_core() for _ in range(2)],
             )
         else:
-            self.attn_backend = self._create_attention_backend()
+            self.attn_backend = self._create_attention_backend_core()
 
-    def _create_attention_backend(self):
+    def _create_attention_backend_core(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
             from sglang.srt.layers.attention.flashinfer_backend import (
