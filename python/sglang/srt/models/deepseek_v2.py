@@ -84,6 +84,9 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as ops
 
+if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter.rotary_embedding import get_rope as aiter_get_rope
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -514,20 +517,33 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
-            qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=False,
-        )
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            self.rotary_emb = aiter_get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=False,
+            )
+        else:
+            self.rotary_emb = get_rope(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=False,
+            )
 
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
+            # TODO aiter dsv rope
+            # if _is_hip and get_bool_env_var("CK_MOE"):
+            #    self.rotary_emb.forward = self.rotary_emb.forward_new
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
 
