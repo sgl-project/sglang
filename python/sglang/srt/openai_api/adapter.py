@@ -327,7 +327,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 )
             else:
                 responses = v1_generate_response(
-                    request, ret, tokenizer_manager, to_file=True
+                    request, ret, tokenizer_manager, to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                 )
 
