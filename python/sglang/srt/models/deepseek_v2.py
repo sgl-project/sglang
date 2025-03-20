@@ -360,8 +360,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_stage_prefill_extra_a(self, state):
-        state_dispatch = self._forward_tbo_substage_dispatch_start(state)
-        return state | state_dispatch, None
+        state |= self._forward_tbo_substage_dispatch_start(state)
+        return state , None
 
     def _forward_tbo_stage_prefill_post_attn_full_b(self, state):
         state |= self._forward_tbo_substage_dispatch_start(state)
