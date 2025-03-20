@@ -1214,11 +1214,12 @@ class DeepseekV2DecoderLayer(nn.Module):
     def get_forward_stages(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
             return [
-                self._forward_stage_prefill_attn_full,
                 *([
+                      self._forward_stage_prefill_attn_full_a,
                       self.mlp._forward_stage_prefill_extra_a,
                       self.mlp._forward_stage_prefill_mlp_a,
                   ] if TODO else [
+                    self._forward_stage_prefill_attn_full_b,
                     self.mlp._forward_stage_prefill_mlp_b,
                     self.mlp._forward_stage_prefill_extra_b,
                 ]),
