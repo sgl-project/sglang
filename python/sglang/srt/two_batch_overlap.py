@@ -85,13 +85,10 @@ def _model_forward_filter_inputs(
 
 
 def model_forward_merge_outputs(output_a, output_b):
-    hidden_states_a, residual_a = output_a
-    hidden_states_b, residual_b = output_b
+    def _handle_key(name):
+        return torch.concat([output_a[name], output_b[name]], dim=0)
 
-    hidden_states = torch.concat([hidden_states_a, hidden_states_b], dim=0)
-    residual = torch.concat([residual_a, residual_b], dim=0)
-
-    return hidden_states, residual
+    return _handle_key('hidden_states'), _handle_key('residual')
 
 
 _ENABLE_PROFILE = bool(
