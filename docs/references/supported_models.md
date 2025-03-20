@@ -4,7 +4,7 @@
 - Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3
 - Mistral / Mixtral / Mistral NeMo / Mistral Small 3
 - Gemma / Gemma 2
-- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / [Olympic Coder, part of open-r1 by HuggingFace](https://huggingface.co/open-r1/OlympicCoder-32B)
+- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / Olympic Coder
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
 - OLMoE
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
