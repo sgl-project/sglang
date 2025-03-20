@@ -108,6 +108,8 @@ class TboAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_sum: int,
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode,
@@ -151,6 +153,12 @@ class TboAttnBackend(AttentionBackend):
             seq_lens=seq_lens[tbo_split_seq_index:],
             **args_common,
         )
+
+        if seq_lens_sum is not None:
+            TODO
+        if seq_lens_cpu is not None:
+            TODO
+       
         return args_left, args_right
 
     def get_cuda_graph_seq_len_fill_value(self):
