@@ -109,8 +109,8 @@ def model_forward_execute_two_batch(
 
 
 def _execute_two_batch_raw(inputs_a, inputs_b, stages, delta_stages: int):
-    executor_a = _StageExecutor("a", stages)
-    executor_b = _StageExecutor("b", stages)
+    executor_a = _StageExecutor("a", stages, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages, inputs=inputs_b)
 
     for _ in range(delta_stages):
         executor_a.next()
@@ -127,12 +127,12 @@ def _execute_two_batch_raw(inputs_a, inputs_b, stages, delta_stages: int):
 
 
 class _StageExecutor:
-    def __init__(self, debug_name: str, stages: List[Callable]):
+    def __init__(self, debug_name: str, stages: List[Callable], inputs):
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
         self._stage_state = None
-        self.output = None
+        self._stage_output = inputs
 
     def next(self):
         assert not self.done
@@ -146,11 +146,14 @@ class _StageExecutor:
             stage = self._stages[self._index]
             TODO_input
             TODO_temporary_output
-            self._stage_state = stage(self._stage_state)
-
-        self.output = TODO
+            self._stage_state, self._stage_output = stage(self._stage_state)
 
         self._index += 1
+
+    @property
+    def output(self):
+        assert self.done
+        return self._stage_output
 
     @property
     def done(self):
