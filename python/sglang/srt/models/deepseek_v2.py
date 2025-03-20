@@ -1302,17 +1302,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        return (
-            state
-            | dict(
-                self_attn_state=self_attn_state,
-                residual_after_input_ln=residual,
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            ),
-            None,
-        )
+        state.update(dict(
+            self_attn_state=self_attn_state,
+            residual_after_input_ln=residual,
+            forward_batch=forward_batch,
+            positions=positions,
+            tbo_subbatch_index=tbo_subbatch_index,
+        ))
 
     def _forward_tbo_stage_decode_attn_1(self, state):
         assert (
@@ -1328,15 +1324,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, state["residual_after_input_ln"]
         )
         router_logits = self.mlp.gate(hidden_states)
-        return (
-            state
-            | dict(
-                hidden_states_for_moe_input=hidden_states,
-                residual_after_post_attn_ln=residual,
-                router_logits=router_logits,
-            ),
-            None,
-        )
+        state.update(dict(
+            hidden_states_for_moe_input=hidden_states,
+            residual_after_post_attn_ln=residual,
+            router_logits=router_logits,
+        ))
 
 
 class DeepseekV2Model(nn.Module):
