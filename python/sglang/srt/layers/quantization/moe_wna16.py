@@ -10,7 +10,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, get_device_capability
 from sglang.srt.layers.quantization.utils import check_marlin_supports_layer
 
 from vllm.model_executor.layers.quantization.awq import AWQConfig
@@ -20,7 +20,6 @@ from vllm.model_executor.layers.quantization.awq_marlin import (
 from vllm.model_executor.layers.quantization.gptq_marlin import (
     GPTQMarlinConfig)
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-from vllm.platforms import current_platform
 
 
 logger = logging.getLogger(__name__)
@@ -48,9 +47,9 @@ class MoeWNA16Config(QuantizationConfig):
             self.use_marlin = GPTQMarlinConfig.is_gptq_marlin_compatible(
                 full_config)
         elif self.linear_quant_method == "awq":
-            capability_tuple = current_platform.get_device_capability()
+            capability_tuple = get_device_capability()
             device_capability = (-1 if capability_tuple is None else
-                                 capability_tuple.to_int())
+                                capability_tuple[0] * 10 + capability_tuple[1])
             awq_min_capability = AWQConfig.get_min_capability()
             if device_capability < awq_min_capability:
                 raise ValueError(
@@ -122,9 +121,9 @@ class MoeWNA16Config(QuantizationConfig):
         num_bits = quant_config.get("bits")
         desc_act = quant_config.get("desc_act")
 
-        capability_tuple = current_platform.get_device_capability()
+        capability_tuple = get_device_capability()
         device_capability = (-1 if capability_tuple is None else
-                             capability_tuple.to_int())
+                             capability_tuple[0] * 10 + capability_tuple[1])
         # Avoid circular import
         awq_min_capability = AWQConfig.get_min_capability()
 
