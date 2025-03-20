@@ -376,8 +376,8 @@ class DeepseekV2MoE(nn.Module):
         return state, None
 
     def _forward_tbo_stage_prefill_extra_b(self, state):
-        state_combine = self._forward_tbo_substage_combine_start(state)
-        return state | state_combine, None
+        state |= self._forward_tbo_substage_combine_start(state)
+        return state , None
 
     def _forward_tbo_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(
