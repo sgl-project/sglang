@@ -727,6 +727,16 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
     format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
