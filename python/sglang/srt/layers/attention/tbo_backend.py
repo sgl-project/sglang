@@ -188,14 +188,14 @@ def _init_forward_metadata_cuda_graph_split(
     )
 
     ans.update(dict(
-        bs=bs_child_left,
+        bs=bs_child,
         req_pool_indices=req_pool_indices[seq_slice],
         seq_lens=seq_lens[seq_slice],
     ))
 
     if fn_name == 'init_forward_metadata_capture_cuda_graph':
         ans.update(dict(
-            num_tokens=num_tokens_child_left,
+            num_tokens=bs_child,
         ))
     elif fn_name == 'init_forward_metadata_replay_cuda_graph':
         ans.update(dict(
