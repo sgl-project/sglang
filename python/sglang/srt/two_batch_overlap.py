@@ -101,20 +101,21 @@ _ENABLE_PROFILE = bool(
 
 def model_forward_execute_two_batch(
         inputs,
-        stages: List[Callable],
+        stages_a: List[Callable],
+        stages_b: List[Callable],
         delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
     output_a, output_b = _execute_two_batch_raw(
-        inputs_a, inputs_b, stages, delta_stages=delta_stages
+        inputs_a, inputs_b, stages_a, stages_b, delta_stages=delta_stages
     )
     return model_forward_merge_outputs(output_a, output_b)
 
 
-def _execute_two_batch_raw(inputs_a, inputs_b, stages, delta_stages: int):
-    executor_a = _StageExecutor("a", stages, inputs=inputs_a)
-    executor_b = _StageExecutor("b", stages, inputs=inputs_b)
+def _execute_two_batch_raw(inputs_a, inputs_b, stages_a, stages_b, delta_stages: int):
+    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
 
     for _ in range(delta_stages):
         executor_a.next()
