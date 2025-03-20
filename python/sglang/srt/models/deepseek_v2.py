@@ -443,11 +443,10 @@ class DeepseekV2MoE(nn.Module):
         return dict(state_combine=state_combine)
 
     def _forward_tbo_substage_combine_wait(self, state):
-        hidden_states_from_combine, combine_event = self.tbo_deepep_dispatchers[
+        hidden_states_from_combine = self.tbo_deepep_dispatchers[
             state["tbo_subbatch_index"]].combine_stage_wait(state['state_combine'])
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
-            combine_event=combine_event,
         )
 
     def _forward_tbo_substage_compute_layer_output(self, state, output_hidden_states):
