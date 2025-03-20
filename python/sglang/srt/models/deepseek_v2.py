@@ -369,7 +369,7 @@ class DeepseekV2MoE(nn.Module):
         self._forward_tbo_substage_mlp(state)
 
     def _forward_tbo_stage_prefill_combine_start(self, state):
-        state |= self._forward_tbo_substage_combine_start(state)
+        self._forward_tbo_substage_combine_start(state)
 
     def _forward_tbo_stage_prefill_shared_and_combine_wait(self, state):
         shared_output = self._forward_deepep_shared_output(
@@ -390,7 +390,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_tbo_stage_decode_mlp(self, state):
         self._forward_tbo_substage_dispatch_wait(state)
         self._forward_tbo_substage_mlp(state)
-        state |= self._forward_tbo_substage_combine_start(state)
+        self._forward_tbo_substage_combine_start(state)
 
     def _forward_tbo_stage_decode_extra(self, state):
         state |= self._forward_tbo_substage_combine_wait(state)
@@ -429,10 +429,9 @@ class DeepseekV2MoE(nn.Module):
         ))
 
     def _forward_tbo_substage_combine_start(self, state):
-        state_combine = self.tbo_deepep_dispatchers[state["tbo_subbatch_index"]].combine_stage_start(
+        state['state_combine'] = self.tbo_deepep_dispatchers[state["tbo_subbatch_index"]].combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
-        return dict(state_combine=state_combine)
 
     def _forward_tbo_substage_combine_wait(self, state):
         hidden_states_from_combine = self.tbo_deepep_dispatchers[
