@@ -309,7 +309,9 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
         if self.tp_size > 1:
-            final_hidden_states = self.deepep_dispatcher.combine(final_hidden_states, forward_mode)
+            final_hidden_states = self.deepep_dispatcher.combine(
+                final_hidden_states, forward_mode
+            )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
