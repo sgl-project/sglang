@@ -298,9 +298,9 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_start BEGIN '
-              f'{hidden_states.shape=} {topk_idx.shape=} {topk_weights.shape=} {num_experts=} {forward_mode=}',
-              flush=True)
+        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_start BEGIN '
+        #       f'{hidden_states.shape=} {topk_idx.shape=} {topk_weights.shape=} {num_experts=} {forward_mode=}',
+        #       flush=True)
         assert self.current_stage is None
         self.current_stage = 'dispatch_start'
 
@@ -335,8 +335,8 @@ class DeepEPDispatcher:
         return event, handle, topk_idx, topk_weights, hidden_states
 
     def dispatch_stage_wait(self, state):
-        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_wait BEGIN',
-              flush=True)
+        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_wait BEGIN',
+        #       flush=True)
         assert self.current_stage == 'dispatch_start'
         self.current_stage = 'dispatch_wait'
 
@@ -474,8 +474,8 @@ class DeepEPDispatcher:
     def combine_stage_start(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ):
-        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_start BEGIN',
-              flush=True)
+        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_start BEGIN',
+        #       flush=True)
         assert self.current_stage == 'dispatch_wait'
         self.current_stage = 'combine_start'
 
@@ -494,8 +494,8 @@ class DeepEPDispatcher:
         return event, hidden_states
 
     def combine_stage_wait(self, state):
-        print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_wait BEGIN',
-              flush=True)
+        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_wait BEGIN',
+        #       flush=True)
         assert self.current_stage == 'combine_start'
         self.current_stage = None
 
