@@ -42,7 +42,8 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
-        args_left, args_right = self._compute_cuda_graph_children_args(
+        self._init_forward_metadata_cuda_graph(
+            fn_name='init_forward_metadata_capture_cuda_graph',
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -51,9 +52,6 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
             capture_num_tokens=num_tokens,
         )
-        child_left, child_right = self.children
-        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
-        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -79,7 +77,8 @@ class TboAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        args_left, args_right = self._compute_cuda_graph_children_args(
+        self._init_forward_metadata_cuda_graph(
+            fn_name='init_forward_metadata_replay_cuda_graph',
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -91,12 +90,9 @@ class TboAttnBackend(AttentionBackend):
             replay_seq_lens_cpu=seq_lens_cpu,
         )
 
-        child_left, child_right = self.children
-        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
-        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
-
-    @staticmethod
-    def _compute_cuda_graph_children_args(
+    def _init_forward_metadata_cuda_graph(
+        self,
+        fn_name: str,
         # common args
         bs: int,
         req_pool_indices: torch.Tensor,
@@ -157,7 +153,9 @@ class TboAttnBackend(AttentionBackend):
         TODO_capture_args
         TODO_replay_args
 
-        return args_left, args_right
+        child_left, child_right = self.children
+        getattr(child_left, fn_name)(**args_left)
+        getattr(child_right, fn_name)(**args_right)
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
