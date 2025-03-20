@@ -1221,6 +1221,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         return dict(self_attn_state=self_attn_state, residual=residual), None
 
     def _forward_stage_decode_attn_1(self, state):
+        assert (
+            (get_tensor_model_parallel_world_size() > 1) and
+            global_server_args_dict["enable_dp_attention"] and
+            global_server_args_dict["enable_deepep_moe"] and
+            isinstance(self.mlp, DeepseekV2MoE)
+        )
         hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual'])
         router_logits = self.mlp.gate(hidden_states)
