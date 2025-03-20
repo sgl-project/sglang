@@ -555,16 +555,18 @@ class ForwardBatch:
                 batch_size=end_seq_index - start_seq_index,
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
-                # TODO test this can be removed
-                global_num_tokens=None,
-                global_num_tokens_cpu=None,
-                gathered_buffer=None,
-                # global_num_tokens=output_global_num_tokens,
-                # gathered_buffer=gathered_buffer,
                 attn_backend=output_attn_backend,
+
+                tbo_split_token_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
-                # TODO make it none because seems not used. should check whether really not used
+
+                # TODO test this can be removed
+                global_num_tokens_gpu=None,
+                global_num_tokens_cpu=None,
+                gathered_buffer=None,
+                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
 
                 # For logits and logprobs post processing, thus we do not care
