@@ -12,12 +12,7 @@ def compute_split_seq_index(
     extend_lens: Sequence[int],
 ) -> Optional[int]:
     if forward_mode.is_extend():
-        split_token_index, split_seq_index = 0, 0
-        for extend_seq_len in extend_lens[:-1]:
-            split_token_index += extend_seq_len
-            split_seq_index += 1
-            if split_token_index >= num_tokens // 2:
-                break
+        split_seq_index = _split_array_by_half_sum(extend_lens)
     elif forward_mode.is_decode():
         split_seq_index = num_tokens // 2
     else:
@@ -27,6 +22,17 @@ def compute_split_seq_index(
         return None
 
     return split_seq_index
+
+
+def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+    arr_sum = sum(arr)
+    cum_sum, split_index = 0, 0
+    for extend_seq_len in arr[:-1]:
+        cum_sum += extend_seq_len
+        split_index += 1
+        if cum_sum >= arr_sum // 2:
+            break
+    return split_index
 
 
 def compute_split_token_index(split_seq_index: int) -> int:
