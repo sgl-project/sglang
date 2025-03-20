@@ -492,7 +492,7 @@ class DeepEPDispatcher:
     def combine_stage_wait(self, state):
         assert self.current_stage == 'combine_start'
         self.current_stage = None
-       
+
         event, hidden_states = state
 
         if self.async_finish:
