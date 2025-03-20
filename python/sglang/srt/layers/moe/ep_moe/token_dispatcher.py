@@ -321,6 +321,9 @@ class DeepEPDispatcher:
         num_experts: int,
         previous_event=None,
     ):
+        # NOTE cannot be too early
+        previous_event = Buffer.capture()
+
         assert previous_event is not None  # temp hack
         assert self.async_finish
 
@@ -448,6 +451,9 @@ class DeepEPDispatcher:
         return hidden_states.view(self.hidden_shape), event
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
+        # NOTE cannot be too early
+        previous_event = Buffer.capture()
+
         assert previous_event is not None  # temp hack
         assert self.async_finish
 
