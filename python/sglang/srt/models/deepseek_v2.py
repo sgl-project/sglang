@@ -21,7 +21,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -1195,13 +1194,16 @@ class DeepseekV2Model(nn.Module):
         for i in range(start_layer, end_layer):
             TODO
 
-        two_batch_overlap.model_forward_execute_two_batch(
-            inputs=TODO,
+        return two_batch_overlap.model_forward_execute_two_batch(
+            inputs=dict(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+            ),
             stages=TODO,
             delta_stages=TODO,
         )
-
-        return hidden_states, residual
 
 
 class DeepseekV2ForCausalLM(nn.Module):
