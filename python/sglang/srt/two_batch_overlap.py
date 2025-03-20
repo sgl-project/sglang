@@ -171,7 +171,22 @@ class _StageExecutor:
 
 
 @contextmanager
-def configure_deep_gemm_num_sm(num_sms):
+def configure_deep_gemm_num_sm(enable_space_for_deepep: bool):
+    overall_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms
+
+    # TODO do not hardcode
+    chosen_num_sms = (
+        overall_num_sms - 20
+        if enable_space_for_deepep
+        else overall_num_sms
+    )
+
+    with _configure_deep_gemm_num_sm_raw(num_sms=chosen_num_sms):
+        yield
+
+
+@contextmanager
+def _configure_deep_gemm_num_sm_raw(num_sms):
     import deep_gemm
     original_num_sms = deep_gemm.get_num_sms()
     deep_gemm.set_num_sms(num_sms)
