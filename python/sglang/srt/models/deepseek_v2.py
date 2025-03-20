@@ -237,12 +237,12 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = self._create_deepep_dispatcher()
+            self.deepep_dispatcher = self._create_deepep_dispatcher(config)
 
         if global_server_args_dict["enable_two_batch_overlap"]:
-            self.deepep_dispatcher_secondary = self._create_deepep_dispatcher()
+            self.deepep_dispatcher_secondary = self._create_deepep_dispatcher(config)
 
-    def _create_deepep_dispatcher(self):
+    def _create_deepep_dispatcher(self, config):
         return DeepEPDispatcher(
             group=parallel_state.get_tp_group().device_group,
             router_topk=self.top_k,
