@@ -150,8 +150,12 @@ class TboAttnBackend(AttentionBackend):
             **args_common,
         )
 
-        TODO_capture_args
-        TODO_replay_args
+        if fn_name == 'init_forward_metadata_capture_cuda_graph':
+            TODO
+        elif fn_name == 'init_forward_metadata_replay_cuda_graph':
+            TODO
+        else:
+            raise NotImplementedError
 
         child_left, child_right = self.children
         getattr(child_left, fn_name)(**args_left)
