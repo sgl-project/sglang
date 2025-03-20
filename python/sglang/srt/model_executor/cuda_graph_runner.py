@@ -317,7 +317,7 @@ class CudaGraphRunner:
 
         is_tbo_supported = (
             forward_batch.can_run_tbo
-            if TODO
+            if self.model_runner.server_args.enable_two_batch_overlap
             else True
         )
 
