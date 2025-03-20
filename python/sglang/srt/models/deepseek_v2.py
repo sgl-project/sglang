@@ -366,8 +366,8 @@ class DeepseekV2MoE(nn.Module):
     def _forward_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(state['common']['forward_batch'].forward_mode, hidden_states)
         state['combine_event'].current_stream_wait()
-        final_hidden_states = final_hidden_states + shared_output
-        return None, final_hidden_states
+        output_hidden_states = state['hidden_states_from_combine'] + shared_output
+        return None, output_hidden_states
 
     def _forward_stage_decode_shared(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
@@ -379,8 +379,8 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
-        final_hidden_states = final_hidden_states + shared_output
-        return None, final_hidden_states
+        output_hidden_states = state['hidden_states_from_combine'] + state['shared_output']
+        return None, output_hidden_states
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
         state['dispatch_event'].current_stream_wait()
