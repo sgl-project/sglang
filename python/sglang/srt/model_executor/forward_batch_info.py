@@ -431,24 +431,26 @@ class ForwardBatch:
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
     def prepare_tbo(self, tbo_split_seq_index: Optional[int]):
-        if tbo_split_seq_index is not None:
-            child_a = self.filter_batch(
-                start_token_index=0,
-                end_token_index=split_token_index,
-                start_seq_index=0,
-                end_seq_index=split_seq_index,
-                output_attn_backend=model_runner.attn_backend_child_a,
-            )
-            child_b = self.filter_batch(
-                start_token_index=split_token_index,
-                end_token_index=ret.input_ids.shape[0],
-                start_seq_index=split_seq_index,
-                end_seq_index=ret.batch_size,
-                output_attn_backend=model_runner.attn_backend_child_b,
-            )
+        if tbo_split_seq_index is None:
+            return
 
-            assert self.tbo_children is None
-            self.tbo_children = [child_a, child_b]
+        child_a = self.filter_batch(
+            start_token_index=0,
+            end_token_index=tbo_split_token_index,
+            start_seq_index=0,
+            end_seq_index=tbo_split_seq_index,
+            output_attn_backend=model_runner.attn_backend_child_a,
+        )
+        child_b = self.filter_batch(
+            start_token_index=tbo_split_token_index,
+            end_token_index=self.input_ids.shape[0],
+            start_seq_index=tbo_split_seq_index,
+            end_seq_index=self.batch_size,
+            output_attn_backend=model_runner.attn_backend_child_b,
+        )
+
+        assert self.tbo_children is None
+        self.tbo_children = [child_a, child_b]
 
     def filter_batch(
         self,
