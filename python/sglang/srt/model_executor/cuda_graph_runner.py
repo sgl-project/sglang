@@ -220,7 +220,19 @@ class CudaGraphRunner:
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
             # Speculative_inference
-            if model_runner.spec_algorithm.is_eagle():
+            if (
+                model_runner.spec_algorithm.is_eagle3()
+                and not model_runner.is_draft_worker
+            ):
+                self.hidden_states = torch.zeros(
+                    (
+                        self.max_num_token,
+                        3 * self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+                self.model_runner.model.set_eagle3_layers_to_capture()
+            elif model_runner.spec_algorithm.is_eagle():
                 self.hidden_states = torch.zeros(
                     (self.max_num_token, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,

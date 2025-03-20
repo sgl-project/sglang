@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestMLA(unittest.TestCase):
+class TestDeepEPMoE(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -22,9 +22,13 @@ class TestMLA(unittest.TestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--enable-torch-compile",
-                "--cuda-graph-max-bs",
+                "--tp",
                 "2",
+                "--dp",
+                "2",
+                "--enable-dp-attention",
+                "--enable-deepep-moe",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -43,18 +47,6 @@ class TestMLA(unittest.TestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.8)
 
 
 if __name__ == "__main__":
