@@ -358,10 +358,8 @@ class DeepseekV2MoE(nn.Module):
         return self._forward_stage_mlp_raw(state, start_combine=False)
 
     def _forward_stage_prefill_extra_b(self, state):
-        final_hidden_states, combine_event = self.deepep_dispatcher.combine(
-            state['expert_output_hidden_states'], state['common']['forward_batch'].forward_mode
-        )
-        return TODO, None
+        state_combine = self._forward_substage_combine(state)
+        return dict(**state_combine, common=state['common']), None
 
     def _forward_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(state['common']['forward_batch'].forward_mode, hidden_states)
