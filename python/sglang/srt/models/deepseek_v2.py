@@ -359,7 +359,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_prefill_extra_b(self, state):
         final_hidden_states, combine_event = self.deepep_dispatcher.combine(
-            final_hidden_states, state['common']['forward_batch'].forward_mode
+            state['expert_output_hidden_states'], state['common']['forward_batch'].forward_mode
         )
         return TODO, None
 
@@ -390,17 +390,12 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if start_combine:
-            hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine(
-                expert_output_hidden_states, state['common']['forward_batch'].forward_mode
-            )
+            state_combine = self._forward_substage_combine(
+                state | dict(expert_output_hidden_states=expert_output_hidden_states))
         else:
-            hidden_states_from_combine = combine_event = None
+            state_combine = {}
 
-        return dict(
-            expert_output_hidden_states=expert_output_hidden_states,
-            hidden_states_from_combine=hidden_states_from_combine,
-            combine_event=combine_event,
-        ), None
+        return dict(**state_combine, common=state['common']), None
 
     def _forward_substage_dispatch(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
@@ -411,6 +406,15 @@ class DeepseekV2MoE(nn.Module):
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
             dispatch_event=dispatch_event,
+        )
+
+    def _forward_substage_combine(self, state):
+        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine(
+            state['expert_output_hidden_states'], state['common']['forward_batch'].forward_mode
+        )
+        return dict(
+            hidden_states_from_combine=hidden_states_from_combine,
+            combine_event=combine_event,
         )
 
 
