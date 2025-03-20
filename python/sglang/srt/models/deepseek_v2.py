@@ -1112,7 +1112,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
     @property
-    def model_forward_stages(self):
+    def forward_stages(self):
         return [
             TODO,
         ]
@@ -1199,7 +1199,7 @@ class DeepseekV2Model(nn.Module):
 
         stages = []
         for i in range(start_layer, end_layer):
-            stages += self.layers[i].model_forward_stages
+            stages += self.layers[i].forward_stages
 
         return two_batch_overlap.model_forward_execute_two_batch(
             inputs=dict(
