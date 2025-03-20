@@ -42,7 +42,15 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
-        args_left, args_right = self._compute_cuda_graph_children_args()
+        args_left, args_right = self._compute_cuda_graph_children_args(
+            bs=bs,
+            num_tokens=num_tokens,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(**args_left)
         child_right.init_forward_metadata_capture_cuda_graph(**args_right)
@@ -71,9 +79,29 @@ class TboAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        TODO
+        args_left, args_right = self._compute_cuda_graph_children_args(
+            bs=bs,
+            num_tokens=num_tokens,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
+        child_left, child_right = self.children
+        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
+        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
 
-    def _compute_cuda_graph_children_args(self):
+    @staticmethod
+    def _compute_cuda_graph_children_args(
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode,
             num_tokens=num_tokens,
