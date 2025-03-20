@@ -13,3 +13,6 @@
 [submodule "QwQ"]
 	path = QwQ
 	url = https://github.com/QwenLM/QwQ.git
+[submodule "benchmark/reasoning_benchmark/QwQ_benchmark/QwQ"]
+	path = benchmark/reasoning_benchmark/QwQ_benchmark/QwQ
+	url = https://github.com/QwenLM/QwQ.git

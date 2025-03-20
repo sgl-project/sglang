@@ -2,26 +2,24 @@
 
 Currently, this repository contains the code to reproduce the following scores.
 
-| Datasets                 | QwQ-32B |
-|--------------------------|---------|
-| AIME24                   | 79.5    |
-| AIME25                   | 69.5    |
-| LiveCodeBench 2408-2502  | 63.4    |
-| IFeval(Strict Prompt Acc)| 83.9    |
+| Datasets                 | SGLang   | QwQ-32B-official |
+|--------------------------|----------|------------------|
+| AIME24                   | 75.4     | 79.5             |
+| AIME25                   |          | 69.5             |
+| LiveCodeBench 2408-2502  | 61.9     | 63.4             |
+| IFeval(Strict Prompt Acc)|          | 83.9             |
 
-## Download data
+## Download repo
 ```
-wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/aime24.jsonl
-wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/aime25.jsonl
-wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/ifeval.jsonl
-wget -P data https://raw.githubusercontent.com/QwenLM/QwQ/refs/heads/main/eval/data/livecodebench_v5.jsonl
+git submodule init
+git submodule update
 
 ```
 
 ## Run benchmark
 ```
 pip install -r requirements.txt
-python -m sglang.launch_server --model-path Qwen/QwQ-32B --host=0.0.0.0 --port=30000
+python -m sglang_router.launch_server --model-path Qwen/QwQ-32B --dp-size 4 --host=0.0.0.0 --port=30000
 ```
 
 
@@ -31,6 +29,8 @@ python -m sglang.launch_server --model-path Qwen/QwQ-32B --host=0.0.0.0 --port=3
 After starting the vLLM service, run the inference script to generate responses.
 
 ```bash
+cd QwQ/eval
+
 mkdir -p output
 
 # aime24 (repeated sample 64 times)
