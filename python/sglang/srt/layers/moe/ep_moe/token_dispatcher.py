@@ -319,6 +319,7 @@ class DeepEPDispatcher:
         previous_event=None,
     ):
         assert previous_event is not None  # temp hack
+        assert self.async_finish
 
         (
             num_tokens_per_rank,
@@ -445,6 +446,7 @@ class DeepEPDispatcher:
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
         assert previous_event is not None  # temp hack
+        assert self.async_finish
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
