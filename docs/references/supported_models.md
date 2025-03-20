@@ -34,6 +34,7 @@
 - Janus-Pro-1B / Janus-Pro-7B
 - Deepseek-VL2 / Deepseek-VL2-small
 - Gemma 3 (it)
+- [Olympic Coder, part of open-r1 by HuggingFace](https://huggingface.co/open-r1/OlympicCoder-32B)
 
 ## Embedding Models
 
