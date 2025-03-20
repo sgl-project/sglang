@@ -318,6 +318,8 @@ class DeepEPDispatcher:
         num_experts: int,
         previous_event=None,
     ):
+        assert previous_event is not None  # temp hack
+
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -442,6 +444,8 @@ class DeepEPDispatcher:
         return hidden_states.view(self.hidden_shape), event
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
+        assert previous_event is not None  # temp hack
+
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
