@@ -1405,7 +1405,7 @@ class DeepseekV2Model(nn.Module):
         residual = None
 
         normal_num_layers = (
-            self.first_k_dense_replace
+            self.config.first_k_dense_replace
             if forward_batch.can_run_tbo
             else len(self.layers)
         )
