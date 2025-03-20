@@ -1171,20 +1171,24 @@ class PortArgs:
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
-            port_base = int(dist_init_port) + 1
+            port_args = {}
+            for name in (
+                "tokenizer_ipc_name",
+                "detokenizer_ipc_name",
+                "rpc_ipc_name",
+            ):
+                port_args[name] = f"tcp://{dist_init_host}:{dist_init_port + len(port_args)}"
             if dp_rank is None:
                 scheduler_input_port = (
-                    port_base + 2
+                    dist_init_port + len(port_args)
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = dist_init_port + len(port_args) + 1 + dp_rank
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                **port_args,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
 
 
