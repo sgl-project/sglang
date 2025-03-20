@@ -18,8 +18,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-_buffer_normal = None
-# TODO temp disable
+# TODO try disable global variable
+# _buffer_normal = None
 # _buffer_low_latency = None
 
 
@@ -29,7 +29,8 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-model-training-or-inference-prefilling
     """
 
-    global _buffer_normal
+    # TODO try disable global variable
+    # global _buffer_normal
 
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
@@ -43,12 +44,16 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
             config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
         )
 
+    # TODO try disable global variable
+    _buffer_normal = None
+
     if (
         _buffer_normal is None
         or _buffer_normal.group != group
         or _buffer_normal.num_nvl_bytes < num_nvl_bytes
         or _buffer_normal.num_rdma_bytes < num_rdma_bytes
     ):
+        print('hi get_buffer_normal create a new buffer', flush=True)
         _buffer_normal = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer_normal
 
