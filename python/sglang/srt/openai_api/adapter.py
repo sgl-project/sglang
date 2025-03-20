@@ -1371,7 +1371,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         if (delta and len(delta) == 0) or not delta:
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
-                            continue
+                            # if the chunk's finish_reason is not empty, then we should yield it
+                            if finish_reason_type is None:
+                                continue
 
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
