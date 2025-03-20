@@ -362,7 +362,7 @@ class DeepseekV2MoE(nn.Module):
         return self._forward_stage_mlp_raw(state, start_combine=False)
 
     def _forward_stage_prefill_extra_b(self, state):
-        state_combine = self._forward_substage_combine(state)
+        state_combine = self._forward_substage_combine_start(state)
         return state | state_combine, None
 
     def _forward_stage_prefill_shared(self, state):
@@ -395,7 +395,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
-        state["dispatch_event"].current_stream_wait()
+        self._forward_substage_dispatch_wait(state)
 
         expert_output_hidden_states = self._forward_deepep_expert(
             state["forward_batch"].forward_mode,
@@ -404,7 +404,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if start_combine:
-            state_combine = self._forward_substage_combine(
+            state_combine = self._forward_substage_combine_start(
                 state | dict(expert_output_hidden_states=expert_output_hidden_states)
             )
         else:
@@ -424,19 +424,20 @@ class DeepseekV2MoE(nn.Module):
         (
             recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch,
-            dispatch_event,
         ) = self._forward_deepep_dispatch_stage_wait(state['state_dispatch'])
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
-            dispatch_event=dispatch_event,
         )
 
-    def _forward_substage_combine(self, state):
+    def _forward_substage_combine_start(self, state):
         state_combine = self.deepep_dispatcher.combine_stage_start(
             state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
-        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine_stage_wait(state_combine)
+        return dict(state_combine=state_combine)
+
+    def _forward_substage_combine_wait(self, state):
+        hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine_stage_wait(state['state_combine'])
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
             combine_event=combine_event,
