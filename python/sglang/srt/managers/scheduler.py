@@ -1349,7 +1349,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             num_tokens=local_batch.input_ids.shape[0],
             extend_lens=local_batch.extend_lens,
         )
-        enable_tbo = local_tbo_split_seq_index is not None
+        can_run_tbo = local_tbo_split_seq_index is not None
 
         local_info = torch.tensor(
             [
@@ -1357,7 +1357,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
-                enable_tbo,
+                can_run_tbo,
             ],
             dtype=torch.int64,
         )
@@ -1374,7 +1374,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
-        enable_tbo = min(global_info[:, 0, 4].tolist())
+        can_run_tbo = min(global_info[:, 0, 4].tolist())
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1382,7 +1382,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-            local_batch.tbo_split_seq_index = local_tbo_split_seq_index if enable_tbo else None
+            local_batch.tbo_split_seq_index = local_tbo_split_seq_index if can_run_tbo else None
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
