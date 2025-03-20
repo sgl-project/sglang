@@ -51,10 +51,11 @@ class TboAttnBackend(AttentionBackend):
         assert encoder_lens is None, 'encoder_lens is not supported yet'
         assert spec_info is None, 'spec_info is not supported yet'
 
+        num_tokens_child = TODO
+
         # not yet support `num_tokens_per_bs>1`
         assert num_tokens == bs
-        bs_child = bs // 2
-        num_tokens_child = bs_child
+        bs_child = num_tokens_child
 
         child_left, child_right = self.children
         child_left.init_forward_metadata_capture_cuda_graph(
