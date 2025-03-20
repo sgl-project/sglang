@@ -1240,7 +1240,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_stage_prefill_attn_full_a(self, state, **kwargs):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_stage_decode_attn_1(state)
-        return state, None
+        return dict(), None
 
     def _forward_stage_prefill_attn_full_b(self, state, **kwargs):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
@@ -1249,7 +1249,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         recv_hidden_states, tokens_per_expert, dispatch_event = self.mlp._forward_deepep_dispatch(
             state['forward_mode'], state['hidden_states'], state['router_logits']
         )
-        return state, None
+        return dict(), None
 
     def _forward_stage_decode_attn_0(
         self,
@@ -1279,7 +1279,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual'])
         router_logits = self.mlp.gate(hidden_states)
-        return dict(hidden_states=hidden_states, residual=residual, router_logits=router_logits), None
+        return dict(
+            hidden_states_after_post_attn_ln=hidden_states,
+            residual_after_post_attn_ln=residual,
+            router_logits=router_logits,
+        ), None
 
 
 class DeepseekV2Model(nn.Module):
