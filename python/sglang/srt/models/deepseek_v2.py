@@ -387,7 +387,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = self._forward_deepep_shared_output(
             state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
         )
-        self._forward_tbo_substage_combine_wait(state)
+        state |= self._forward_tbo_substage_combine_wait(state)
         output_hidden_states = state["hidden_states_from_combine"] + shared_output
         return dict(), self._forward_tbo_substage_compute_layer_output(
             state, output_hidden_states
@@ -407,7 +407,7 @@ class DeepseekV2MoE(nn.Module):
         return state, None
 
     def _forward_tbo_stage_decode_extra(self, state):
-        self._forward_tbo_substage_combine_wait(state)
+        state |= self._forward_tbo_substage_combine_wait(state)
         output_hidden_states = (
             state["hidden_states_from_combine"] + state["shared_output"]
         )
