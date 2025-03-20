@@ -375,7 +375,7 @@ class DeepseekV2MoE(nn.Module):
         return dict(**state_dispatch, shared_output=shared_output, common=state['common']), None
 
     def _forward_stage_decode_mlp(self, state):
-        return _forward_stage_mlp_raw(state)
+        return self._forward_stage_mlp_raw(state)
 
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
@@ -384,14 +384,23 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
         state['dispatch_event'].current_stream_wait()
-        final_hidden_states = self._forward_deepep_expert(
+
+        expert_output_hidden_states = self._forward_deepep_expert(
             state['common']['forward_batch'].forward_mode, recv_hidden_states, tokens_per_expert
         )
+
         if start_combine:
-            final_hidden_states, combine_event = self.deepep_dispatcher.combine(
-                final_hidden_states, state['common']['forward_batch'].forward_mode
+            hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine(
+                expert_output_hidden_states, state['common']['forward_batch'].forward_mode
             )
-        return TODO, None
+        else:
+            hidden_states_from_combine = combine_event = None
+
+        return dict(
+            expert_output_hidden_states=expert_output_hidden_states,
+            hidden_states_from_combine=hidden_states_from_combine,
+            combine_event=combine_event,
+        ), None
 
     def _forward_substage_dispatch(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
