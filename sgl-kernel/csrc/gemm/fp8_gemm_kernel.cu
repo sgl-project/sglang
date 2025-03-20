@@ -823,8 +823,12 @@ struct DeviceGemmFp8RowwiseSm100 {
       ElementComputeEpilogue,
       cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
-  using Bias = cutlass::epilogue::fusion::
-      Sm90RowBroadcast<0, TileShape, OutElementType, OutElementType, cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+  using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0,
+      TileShape,
+      OutElementType,
+      OutElementType,
+      cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
   using Compute0 = cutlass::epilogue::fusion::
       Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
