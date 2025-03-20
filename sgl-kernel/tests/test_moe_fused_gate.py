@@ -48,7 +48,6 @@ def test_moe_fused_gate_combined(seq_length, dtype, params):
         compiled=False,
     )
 
-    # Correctness check
     idx_check = torch.allclose(
         ref_indices.sort()[0].to(torch.int32),
         indices.sort()[0].to(torch.int32),
