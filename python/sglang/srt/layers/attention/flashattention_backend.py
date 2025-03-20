@@ -5,17 +5,27 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.python.sglang.srt.model_executor.model_runner import ModelRunner
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
-from flash_attn_interface import (
-    flash_attn_varlen_func,
-)
+from flash_attn_interface import flash_attn_varlen_func
+
 
 class FlashAttentionBackend(ABC):
     """The FA3 attention backend"""
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+    ):
+        super().__init__()
+
+        self.forward_metadata = None
+        self.device = model_runner.device
 
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -96,7 +106,7 @@ class FlashAttentionBackend(ABC):
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         """Run forward for decode mode using FlashAttention.
-        
+
         Args:
             q: Query tensor [num_tokens, num_heads, head_size]
             k: Key tensor [num_tokens, num_kv_heads, head_size]
@@ -104,7 +114,7 @@ class FlashAttentionBackend(ABC):
             layer: RadixAttention layer
             forward_batch: Batch information for the forward pass
             save_kv_cache: Whether to save the KV cache
-        
+
         Returns:
             Output tensor [num_tokens, num_heads * head_size]
         """
@@ -126,7 +136,7 @@ class FlashAttentionBackend(ABC):
             softmax_scale=layer.scale,
             causal=True,
             # Optional parameters
-            alibi_slopes=layer.alibi_slopes if hasattr(layer, 'alibi_slopes') else None,
+            alibi_slopes=layer.alibi_slopes if hasattr(layer, "alibi_slopes") else None,
             window_size=(-1, -1),  # No sliding window by default
             block_table=forward_batch.block_table,
         )
@@ -143,7 +153,7 @@ class FlashAttentionBackend(ABC):
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         """Run a forward for extend mode using FlashAttention.
-        
+
         Args:
             q: Query tensor [num_tokens, num_heads, head_size]
             k: Key tensor [num_tokens, num_kv_heads, head_size]
@@ -151,13 +161,13 @@ class FlashAttentionBackend(ABC):
             layer: RadixAttention layer
             forward_batch: Batch information for the forward pass
             save_kv_cache: Whether to save the KV cache
-        
+
         Returns:
             Output tensor [num_tokens, num_heads * head_size]
         """
         # Get batch metadata
         num_tokens = q.shape[0]
-        
+
         # Run flash attention with variable length sequences
         output = flash_attn_varlen_func(
             q=q,
@@ -170,12 +180,16 @@ class FlashAttentionBackend(ABC):
             softmax_scale=layer.scale,
             causal=True,
             # Optional parameters
-            alibi_slopes=layer.alibi_slopes if hasattr(layer, 'alibi_slopes') else None,
+            alibi_slopes=layer.alibi_slopes if hasattr(layer, "alibi_slopes") else None,
             window_size=(-1, -1),  # No sliding window by default
         )
 
         # Save KV cache if requested
-        if save_kv_cache and hasattr(layer, 'key_cache') and hasattr(layer, 'value_cache'):
+        if (
+            save_kv_cache
+            and hasattr(layer, "key_cache")
+            and hasattr(layer, "value_cache")
+        ):
             # Update the key/value cache
             # Note: This assumes the cache tensors are already properly initialized
             layer.key_cache[forward_batch.slot_mapping] = k

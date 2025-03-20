@@ -868,6 +868,12 @@ class ModelRunner:
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             self.attn_backend = FlashMLABackend(self)
+        elif self.server_args.attention_backend == "flashattention":
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            self.attn_backend = FlashAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
