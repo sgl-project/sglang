@@ -276,14 +276,7 @@ class DeepseekV2MoE(nn.Module):
         recv_hidden_states, tokens_per_expert = (
             self._forward_deepep_dispatch(forward_mode, hidden_states, router_logits))
 
-        final_hidden_states = (
-            self.experts(
-                hidden_states=recv_hidden_states,
-                tokens_per_expert=tokens_per_expert,
-                forward_mode=forward_mode,
-            )
-            * self.routed_scaling_factor
-        )
+        final_hidden_states = self._forward_deepep_expert(forward_mode, recv_hidden_states, tokens_per_expert)
 
         if self.tp_size > 1:
             final_hidden_states, event = self.deepep_dispatcher.combine(
@@ -331,6 +324,16 @@ class DeepseekV2MoE(nn.Module):
             )
             event.current_stream_wait()  # TODO
         return recv_hidden_states, tokens_per_expert
+
+    def _forward_deepep_expert(self, forward_mode, recv_hidden_states, tokens_per_expert):
+        return (
+            self.experts(
+                hidden_states=recv_hidden_states,
+                tokens_per_expert=tokens_per_expert,
+                forward_mode=forward_mode,
+            )
+            * self.routed_scaling_factor
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
