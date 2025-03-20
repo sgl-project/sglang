@@ -314,7 +314,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_tbo_supported = (
+            forward_batch.tbo_split_seq_index is not None
+            if TODO
+            else True
+        )
+
+        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
