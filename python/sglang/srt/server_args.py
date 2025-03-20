@@ -1180,10 +1180,12 @@ class PortArgs:
                 "detokenizer_ipc_name",
                 "rpc_ipc_name",
             ):
-                port_args[name] = f"tcp://{dist_init_host}:{dist_init_port + len(port_args)}"
+                port_args[name] = (
+                    f"tcp://{dist_init_host}:{dist_init_port + len(port_args)}"
+                )
             if dp_rank is None:
-                scheduler_input_port = (
-                    dist_init_port + len(port_args)
+                scheduler_input_port = dist_init_port + len(
+                    port_args
                 )  # TokenizerManager to DataParallelController
             else:
                 scheduler_input_port = dist_init_port + len(port_args) + 1 + dp_rank
