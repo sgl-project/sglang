@@ -608,6 +608,28 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         except psutil.NoSuchProcess:
             pass
 
+def process_and_transfer_signal():
+    def sigchld_handler(signum, frame):
+        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        if exitcode != 0:
+            logger.warning(
+                "Child process unexpectedly failed with an exit code %d. pid=%d",
+                exitcode,
+                pid,
+            )
+
+    signal.signal(signal.SIGCHLD, sigchld_handler)
+
+    # Register the signal handler.
+    # The child processes will send SIGQUIT to this process when any error happens
+    # This process then clean up the whole process tree
+    def sigquit_handler(signum, frame):
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed."
+        )
+        kill_process_tree(os.getpid())
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
 
 def monkey_patch_p2p_access_check():
     """
