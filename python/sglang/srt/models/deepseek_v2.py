@@ -352,7 +352,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_prefill_extra_a(self, state):
-        state_dispatch = self._forward_substage_dispatch(state)
+        state_dispatch = self._forward_substage_dispatch_start(state)
         return state | state_dispatch, None
 
     def _forward_stage_prefill_mlp_a(self, state):
@@ -376,7 +376,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_stage_decode_shared(self, state):
-        state_dispatch = self._forward_substage_dispatch(state)
+        state_dispatch = self._forward_substage_dispatch_start(state)
         shared_output = self._forward_deepep_shared_output(
             state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
         )
@@ -412,17 +412,20 @@ class DeepseekV2MoE(nn.Module):
 
         return state | state_combine, None
 
-    def _forward_substage_dispatch(self, state):
+    def _forward_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
             state["forward_batch"].forward_mode,
             state["hidden_states_for_moe_input"],
             state["router_logits"],
         )
+        return dict(state_dispatch=state_dispatch)
+
+    def _forward_substage_dispatch_wait(self, state):
         (
             recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch,
             dispatch_event,
-        ) = self._forward_deepep_dispatch_stage_wait(state_dispatch)
+        ) = self._forward_deepep_dispatch_stage_wait(state['state_dispatch'])
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
