@@ -1215,8 +1215,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         if forward_mode == ForwardMode.EXTEND:
             return [
                 self._forward_stage_prefill_attn_full,
-                self.mlp._forward_stage_prefill_extra,
-                self.mlp._forward_stage_prefill_mlp,
+                *[
+                    self.mlp._forward_stage_prefill_extra_a,
+                    self.mlp._forward_stage_prefill_mlp_a,
+                ] if TODO else [
+                    self.mlp._forward_stage_prefill_mlp_b,
+                    self.mlp._forward_stage_prefill_extra_b,
+                ],
                 self.mlp._forward_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
