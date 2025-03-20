@@ -270,7 +270,6 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         num_experts: int,
         forward_mode: ForwardMode,
-        previous_event=None,
         num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.hidden_shape = hidden_states.shape
@@ -285,7 +284,7 @@ class DeepEPDispatcher:
                 handle,
                 event,
             ) = self.dispatch_normal(
-                hidden_states, topk_idx, topk_weights, num_experts, previous_event
+                hidden_states, topk_idx, topk_weights, num_experts
             )
             self.tokens_per_expert = torch.tensor(
                 num_recv_tokens_per_expert_list,
@@ -319,9 +318,7 @@ class DeepEPDispatcher:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
-        previous_event=None,
     ):
-        # NOTE cannot be too early
         previous_event = Buffer.capture()
 
         (
@@ -429,7 +426,7 @@ class DeepEPDispatcher:
         return recv_hidden_states, recv_expert_count, handle, event, hook
 
     def combine(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode, previous_event=None,
+        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
@@ -437,7 +434,7 @@ class DeepEPDispatcher:
                 hidden_states = self.get_restored_hidden_states_by_experts(
                     hidden_states
                 )
-            hidden_states, event = self.combine_normal(hidden_states, self.handle, previous_event=previous_event)
+            hidden_states, event = self.combine_normal(hidden_states, self.handle)
         else:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
@@ -445,8 +442,7 @@ class DeepEPDispatcher:
         self.handle = None
         return hidden_states.view(self.hidden_shape), event
 
-    def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event=None):
-        # NOTE cannot be too early
+    def combine_normal(self, x: torch.Tensor, handle: Tuple):
         previous_event = Buffer.capture()
 
         combined_x, _, event = self.buffer_normal.combine(
