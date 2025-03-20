@@ -43,7 +43,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -446,6 +445,7 @@ class ForwardBatch:
             extend_seq_lens=self.extend_seq_lens,
         )
 
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
         assert isinstance(self.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = self.attn_backend.children
 
