@@ -357,7 +357,9 @@ class DeepseekV2MoE(nn.Module):
         return _forward_stage_decode_mlp(state)
 
     def _forward_stage_prefill_shared(self, state):
-        return TODO, TODO
+        TODO_shared
+        state['combine_event'].current_stream_wait()
+        return None, TODO
 
     def _forward_stage_decode_shared(self, state):
         return TODO, None
@@ -373,7 +375,8 @@ class DeepseekV2MoE(nn.Module):
         return TODO, None
 
     def _forward_stage_decode_extra(self, state):
-        return TODO, TODO
+        state['combine_event'].current_stream_wait()
+        return None, TODO
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
