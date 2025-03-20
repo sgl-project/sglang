@@ -157,6 +157,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -231,7 +232,10 @@ class ServerArgs:
         assert self.chunked_prefill_size % self.page_size == 0
 
         if self.enable_flashmla is True:
-            assert self.page_size == 64, "FlashMLA only support page_size=64"
+            logger.warning(
+                "FlashMLA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -281,6 +285,12 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
+            # DeepEP MoE
+            if self.enable_deepep_moe:
+                self.ep_size = self.dp_size
+                logger.info(
+                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
+                )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1017,6 +1027,11 @@ class ServerArgs:
             required=False,
             default=ServerArgs.hicache_ratio,
             help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="Enabling DeepEP MoE implementation for EP MoE.",
         )
 
         # Server warmups
