@@ -526,7 +526,6 @@ class ForwardBatch:
             "padded_static_len",
             # TODO only used by qwen2-vl, thus not checked
             "mrope_positions",
-            "temp_scaled_logprobs",
         ]:
             output_dict[key] = getattr(self, key)
 
@@ -566,9 +565,12 @@ class ForwardBatch:
                 tbo_children=None,
                 # TODO make it none because seems not used. should check whether really not used
                 sampling_info=None,
-                # No longer used
-                global_split_token_index=None,
-                global_split_seq_index=None,
+
+                # For logits and logprobs post processing, thus we do not care
+                temp_scaled_logprobs=False,
+                temperature=None,
+                top_p_normalized_logprobs=False,
+                top_p=None,
             )
         )
 
