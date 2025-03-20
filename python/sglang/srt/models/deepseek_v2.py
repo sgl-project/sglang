@@ -1270,7 +1270,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        return dict(self_attn_state=self_attn_state, residual_after_input_ln=residual), None
+        return dict(
+            self_attn_state=self_attn_state,
+            residual_after_input_ln=residual,
+        ), None
 
     def _forward_stage_decode_attn_1(self, state):
         assert (
