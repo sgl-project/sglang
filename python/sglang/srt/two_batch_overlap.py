@@ -142,15 +142,16 @@ class _StageExecutor:
     def next(self):
         assert not self.done
 
+        stage = self._stages[self._index]
+
         if _ENABLE_PROFILE:
             ctx = torch.profiler.record_function(
-                f"Stage-{self._debug_name}{self._index}"
+                f"Stage-{self._debug_name}-{self._index}-{stage.__name__}"
             )
         else:
             ctx = nullcontext()
 
         with ctx:
-            stage = self._stages[self._index]
             self._stage_state, self._stage_output = stage(
                 state=self._stage_state, **(self._stage_output or {})
             )
