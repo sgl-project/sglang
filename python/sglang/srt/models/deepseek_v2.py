@@ -363,6 +363,10 @@ class DeepseekV2MoE(nn.Module):
         state_dispatch = self._forward_tbo_substage_dispatch_start(state)
         return state | state_dispatch, None
 
+    def _forward_tbo_stage_prefill_post_attn_full_b(self, state):
+        state |= self._forward_tbo_substage_dispatch_start(state)
+        return state, None
+
     def _forward_tbo_stage_prefill_pre_mlp(self, state):
         state |= self._forward_tbo_substage_dispatch_wait(state)
         return state, None
@@ -1309,10 +1313,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_tbo_stage_prefill_attn_full(self, state, **kwargs):
         state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_tbo_stage_decode_attn_1(state)
-        return state, None
-
-    def _forward_tbo_stage_prefill_post_attn_full_b(self, state):
-        state |= self.mlp._forward_tbo_substage_dispatch_start(state)
         return state, None
 
     def _forward_tbo_stage_decode_attn_0(
