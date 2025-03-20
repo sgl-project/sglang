@@ -154,6 +154,8 @@ class _StageExecutor:
 
         with ctx:
             stage = self._stages[self._index]
+            TODO_input
+            TODO_temporary_output
             self._stage_state = stage(self._stage_state)
 
         self.output = TODO
