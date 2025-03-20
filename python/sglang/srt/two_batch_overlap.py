@@ -163,9 +163,7 @@ class _StageExecutor:
         with ctx:
             try:
                 # print(f'hi [{get_tensor_model_parallel_rank()}] StageExecutor.next {debug_name=} START', flush=True)
-                self._stage_state, self._stage_output = stage(
-                    state=self._stage_state, **(self._stage_output or {})
-                )
+                self._stage_output = stage(state=self._stage_state, **(self._stage_output or {}))
                 # print(f'hi [{get_tensor_model_parallel_rank()}] StageExecutor.next {debug_name=} END', flush=True)
             except Exception as e:
                 raise Exception(f'Error when handling stage {debug_name} {e=}')
