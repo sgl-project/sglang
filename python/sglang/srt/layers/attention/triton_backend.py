@@ -121,6 +121,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
+            max_prefix_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
@@ -154,6 +155,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
+            max_prefix_extend_len = None
             attn_logits = None
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
@@ -166,6 +168,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             mask_indptr = None
             max_extend_len = torch.max(spec_info.accept_length).item()
+            max_prefix_extend_len = None
             attn_logits = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
@@ -268,6 +271,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
+            max_prefix_extend_len = None
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -295,6 +299,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
+            max_prefix_extend_len = None
             attn_logits = None
         else:
             raise ValueError(
@@ -304,6 +309,7 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata = (
             attn_logits,
             max_extend_len,
+            max_prefix_extend_len,
             kv_indptr,
             kv_indices,
             qo_indptr,
@@ -517,7 +523,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        attn_logits, _, kv_indptr, kv_indices, _, _, _ = self.forward_metadata
+        attn_logits, _, _, kv_indptr, kv_indices, _, _, _ = self.forward_metadata
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
