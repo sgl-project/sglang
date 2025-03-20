@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -30,7 +29,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "2",
                 "--enable-dp-attention",
                 "--enable-deepep-moe",
-                "--two-batch-overlap",
+                "--enable-two-batch-overlap",
                 "--disable-cuda-graph",  # TODO DeepEP does not support this yet
             ],
         )
