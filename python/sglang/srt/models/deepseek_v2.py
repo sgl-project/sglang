@@ -1368,6 +1368,7 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1405,7 +1406,7 @@ class DeepseekV2Model(nn.Module):
         residual = None
 
         normal_num_layers = (
-            self.config.first_k_dense_replace
+            self.first_k_dense_replace
             if forward_batch.can_run_tbo
             else len(self.layers)
         )
