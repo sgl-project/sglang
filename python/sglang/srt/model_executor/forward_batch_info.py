@@ -468,8 +468,9 @@ class ForwardBatch:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
-        output_global_num_tokens: List[int],
         output_attn_backend: AttentionBackend,
+        # TODO test this can be removed
+        # output_global_num_tokens: List[int],
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
@@ -530,17 +531,18 @@ class ForwardBatch:
             output_dict["input_ids"], output_dict["forward_mode"]
         )
 
-        # TODO improve, e.g. unify w/ `init_raw`
-        if output_global_num_tokens is not None:
-            max_len = max(output_global_num_tokens)
-            tp_size = get_tensor_model_parallel_world_size()
-            gathered_buffer = torch.zeros(
-                (max_len * tp_size, self.gathered_buffer.shape[1]),
-                dtype=self.gathered_buffer.dtype,
-                device=self.gathered_buffer.device,
-            )
-        else:
-            gathered_buffer = None
+        # TODO test this can be removed
+        # # TODO improve, e.g. unify w/ `init_raw`
+        # if output_global_num_tokens is not None:
+        #     max_len = max(output_global_num_tokens)
+        #     tp_size = get_tensor_model_parallel_world_size()
+        #     gathered_buffer = torch.zeros(
+        #         (max_len * tp_size, self.gathered_buffer.shape[1]),
+        #         dtype=self.gathered_buffer.dtype,
+        #         device=self.gathered_buffer.device,
+        #     )
+        # else:
+        #     gathered_buffer = None
 
         output_dict.update(
             dict(
@@ -548,7 +550,7 @@ class ForwardBatch:
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
                 global_num_tokens=output_global_num_tokens,
-                gathered_buffer=gathered_buffer,
+                # gathered_buffer=gathered_buffer,
                 attn_backend=output_attn_backend,
                 tbo_parent_start_token_index=start_token_index,
                 tbo_parent_end_token_index=end_token_index,
