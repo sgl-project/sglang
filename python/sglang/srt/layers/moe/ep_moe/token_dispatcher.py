@@ -310,7 +310,7 @@ class DeepEPDispatcher:
         self.topk_weights = topk_weights
         if hidden_states.shape[0] > 0:
             hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
-        return hidden_states, topk_idx, topk_weights, tokens_per_expert, event
+        return hidden_states, topk_idx, topk_weights, tokens_per_expert
 
     def dispatch_normal(
         self,
@@ -444,7 +444,7 @@ class DeepEPDispatcher:
             event.current_stream_wait()
 
         self.handle = None
-        return hidden_states.view(self.hidden_shape), event
+        return hidden_states.view(self.hidden_shape)
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple):
         previous_event = Buffer.capture()
