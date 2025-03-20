@@ -5,6 +5,30 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch._dynamo.eval_frame import null_context
 
 
+# TODO refactor
+def compute_middle_split_token_and_seq_index(self):
+    num_tokens = self.input_ids.shape[0]
+
+    if self.forward_mode.is_extend():
+        split_token_index, split_seq_index = 0, 0
+        for extend_seq_len in self.extend_lens[:-1]:
+            split_token_index += extend_seq_len
+            split_seq_index += 1
+            if split_token_index >= num_tokens // 2:
+                break
+    elif self.forward_mode.is_decode():
+        split_token_index = split_seq_index = num_tokens // 2
+    else:
+        raise NotImplementedError
+
+    # print(
+    #     f'[TP{get_tensor_model_parallel_rank()}] compute_middle_split_token_and_seq_index {num_tokens=} {split_token_index=} {self.input_ids.tolist()=} {self.forward_mode=}')
+    if split_token_index == 0 or split_token_index == num_tokens:
+        return -1, -1
+
+    return split_token_index, split_seq_index
+
+
 def compute_split_token_index(split_seq_index: int) -> int:
     return TODO
 
