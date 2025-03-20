@@ -1345,7 +1345,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
         )
 
         local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
-            forward_mode=TODO, num_tokens=TODO, extend_lens=TODO)
+            forward_mode=local_batch.forward_mode,
+            num_tokens=local_batch.input_ids.shape[0],
+            extend_lens=local_batch.extend_lens,
+        )
         enable_tbo = local_tbo_split_seq_index is not None
 
         local_info = torch.tensor(
