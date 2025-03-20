@@ -1378,7 +1378,8 @@ class DeepseekV2Model(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                 ),
-                stages=stages,
+                stages_a=stages_a,
+                stages_b=stages_b,
                 delta_stages={
                     ForwardMode.EXTEND: 1,
                     ForwardMode.DECODE: 2,
