@@ -85,6 +85,7 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
+        max_prefix_extend_len = 0
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -121,7 +122,6 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
-            max_prefix_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
@@ -155,7 +155,6 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
-            max_prefix_extend_len = None
             attn_logits = None
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
@@ -168,7 +167,6 @@ class TritonAttnBackend(AttentionBackend):
             )
             mask_indptr = None
             max_extend_len = torch.max(spec_info.accept_length).item()
-            max_prefix_extend_len = None
             attn_logits = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
@@ -248,6 +246,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         assert encoder_lens is None, "Not supported"
 
+        max_prefix_extend_len = 0
+
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
                 kv_indptr = self.kv_indptr
@@ -271,7 +271,6 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
-            max_prefix_extend_len = None
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -299,7 +298,6 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
-            max_prefix_extend_len = None
             attn_logits = None
         else:
             raise ValueError(
