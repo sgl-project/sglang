@@ -126,15 +126,6 @@ class TboAttnBackend(AttentionBackend):
         bs_child_left = num_tokens_child_left
         bs_child_right = num_tokens_child_right
 
-        assert encoder_lens is None, 'encoder_lens is not supported yet'
-        assert spec_info is None, 'spec_info is not supported yet'
-
-        args_common = dict(
-            encoder_lens=None,
-            forward_mode=forward_mode,
-            spec_info=None,
-        )
-
         seq_slice_left = slice(None, tbo_split_seq_index)
         seq_slice_right = slice(tbo_split_seq_index, None)
 
@@ -191,3 +182,32 @@ class TboAttnBackend(AttentionBackend):
     def _primary_and_children(self):
         yield self.primary
         yield from self.children
+
+
+def _init_forward_metadata_cuda_graph_split(
+    # common args
+    bs: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    encoder_lens: Optional[torch.Tensor],
+    forward_mode: ForwardMode,
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    # capture args
+    capture_num_tokens: int = None,
+    # replay args
+    replay_num_kv_heads: int = None,
+    replay_seq_lens_sum: int = None,
+    replay_seq_lens_cpu: Optional[torch.Tensor] = None,
+):
+    assert encoder_lens is None, 'encoder_lens is not supported yet'
+    assert spec_info is None, 'spec_info is not supported yet'
+
+    return dict(
+        # split
+        TODO=TODO,
+        # directly forward
+        forward_mode=forward_mode,
+        # ignore
+        encoder_lens=None,
+        spec_info=None,
+    )
