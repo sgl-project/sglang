@@ -159,11 +159,11 @@ class TboAttnBackend(AttentionBackend):
             ))
             args_left.update(dict(
                 seq_lens_sum=TODO,
-                seq_lens_cpu=TODO,
+                seq_lens_cpu=replay_seq_lens_cpu[:tbo_split_seq_index],
             ))
             args_right.update(dict(
                 seq_lens_sum=TODO,
-                seq_lens_cpu=TODO,
+                seq_lens_cpu=replay_seq_lens_cpu[tbo_split_seq_index:],
             ))
         else:
             raise NotImplementedError
