@@ -349,7 +349,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_prefill_extra_a(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
+            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
         )
         return TODO, None
 
@@ -373,7 +373,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_decode_shared(self, state):
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
+            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
         )
         shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
         return TODO, None
@@ -1246,12 +1246,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_stage_decode_attn_1(state)
         recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
+            state['common']['forward_batch'].forward_mode, state['hidden_states_after_post_attn_ln'], state['router_logits']
         )
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
             tokens_per_expert_from_dispatch=tokens_per_expert_from_dispatch,
             dispatch_event=dispatch_event,
+            common=state['common'],
         ), None
 
     def _forward_stage_decode_attn_0(
@@ -1273,6 +1274,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         return dict(
             self_attn_state=self_attn_state,
             residual_after_input_ln=residual,
+            common=dict(forward_batch=forward_batch),
         ), None
 
     def _forward_stage_decode_attn_1(self, state):
@@ -1289,6 +1291,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states_after_post_attn_ln=hidden_states,
             residual_after_post_attn_ln=residual,
             router_logits=router_logits,
+            common=state['common'],
         ), None
 
 
