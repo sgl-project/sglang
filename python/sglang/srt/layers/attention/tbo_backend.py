@@ -129,9 +129,12 @@ class TboAttnBackend(AttentionBackend):
         seq_slice_left = slice(None, tbo_split_seq_index)
         seq_slice_right = slice(tbo_split_seq_index, None)
 
+        args_left = _init_forward_metadata_cuda_graph_split(TODO)
+        args_right = _init_forward_metadata_cuda_graph_split(TODO)
+
         child_left, child_right = self.children
-        getattr(child_left, fn_name)(**args_left, **args_common)
-        getattr(child_right, fn_name)(**args_right, **args_common)
+        getattr(child_left, fn_name)(**args_left)
+        getattr(child_right, fn_name)(**args_right)
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
@@ -153,6 +156,7 @@ class TboAttnBackend(AttentionBackend):
 
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,
+    seq_slice: slice,
     # common args
     bs: int,
     req_pool_indices: torch.Tensor,
@@ -180,8 +184,8 @@ def _init_forward_metadata_cuda_graph_split(
 
     ans.update(dict(
         bs=bs_child_left,
-        req_pool_indices=req_pool_indices[seq_slice_left],
-        seq_lens=seq_lens[seq_slice_left],
+        req_pool_indices=req_pool_indices[seq_slice],
+        seq_lens=seq_lens[seq_slice],
     ))
 
     if fn_name == 'init_forward_metadata_capture_cuda_graph':
@@ -192,7 +196,7 @@ def _init_forward_metadata_cuda_graph_split(
         ans.update(dict(
             num_kv_heads=replay_num_kv_heads,
             seq_lens_sum=TODO,
-            seq_lens_cpu=replay_seq_lens_cpu[seq_slice_left],
+            seq_lens_cpu=replay_seq_lens_cpu[seq_slice],
         ))
     else:
         raise NotImplementedError
