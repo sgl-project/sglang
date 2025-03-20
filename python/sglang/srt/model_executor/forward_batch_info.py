@@ -557,7 +557,7 @@ class ForwardBatch:
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
 
-                tbo_split_token_index=None,
+                tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
 
