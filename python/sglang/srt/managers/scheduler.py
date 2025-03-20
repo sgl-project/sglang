@@ -1345,11 +1345,14 @@ class Scheduler(SchedulerOutputProcessorMixin):
             local_batch.forward_mode.is_extend() if local_batch else False
         )
 
-        local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
-            forward_mode=local_batch.forward_mode,
-            num_tokens=local_batch.input_ids.shape[0],
-            extend_lens=local_batch.extend_lens,
-        )
+        if local_batch is not None:
+            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=local_batch.forward_mode,
+                num_tokens=local_batch.input_ids.shape[0],
+                extend_lens=local_batch.extend_lens,
+            )
+        else:
+            local_tbo_split_seq_index = None
         can_run_tbo = local_tbo_split_seq_index is not None
 
         local_info = torch.tensor(
