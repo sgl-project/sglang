@@ -67,6 +67,7 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
@@ -159,6 +160,10 @@ class ImageInputs:
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Qwen2-VL video related
+    video_token_id: Optional[int] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
     # deepseek vl2 related
     image_seq_mask: Optional[List[torch.Tensor]] = None
