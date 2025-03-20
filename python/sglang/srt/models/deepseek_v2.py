@@ -396,7 +396,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_stage_mlp_raw(self, state, start_combine: bool = True):
-        self._forward_tbo_substage_dispatch_wait(state)
+        state |= self._forward_tbo_substage_dispatch_wait(state)
 
         expert_output_hidden_states = self._forward_deepep_expert(
             state["forward_batch"].forward_mode,
