@@ -107,6 +107,11 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
+        # Only support bs == num_tokens currently
+        if fn_name == 'init_forward_metadata_capture_cuda_graph':
+            assert capture_num_tokens == bs
+        num_tokens = bs
+
         tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
             forward_mode=forward_mode,
             num_tokens=num_tokens,
