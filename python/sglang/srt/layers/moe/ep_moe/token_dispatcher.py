@@ -104,8 +104,8 @@ def permute(
         assert not routing_map.requires_grad
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
+                         :, :capacity
+                         ].contiguous()
         sorted_indices = sorted_indices.view(-1)
     else:
         routing_map = routing_map.bool().T.contiguous()
@@ -273,6 +273,19 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        state = self.dispatch_start(hidden_states, topk_idx, topk_weights, num_experts, forward_mode,
+                                    num_max_dispatch_tokens_per_rank)
+        return self.dispatch_wait(state)
+
+    def dispatch_start(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        forward_mode: ForwardMode,
+        num_max_dispatch_tokens_per_rank: int = 128,
+    ):
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
         # Todo: enable low latency dispatch
@@ -300,6 +313,11 @@ class DeepEPDispatcher:
                 )
             )
             self.recv_expert_count = recv_expert_count
+
+        return event, handle, topk_idx, topk_weights, hidden_states
+
+    def dispatch_wait(self, state):
+        event, handle, topk_idx, topk_weights, hidden_states = state
 
         if self.async_finish:
             event.current_stream_wait()
