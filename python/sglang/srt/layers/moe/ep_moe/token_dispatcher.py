@@ -503,7 +503,6 @@ class DeepEPDispatcher:
 
         mask = indices != -1
         valid_indices = indices[mask]
-        print(valid_indices.min(), valid_indices.max())
         row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
             mask.sum(dim=1)
         )
