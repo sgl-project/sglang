@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
@@ -433,6 +434,8 @@ class ForwardBatch:
     def prepare_tbo(self, tbo_split_seq_index: Optional[int]):
         if tbo_split_seq_index is None:
             return
+
+        tbo_split_token_index = two_batch_overlap.compute_split_token_index(split_seq_index=tbo_split_seq_index)
 
         child_a = self.filter_batch(
             start_token_index=0,

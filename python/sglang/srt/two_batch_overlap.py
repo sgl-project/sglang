@@ -4,6 +4,11 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from torch._dynamo.eval_frame import null_context
 
+
+def compute_split_token_index(split_seq_index: int) -> int:
+    return TODO
+
+
 # ------------------------------------------ TODO ------------------------------------------
 
 _ENABLE_PROFILE = bool(
@@ -12,12 +17,12 @@ _ENABLE_PROFILE = bool(
 
 
 def execute_maybe_two_batch(
-        inputs,
-        fn,
-        delta_stages: int,
-        enable_two_batch_overlap: bool,
-        split_inputs,
-        merge_outputs,
+    inputs,
+    fn,
+    delta_stages: int,
+    enable_two_batch_overlap: bool,
+    split_inputs,
+    merge_outputs,
 ):
     # TODO maybe optimize these nested `if`s
     if enable_two_batch_overlap:
