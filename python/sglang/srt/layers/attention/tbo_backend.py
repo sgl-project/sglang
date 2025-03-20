@@ -17,7 +17,9 @@ class TboAttnBackend(AttentionBackend):
             item.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
-        TODO
+        for item in self._primary_and_children:
+            # TODO for children, maybe can provide *smaller* max_bs to optimize
+            item.init_cuda_graph_state(max_bs=max_bs)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
