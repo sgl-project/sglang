@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -16,7 +15,7 @@ class TestDeepEPMoE(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:" + os.environ.get("HACK_PORT", "2157")
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
