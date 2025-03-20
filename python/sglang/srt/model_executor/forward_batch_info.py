@@ -37,7 +37,11 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import triton
 import triton.language as tl
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
+
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -211,8 +215,8 @@ class ForwardBatch:
     # TODO beautify
     tbo_parent_start_token_index: Optional[int] = None
     tbo_parent_end_token_index: Optional[int] = None
-    tbo_child_a: Optional['ForwardBatch'] = None
-    tbo_child_b: Optional['ForwardBatch'] = None
+    tbo_child_a: Optional["ForwardBatch"] = None
+    tbo_child_b: Optional["ForwardBatch"] = None
 
     @classmethod
     def init_new(
@@ -380,20 +384,20 @@ class ForwardBatch:
                 if image_inputs is None:
                     # text only
                     mrope_positions = [
-                                          [
-                                              pos
-                                              for pos in range(
-                                              extend_prefix_len, extend_prefix_len + extend_seq_len
-                                          )
-                                          ]
-                                      ] * 3
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len, extend_prefix_len + extend_seq_len
+                            )
+                        ]
+                    ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                         extend_start_loc: extend_start_loc + extend_seq_len
-                                         ],
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
                             image_grid_thw=image_inputs.image_grid_thws,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
@@ -430,7 +434,9 @@ class ForwardBatch:
             "out_cache_loc",
         ]:
             old_value = getattr(self, key)
-            assert old_value.shape[0] == num_tokens, f'{key=} {old_value=} {num_tokens=} {self=}'
+            assert (
+                old_value.shape[0] == num_tokens
+            ), f"{key=} {old_value=} {num_tokens=} {self=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         for key in [
@@ -448,7 +454,9 @@ class ForwardBatch:
             old_value = getattr(self, key)
             if old_value is None:
                 continue
-            assert len(old_value) == num_seqs, f'{key=} {old_value=} {num_seqs=} {self=}'
+            assert (
+                len(old_value) == num_seqs
+            ), f"{key=} {old_value=} {num_seqs=} {self=}"
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
         for key in [
@@ -466,8 +474,13 @@ class ForwardBatch:
         ]:
             output_dict[key] = getattr(self, key)
 
-        assert _compute_extend_num_tokens(self.input_ids, self.forward_mode) == self.extend_num_tokens, f'{self=}'
-        extend_num_tokens = _compute_extend_num_tokens(output_dict['input_ids'], output_dict['forward_mode'])
+        assert (
+            _compute_extend_num_tokens(self.input_ids, self.forward_mode)
+            == self.extend_num_tokens
+        ), f"{self=}"
+        extend_num_tokens = _compute_extend_num_tokens(
+            output_dict["input_ids"], output_dict["forward_mode"]
+        )
 
         # TODO improve, e.g. unify w/ `init_raw`
         if output_global_num_tokens is not None:
@@ -503,8 +516,7 @@ class ForwardBatch:
 
         for field in dataclasses.fields(ForwardBatch):
             assert not (
-                getattr(self, field.name) is not None
-                and field.name not in output_dict
+                getattr(self, field.name) is not None and field.name not in output_dict
             ), f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
 
         return ForwardBatch(**output_dict)
