@@ -56,8 +56,8 @@ class TboAttnBackend(AttentionBackend):
         child_left.init_forward_metadata_capture_cuda_graph(
             bs=bs_child,
             num_tokens=TODO,
-            req_pool_indices=TODO,
-            seq_lens=TODO,
+            req_pool_indices=req_pool_indices[:tbo_split_seq_index],
+            seq_lens=seq_lens[:tbo_split_seq_index],
             encoder_lens=None,
             forward_mode=forward_mode,
             spec_info=None,
@@ -65,8 +65,8 @@ class TboAttnBackend(AttentionBackend):
         child_right.init_forward_metadata_capture_cuda_graph(
             bs=bs_child,
             num_tokens=TODO,
-            req_pool_indices=TODO,
-            seq_lens=TODO,
+            req_pool_indices=req_pool_indices[tbo_split_seq_index:],
+            seq_lens=seq_lens[tbo_split_seq_index:],
             encoder_lens=None,
             forward_mode=forward_mode,
             spec_info=None,
