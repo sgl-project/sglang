@@ -27,8 +27,8 @@ def compute_split_seq_index(
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     arr_sum = sum(arr)
     cum_sum, split_index = 0, 0
-    for extend_seq_len in arr[:-1]:
-        cum_sum += extend_seq_len
+    for value in arr[:-1]:
+        cum_sum += value
         split_index += 1
         if cum_sum >= arr_sum // 2:
             break
