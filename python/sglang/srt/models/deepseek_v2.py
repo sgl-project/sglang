@@ -289,7 +289,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        dispatch_state = self._forward_deepep_dispatch_stage_start(forward_mode, hidden_states, router_logits)
+        dispatch_state = self._forward_deepep_dispatch_stage_start(self.deepep_dispatcher, forward_mode, hidden_states, router_logits)
         recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = \
             self.deepep_dispatcher.dispatch_stage_wait(dispatch_state)
 
@@ -316,7 +316,7 @@ class DeepseekV2MoE(nn.Module):
             return self.shared_experts(hidden_states)
         return None
 
-    def _forward_deepep_dispatch_stage_start(self, forward_mode, hidden_states, router_logits):
+    def _forward_deepep_dispatch_stage_start(self, chosen_deepep_dispatcher, forward_mode, hidden_states, router_logits):
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
         )
@@ -334,7 +334,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        return self.deepep_dispatcher.dispatch_stage_start(
+        return chosen_deepep_dispatcher.dispatch_stage_start(
             hidden_states,
             topk_idx,
             topk_weights,
@@ -415,6 +415,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_substage_dispatch_start(self, state):
         state_dispatch = self._forward_deepep_dispatch_stage_start(
+            self.tbo_deepep_dispatchers[TODO],
             state["forward_batch"].forward_mode,
             state["hidden_states_for_moe_input"],
             state["router_logits"],
