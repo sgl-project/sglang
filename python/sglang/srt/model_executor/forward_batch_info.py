@@ -574,10 +574,13 @@ class ForwardBatch:
             )
         )
 
+        errors = []
         for field in dataclasses.fields(ForwardBatch):
-            assert not (
-                getattr(self, field.name) is not None and field.name not in output_dict
-            ), f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
+            if getattr(self, field.name) is not None and field.name not in output_dict:
+                errors.append(
+                    f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})")
+        if len(errors) > 0:
+            raise Exception(f"{len(errors)} errors happen:\n" + '\n\n'.join(errors))
 
         return ForwardBatch(**output_dict)
 
