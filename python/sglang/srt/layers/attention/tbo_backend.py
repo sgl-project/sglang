@@ -129,39 +129,6 @@ class TboAttnBackend(AttentionBackend):
         seq_slice_left = slice(None, tbo_split_seq_index)
         seq_slice_right = slice(tbo_split_seq_index, None)
 
-        args_left = dict(
-            bs=bs_child_left,
-            req_pool_indices=req_pool_indices[seq_slice_left],
-            seq_lens=seq_lens[seq_slice_left],
-        )
-        args_right = dict(
-            bs=bs_child_right,
-            req_pool_indices=req_pool_indices[seq_slice_right],
-            seq_lens=seq_lens[seq_slice_right],
-        )
-
-        if fn_name == 'init_forward_metadata_capture_cuda_graph':
-            args_left.update(dict(
-                num_tokens=num_tokens_child_left,
-            ))
-            args_right.update(dict(
-                num_tokens=num_tokens_child_right,
-            ))
-        elif fn_name == 'init_forward_metadata_replay_cuda_graph':
-            args_common.update(dict(
-                num_kv_heads=replay_num_kv_heads,
-            ))
-            args_left.update(dict(
-                seq_lens_sum=TODO,
-                seq_lens_cpu=replay_seq_lens_cpu[seq_slice_left],
-            ))
-            args_right.update(dict(
-                seq_lens_sum=TODO,
-                seq_lens_cpu=replay_seq_lens_cpu[seq_slice_right],
-            ))
-        else:
-            raise NotImplementedError
-
         child_left, child_right = self.children
         getattr(child_left, fn_name)(**args_left, **args_common)
         getattr(child_right, fn_name)(**args_right, **args_common)
@@ -185,6 +152,7 @@ class TboAttnBackend(AttentionBackend):
 
 
 def _init_forward_metadata_cuda_graph_split(
+    fn_name: str,
     # common args
     bs: int,
     req_pool_indices: torch.Tensor,
@@ -202,12 +170,31 @@ def _init_forward_metadata_cuda_graph_split(
     assert encoder_lens is None, 'encoder_lens is not supported yet'
     assert spec_info is None, 'spec_info is not supported yet'
 
-    return dict(
-        # split
-        TODO=TODO,
+    ans = dict(
         # directly forward
         forward_mode=forward_mode,
         # ignore
         encoder_lens=None,
         spec_info=None,
     )
+
+    ans.update(dict(
+        bs=bs_child_left,
+        req_pool_indices=req_pool_indices[seq_slice_left],
+        seq_lens=seq_lens[seq_slice_left],
+    ))
+
+    if fn_name == 'init_forward_metadata_capture_cuda_graph':
+        ans.update(dict(
+            num_tokens=num_tokens_child_left,
+        ))
+    elif fn_name == 'init_forward_metadata_replay_cuda_graph':
+        ans.update(dict(
+            num_kv_heads=replay_num_kv_heads,
+            seq_lens_sum=TODO,
+            seq_lens_cpu=replay_seq_lens_cpu[seq_slice_left],
+        ))
+    else:
+        raise NotImplementedError
+
+    return ans
