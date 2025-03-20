@@ -216,10 +216,11 @@ def _init_forward_metadata_cuda_graph_split(
             num_tokens=output_bs,
         ))
     elif fn_name == 'init_forward_metadata_replay_cuda_graph':
+        output_seq_lens_cpu = replay_seq_lens_cpu[seq_slice]
         ans.update(dict(
             num_kv_heads=replay_num_kv_heads,
-            seq_lens_sum=TODO,
-            seq_lens_cpu=replay_seq_lens_cpu[seq_slice],
+            seq_lens_sum=output_seq_lens_cpu.sum().item(),
+            seq_lens_cpu=output_seq_lens_cpu,
         ))
     else:
         raise NotImplementedError
