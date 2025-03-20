@@ -274,11 +274,13 @@ class DeepseekV2MoE(nn.Module):
         topk_weights = torch.empty(
             (0, self.top_k), dtype=torch.float32, device=hidden_states.device
         )
+
+        if forward_mode is not None and not forward_mode.is_idle() and self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+
         if forward_mode is not None and not forward_mode.is_idle():
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if self.n_shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
