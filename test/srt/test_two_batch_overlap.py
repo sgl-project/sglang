@@ -44,7 +44,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             self.base_url + "/generate",
             # we use an uncommon start to minimise the chance that the cache is hit by chance
             json={
-                "text": "_ The capital of France is",
+                "text": "_ 1+1=2, 1+2=3, 1+3=4, 1+4=",
                 "sampling_params": {"temperature": 0, "max_new_tokens": 8},
             },
         )
