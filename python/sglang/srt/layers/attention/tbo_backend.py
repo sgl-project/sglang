@@ -42,9 +42,10 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
+        args_left, args_right = self._compute_cuda_graph_children_args()
         child_left, child_right = self.children
-        self._compute_cuda_graph_children_args()
-        TODO
+        child_left.init_forward_metadata_capture_cuda_graph(**args_left)
+        child_right.init_forward_metadata_capture_cuda_graph(**args_right)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -95,7 +96,7 @@ class TboAttnBackend(AttentionBackend):
         assert encoder_lens is None, 'encoder_lens is not supported yet'
         assert spec_info is None, 'spec_info is not supported yet'
 
-        child_left.init_forward_metadata_capture_cuda_graph(
+        args_left = dict(
             bs=bs_child_left,
             num_tokens=num_tokens_child_left,
             req_pool_indices=req_pool_indices[:tbo_split_seq_index],
@@ -104,7 +105,7 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=None,
         )
-        child_right.init_forward_metadata_capture_cuda_graph(
+        args_right = dict(
             bs=bs_child_right,
             num_tokens=num_tokens_child_right,
             req_pool_indices=req_pool_indices[tbo_split_seq_index:],
@@ -113,6 +114,7 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=None,
         )
+        return args_left, args_right
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
