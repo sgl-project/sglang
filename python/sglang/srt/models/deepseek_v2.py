@@ -1280,16 +1280,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         if forward_mode == ForwardMode.EXTEND:
             assert subbatch_index in [0, 1]
             return [
+                self._forward_tbo_stage_prefill_attn_full,
                 *(
                     [
-                        self._forward_tbo_stage_prefill_attn_full_a,
                         self.mlp._forward_tbo_stage_prefill_extra_a,
                         self.mlp._forward_tbo_stage_prefill_pre_mlp_a,
                         self.mlp._forward_tbo_stage_prefill_mlp_a,
                     ]
                     if subbatch_index == 0
                     else [
-                        self._forward_tbo_stage_prefill_attn_full_b,
                         self._forward_tbo_stage_prefill_post_attn_full_b,
                         self.mlp._forward_tbo_stage_prefill_mlp_b,
                         self.mlp._forward_tbo_stage_prefill_extra_b,
@@ -1308,17 +1307,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_tbo_stage_prefill_attn_full_a(self, state, **kwargs):
+    def _forward_tbo_stage_prefill_attn_full(self, state, **kwargs):
         state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
         state, _ = self._forward_tbo_stage_decode_attn_1(state)
         return state, None
 
-    def _forward_tbo_stage_prefill_attn_full_b(self, state, **kwargs):
-        state, _ = self._forward_tbo_stage_decode_attn_0(state, **kwargs)
-        state, _ = self._forward_tbo_stage_decode_attn_1(state)
-        return state, None
-
-    def _forward_tbo_stage_prefill_post_attn_full_b(self, state, **kwargs):
+    def _forward_tbo_stage_prefill_post_attn_full_b(self, state):
         state |= self.mlp._forward_tbo_substage_dispatch_start(state)
         return state, None
 
