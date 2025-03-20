@@ -1475,7 +1475,7 @@ class DeepseekV2Model(nn.Module):
         )
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
             print(
-                f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model._forward_tbo_layers START {hidden_states.shape=}',
+                f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model._forward_tbo_layers really run START {hidden_states.shape=} {forward_batch.forward_mode=}',
                 flush=True)
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
