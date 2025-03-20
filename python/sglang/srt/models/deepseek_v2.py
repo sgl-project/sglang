@@ -347,14 +347,23 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
-    def _forward_stage_prefill_extra(self, state):
+    def _forward_stage_prefill_extra_a(self, state):
         recv_hidden_states, tokens_per_expert, dispatch_event = self._forward_deepep_dispatch(
             state['forward_mode'], state['hidden_states'], state['router_logits']
         )
         return TODO, None
 
-    def _forward_stage_prefill_mlp(self, state):
-        return self._forward_stage_decode_mlp(state)
+    def _forward_stage_prefill_mlp_a(self, state):
+        return self._forward_stage_mlp_raw(state)
+
+    def _forward_stage_prefill_mlp_b(self, state):
+        return self._forward_stage_mlp_raw(state, start_combine=False)
+
+    def _forward_stage_prefill_extra_b(self, state):
+        final_hidden_states, combine_event = self.deepep_dispatcher.combine(
+            final_hidden_states, forward_mode
+        )
+        return TODO, None
 
     def _forward_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(forward_mode, hidden_states)
@@ -370,19 +379,23 @@ class DeepseekV2MoE(nn.Module):
         return TODO, None
 
     def _forward_stage_decode_mlp(self, state):
-        state['dispatch_event'].current_stream_wait()
-        final_hidden_states = self._forward_deepep_expert(
-            forward_mode, recv_hidden_states, tokens_per_expert
-        )
-        final_hidden_states, combine_event = self.deepep_dispatcher.combine(
-            final_hidden_states, forward_mode
-        )
-        return TODO, None
+        return _forward_stage_mlp_raw(state)
 
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
         final_hidden_states = final_hidden_states + shared_output
         return None, final_hidden_states
+
+    def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
+        state['dispatch_event'].current_stream_wait()
+        final_hidden_states = self._forward_deepep_expert(
+            forward_mode, recv_hidden_states, tokens_per_expert
+        )
+        if start_combine:
+            final_hidden_states, combine_event = self.deepep_dispatcher.combine(
+                final_hidden_states, forward_mode
+            )
+        return TODO, None
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
