@@ -21,6 +21,9 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -68,9 +71,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip, configure_deep_gemm_num_sms
-from torch import nn
-from transformers import PretrainedConfig
+from sglang.srt.utils import (
+    add_prefix,
+    configure_deep_gemm_num_sms,
+    is_cuda,
+    is_cuda_available,
+    is_hip,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -363,46 +370,60 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_stage_prefill_shared(self, state):
         shared_output = self._forward_deepep_shared_output(
-            state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
-        state['combine_event'].current_stream_wait()
-        output_hidden_states = state['hidden_states_from_combine'] + shared_output
-        return None, self._forward_substage_compute_layer_output(state, output_hidden_states)
+            state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
+        )
+        state["combine_event"].current_stream_wait()
+        output_hidden_states = state["hidden_states_from_combine"] + shared_output
+        return None, self._forward_substage_compute_layer_output(
+            state, output_hidden_states
+        )
 
     def _forward_stage_decode_shared(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
         shared_output = self._forward_deepep_shared_output(
-            state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
+            state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
+        )
         return state | state_dispatch | dict(shared_output=shared_output), None
 
     def _forward_stage_decode_mlp(self, state):
         return self._forward_stage_mlp_raw(state)
 
     def _forward_stage_decode_extra(self, state):
-        state['combine_event'].current_stream_wait()
-        output_hidden_states = state['hidden_states_from_combine'] + state['shared_output']
-        return None, self._forward_substage_compute_layer_output(state, output_hidden_states)
+        state["combine_event"].current_stream_wait()
+        output_hidden_states = (
+            state["hidden_states_from_combine"] + state["shared_output"]
+        )
+        return None, self._forward_substage_compute_layer_output(
+            state, output_hidden_states
+        )
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
-        state['dispatch_event'].current_stream_wait()
+        state["dispatch_event"].current_stream_wait()
 
         expert_output_hidden_states = self._forward_deepep_expert(
-            state['forward_batch'].forward_mode,
-            state['recv_hidden_states_from_dispatch'],
-            state['tokens_per_expert_from_dispatch']
+            state["forward_batch"].forward_mode,
+            state["recv_hidden_states_from_dispatch"],
+            state["tokens_per_expert_from_dispatch"],
         )
 
         if start_combine:
             state_combine = self._forward_substage_combine(
-                state | dict(expert_output_hidden_states=expert_output_hidden_states))
+                state | dict(expert_output_hidden_states=expert_output_hidden_states)
+            )
         else:
             state_combine = {}
 
         return state | state_combine, None
 
     def _forward_substage_dispatch(self, state):
-        recv_hidden_states_from_dispatch, tokens_per_expert_from_dispatch, dispatch_event = self._forward_deepep_dispatch(
-            state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'],
-            state['router_logits']
+        (
+            recv_hidden_states_from_dispatch,
+            tokens_per_expert_from_dispatch,
+            dispatch_event,
+        ) = self._forward_deepep_dispatch(
+            state["forward_batch"].forward_mode,
+            state["hidden_states_for_moe_input"],
+            state["router_logits"],
         )
         return dict(
             recv_hidden_states_from_dispatch=recv_hidden_states_from_dispatch,
@@ -412,7 +433,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_substage_combine(self, state):
         hidden_states_from_combine, combine_event = self.deepep_dispatcher.combine(
-            state['expert_output_hidden_states'], state['forward_batch'].forward_mode
+            state["expert_output_hidden_states"], state["forward_batch"].forward_mode
         )
         return dict(
             hidden_states_from_combine=hidden_states_from_combine,
@@ -421,10 +442,10 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_substage_compute_layer_output(self, state, output_hidden_states):
         return dict(
-            positions=state['positions'],
+            positions=state["positions"],
             hidden_states=output_hidden_states,
-            forward_batch=state['forward_batch'],
-            residual=state['residual_after_post_attn_ln'],
+            forward_batch=state["forward_batch"],
+            residual=state["residual_after_post_attn_ln"],
         )
 
 
@@ -473,7 +494,7 @@ class DeepseekV2Attention(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim ** -0.5
+        self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -585,12 +606,12 @@ class DeepseekV2Attention(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim:] = q_pe
+        q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
+        k[..., self.qk_nope_head_dim :] = k_pe
         q = torch.nn.functional.pad(q, [0, 256 - self.qk_head_dim], value=0).view(
             -1, self.num_local_heads * 256
         )
@@ -602,8 +623,8 @@ class DeepseekV2Attention(nn.Module):
         )
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, 256)[
-                      ..., : self.v_head_dim
-                      ].reshape(-1, self.num_local_heads * self.v_head_dim)
+            ..., : self.v_head_dim
+        ].reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -644,7 +665,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim ** -0.5
+        self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -826,16 +847,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim:]
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        v = kv[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim:] = q_pe
+        q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
+        k[..., self.qk_nope_head_dim :] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank:] = k_pe
+        latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -899,11 +920,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank:]
+        k_pe = k_input[..., self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_input[..., self.kv_lora_rank:] = q_pe
-        k_input[..., self.kv_lora_rank:] = k_pe
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
 
         return q_input, k_input, v_input, forward_batch
 
@@ -984,15 +1005,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., : self.kv_lora_rank] = v_input
 
         if not enable_rope_fusion:
-            k_pe = k_input[..., self.kv_lora_rank:]
+            k_pe = k_input[..., self.kv_lora_rank :]
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q_input[..., self.kv_lora_rank:] = q_pe
-            k_input[..., self.kv_lora_rank:] = k_pe
+            q_input[..., self.kv_lora_rank :] = q_pe
+            k_input[..., self.kv_lora_rank :] = k_pe
             k_pe_output = None
         else:
-            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank:])
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
 
-        q_input[..., self.kv_lora_rank:] = q_pe
+        q_input[..., self.kv_lora_rank :] = q_pe
 
         # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -1049,7 +1070,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         if enable_rope_fusion:
-            k_input[..., self.kv_lora_rank:] = k_pe_output
+            k_input[..., self.kv_lora_rank :] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
@@ -1245,15 +1266,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         if forward_mode == ForwardMode.EXTEND:
             assert subbatch_index in [0, 1]
             return [
-                *([
-                      self._forward_stage_prefill_attn_full_a,
-                      self.mlp._forward_stage_prefill_extra_a,
-                      self.mlp._forward_stage_prefill_mlp_a,
-                  ] if subbatch_index == 0 else [
-                    self._forward_stage_prefill_attn_full_b,
-                    self.mlp._forward_stage_prefill_mlp_b,
-                    self.mlp._forward_stage_prefill_extra_b,
-                ]),
+                *(
+                    [
+                        self._forward_stage_prefill_attn_full_a,
+                        self.mlp._forward_stage_prefill_extra_a,
+                        self.mlp._forward_stage_prefill_mlp_a,
+                    ]
+                    if subbatch_index == 0
+                    else [
+                        self._forward_stage_prefill_attn_full_b,
+                        self.mlp._forward_stage_prefill_mlp_b,
+                        self.mlp._forward_stage_prefill_extra_b,
+                    ]
+                ),
                 self.mlp._forward_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
@@ -1286,36 +1311,46 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ):
-        hidden_states, residual = self._forward_input_layernorm(
-            hidden_states, residual
-        )
+        hidden_states, residual = self._forward_input_layernorm(hidden_states, residual)
         self_attn_state = self.self_attn.forward_absorb_stage_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        return state | dict(
-            self_attn_state=self_attn_state,
-            residual_after_input_ln=residual,
-            forward_batch=forward_batch,
-            positions=positions,
-        ), None
+        return (
+            state
+            | dict(
+                self_attn_state=self_attn_state,
+                residual_after_input_ln=residual,
+                forward_batch=forward_batch,
+                positions=positions,
+            ),
+            None,
+        )
 
     def _forward_stage_decode_attn_1(self, state):
         assert (
-            (get_tensor_model_parallel_world_size() > 1) and
-            global_server_args_dict["enable_dp_attention"] and
-            global_server_args_dict["enable_deepep_moe"] and
-            isinstance(self.mlp, DeepseekV2MoE)
+            (get_tensor_model_parallel_world_size() > 1)
+            and global_server_args_dict["enable_dp_attention"]
+            and global_server_args_dict["enable_deepep_moe"]
+            and isinstance(self.mlp, DeepseekV2MoE)
         )
-        hidden_states = self.self_attn.forward_absorb_stage_core(state['self_attn_state'])
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual_after_input_ln'])
+        hidden_states = self.self_attn.forward_absorb_stage_core(
+            state["self_attn_state"]
+        )
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, state["residual_after_input_ln"]
+        )
         router_logits = self.mlp.gate(hidden_states)
-        return state | dict(
-            hidden_states_for_moe_input=hidden_states,
-            residual_after_post_attn_ln=residual,
-            router_logits=router_logits,
-        ), None
+        return (
+            state
+            | dict(
+                hidden_states_for_moe_input=hidden_states,
+                residual_after_post_attn_ln=residual,
+                router_logits=router_logits,
+            ),
+            None,
+        )
 
 
 class DeepseekV2Model(nn.Module):
@@ -1403,10 +1438,15 @@ class DeepseekV2Model(nn.Module):
 
         def get_forward_tbo_stages(subbatch_index: int):
             for i in range(start_layer, end_layer):
-                yield from self.layers[i].get_forward_stages(forward_batch.forward_mode, subbatch_index)
+                yield from self.layers[i].get_forward_stages(
+                    forward_batch.forward_mode, subbatch_index
+                )
 
         # TODO do not hardcode
-        chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
+        chosen_num_sms = (
+            torch.cuda.get_device_properties(device="cuda").multi_processor_countnum_sms
+            - 20
+        )
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(

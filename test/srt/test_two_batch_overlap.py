@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -47,7 +48,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
                 "sampling_params": {"temperature": 0, "max_new_tokens": 8},
             },
         )
-        print(f'{response=}')
+        print(f"{response=}")
         TODO_assert_response
 
     def test_mmlu(self):
