@@ -1216,9 +1216,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             return [
                 self._forward_stage_prefill_attn_full,
                 *([
-                    self.mlp._forward_stage_prefill_extra_a,
-                    self.mlp._forward_stage_prefill_mlp_a,
-                ] if TODO else [
+                      self.mlp._forward_stage_prefill_extra_a,
+                      self.mlp._forward_stage_prefill_mlp_a,
+                  ] if TODO else [
                     self.mlp._forward_stage_prefill_mlp_b,
                     self.mlp._forward_stage_prefill_extra_b,
                 ]),
@@ -1235,9 +1235,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_stage_prefill_attn_full(self, state, **kwargs):
+    def _forward_stage_prefill_attn_full_a(self, state, **kwargs):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
-        return self._forward_stage_decode_attn_1(state)
+        state, _ = self._forward_stage_decode_attn_1(state)
+        return state, None
+
+    def _forward_stage_prefill_attn_full_b(self, state, **kwargs):
+        state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
+        state, _ = self._forward_stage_decode_attn_1(state)
+        # TODO handle these variables
+        recv_hidden_states, tokens_per_expert, dispatch_event = self.mlp._forward_deepep_dispatch(
+            state['forward_mode'], state['hidden_states'], state['router_logits']
+        )
+        return state, None
 
     def _forward_stage_decode_attn_0(
         self,
