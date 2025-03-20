@@ -347,6 +347,24 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
 
+    def _forward_stage_prefill_extra(self, state):
+        return TODO, TODO
+
+    def _forward_stage_prefill_mlp(self, state):
+        return TODO, TODO
+
+    def _forward_stage_prefill_shared(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_shared(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_mlp(self, state):
+        return TODO, TODO
+
+    def _forward_stage_decode_extra(self, state):
+        return TODO, TODO
+
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     import math
@@ -1165,17 +1183,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         if forward_mode == ForwardMode.EXTEND:
             return [
                 self._forward_stage_prefill_attn_full,
-                self._forward_stage_prefill_extra,
-                self._forward_stage_prefill_mlp,
-                self._forward_stage_prefill_shared,
+                self.mlp._forward_stage_prefill_extra,
+                self.mlp._forward_stage_prefill_mlp,
+                self.mlp._forward_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
                 self._forward_stage_decode_attn_0,
                 self._forward_stage_decode_attn_1,
-                self._forward_stage_decode_shared,
-                self._forward_stage_decode_mlp,
-                self._forward_stage_decode_extra,
+                self.mlp._forward_stage_decode_shared,
+                self.mlp._forward_stage_decode_mlp,
+                self.mlp._forward_stage_decode_extra,
             ]
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
@@ -1183,15 +1201,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_stage_prefill_attn_full(self, state, **kwargs):
         state, _ = self._forward_stage_decode_attn_0(state, **kwargs)
         return self._forward_stage_decode_attn_1(state)
-
-    def _forward_stage_prefill_extra(self, state):
-        return TODO, TODO
-
-    def _forward_stage_prefill_mlp(self, state):
-        return TODO, TODO
-
-    def _forward_stage_prefill_shared(self, state):
-        return TODO, TODO
 
     def _forward_stage_decode_attn_0(
         self,
@@ -1216,15 +1225,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, state['residual'])
         TODO_mlp_gate
         return dict(TODO=TODO), None
-
-    def _forward_stage_decode_shared(self, state):
-        return TODO, TODO
-
-    def _forward_stage_decode_mlp(self, state):
-        return TODO, TODO
-
-    def _forward_stage_decode_extra(self, state):
-        return TODO, TODO
 
 
 class DeepseekV2Model(nn.Module):
