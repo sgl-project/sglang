@@ -1404,6 +1404,7 @@ class DeepseekV2Model(nn.Module):
         def get_forward_tbo_stages(subbatch_index: int):
             for i in range(start_layer, end_layer):
                 yield from self.layers[i].get_forward_stages(forward_batch.forward_mode, subbatch_index)
+            yield self._forward_stage_postprocess
 
         # TODO do not hardcode
         chosen_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_countnum_sms - 20
@@ -1422,6 +1423,9 @@ class DeepseekV2Model(nn.Module):
                     ForwardMode.DECODE: 2,
                 }[forward_batch.forward_mode],
             )
+
+    def _forward_stage_postprocess(self, state, hidden_states, residual, **_kwargs):
+        return None, (hidden_states, residual)
 
 
 class DeepseekV2ForCausalLM(nn.Module):
