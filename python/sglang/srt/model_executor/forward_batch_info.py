@@ -568,7 +568,7 @@ class ForwardBatch:
         return ForwardBatch(**output_dict)
 
     @property
-    def enable_tbo(self):
+    def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
 
 

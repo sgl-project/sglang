@@ -316,7 +316,7 @@ class CudaGraphRunner:
         )
 
         is_tbo_supported = (
-            forward_batch.tbo_split_seq_index is not None
+            forward_batch.can_run_tbo
             if TODO
             else True
         )
