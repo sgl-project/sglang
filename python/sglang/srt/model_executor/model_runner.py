@@ -174,14 +174,6 @@ class ModelRunner:
             enable=self.server_args.enable_memory_saver
         )
 
-        # TODO probably move it
-        # TODO do not hard wire it
-        if server_args.enable_two_batch_overlap:
-            deep_gemm_num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 20
-            import deep_gemm
-            print(f'Call deep_gemm.set_num_sms({deep_gemm_num_sms}) because enable_two_batch_overlap')
-            deep_gemm.set_num_sms(deep_gemm_num_sms)
-
         # Load the model
         self.sampler = Sampler()
         self.load_model()
