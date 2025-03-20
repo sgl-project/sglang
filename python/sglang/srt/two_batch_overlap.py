@@ -135,7 +135,7 @@ class _StageExecutor:
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
-        self._stage_state = None
+        self._stage_state = {}
         self._stage_output = inputs
 
     def next(self):
