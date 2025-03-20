@@ -33,6 +33,7 @@ import setproctitle
 import torch
 import zmq
 from sglang.global_config import global_config
+from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
@@ -1342,7 +1343,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
-        enable_tbo = TODO
+
+        local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+            forward_mode=TODO, num_tokens=TODO, extend_lens=TODO)
+        enable_tbo = local_tbo_split_seq_index is not None
 
         local_info = torch.tensor(
             [
@@ -1375,7 +1379,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-            local_batch.tbo_split_seq_index = TODO if enable_tbo else None
+            local_batch.tbo_split_seq_index = local_tbo_split_seq_index if enable_tbo else None
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
