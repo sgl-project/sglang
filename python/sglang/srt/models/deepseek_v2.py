@@ -1114,7 +1114,10 @@ class DeepseekV2DecoderLayer(nn.Module):
     @property
     def forward_stages(self):
         return [
-            TODO,
+            self._forward_stage_prefill_attn_full,
+            self._forward_stage_prefill_extra,
+            self._forward_stage_prefill_mlp,
+            self._forward_stage_prefill_shared,
         ]
 
 
