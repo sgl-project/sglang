@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.layers.moe.ep_moe.kernels import (
     compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
@@ -273,11 +272,11 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        state = self.dispatch_start(hidden_states, topk_idx, topk_weights, num_experts, forward_mode,
-                                    num_max_dispatch_tokens_per_rank)
-        return self.dispatch_wait(state)
+        state = self.dispatch_stage_start(hidden_states, topk_idx, topk_weights, num_experts, forward_mode,
+                                          num_max_dispatch_tokens_per_rank)
+        return self.dispatch_stage_wait(state)
 
-    def dispatch_start(
+    def dispatch_stage_start(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -316,7 +315,7 @@ class DeepEPDispatcher:
 
         return event, handle, topk_idx, topk_weights, hidden_states
 
-    def dispatch_wait(self, state):
+    def dispatch_stage_wait(self, state):
         event, handle, topk_idx, topk_weights, hidden_states = state
 
         if self.async_finish:
@@ -445,6 +444,12 @@ class DeepEPDispatcher:
     def combine(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        state = self.combine_stage_start(hidden_states, forward_mode)
+        return self.combine_stage_wait(state)
+
+    def combine_stage_start(
+        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+    ):
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
@@ -456,6 +461,11 @@ class DeepEPDispatcher:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
             )
+
+        return event, hidden_states
+
+    def combine_stage_wait(self, state):
+        event, hidden_states = state
 
         if self.async_finish:
             event.current_stream_wait()
