@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.layers.moe.ep_moe.kernels import (
     compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
@@ -17,6 +16,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
 
 # TODO try disable global variable
 # _buffer_normal = None
@@ -111,8 +111,8 @@ def permute(
         assert not routing_map.requires_grad
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
+                         :, :capacity
+                         ].contiguous()
         sorted_indices = sorted_indices.view(-1)
     else:
         routing_map = routing_map.bool().T.contiguous()
@@ -299,6 +299,8 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
+        assert getattr(self, 'hidden_shape') is None
+
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
         # Todo: enable low latency dispatch
