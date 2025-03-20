@@ -30,8 +30,8 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     for index, value in enumerate(arr):
         cum_sum += value
         if cum_sum >= arr_sum // 2:
-            return index
-    raise Exception
+            return index + 1
+    return len(arr)
 
 
 def compute_split_token_index(split_seq_index: int) -> int:
