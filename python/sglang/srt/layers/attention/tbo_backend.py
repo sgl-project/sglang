@@ -48,7 +48,10 @@ class TboAttnBackend(AttentionBackend):
         TODO
 
     def get_cuda_graph_seq_len_fill_value(self):
-        TODO
+        ans = self.primary.get_cuda_graph_seq_len_fill_value()
+        for child in self.children:
+            assert ans == child.get_cuda_graph_seq_len_fill_value()
+        return ans
 
     def forward_extend(self, *args, **kwargs):
         TODO
