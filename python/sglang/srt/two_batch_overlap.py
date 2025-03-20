@@ -1,5 +1,5 @@
 import os
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Tuple, Dict
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -53,22 +53,20 @@ def compute_split_token_index(
 # ------------------------------------------ TODO ------------------------------------------
 
 
-# TODO maybe optimize these
-@staticmethod
 def _split_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> Optional[Tuple[Dict, Dict]]:
-    output_a = DeepseekV2Model._filter_inputs(
+    output_a = _filter_inputs(
         hidden_states=hidden_states,
         residual=residual,
         positions=positions,
         forward_batch=forward_batch,
         child_mode="a",
     )
-    output_b = DeepseekV2Model._filter_inputs(
+    output_b = _filter_inputs(
         hidden_states=hidden_states,
         residual=residual,
         positions=positions,
@@ -84,7 +82,6 @@ def _split_inputs(
     return output_a, output_b
 
 
-@staticmethod
 def _filter_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -110,7 +107,6 @@ def _filter_inputs(
     )
 
 
-@staticmethod
 def _merge_outputs(output_a, output_b):
     hidden_states_a, residual_a = output_a
     hidden_states_b, residual_b = output_b
