@@ -335,38 +335,7 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        # TODO maybe move
-        # ====================================================================================
-        enable_tbo = all(x != -1 for x in ret.global_split_token_index)
-        tp_rank = get_tensor_model_parallel_rank()
-        if enable_tbo:
-            split_token_index = ret.global_split_token_index[tp_rank]
-            split_seq_index = ret.global_split_seq_index[tp_rank]
-
-            ret.tbo_child_a = ret.filter_batch(
-                start_token_index=0,
-                end_token_index=split_token_index,
-                start_seq_index=0,
-                end_seq_index=split_seq_index,
-                output_attn_backend=model_runner.attn_backend_child_a,
-                output_global_num_tokens=ret.global_split_token_index,
-            )
-            ret.tbo_child_b = ret.filter_batch(
-                start_token_index=split_token_index,
-                end_token_index=ret.input_ids.shape[0],
-                start_seq_index=split_seq_index,
-                end_seq_index=ret.batch_size,
-                output_attn_backend=model_runner.attn_backend_child_b,
-                output_global_num_tokens=[
-                    rank_num_tokens - rank_split_token_index
-                    for rank_split_token_index, rank_num_tokens in zip(
-                        ret.global_split_token_index,
-                        ret.global_num_tokens,
-                        strict=True,
-                    )
-                ],
-            )
-        # ====================================================================================
+        ret.prepare_tbo()
 
         return ret
 
@@ -460,6 +429,37 @@ class ForwardBatch:
             axis=1,
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
+
+    def prepare_tbo(self):
+        enable_tbo = all(x != -1 for x in ret.global_split_token_index)
+        tp_rank = get_tensor_model_parallel_rank()
+        if enable_tbo:
+            split_token_index = ret.global_split_token_index[tp_rank]
+            split_seq_index = ret.global_split_seq_index[tp_rank]
+
+            ret.tbo_child_a = ret.filter_batch(
+                start_token_index=0,
+                end_token_index=split_token_index,
+                start_seq_index=0,
+                end_seq_index=split_seq_index,
+                output_attn_backend=model_runner.attn_backend_child_a,
+                output_global_num_tokens=ret.global_split_token_index,
+            )
+            ret.tbo_child_b = ret.filter_batch(
+                start_token_index=split_token_index,
+                end_token_index=ret.input_ids.shape[0],
+                start_seq_index=split_seq_index,
+                end_seq_index=ret.batch_size,
+                output_attn_backend=model_runner.attn_backend_child_b,
+                output_global_num_tokens=[
+                    rank_num_tokens - rank_split_token_index
+                    for rank_split_token_index, rank_num_tokens in zip(
+                        ret.global_split_token_index,
+                        ret.global_num_tokens,
+                        strict=True,
+                    )
+                ],
+            )
 
     def filter_batch(
         self,
