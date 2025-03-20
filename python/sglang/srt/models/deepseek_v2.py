@@ -1120,7 +1120,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_stage_prefill_shared,
             ]
         elif forward_mode == ForwardMode.DECODE:
-            return TODO
+            return [
+                self._forward_stage_decode_attn_0,
+                self._forward_stage_decode_attn_1,
+                self._forward_stage_decode_shared,
+                self._forward_stage_decode_mlp,
+                self._forward_stage_decode_extra,
+            ]
         else:
             raise NotImplementedError(f'Unsupported {forward_mode=}')
 
