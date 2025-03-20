@@ -366,7 +366,7 @@ class DeepseekV2MoE(nn.Module):
             state['forward_batch'].forward_mode, state['hidden_states_for_moe_input'])
         state['combine_event'].current_stream_wait()
         output_hidden_states = state['hidden_states_from_combine'] + shared_output
-        return None, TODO(output_hidden_states)
+        return None, self._forward_substage_compute_layer_output(state, output_hidden_states)
 
     def _forward_stage_decode_shared(self, state):
         state_dispatch = self._forward_substage_dispatch(state)
@@ -380,7 +380,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_stage_decode_extra(self, state):
         state['combine_event'].current_stream_wait()
         output_hidden_states = state['hidden_states_from_combine'] + state['shared_output']
-        return None, TODO(output_hidden_states)
+        return None, self._forward_substage_compute_layer_output(state, output_hidden_states)
 
     def _forward_stage_mlp_raw(self, state, start_combine: bool = True):
         state['dispatch_event'].current_stream_wait()
@@ -419,12 +419,12 @@ class DeepseekV2MoE(nn.Module):
             combine_event=combine_event,
         )
 
-    def _forward_substage_compute_layer_output(self):
+    def _forward_substage_compute_layer_output(self, state, output_hidden_states):
         return dict(
-            positions=TODO,
-            hidden_states=TODO,
-            forward_batch=TODO,
-            residual=TODO,
+            positions=state['positions'],
+            hidden_states=output_hidden_states,
+            forward_batch=state['forward_batch'],
+            residual=state['residual_after_post_attn_ln'],
         )
 
 
