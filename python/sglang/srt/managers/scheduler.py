@@ -341,8 +341,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
             1.0,
         )
         self.new_token_ratio_decay = (
-                                         self.init_new_token_ratio - self.min_new_token_ratio
-                                     ) / global_config.default_new_token_ratio_decay_steps
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -1071,10 +1071,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
             if (
                 self.lora_paths
                 and len(
-                lora_set
-                | set([req.lora_path for req in adder.can_run_list])
-                | set([req.lora_path])
-            )
+                    lora_set
+                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path])
+                )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1099,9 +1099,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                                                               self.running_batch is not None
-                                                               and not self.running_batch.is_empty()
-                                                           )
+                            self.running_batch is not None
+                            and not self.running_batch.is_empty()
+                        )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1329,8 +1329,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                )
+                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                    )
                 ]
             )
 
@@ -1385,7 +1385,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
 
-        can_run_tbo = enable_two_batch_overlap and local_can_run_tbo_aggregated and forward_mode_same
+        can_run_tbo = (
+            enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_same
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
