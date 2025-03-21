@@ -1,6 +1,5 @@
 """
-Minimal HTTP load balancer for prefill and decode servers for testing.
-In real production, we use GRPC and rust load load balancer.
+Minimal HTTP load balancer for prefill and decode servers for testing purpose.
 """
 
 import asyncio
