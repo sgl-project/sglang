@@ -95,9 +95,9 @@ class FlashAttentionBackend(AttentionBackend):
         max_seq_len_k = max_seq_len_q
 
         o, _ = flash_attn_varlen_func(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
+            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k=k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+            v=v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seq_len_q,
@@ -203,8 +203,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def prepare_kv_cache(self, forward_batch: ForwardBatch, layer: RadixAttention):
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        key_cache_pool = kv_cache[0]
-        value_cache_pool = kv_cache[1]
+        key_cache_pool, value_cache_pool = kv_cache[0], kv_cache[1]
 
         # QQ NOTE: need a faster way
         req_to_token = forward_batch.req_to_token_pool.req_to_token
