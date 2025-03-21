@@ -5,12 +5,15 @@ import unittest
 import torch
 
 import sglang as sgl
+from sglang.srt.utils import get_device, get_device_count
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
-def test_update_weights_from_tensor(tp_size):
-    assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
-    torch.cuda.empty_cache()
+def test_update_weights_from_tensor(tp_size, device):
+    module = torch.get_device_module(device)
+    assert module.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, tp_size=tp_size)
 
@@ -18,8 +21,8 @@ def test_update_weights_from_tensor(tp_size):
 
     _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
 
-    memory_before = torch.cuda.memory_allocated()
-    new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+    memory_before = module.memory_allocated()
+    new_tensor = torch.full((16384, 2048), 1.5, device=device)
 
     time_start = time.time()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
@@ -32,23 +35,29 @@ def test_update_weights_from_tensor(tp_size):
 
     del new_tensor
     gc.collect()
-    torch.cuda.ipc_collect()
-    torch.cuda.empty_cache()
-    memory_after = torch.cuda.memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+    memory_after = module.memory_allocated()
     assert (
         memory_after <= memory_before + 1024
     ), f"Memory leak detected: {memory_after - memory_before} bytes"
 
 
 class TestUpdateWeightsFromTensor(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = get_device()
+        cls.num_gpus = get_device_count()
+
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:
-            if torch.cuda.device_count() < tp_size:
+            if self.num_gpus < tp_size:
                 continue
 
             with self.subTest(tp_size=tp_size):
-                test_update_weights_from_tensor(tp_size)
+                test_update_weights_from_tensor(tp_size, self.device)
 
     def test_update_weights_from_tensor_load_format_direct(self):
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
