@@ -95,7 +95,7 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
             )
-            k, v, _ = self.prepare_kv_cache(forward_batch, layer)
+            k, v, _ = self.prepare_kv_cache_v2(forward_batch, layer)
         else:
             cu_seqlens_q = cu_seqlens_k
         max_seq_len_q = seqlens_in_batch.max().item()
@@ -157,7 +157,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
         # Get KV cache
-        key_cache, value_cache, cache_seqlens = self.prepare_kv_cache(
+        key_cache, value_cache, cache_seqlens = self.prepare_kv_cache_v2(
             forward_batch, layer
         )
 
@@ -214,6 +214,78 @@ class FlashAttentionBackend(AttentionBackend):
         value_cache = value_cache_pool[req_tokens]
         cache_seqlens = seq_lens
         return key_cache, value_cache, cache_seqlens
+
+    def prepare_kv_cache_v2(self, forward_batch: ForwardBatch, layer: RadixAttention):
+        """Optimized KV cache preparation.
+
+        Args:
+            forward_batch: ForwardBatch containing sequence information
+            layer: RadixAttention layer instance
+
+        Returns:
+            Tuple of (key_cache, value_cache, cache_seqlens)
+        """
+        # Check for empty batch
+        if forward_batch.seq_lens.numel() == 0:
+            empty_shape = (0, layer.tp_k_head_num, layer.head_dim)
+            empty_tensor = torch.empty(
+                empty_shape,
+                device=forward_batch.req_pool_indices.device,
+                dtype=torch.float16,
+            )
+            return empty_tensor, empty_tensor, forward_batch.seq_lens
+
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache_pool, value_cache_pool = kv_cache[0], kv_cache[1]
+
+        # Get required tensors
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+
+        # Calculate total number of tokens
+        total_tokens = seq_lens.sum().item()
+        if total_tokens == 0:
+            empty_shape = (0, layer.tp_k_head_num, layer.head_dim)
+            empty_tensor = torch.empty(
+                empty_shape,
+                device=forward_batch.req_pool_indices.device,
+                dtype=torch.float16,
+            )
+            return empty_tensor, empty_tensor, seq_lens
+
+        # Vectorized approach using index_select instead of the loop
+        # Calculate cumulative sequence lengths for offsets
+        cum_seq_lens = torch.cat(
+            [
+                torch.zeros(1, device=seq_lens.device, dtype=seq_lens.dtype),
+                seq_lens.cumsum(0)[:-1],
+            ]
+        )
+
+        # Create indices for batched indexing
+        batch_indices = torch.arange(seq_lens.size(0), device=seq_lens.device)
+        token_indices = torch.arange(seq_lens.max().item(), device=seq_lens.device)
+
+        # Create a mask for valid indices
+        mask = token_indices.unsqueeze(0) < seq_lens.unsqueeze(1)
+
+        # Get the req_pool_indices for each sequence
+        batch_req_indices = req_pool_indices[batch_indices].unsqueeze(1)
+
+        # Create token indices for all sequences
+        all_tokens = req_to_token[
+            batch_req_indices, token_indices.unsqueeze(0)
+        ].masked_fill_(~mask, 0)
+
+        # Flatten and remove padding (invalid) tokens
+        valid_tokens = all_tokens[mask]
+
+        # Index into KV cache pools
+        key_cache = key_cache_pool[valid_tokens]
+        value_cache = value_cache_pool[valid_tokens]
+
+        return key_cache, value_cache, seq_lens
 
     def init_cuda_graph_state(self, max_bs: int):
         """Initialize CUDA graph state for the attention backend."""
