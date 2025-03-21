@@ -1,21 +1,16 @@
-"""
-    Bench the huggingface vLM with benchmark MMMU
-
-    Usage:
-        python benchmark/mmmu/bench_hf.py --model-path Qwen/Qwen2-VL-7B-Instruct
-
-    The eval output will be logged
-"""
-
 import argparse
-import random
 
 import torch
-from bench_sglang import EvalArgs, prepare_samples
 from data_utils import save_json
-from eval_utils import eval_result, get_sampling_params, parse_multi_choice_response
+from eval_utils import (
+    EvalArgs,
+    eval_result,
+    get_sampling_params,
+    prepare_samples,
+    process_result,
+)
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationConfig
 
 
 @torch.no_grad()
@@ -28,7 +23,6 @@ def eval_mmmu(args):
         trust_remote_code=True,
     )
     model = model.eval().cuda()
-    model = torch.compile(model)
 
     processor = AutoProcessor.from_pretrained(
         args.model_path, torch_dtype="auto", device_map="auto"
@@ -38,6 +32,10 @@ def eval_mmmu(args):
     out_samples = dict()
 
     sampling_params = get_sampling_params(eval_args)
+    generation_config = GenerationConfig(
+        max_new_tokens=sampling_params["max_new_tokens"],
+        do_sample=False,
+    )
 
     answer_dict = {}
     for sample in tqdm(samples):
@@ -45,64 +43,36 @@ def eval_mmmu(args):
         image = sample["image"]
         prefix = prompt.split("<")[0]
         suffix = prompt.split(">")[1]
-        if image is not None:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prefix},
-                        {
-                            "type": "image",
-                            "image": image,
-                        },
-                        {"type": "text", "text": suffix},
-                    ],
-                }
-            ]
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-
-            inputs = processor(
-                text=[text],
-                images=[image],
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-
-            generated_ids = model.generate(**inputs, **sampling_params)
-
-            response = processor.decode(
-                generated_ids[0],
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[len(text) :]
-        else:  # multiple images actually
-            if sample["question_type"] == "multiple-choice":
-                all_choices = sample["all_choices"]
-                response = random.choice(all_choices)
-
-            else:
-                response = "INVALID GENERATION FOR MULTIPLE IMAGE INPUTS"
-
-        if sample["question_type"] == "multiple-choice":
-            pred_ans = parse_multi_choice_response(
-                response, sample["all_choices"], sample["index2ans"]
-            )
-        else:  # open question
-            pred_ans = response
-        out_samples[sample["id"]] = pred_ans
-
-        torch.cuda.empty_cache()
-        # set ground truth answer
-        answer_dict[sample["id"]] = {
-            "question_type": sample["question_type"],
-            "ground_truth": sample["answer"],
-        }
+        assert image is not None
+        contents = []
+        if prefix:
+            contents += [{"type": "text", "text": prefix}]
+        contents += [
+            {
+                "type": "image",
+                "image": sample["image_path"],
+            }
+        ]
+        if suffix:
+            contents += [{"type": "text", "text": suffix}]
+        messages = [{"role": "user", "content": contents}]
+        model_inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).to(model.device)
+        input_len = model_inputs["input_ids"].shape[-1]
+        generation = model.generate(**model_inputs, generation_config=generation_config)
+        generation = generation[0][input_len:]
+        response = processor.decode(generation, skip_special_tokens=True)
+        print(f"response: {response}")
+        process_result(response, sample, answer_dict, out_samples)
 
     args.output_path = f"{args.model_path}_val_hf.json"
     save_json(args.output_path, out_samples)
-    eval_result(output_path=args.output_path, answer_dict=answer_dict)
+    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
 
 
 if __name__ == "__main__":

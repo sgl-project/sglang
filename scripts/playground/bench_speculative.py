@@ -2,6 +2,9 @@
 Usage:
 # single GPU
 python3 bench_speculative.py --model-path meta-llama/Llama-2-7b-chat-hf --speculative-draft-model-path lmsys/sglang-EAGLE-llama2-chat-7B
+
+# multiple GPU
+python3 bench_speculative.py --model-path deepseek-ai/DeepSeek-V3 --speculative-draft-model-path lmsys/DeepSeek-V3-NextN --tp-size 8 --trust-remote-code --batch-size 1 4 8 16 32 --steps 0 1 2 --topk 0 1 2 4 --num_draft_tokens 0 2 4 8
 """
 
 import argparse
@@ -165,6 +168,26 @@ def main(args, server_args):
                 batch_size,
             ]
         )
+
+        if server_args.trust_remote_code:
+            other_args.extend(
+                [
+                    "--trust-remote-code",
+                ]
+            )
+
+        if server_args.enable_flashinfer_mla:
+            other_args.extend(
+                [
+                    "--enable-flashinfer-mla",
+                ]
+            )
+        if server_args.enable_flashmla:
+            other_args.extend(
+                [
+                    "--enable-flashmla",
+                ]
+            )
 
         if server_args.quantization:
             other_args.extend(

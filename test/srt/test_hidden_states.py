@@ -4,13 +4,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestHiddenState(unittest.TestCase):
     def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 
@@ -33,8 +33,11 @@ class TestHiddenState(unittest.TestCase):
 
         for output in outputs:
             self.assertEqual(len(output["meta_info"]["hidden_states"]), 8)
-            for hidden_state in output["meta_info"]["hidden_states"]:
-                self.assertIsInstance(hidden_state, torch.Tensor)
+            for i in range(len(output["meta_info"]["hidden_states"])):
+                assert isinstance(output["meta_info"]["hidden_states"][i], list)
+                output["meta_info"]["hidden_states"][i] = torch.tensor(
+                    output["meta_info"]["hidden_states"][i], dtype=torch.bfloat16
+                )
         # Checks that splicing of the batch was done correctly
         self.assertGreater(
             outputs[1]["meta_info"]["hidden_states"][0].shape[0],
@@ -80,7 +83,7 @@ class TestHiddenState(unittest.TestCase):
 
     def test_repeatedly_changes_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
-        model_path = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         input_ids = tokenizer(prompts).input_ids
 

@@ -18,7 +18,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm import _custom_ops as ops
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -30,6 +29,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.quantization.int8_utils import (
+    block_dequant as int8_block_dequant,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,9 +40,15 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import awq_dequantize
+else:
+    from vllm import _custom_ops as ops
 
 
 class DeepseekModelNextN(nn.Module):
@@ -48,6 +56,7 @@ class DeepseekModelNextN(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -56,6 +65,7 @@ class DeepseekModelNextN(nn.Module):
             config.vocab_size,
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -64,7 +74,11 @@ class DeepseekModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.decoder = DeepseekV2DecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+            config,
+            0,
+            quant_config=quant_config,
+            is_nextn=True,
+            prefix=add_prefix("decoder", prefix),
         )
 
         self.shared_head = nn.Module()
@@ -108,18 +122,22 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
 
-        self.model = DeepseekModelNextN(config, quant_config)
+        self.model = DeepseekModelNextN(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
 
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                prefix=add_prefix("model.shared_head.head", prefix),
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
@@ -127,6 +145,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
             )
             self.logits_processor = LogitsProcessor(config)
 
@@ -247,14 +266,21 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self_attn = self.model.decoder.self_attn
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # AWQ compatible
-                w = ops.awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                    0,
-                    0,
-                    0,
-                ).T
+                if _is_cuda:
+                    w = awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                    ).T
+                else:
+                    w = ops.awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
             else:
                 w = self_attn.kv_b_proj.weight
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
@@ -266,7 +292,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if is_hip_:
+                    if _is_hip:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=self_attn.kv_b_proj.weight_scale_inv,
@@ -280,6 +306,23 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         weight, weight_scale, weight_block_size
                     )
                     self_attn.w_scale = scale
+            if w.dtype == torch.int8:
+                if hasattr(self.quant_config, "weight_block_size"):
+                    # block-wise int8 need it
+                    weight_block_size = self.quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                        w = int8_block_dequant(
+                            weight, weight_scale, weight_block_size
+                        ).to(torch.bfloat16)
+                else:
+                    # channel-wise int8 need it
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale")
+                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                        torch.bfloat16
+                    )
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -290,7 +333,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 and self_attn.w_scale is None
             ):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if is_hip_:
+                if _is_hip:
                     self_attn.w_scale *= 2.0
 
 

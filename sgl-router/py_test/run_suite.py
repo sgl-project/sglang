@@ -1,7 +1,7 @@
 import argparse
 import glob
 
-from sglang.test.test_utils import run_unittest_files
+from sglang.test.test_utils import TestFile, run_unittest_files
 
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
@@ -15,5 +15,6 @@ if __name__ == "__main__":
 
     files = glob.glob("**/test_*.py", recursive=True)
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    test_files = [TestFile(name=file) for file in files]
+    exit_code = run_unittest_files(test_files, args.timeout_per_file)
     exit(exit_code)
