@@ -1,11 +1,11 @@
 [build-system]
 requires = [
-  "setuptools>=75.0",
+  "pybind11==2.13.6",
   "scikit-build-core>=0.10",
   "torch==2.5.1",
   "wheel",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
@@ -25,8 +25,8 @@ dependencies = []
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
-[tool.wheel]
-exclude = [
-  "dist*",
-  "tests*",
-]
+[tool.scikit-build]
+cmake.build-type = "Release"
+minimum-version = "build-system.requires"
+wheel.license-files = []
+wheel.packages = ["python/sgl_kernel"]
