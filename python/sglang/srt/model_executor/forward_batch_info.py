@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -399,20 +400,20 @@ class ForwardBatch:
                 if image_inputs is None:
                     # text only
                     mrope_positions = [
-                                          [
-                                              pos
-                                              for pos in range(
-                                              extend_prefix_len, extend_prefix_len + extend_seq_len
-                                          )
-                                          ]
-                                      ] * 3
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len, extend_prefix_len + extend_seq_len
+                            )
+                        ]
+                    ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                         extend_start_loc: extend_start_loc + extend_seq_len
-                                         ],
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
                             image_grid_thw=image_inputs.image_grid_thws,
                             video_grid_thw=image_inputs.video_grid_thws,
                             image_token_id=image_inputs.im_token_id,
@@ -446,6 +447,7 @@ class ForwardBatch:
         )
 
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
         assert isinstance(self.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = self.attn_backend.children
 
@@ -540,18 +542,15 @@ class ForwardBatch:
                 seq_lens_sum=output_dict["seq_lens"].sum().item(),
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
-
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
-
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 gathered_buffer=None,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
-
                 # For logits and logprobs post processing, thus we do not care
                 temp_scaled_logprobs=False,
                 temperature=None,
@@ -564,9 +563,10 @@ class ForwardBatch:
         for field in dataclasses.fields(ForwardBatch):
             if getattr(self, field.name) is not None and field.name not in output_dict:
                 errors.append(
-                    f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})")
+                    f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
+                )
         if len(errors) > 0:
-            raise Exception(f"{len(errors)} errors happen:\n" + '\n\n'.join(errors))
+            raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
 
         return ForwardBatch(**output_dict)
 

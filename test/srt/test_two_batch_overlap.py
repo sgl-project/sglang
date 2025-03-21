@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -48,7 +49,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             },
         )
         print(f"{response.json()=}")
-        self.assertEquals(response.json()['text'], '5, 1+5=6')
+        self.assertEquals(response.json()["text"], "5, 1+5=6")
 
     def test_mmlu(self):
         args = SimpleNamespace(

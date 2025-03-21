@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.layers.moe.ep_moe.kernels import (
     compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
@@ -105,8 +106,8 @@ def permute(
         assert not routing_map.requires_grad
         routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
         sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-                         :, :capacity
-                         ].contiguous()
+            :, :capacity
+        ].contiguous()
         sorted_indices = sorted_indices.view(-1)
     else:
         routing_map = routing_map.bool().T.contiguous()
@@ -187,7 +188,7 @@ class DeepEPDispatcher:
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
         async_finish: bool = False,
-        debug_name: str = '',
+        debug_name: str = "",
     ):
         self.group = group
         self.router_topk = router_topk

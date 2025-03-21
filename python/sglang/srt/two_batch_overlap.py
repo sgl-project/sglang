@@ -1,8 +1,9 @@
 import os
 from contextlib import nullcontext
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -10,9 +11,9 @@ if TYPE_CHECKING:
 
 
 def compute_split_seq_index(
-        forward_mode: 'ForwardMode',
-        num_tokens: int,
-        extend_lens: Optional[Sequence[int]],
+    forward_mode: "ForwardMode",
+    num_tokens: int,
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -40,9 +41,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-        split_seq_index: int,
-        forward_mode: 'ForwardMode',
-        extend_seq_lens: Optional[Sequence[int]],
+    split_seq_index: int,
+    forward_mode: "ForwardMode",
+    extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
@@ -54,10 +55,10 @@ def compute_split_token_index(
 
 
 def model_forward_split_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: 'ForwardBatch',
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
 ) -> Tuple[Dict, Dict]:
     return tuple(
         [
@@ -68,17 +69,19 @@ def model_forward_split_inputs(
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
             )
-            for tbo_subbatch_index, output_forward_batch in enumerate(forward_batch.tbo_children)
+            for tbo_subbatch_index, output_forward_batch in enumerate(
+                forward_batch.tbo_children
+            )
         ]
     )
 
 
 def _model_forward_filter_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        output_forward_batch: 'ForwardBatch',
-        tbo_subbatch_index: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    output_forward_batch: "ForwardBatch",
+    tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
@@ -97,16 +100,14 @@ def model_forward_merge_outputs(output_a, output_b):
     return _handle_key("hidden_states"), _handle_key("residual")
 
 
-_ENABLE_PROFILE = bool(
-    int(os.environ.get("SGLANG_TBO_ENABLE_PROFILE", "0"))
-)
+_ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_TBO_ENABLE_PROFILE", "0")))
 
 
 def model_forward_execute_two_batch(
-        inputs,
-        stages_a: List[Callable],
-        stages_b: List[Callable],
-        delta_stages: int,
+    inputs,
+    stages_a: List[Callable],
+    stages_b: List[Callable],
+    delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
@@ -155,9 +156,11 @@ class _StageExecutor:
 
         with ctx:
             try:
-                self._stage_output = stage(state=self._stage_state, **(self._stage_output or {}))
+                self._stage_output = stage(
+                    state=self._stage_state, **(self._stage_output or {})
+                )
             except Exception as e:
-                raise Exception(f'Error when handling stage {debug_name} {e=}')
+                raise Exception(f"Error when handling stage {debug_name} {e=}")
 
         self._index += 1
 

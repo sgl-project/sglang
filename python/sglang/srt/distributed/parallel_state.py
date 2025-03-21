@@ -112,10 +112,8 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         group._all_reduce_in_place(tensor)
 
-
     def inplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="inplace_all_reduce",
@@ -124,7 +122,6 @@ if supports_custom_op():
         fake_impl=inplace_all_reduce_fake,
     )
 
-
     def outplace_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
@@ -132,10 +129,8 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_reduce_out_place(tensor)
 
-
     def outplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         return torch.empty_like(tensor)
-
 
     direct_register_custom_op(
         op_name="outplace_all_reduce",
@@ -143,7 +138,6 @@ if supports_custom_op():
         mutates_args=[],
         fake_impl=outplace_all_reduce_fake,
     )
-
 
     def reg_all_gather_into_tensor(
         output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -154,12 +148,10 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         group._all_gather_into_tensor(output, input)
 
-
     def reg_all_gather_into_tensor_fake(
         output: torch.Tensor, input: torch.Tensor, group_name: str
     ) -> None:
         pass
-
 
     direct_register_custom_op(
         op_name="reg_all_gather_into_tensor",
@@ -496,7 +488,7 @@ class GroupCoordinator:
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1:]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
 
