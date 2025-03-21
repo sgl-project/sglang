@@ -9,15 +9,19 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
 
-def quantize_weights(w: torch.Tensor,
-                     quant_type: str,
-                     group_size: Optional[int],
-                     zero_points: bool = False,
-                     ref_zero_points_after_scales: bool = False):
+
+def quantize_weights(
+    w: torch.Tensor,
+    quant_type: str,
+    group_size: Optional[int],
+    zero_points: bool = False,
+    ref_zero_points_after_scales: bool = False,
+):
     assert quant_type in ["w4a16", "w4a16b8", "w8a16", "w8a16b128"]
-    assert not zero_points or group_size is not None, \
-        "to have group zero points, group_size must be provided "\
+    assert not zero_points or group_size is not None, (
+        "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
+    )
 
     orig_device = w.device
     orig_type = w.dtype
@@ -56,14 +60,16 @@ def quantize_weights(w: torch.Tensor,
     if group_size is not None:
         if zero_points:
             w_s = (max_val - min_val).clamp(min=1e-5) / max_q_val
-            maybe_w_zp = torch.round(torch.abs(min_val / w_s)) \
-                .clamp(min_q_val, max_q_val).int()
+            maybe_w_zp = (
+                torch.round(torch.abs(min_val / w_s)).clamp(min_q_val, max_q_val).int()
+            )
         else:
             # If the bias is such that there are no possible negative/positive
             #  values, set the max value to inf to avoid divide by 0
             w_s = torch.max(
                 abs(max_val / (max_q_val if max_q_val != 0 else torch.inf)),
-                abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)))
+                abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)),
+            )
 
     # Quantize
     w_q = torch.round(w / w_s).int() + (maybe_w_zp if zero_points else 0)
@@ -107,6 +113,7 @@ def quantize_weights(w: torch.Tensor,
         maybe_w_zp,
     )
 
+
 def torch_moe(a, w1, w2, score, topk):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -118,10 +125,13 @@ def torch_moe(a, w1, w2, score, topk):
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            out[mask] = SiluAndMul()(
-                a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
-    return (out.view(B, -1, w2.shape[1]) *
-            topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+            out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
+                0, 1
+            )
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
+
 
 # fork from https://github.com/vllm-project/vllm/blob/main/tests/kernels/test_moe.py
 @pytest.mark.parametrize("m", [1, 32, 222])
@@ -132,10 +142,18 @@ def torch_moe(a, w1, w2, score, topk):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("has_zp", [True, False])
-@pytest.mark.parametrize("weight_bits", [8])#[4, 8])
-def test_fused_moe_wn16(m: int, n: int, k: int, e: int, topk: int,
-                        dtype: torch.dtype, group_size: int, has_zp: bool,
-                        weight_bits: int):
+@pytest.mark.parametrize("weight_bits", [8])  # [4, 8])
+def test_fused_moe_wn16(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    dtype: torch.dtype,
+    group_size: int,
+    has_zp: bool,
+    weight_bits: int,
+):
     print(m, n, k, e, topk, dtype, group_size, has_zp, weight_bits)
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
@@ -151,35 +169,40 @@ def test_fused_moe_wn16(m: int, n: int, k: int, e: int, topk: int,
 
     w1_ref = w1.clone()
     w2_ref = w2.clone()
-    w1_qweight = torch.empty((e, 2 * n, k // pack_factor),
-                             device="cuda",
-                             dtype=torch.uint8)
-    w2_qweight = torch.empty((e, k, n // pack_factor),
-                             device="cuda",
-                             dtype=torch.uint8)
-    w1_scales = torch.empty((e, 2 * n, k // group_size),
-                            device="cuda",
-                            dtype=dtype)
-    w2_scales = torch.empty((e, k, n // group_size),
-                            device="cuda",
-                            dtype=dtype)
-    w1_qzeros = torch.empty((e, 2 * n // pack_factor, k // group_size),
-                            device="cuda",
-                            dtype=torch.uint8)
-    w2_qzeros = torch.empty((e, k // pack_factor, n // group_size),
-                            device="cuda",
-                            dtype=torch.uint8)
+    w1_qweight = torch.empty(
+        (e, 2 * n, k // pack_factor), device="cuda", dtype=torch.uint8
+    )
+    w2_qweight = torch.empty((e, k, n // pack_factor), device="cuda", dtype=torch.uint8)
+    w1_scales = torch.empty((e, 2 * n, k // group_size), device="cuda", dtype=dtype)
+    w2_scales = torch.empty((e, k, n // group_size), device="cuda", dtype=dtype)
+    w1_qzeros = torch.empty(
+        (e, 2 * n // pack_factor, k // group_size), device="cuda", dtype=torch.uint8
+    )
+    w2_qzeros = torch.empty(
+        (e, k // pack_factor, n // group_size), device="cuda", dtype=torch.uint8
+    )
 
     for i in range(e * 2):
         expert_id = i % e
         if i // e == 0:
-            w, w_ref, w_qweight, w_scales, w_qzeros = \
-                w1, w1_ref, w1_qweight, w1_scales, w1_qzeros
+            w, w_ref, w_qweight, w_scales, w_qzeros = (
+                w1,
+                w1_ref,
+                w1_qweight,
+                w1_scales,
+                w1_qzeros,
+            )
         else:
-            w, w_ref, w_qweight, w_scales, w_qzeros = \
-                w2, w2_ref, w2_qweight, w2_scales, w2_qzeros
+            w, w_ref, w_qweight, w_scales, w_qzeros = (
+                w2,
+                w2_ref,
+                w2_qweight,
+                w2_scales,
+                w2_qzeros,
+            )
         weight, qweight, scales, qzeros = quantize_weights(
-            w[expert_id].T, quant_type, group_size, has_zp, False)
+            w[expert_id].T, quant_type, group_size, has_zp, False
+        )
         weight = weight.T
         qweight = qweight.T.contiguous().to(torch.uint8)
         scales = scales.T
@@ -196,18 +219,20 @@ def test_fused_moe_wn16(m: int, n: int, k: int, e: int, topk: int,
         if has_zp:
             w_qzeros[expert_id] = qzeros
 
-    triton_output = fused_moe(a,
-                              w1_qweight,
-                              w2_qweight,
-                              score,
-                              topk,
-                              renormalize=False,
-                              use_int4_w4a16=weight_bits == 4,
-                              use_int8_w8a16=weight_bits == 8,
-                              w1_scale=w1_scales,
-                              w2_scale=w2_scales,
-                              w1_zp=w1_qzeros if has_zp else None,
-                              w2_zp=w2_qzeros if has_zp else None,
-                              block_shape=[0, group_size])
+    triton_output = fused_moe(
+        a,
+        w1_qweight,
+        w2_qweight,
+        score,
+        topk,
+        renormalize=False,
+        use_int4_w4a16=weight_bits == 4,
+        use_int8_w8a16=weight_bits == 8,
+        w1_scale=w1_scales,
+        w2_scale=w2_scales,
+        w1_zp=w1_qzeros if has_zp else None,
+        w2_zp=w2_qzeros if has_zp else None,
+        block_shape=[0, group_size],
+    )
     torch_output = torch_moe(a, w1_ref, w2_ref, score, topk)
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)

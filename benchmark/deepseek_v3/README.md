@@ -178,7 +178,7 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
-AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. 
+AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization.
 Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better performance.
 One example is as follows:
 
