@@ -839,7 +839,9 @@ class DeepEPMoE(EPMoE):
         if True:  # not forward_mode.is_decode():
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         else:
-            return self.forward_deepgemm_masked(hidden_states, reorder_topk_ids, seg_indptr)
+            return self.forward_deepgemm_masked(
+                hidden_states, reorder_topk_ids, seg_indptr
+            )
 
     def forward_normal(
         self,
@@ -875,7 +877,7 @@ class DeepEPMoE(EPMoE):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        
+
         if hidden_states.shape[0] > 0:
             gateup_output = self.grouped_gemm_runner(
                 a=hidden_states,

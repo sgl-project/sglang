@@ -12,19 +12,12 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    compute_src2dst_triton_kernel,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_run_moe_deep_preprocess,
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    compute_src2dst_triton_kernel
-)
 _buffer_normal = None
 _buffer_low_latency = None
 
@@ -92,90 +85,6 @@ def get_buffer_low_latency(
     return _buffer_low_latency
 
 
-def permute(
-    tokens,
-    routing_map,
-    num_out_tokens: Optional[int] = None,
-    fused: bool = False,
-    drop_and_pad: bool = False,
-):
-    """
-    Copy from Megatron-Core moe for token permutation
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/moe_utils.py
-    """
-
-    num_tokens, _ = tokens.shape
-    num_experts = routing_map.shape[1]
-    if drop_and_pad and not (num_out_tokens is None):
-        capacity = num_out_tokens // num_experts
-        assert not routing_map.requires_grad
-        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
-        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
-        sorted_indices = sorted_indices.view(-1)
-    else:
-        routing_map = routing_map.bool().T.contiguous()
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device)
-            .unsqueeze(0)
-            .expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
-    permuted_input = tokens.index_select(0, sorted_indices)
-
-    return permuted_input, sorted_indices
-
-
-def unpermute(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
-    fused: bool = False,
-    drop_and_pad: bool = False,
-):
-    """
-    Copy from Megatron-Core moe for token unpermutation
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/moe_utils.py
-    """
-
-    _, hidden = restore_shape
-
-    if probs is not None:
-        assert routing_map is not None, "Mask must be provided to permute the probs."
-        if drop_and_pad:
-            num_experts = routing_map.size(1)
-            num_permuted_tokens = sorted_indices.size(0)
-            capacity = num_permuted_tokens // num_experts
-            num_unpermuted_tokens = probs.size(0)
-
-            probs_T_1D = probs.T.contiguous().view(-1)
-
-            indices_dim0 = torch.arange(
-                num_experts, device=routing_map.device
-            ).unsqueeze(-1)
-            indices_dim1 = sorted_indices.view(num_experts, capacity)
-            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
-
-            permuted_probs = probs_T_1D.index_select(0, indices_1D)
-        else:
-            permuted_probs = probs.T.contiguous().masked_select(
-                routing_map.T.contiguous()
-            )
-        permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
-
-    output_tokens = torch.zeros(
-        restore_shape, device=permuted_tokens.device, dtype=permuted_tokens.dtype
-    )
-    output_tokens.scatter_add_(
-        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-    )
-
-    return output_tokens
-
-
 class DeepEPDispatcher:
     """
     Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
@@ -235,9 +144,9 @@ class DeepEPDispatcher:
     def deepep_permute(
         self,
         hidden_states,
-        fp8_dtype = None,
-        use_fp8_w8a8 = False,
-        use_block_quant = False,
+        fp8_dtype=None,
+        use_fp8_w8a8=False,
+        use_block_quant=False,
     ):
         reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
             self.topk_idx, self.num_experts
@@ -309,8 +218,16 @@ class DeepEPDispatcher:
         self.topk_idx = topk_idx
         self.topk_weights = topk_weights
         if hidden_states.shape[0] > 0:
-            # hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
-            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(hidden_states, fp8_dtype=hidden_states.dtype)
+            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
+                hidden_states, fp8_dtype=hidden_states.dtype
+            )
+        else:
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            )
         return hidden_states, reorder_topk_ids, seg_indptr
 
     def dispatch_normal(
@@ -430,10 +347,29 @@ class DeepEPDispatcher:
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
-                hidden_states = self.get_restored_hidden_states_by_experts(
-                    hidden_states
+                num_tokens = self.src2dst.shape[0] // self.router_topk
+                output = torch.zeros(
+                    (num_tokens, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
                 )
-            hidden_states, event = self.combine_normal(hidden_states, self.handle)
+                deepep_post_reorder_triton_kernel[(num_tokens,)](
+                    hidden_states,
+                    output,
+                    self.src2dst,
+                    self.topk_idx,
+                    self.topk_weights,
+                    self.router_topk,
+                    hidden_states.shape[1],
+                    BLOCK_SIZE=512,
+                )
+            else:
+                output = torch.zeros(
+                    (0, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            hidden_states, event = self.combine_normal(output, self.handle)
         else:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states, self.topk_idx, self.topk_weights, self.handle
@@ -470,176 +406,3 @@ class DeepEPDispatcher:
         )
         # hook()
         return combined_hidden_states, event_overlap, hook
-
-    def _indices_to_multihot(self, indices, probs):
-        batch_size = indices.shape[0]
-        multihot_routing_map = torch.zeros(
-            (batch_size, self.num_local_experts),
-            dtype=torch.long,
-            device=indices.device,
-        )
-
-        multihot_probs = torch.zeros(
-            (batch_size, self.num_local_experts),
-            dtype=torch.float,
-            device=indices.device,
-        )
-
-        mask = indices != -1
-        valid_indices = indices[mask]
-        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
-            mask.sum(dim=1)
-        )
-        multihot_routing_map[row_indices, valid_indices] = 1
-        multihot_probs[row_indices, valid_indices] = probs[mask]
-        return multihot_routing_map.bool(), multihot_probs
-
-    def get_dispached_metadata(self) -> torch.Tensor:
-        return self.topk_idx, self.topk_weights
-
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """
-        Get the number of tokens per expert.
-        """
-        return self.tokens_per_expert
-
-    def get_permuted_hidden_states_by_experts(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
-            self.topk_idx, self.topk_weights
-        )
-        self.hidden_shape_before_permute = hidden_states.shape
-        hidden_states, self.reversed_mapping_for_combine = permute(
-            hidden_states,
-            self.dispatched_routing_map,
-            num_out_tokens=self.tokens_per_expert.sum(),
-            fused=self.permute_fusion,
-        )
-        return hidden_states
-
-    def get_restored_hidden_states_by_experts(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        assert (
-            self.topk_weights.dtype == torch.float32
-        ), "DeepEP only supports float32 probs"
-        hidden_states = unpermute(
-            hidden_states,
-            self.reversed_mapping_for_combine,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.dispatched_routing_map,
-            probs=self.topk_weights,
-            fused=self.permute_fusion,
-        )
-        return hidden_states.to(input_dtype)
-
-
-class DeepEPTokenDispatcher:
-    """
-    Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py#L851
-    """
-
-    def __init__(
-        self,
-        num_local_experts: int,
-        top_k: int,
-        num_experts: int,
-        hidden_size: int,
-        params_dtype: torch.dtype,
-    ):
-        self.num_local_experts = num_local_experts
-
-        self._comm_manager = DeepEPManager(
-            group=get_tp_group().device_group,
-            router_topk=top_k,
-            permute_fusion=True,
-            num_experts=num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=hidden_size,
-            params_dtype=params_dtype,
-        )
-
-    def deepep_permute(self, topk_ids, hidden_states, num_experts, top_k, use_fp8_w8a8, use_block_quant, fp8_dtype):
-        reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-            topk_ids, num_experts
-        )
-        num_total_tokens = reorder_topk_ids.numel()
-        gateup_input = torch.empty(
-            (int(num_total_tokens), hidden_states.shape[1]),
-            device=hidden_states.device,
-            dtype=(
-                fp8_dtype
-                if (use_fp8_w8a8 and not use_block_quant)
-                else hidden_states.dtype
-            ),
-        )
-        # PreReorder
-        deepep_permute_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            None,
-            top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-        )
-        self.src2dst = src2dst
-        return reorder_topk_ids, seg_indptr, gateup_input
-
-
-    def token_permutation(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_experts: int,
-        forward_mode: ForwardMode,
-        num_max_dispatch_tokens_per_rank: int = 256,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.hidden_shape = hidden_states.shape
-        topk_ids = topk_ids.to(torch.int64)
-        hidden_states, topk_ids, topk_weights = self._comm_manager.dispatch(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            num_experts,
-            forward_mode=forward_mode,
-            previous_event=None,
-            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
-        )
-        if hidden_states.shape[0] > 0:
-            global_input_tokens = hidden_states
-            reorder_topk_ids, seg_indptr, global_input_tokens = self.deepep_permute(topk_ids, hidden_states, num_experts, self._comm_manager.router_topk, False, False, hidden_states.dtype)
-        else:
-            global_input_tokens = hidden_states
-            reorder_topk_ids = torch.empty((0,), device=hidden_states.device, dtype=torch.int64)
-            seg_indptr = torch.zeros((self._comm_manager.num_experts + 1,), device=hidden_states.device, dtype=torch.int64)
-
-        return global_input_tokens, reorder_topk_ids, seg_indptr
-
-
-    def token_unpermutation(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if hidden_states.shape[0] > 0:
-            num_tokens = self.src2dst.shape[0] // self._comm_manager.router_topk
-            output = torch.zeros((num_tokens, hidden_states.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
-            deepep_post_reorder_triton_kernel[(num_tokens,)](
-                hidden_states,
-                output,
-                self.src2dst,
-                self._comm_manager.topk_idx,
-                self._comm_manager.topk_weights,
-                self._comm_manager.router_topk,
-                hidden_states.shape[1],
-                BLOCK_SIZE=512,
-            )
-        else:
-            output = torch.zeros((0, hidden_states.shape[1]), device=hidden_states.device, dtype=hidden_states.dtype)
-
-        hidden_states = self._comm_manager.combine(output, forward_mode)
-        return hidden_states.view(self.hidden_shape)
