@@ -140,7 +140,7 @@ class RadixCache(BasePrefixCache):
             return (
                 torch.empty(
                     (0,),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 ),
                 self.root_node,
@@ -154,7 +154,7 @@ class RadixCache(BasePrefixCache):
         if value:
             value = torch.cat(value)
         else:
-            value = torch.empty((0,), dtype=torch.int32, device=self.device)
+            value = torch.empty((0,), dtype=torch.int64, device=self.device)
         return value, last_node
 
     def insert(self, key: List, value=None):

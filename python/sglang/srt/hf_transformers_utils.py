@@ -33,7 +33,10 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
+    DeepseekVL2Config,
     ExaoneConfig,
+    Gemma3Config,
+    Gemma3TextConfig,
     MultiModalityConfig,
     Qwen2_5_VLConfig,
 )
@@ -45,7 +48,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     DbrxConfig.model_type: DbrxConfig,
     ExaoneConfig.model_type: ExaoneConfig,
     Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
+    DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
+    Gemma3Config.model_type: Gemma3Config,
+    Gemma3TextConfig.model_type: Gemma3TextConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

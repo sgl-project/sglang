@@ -168,7 +168,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = MiniCPMV
+        cls.model_path = "openbmb/MiniCPM-V-2_6"
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
