@@ -27,23 +27,13 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.conn import (
-    KVArgs,
-    KVManager,
-    KVPoll,
-    KVReceiver,
-    KVSender,
-)
+from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
 from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -180,8 +170,6 @@ class DecodePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
-            # Memory estimation: don't add if the projected memory cannot be met
-            # TODO: add new_token ratio
             required_tokens_for_request = (
                 len(decode_req.req.origin_input_ids) + self.num_reserved_decode_tokens
             )
@@ -214,7 +202,7 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
-    def _allocatable_tokens(self, count_retracted: bool = True) -> int:
+    def _allocatable_tokens(self) -> int:
         allocatable_tokens = (
             self.token_to_kv_pool_allocator.available_size()
             - self.num_reserved_decode_tokens
