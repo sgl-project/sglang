@@ -28,7 +28,8 @@ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPo
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs, MediaPaddingHelperTokenPairs
+from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.multi_modality_padding import MediaPaddingHelperTokenPairs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
@@ -218,7 +219,6 @@ class InternAttention(nn.Module):
 
     def _naive_attn(self, x):
         B, N, C = x.shape
-        print(x.shape)
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
 

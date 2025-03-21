@@ -32,6 +32,7 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -63,6 +64,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
@@ -102,6 +105,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
@@ -197,8 +201,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
+
+            self.recv_from_rpc = get_zmq_socket(
+                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
         else:
             self.recv_from_tokenizer = None
+            self.recv_from_rpc = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
@@ -380,6 +389,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (RpcReqInput, self.handle_rpc_request),
             ]
         )
 
@@ -438,6 +448,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_worker.get_tp_cpu_group(),
+                    page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -481,7 +493,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 },
             )
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -501,7 +513,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
@@ -552,6 +564,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+
+            while True:
+                try:
+                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
 
@@ -603,7 +622,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                if isinstance(output, RpcReqOutput):
+                    if self.recv_from_rpc is not None:
+                        self.recv_from_rpc.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
 
     def handle_generate_request(
         self,
@@ -878,7 +901,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
             spec_accept_length = 0
@@ -896,7 +918,6 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-                f"largest-len: {self._largest_prefill_decode_len}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
             )
 
@@ -1001,7 +1022,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
 
         # Handle DP attention
         if self.server_args.enable_dp_attention:
-            ret = self.prepare_dp_attn_batch(ret)
+            ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
 
@@ -1273,39 +1294,72 @@ class Scheduler(SchedulerOutputProcessorMixin):
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
+            global_num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
+            if not self.spec_algorithm.is_none() and self.spec_algorithm.is_eagle():
+                num_tokens = num_tokens * self.server_args.speculative_num_draft_tokens
+            global_num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
+            global_num_tokens_for_logprob = sum(
+                [
+                    # We should have at least 1 token for sample in every case.
+                    max(extend_len - logprob_start_len, 1)
+                    for logprob_start_len, extend_len in zip(
+                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                    )
+                ]
+            )
 
-        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
-        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
+        if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
+            can_cuda_graph = 1
+        else:
+            can_cuda_graph = 0
+
+        if not self.spec_algorithm.is_none():
+            # TODO(sang): Support cuda graph when idle batch is there.
+            if local_batch is None or local_batch.forward_mode.is_idle():
+                can_cuda_graph = 0
+
+        is_extend_in_batch = (
+            local_batch.forward_mode.is_extend() if local_batch else False
+        )
+        local_info = torch.tensor(
+            [
+                num_tokens,
+                can_cuda_graph,
+                global_num_tokens_for_logprob,
+                is_extend_in_batch,
+            ],
+            dtype=torch.int64,
+        )
+        global_info = torch.empty(
+            (self.server_args.dp_size, self.attn_tp_size, 4),
+            dtype=torch.int64,
+        )
         torch.distributed.all_gather_into_tensor(
-            global_num_tokens,
-            local_num_tokens,
+            global_info.flatten(),
+            local_info,
             group=self.tp_cpu_group,
         )
+        global_num_tokens = global_info[:, 0, 0].tolist()
+        can_cuda_graph = min(global_info[:, 0, 1].tolist())
+        global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+        is_extend_in_batch = global_info[:, 0, 3].tolist()
 
-        if local_batch is None and global_num_tokens.max().item() > 0:
+        if local_batch is None and max(global_num_tokens) > 0:
             local_batch = self.get_idle_batch()
 
         if local_batch is not None:
-            local_batch.global_num_tokens = global_num_tokens.tolist()
+            local_batch.global_num_tokens = global_num_tokens
+            local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
 
             # Check forward mode for cuda graph
             if not self.server_args.disable_cuda_graph:
-                forward_mode_state = torch.tensor(
-                    (1 if local_batch.forward_mode.is_decode_or_idle() else 0),
-                    dtype=torch.int32,
-                )
-                torch.distributed.all_reduce(
-                    forward_mode_state,
-                    op=torch.distributed.ReduceOp.MIN,
-                    group=self.tp_cpu_group,
-                )
-                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
+                local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
-        return local_batch
+        return local_batch, any(is_extend_in_batch)
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
@@ -1460,6 +1514,47 @@ class Scheduler(SchedulerOutputProcessorMixin):
         return SetInternalStateReqOutput(
             updated=True,
             server_args=global_server_args_dict,
+        )
+
+    def handle_rpc_request(self, recv_req: RpcReqInput):
+        # Handle RPC requests
+        logger.info(
+            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
+        )
+
+        success = True
+        exec = None
+        try:
+            func = getattr(self, recv_req.method)
+            func(recv_req.parameters)
+        except Exception as e:
+            success = False
+            exec = e
+            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+
+        barrier()
+        return RpcReqOutput(success, "" if not exec else str(exec))
+
+    def save_remote_model(self, params):
+        url = params["url"]
+
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            worker = self.tp_worker.worker
+        else:
+            worker = self.tp_worker
+
+        worker.model_runner.save_remote_model(url)
+
+    def save_sharded_model(self, params):
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            worker = self.tp_worker.worker
+        else:
+            worker = self.tp_worker
+
+        worker.model_runner.save_sharded_model(
+            path=params["path"],
+            pattern=params["pattern"],
+            max_size=params["max_size"],
         )
 
     def abort_request(self, recv_req: AbortReq):
@@ -1696,7 +1791,7 @@ def run_scheduler_process(
         prefix = f" DP{dp_rank} TP{tp_rank}"
 
     # Config the process
-    # kill_itself_when_parent_died()  # This is disabled because it does not work for `--dp 2`
+    kill_itself_when_parent_died()
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
     parent_process = psutil.Process().parent()

@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -453,7 +454,13 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: List, timeout_per_file: float):
+@dataclass
+class TestFile:
+    name: str
+    estimated_time: float = 60
+
+
+def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.time()
     success = True
 

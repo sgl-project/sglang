@@ -21,7 +21,6 @@ IMAGE_PROCESSOR_MAPPING = {}
 def get_image_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseImageProcessor:
-    # print(IMAGE_PROCESSOR_MAPPING)
     for model_cls, processor_cls in IMAGE_PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
             return processor_cls(hf_config, server_args, processor)

@@ -172,27 +172,32 @@ class TokenizerManager:
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
 
-        # Create image processor placeholder
-        self.image_processor = get_dummy_image_processor()
+        if self.model_config.is_multimodal:
+            _processor = get_processor(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
 
-        # Create tokenizer
-        if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
+            # We want to parallelize the image pre-processing so we create an executor for it
+            # We creat image_processor for any skip_tokenizer_init to make sure we still encode
+            # images even with skip_tokenizer_init=False.
+            self.image_processor = get_image_processor(
+                self.model_config.hf_config, server_args, _processor
+            )
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = self.processor = None
+            else:
+                self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        else:
+            self.image_processor = get_dummy_image_processor()
 
-                # We want to parallelize the image pre-processing so we create an executor for it
-                self.image_processor = get_image_processor(
-                    self.model_config.hf_config, server_args, self.processor
-                )
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = self.processor = None
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -200,6 +205,7 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+
 
         # Store states
         self.no_create_loop = False

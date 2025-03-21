@@ -51,7 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend, next_power_of_2
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -69,10 +69,12 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
+    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
 }
@@ -140,129 +142,6 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
-class MediaPaddingHelper:
-    """
-    Media tokens (like image tokens) often need special handling during padding
-    to maintain model compatibility. This class provides the interface for
-    implementing different padding strategies for media tokens
-    """
-
-    @abstractmethod
-    def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
-    ) -> List[int]:
-        """
-        Pad the input ids sequence containing media tokens, and replace them with pad_values
-        """
-        pass
-
-
-class MediaPaddingHelperTokenPairs(MediaPaddingHelper):
-    """Handles media tokens enclosed by special token pairs (e.g., <image>...</image>).
-
-    This strategy is used when media content is marked by start/end token pairs
-    in the input sequence.
-    """
-
-    def __init__(self, media_token_pairs: List[Tuple[int, int]]) -> None:
-        self.media_token_pairs = media_token_pairs
-
-    def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
-    ) -> List[int]:
-        """
-        Media tokens are enclosed by special token pairs (e.g. <image>...</image>)
-
-        Pad the input ids sequence containing media tokens, and replace them with pad_values
-        """
-        pad_values = image_inputs.pad_values
-        media_token_pairs = self.media_token_pairs
-        start_tokens = [s for s, _e in media_token_pairs]
-        end_tokens = [e for _s, e in media_token_pairs]
-        # First start token marks new media
-        media_start_token = start_tokens[0]
-
-        padded_ids = []
-        last_idx = 0
-        media_idx = -1
-
-        start_indices = [i for i, x in enumerate(input_ids) if x in start_tokens]
-        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens]
-
-        if len(start_indices) != len(end_indices):
-            return input_ids
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
-
-            if input_ids[start_idx] == media_start_token:
-                media_idx += 1
-
-            num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[media_idx]
-            padded_ids.extend([pad_value] * num_tokens)
-
-            last_idx = end_idx
-
-        padded_ids.extend(input_ids[last_idx:])
-
-        assert len(input_ids) == len(padded_ids)
-        return padded_ids
-
-
-class MediaPaddingHelperSingleToken(MediaPaddingHelper):
-    """Handles single media tokens that need to be expanded to multiple tokens.
-
-    This strategy is used when a single media token represents content that should
-    be expanded to multiple tokens during processing.
-    """
-
-    def __init__(
-        self, num_media_token_calc_func: Callable[[Tuple[int, int, int]], int]
-    ) -> None:
-        self.num_media_token_calc_func = num_media_token_calc_func
-
-    def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: ImageInputs
-    ) -> List[int]:
-        """
-        Media tokens are enclosed by special token pairs (e.g. <image>...</image>)
-
-        Pad the input ids sequence containing media tokens, and replace them with pad_values
-        """
-        image_grid_thws = image_inputs.image_grid_thws
-        pad_values = image_inputs.pad_values
-
-        image_indices = [
-            idx
-            for idx, token in enumerate(input_ids)
-            if token == image_inputs.im_token_id
-        ]
-
-        image_inputs.image_offsets = []
-
-        input_ids_with_image = []
-        for image_cnt, _ in enumerate(image_grid_thws):
-            num_image_tokens = self.num_media_token_calc_func(
-                image_grid_thws[image_cnt]
-            )
-            if image_cnt == 0:
-                non_image_tokens = input_ids[: image_indices[image_cnt]]
-            else:
-                non_image_tokens = input_ids[
-                    image_indices[image_cnt - 1] + 1 : image_indices[image_cnt]
-                ]
-            input_ids_with_image.extend(non_image_tokens)
-            image_inputs.image_offsets.append(len(input_ids_with_image))
-            pad_ids = pad_values * (
-                (num_image_tokens + len(pad_values)) // len(pad_values)
-            )
-            input_ids_with_image.extend(pad_ids[:num_image_tokens])
-        input_ids_with_image.extend(input_ids[image_indices[-1] + 1 :])
-
-        return input_ids_with_image
-
-
 @dataclasses.dataclass
 class ImageInputs:
     """The image related inputs."""
@@ -283,9 +162,18 @@ class ImageInputs:
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Qwen2-VL video related
+    video_token_id: Optional[int] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+
+    # deepseek vl2 related
+    image_seq_mask: Optional[List[torch.Tensor]] = None
+    image_spatial_crop: Optional[List[torch.Tensor]] = None
 
     # The id of the single-image placeholder token
     im_token_id: Optional[torch.Tensor] = None
+
     # All the images in the batch should share the same special image
     # bound token ids.
     im_start_id: Optional[int] = None
@@ -316,6 +204,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -331,6 +221,9 @@ class ImageInputs:
         return ret
 
     def merge(self, other):
+        """
+        merge image inputs when requests are being merged
+        """
         assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
         self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
@@ -349,6 +242,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
@@ -505,7 +400,7 @@ class Req:
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
             ) = None
-        self.hidden_states = []
+        self.hidden_states: List[List[float]] = []
 
         # Embedding (return values)
         self.embedding = None
@@ -1388,14 +1283,14 @@ class ScheduleBatch:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
 
-        self.req_pool_indices = torch.concat(
+        self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            self.output_ids = torch.concat([self.output_ids, other.output_ids])
+            self.output_ids = torch.cat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -1417,7 +1312,10 @@ class ScheduleBatch:
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            if global_server_args_dict["enable_flashinfer_mla"]:
+            if (
+                global_server_args_dict["enable_flashinfer_mla"]
+                or global_server_args_dict["enable_flashmla"]
+            ):
                 decode_seq_lens = self.seq_lens.cpu()
             else:
                 decode_seq_lens = None

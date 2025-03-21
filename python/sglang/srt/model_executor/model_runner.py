@@ -35,8 +35,6 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -147,10 +145,12 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "enable_deepep_moe": server_args.enable_deepep_moe,
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
                 "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+                "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
@@ -189,9 +189,6 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
-            self.torch_tp_applied = True
-        else:
-            self.torch_tp_applied = False
 
         # Init lora
         if server_args.lora_paths is not None:
@@ -211,6 +208,10 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+        # auxiliary hidden capture mode. TODO: expose this to server args?
+        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+            self.model.set_eagle3_layers_to_capture()
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
@@ -225,6 +226,9 @@ class ModelRunner:
                         "MLA optimization is turned on. Use flashinfer mla backend."
                     )
                     server_args.attention_backend = "flashinfer_mla"
+                elif server_args.enable_flashmla:
+                    logger.info("MLA optimization is turned on. Use flashmla decode.")
+                    server_args.attention_backend = "flashmla"
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     server_args.attention_backend = "triton"
@@ -256,13 +260,29 @@ class ModelRunner:
 
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
+            ] or self.model_config.hf_config.architectures == [
+                "Qwen2_5_VLForConditionalGeneration"
             ]:
-                # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen-vl series."
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
+
+            if self.model_config.hf_config.architectures == ["DeepseekVL2ForCausalLM"]:
+                # TODO: deepseek-vl2 does not support radix cache now, set disable_radix_cache=True automatically
+                logger.info(
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for deekseek-vl2."
+                )
+                server_args.chunked_prefill_size = -1
+                server_args.disable_radix_cache = True
+
+        if server_args.enable_deepep_moe:
+            logger.info("DeepEP is turned on.")
+            assert (
+                server_args.enable_dp_attention == True
+            ), "Currently DeepEP is bind to Attention DP. Set '--enable-dp-attention --enable-deepep-moe'"
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -608,6 +628,8 @@ class ModelRunner:
             load_config=self.load_config,
             dtype=self.dtype,
             lora_backend=self.server_args.lora_backend,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         logger.info("LoRA manager ready.")
 
@@ -842,6 +864,10 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashInferMLAAttnBackend(self)
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+            self.attn_backend = FlashMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1010,6 +1036,22 @@ class ModelRunner:
         if rope_scaling is None:
             return False
         return rope_scaling.get("type", None) == "mrope"
+
+    def save_remote_model(self, url: str):
+        from sglang.srt.model_loader.loader import RemoteModelLoader
+
+        logger.info(f"Saving model to {url}")
+        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
+
+    def save_sharded_model(
+        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
+    ):
+        from sglang.srt.model_loader.loader import ShardedStateLoader
+
+        logger.info(
+            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
+        )
+        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

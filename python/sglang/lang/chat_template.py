@@ -534,17 +534,17 @@ def match_granite_instruct(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_janus_chat(model_path: str):
-    model_path = model_path.lower()
-    if "janus" in model_path:
-        return get_chat_template("janus")
-
-
-@register_chat_template_matching_function
 def match_internvl_chat(model_path: str):
     model_path = model_path.lower()
     if "internvl" in model_path:
         return get_chat_template("internvl2_5")
+    
+    
+def match_gemma3_instruct(model_path: str):
+    model_path = model_path.lower()
+    if "gemma-3" in model_path and "1b" not in model_path:
+        # gemma-3-1b-it is completion model
+        return get_chat_template("gemma-it")
 
 
 if __name__ == "__main__":
