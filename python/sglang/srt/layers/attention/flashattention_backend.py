@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_varlen_func
 
 
 @dataclass
@@ -70,7 +70,6 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # QQ NOTE: need to support extend case with kv cache
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -85,9 +84,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
         # Use Flash Attention for prefill
-        prefix_lens = forward_batch.extend_prefix_lens
         extend_seq_lens = forward_batch.extend_seq_lens
-        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+        extend_no_prefix = not any(forward_batch.extend_prefix_lens)
         seqlens_in_batch = forward_batch.seq_lens
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
@@ -119,8 +117,6 @@ class FlashAttentionBackend(AttentionBackend):
                 else (-1, -1)
             ),
             softcap=layer.logit_cap,
-            # qv=qv_unpad,
-            # q_descale=q_descale,
             k_descale=layer.k_scale,
             v_descale=layer.v_scale,
         )
@@ -134,7 +130,19 @@ class FlashAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-    ):
+    ) -> torch.Tensor:
+        """Forward pass with FlashAttention.
+
+        Args:
+            q: shape = [num_tokens, num_heads, head_size]
+            k: shape = [num_tokens, num_kv_heads, head_size]
+            v: shape = [num_tokens, num_kv_heads, head_size]
+            layer: RadixAttention layer
+            forward_batch: ForwardBatch contains forward batch information
+            save_kv_cache: boolean value to indicate if the kv cache should be saved
+        Returns:
+            shape = [num_tokens, num_heads * head_size]
+        """
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -166,8 +174,6 @@ class FlashAttentionBackend(AttentionBackend):
         max_seq_len_q = 1
         max_seq_len_k = seqlens_in_batch.max().item()
 
-        # torch.distributed.breakpoint()
-        # breakpoint()
         o, _ = flash_attn_varlen_func(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k=key_cache.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -184,36 +190,13 @@ class FlashAttentionBackend(AttentionBackend):
                 else (-1, -1)
             ),
             softcap=layer.logit_cap,
-            # qv=qv_unpad,
-            # q_descale=q_descale,
             k_descale=layer.k_scale,
             v_descale=layer.v_scale,
         )
 
-        # torch.distributed.breakpoint()
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-        # return o.squeeze(1).view(-1, layer.tp_q_head_num * layer.head_dim)
-
-        # o, _ = flash_attn_with_kvcache(
-        #     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1),
-        #     k_cache=key_cache,
-        #     v_cache=value_cache,
-        #     cache_seqlens=cache_seqlens,
-        #     softmax_scale=layer.scaling,
-        #     causal=True,
-        #     window_size=((layer.sliding_window_size - 1, 0) if layer.sliding_window_size is not None else (-1, -1)),
-        #     softcap=layer.logit_cap,
-        #     return_softmax_lse=True,
-        #     num_splits=1,  # kv split for chunked process and speed tuning
-        #     # descale_q=descale_q,
-        #     k_descale=layer.k_scale,
-        #     v_descale=layer.v_scale,
-        # )
-        # o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def prepare_kv_cache(self, forward_batch: ForwardBatch, layer: RadixAttention):
-        # torch.distributed.breakpoint()
-        # breakpoint()
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache_pool, value_cache_pool = kv_cache[0], kv_cache[1]
 

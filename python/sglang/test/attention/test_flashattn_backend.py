@@ -19,6 +19,13 @@ class MockModelRunner:
         self.device = device
 
 
+class MockReqToTokenPool:
+    def __init__(self, batch_size, seq_len, device):
+        self.req_to_token = torch.arange(batch_size * seq_len, device=device).reshape(
+            batch_size, seq_len
+        )
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFlashAttentionBackend(unittest.TestCase):
     def setUp(self):
@@ -31,34 +38,12 @@ class TestFlashAttentionBackend(unittest.TestCase):
         self.seq_len = 4
         self.num_heads = 2
         self.head_dim = 8
+        self.device = "cuda"
+        self.dtype = torch.float16
 
-    def test_forward_extend(self):
-        # Create mock inputs with correct shapes
-        # Shape should be [batch_size * seq_len, num_heads, head_dim]
-        q = torch.randn(
-            self.batch_size * self.seq_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        k = torch.randn(
-            self.batch_size * self.seq_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        v = torch.randn(
-            self.batch_size * self.seq_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-
-        # Create attention layer
-        layer = RadixAttention(
+    def _create_attention_layer(self):
+        """Helper method to create an attention layer."""
+        return RadixAttention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             scaling=1.0,
@@ -66,155 +51,145 @@ class TestFlashAttentionBackend(unittest.TestCase):
             layer_id=0,
         )
 
-        # Create mock forward batch with all required arguments
-        forward_batch = ForwardBatch(
-            batch_size=self.batch_size,
-            input_ids=torch.randint(
-                0, 100, (self.batch_size, self.seq_len), device="cuda"
-            ),
-            out_cache_loc=torch.arange(self.batch_size * self.seq_len, device="cuda"),
-            seq_lens_sum=self.batch_size * self.seq_len,
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.arange(self.batch_size, device="cuda"),
-            seq_lens=torch.tensor([self.seq_len] * self.batch_size, device="cuda"),
-            extend_prefix_lens=torch.tensor([2] * self.batch_size, device="cuda"),
-            extend_seq_lens=torch.tensor([2] * self.batch_size, device="cuda"),
-            attn_backend=self.backend,
-        )
-
-        # Initialize KV cache pool with correct shapes
-        kv_cache_size = self.batch_size * self.seq_len
-        forward_batch.token_to_kv_pool = MHATokenToKVPool(
-            size=kv_cache_size,
+    def _create_kv_pool(self, size):
+        """Helper method to create a KV pool."""
+        return MHATokenToKVPool(
+            size=size,
             page_size=1,  # only consider page=1 for unit test
-            dtype=torch.float16,
+            dtype=self.dtype,
             head_num=self.num_heads,
             head_dim=self.head_dim,
             layer_num=1,  # only consider layer=1 for unit test
-            device="cuda",
+            device=self.device,
             enable_memory_saver=False,
         )
 
-        # Run forward_extend
-        output = self.backend.forward_extend(q, k, v, layer, forward_batch)
-
-        # Basic shape checks
-        expected_shape = (
-            self.batch_size * self.seq_len,
-            self.num_heads * self.head_dim,
+    def _create_qkv_tensors(self, tokens_len):
+        """Helper method to create q, k, v tensors."""
+        return (
+            torch.randn(
+                tokens_len,
+                self.num_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            torch.randn(
+                tokens_len,
+                self.num_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            torch.randn(
+                tokens_len,
+                self.num_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            ),
         )
+
+    def _verify_output(self, output, expected_shape):
+        """Helper method to verify output."""
         self.assertEqual(
             output.shape,
             expected_shape,
             f"Expected shape {expected_shape}, got {output.shape}",
         )
-
-        # Check output is not None and contains no NaN values
+        self.assertEqual(output.dtype, self.dtype)
+        self.assertEqual(output.device.type, "cuda")
         self.assertEqual(
             torch.isnan(output).sum().item(), 0, "Output contains NaN values"
         )
 
-    def test_forward_decode(self):
-        # For decode, we only have one token per sequence
-        decode_len = 1
-        curr_seq_len = self.seq_len + decode_len
-        # Create inputs for the current token
-        q = torch.randn(
-            self.batch_size * decode_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        # k and v for current token (will be added to cache)
-        k = torch.randn(
-            self.batch_size * decode_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        v = torch.randn(
-            self.batch_size * decode_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
+    def test_forward_extend(self):
+        """Test the standard extend operation."""
+        # Create test inputs
+        q, k, v = self._create_qkv_tensors(self.batch_size * self.seq_len)
 
         # Create attention layer
-        layer = RadixAttention(
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            scaling=1.0,
-            num_kv_heads=self.num_heads,
-            layer_id=0,
-        )
+        layer = self._create_attention_layer()
 
-        # Create mock req_to_token_pool
-        class MockReqToTokenPool:
-            def __init__(self, batch_size, seq_len, device):
-                self.req_to_token = torch.arange(
-                    batch_size * seq_len, device=device
-                ).reshape(batch_size, seq_len)
-
-        # Create mock forward batch with all required arguments for decode
+        # Create forward batch
         forward_batch = ForwardBatch(
             batch_size=self.batch_size,
             input_ids=torch.randint(
-                0, 100, (self.batch_size, decode_len), device="cuda"
+                0, 100, (self.batch_size, self.seq_len), device=self.device
+            ),
+            out_cache_loc=torch.arange(
+                self.batch_size * self.seq_len, device=self.device
+            ),
+            seq_lens_sum=self.batch_size * self.seq_len,
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.arange(self.batch_size, device=self.device),
+            seq_lens=torch.tensor([self.seq_len] * self.batch_size, device=self.device),
+            extend_prefix_lens=torch.tensor([2] * self.batch_size, device=self.device),
+            extend_seq_lens=torch.tensor([2] * self.batch_size, device=self.device),
+            attn_backend=self.backend,
+        )
+
+        # Add token pool and KV cache
+        forward_batch.req_to_token_pool = MockReqToTokenPool(
+            self.batch_size, self.seq_len, self.device
+        )
+        forward_batch.token_to_kv_pool = self._create_kv_pool(
+            self.batch_size * self.seq_len
+        )
+
+        # Run forward_extend
+        output = self.backend.forward_extend(q, k, v, layer, forward_batch)
+
+        # Verify output
+        expected_shape = (
+            self.batch_size * self.seq_len,
+            self.num_heads * self.head_dim,
+        )
+        self._verify_output(output, expected_shape)
+
+    def test_forward_decode(self):
+        """Test the decode operation with cached tokens."""
+        # For decode, we only have one token per sequence
+        decode_len = 1
+        curr_seq_len = self.seq_len + decode_len
+
+        # Create test inputs
+        q, k, v = self._create_qkv_tensors(self.batch_size * decode_len)
+
+        # Create attention layer
+        layer = self._create_attention_layer()
+
+        # Create forward batch
+        forward_batch = ForwardBatch(
+            batch_size=self.batch_size,
+            input_ids=torch.randint(
+                0, 100, (self.batch_size, decode_len), device=self.device
             ),
             out_cache_loc=torch.arange(
                 self.batch_size * self.seq_len,
                 self.batch_size * curr_seq_len,
-                device="cuda",
+                device=self.device,
             ),
             seq_lens_sum=self.batch_size * curr_seq_len,
             forward_mode=ForwardMode.DECODE,
-            req_pool_indices=torch.arange(self.batch_size, device="cuda"),
-            seq_lens=torch.tensor([curr_seq_len] * self.batch_size, device="cuda"),
+            req_pool_indices=torch.arange(self.batch_size, device=self.device),
+            seq_lens=torch.tensor([curr_seq_len] * self.batch_size, device=self.device),
             attn_backend=self.backend,
         )
 
-        # Add req_to_token_pool to forward_batch
+        # Add token pool and KV cache
         forward_batch.req_to_token_pool = MockReqToTokenPool(
-            self.batch_size, curr_seq_len, "cuda"
+            self.batch_size, curr_seq_len, self.device
+        )
+        forward_batch.token_to_kv_pool = self._create_kv_pool(
+            self.batch_size * curr_seq_len
         )
 
-        # Initialize KV cache pool
-        kv_cache_size = self.batch_size * (
-            curr_seq_len
-        )  # Include space for new token
-        forward_batch.token_to_kv_pool = MHATokenToKVPool(
-            size=kv_cache_size,
-            page_size=1,
-            dtype=torch.float16,
-            head_num=self.num_heads,
-            head_dim=self.head_dim,
-            layer_num=1,
-            device="cuda",
-            enable_memory_saver=False,
-        )
-
-        # Pre-fill the KV cache with some values
-        # This simulates having previous tokens' KV pairs in cache
-        cache_k = torch.randn(
-            self.batch_size * self.seq_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        cache_v = torch.randn(
-            self.batch_size * self.seq_len,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device="cuda",
-        )
+        # Pre-fill KV cache
+        cache_k, cache_v, _ = self._create_qkv_tensors(self.batch_size * self.seq_len)
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer,
-            torch.arange(self.batch_size * self.seq_len, device="cuda"),
+            torch.arange(self.batch_size * self.seq_len, device=self.device),
             cache_k,
             cache_v,
             layer.k_scale,
@@ -224,18 +199,90 @@ class TestFlashAttentionBackend(unittest.TestCase):
         # Run forward_decode
         output = self.backend.forward_decode(q, k, v, layer, forward_batch)
 
-        # Basic shape checks - decode output should be [batch_size, num_heads * head_dim]
+        # Verify output
         expected_shape = (self.batch_size, self.num_heads * self.head_dim)
-        self.assertEqual(
-            output.shape,
-            expected_shape,
-            f"Expected shape {expected_shape}, got {output.shape}",
+        self._verify_output(output, expected_shape)
+
+    def test_forward_extend_with_prefix(self):
+        """Test extending from cached prefix tokens."""
+        # Define prefix and extend lengths
+        prefix_len = 2
+        extend_len = 2
+        total_len = prefix_len + extend_len
+
+        # Create test inputs for the extend portion
+        q, k, v = self._create_qkv_tensors(self.batch_size * extend_len)
+
+        # Create attention layer
+        layer = self._create_attention_layer()
+
+        # Create forward batch
+        forward_batch = ForwardBatch(
+            batch_size=self.batch_size,
+            input_ids=torch.randint(
+                0, 100, (self.batch_size, extend_len), device=self.device
+            ),
+            out_cache_loc=torch.arange(
+                self.batch_size * prefix_len,
+                self.batch_size * total_len,
+                device=self.device,
+            ),
+            seq_lens_sum=self.batch_size * total_len,
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.arange(self.batch_size, device=self.device),
+            seq_lens=torch.tensor([total_len] * self.batch_size, device=self.device),
+            extend_prefix_lens=torch.tensor(
+                [prefix_len] * self.batch_size, device=self.device
+            ),
+            extend_seq_lens=torch.tensor(
+                [extend_len] * self.batch_size, device=self.device
+            ),
+            attn_backend=self.backend,
         )
 
-        # Check output is not None and contains no NaN values
-        self.assertEqual(
-            torch.isnan(output).sum().item(), 0, "Output contains NaN values"
+        # Add token pool and KV cache
+        forward_batch.req_to_token_pool = MockReqToTokenPool(
+            self.batch_size, total_len, self.device
         )
+        forward_batch.token_to_kv_pool = self._create_kv_pool(
+            self.batch_size * total_len
+        )
+
+        # Pre-fill the KV cache for prefix with known values
+        cache_k = torch.ones(
+            self.batch_size * prefix_len,
+            self.num_heads,
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        cache_v = (
+            torch.ones(
+                self.batch_size * prefix_len,
+                self.num_heads,
+                self.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            * 2
+        )
+
+        # Set the prefix KV cache
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer,
+            torch.arange(self.batch_size * prefix_len, device=self.device),
+            cache_k,
+            cache_v,
+            layer.k_scale,
+            layer.v_scale,
+        )
+
+        # Run forward_extend
+        output = self.backend.forward_extend(q, k, v, layer, forward_batch)
+
+        # Verify output
+        expected_shape = (self.batch_size * extend_len, self.num_heads * self.head_dim)
+        self._verify_output(output, expected_shape)
 
 
 if __name__ == "__main__":
