@@ -1,5 +1,4 @@
 import os
-import traceback
 from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -124,15 +123,9 @@ def _execute_two_batch_raw(inputs_a, inputs_b, stages_a, stages_b, delta_stages:
     for _ in range(delta_stages):
         executor_a.next()
 
-    try:
-        for _ in range(executor_a.num_stages - delta_stages):
-            executor_a.next()
-            executor_b.next()
-    except BaseException as e:
-        # TODO adhoc
-        print(f'hi [{get_tensor_model_parallel_rank()}] _execute_two_batch_raw error!!! {e=}')
-        traceback.print_exc()
-        raise
+    for _ in range(executor_a.num_stages - delta_stages):
+        executor_a.next()
+        executor_b.next()
 
     for _ in range(delta_stages):
         executor_b.next()
@@ -162,9 +155,7 @@ class _StageExecutor:
 
         with ctx:
             try:
-                # print(f'hi [{get_tensor_model_parallel_rank()}] StageExecutor.next {debug_name=} START', flush=True)
                 self._stage_output = stage(state=self._stage_state, **(self._stage_output or {}))
-                # print(f'hi [{get_tensor_model_parallel_rank()}] StageExecutor.next {debug_name=} END', flush=True)
             except Exception as e:
                 raise Exception(f'Error when handling stage {debug_name} {e=}')
 

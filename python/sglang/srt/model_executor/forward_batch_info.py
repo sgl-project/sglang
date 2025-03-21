@@ -475,8 +475,6 @@ class ForwardBatch:
         start_seq_index: int,
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
-        # TODO test this can be removed
-        # output_global_num_tokens: List[int],
     ):
         num_tokens = self.input_ids.shape[0]
         num_seqs = self.batch_size
@@ -524,8 +522,7 @@ class ForwardBatch:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            # TODO only used by qwen2-vl, thus not checked
-            "mrope_positions",
+            "mrope_positions",  # only used by qwen2-vl, thus not care
         ]:
             output_dict[key] = getattr(self, key)
 
@@ -536,19 +533,6 @@ class ForwardBatch:
         extend_num_tokens = _compute_extend_num_tokens(
             output_dict["input_ids"], output_dict["forward_mode"]
         )
-
-        # TODO test this can be removed
-        # # TODO improve, e.g. unify w/ `init_raw`
-        # if output_global_num_tokens is not None:
-        #     max_len = max(output_global_num_tokens)
-        #     tp_size = get_tensor_model_parallel_world_size()
-        #     gathered_buffer = torch.zeros(
-        #         (max_len * tp_size, self.gathered_buffer.shape[1]),
-        #         dtype=self.gathered_buffer.dtype,
-        #         device=self.gathered_buffer.device,
-        #     )
-        # else:
-        #     gathered_buffer = None
 
         output_dict.update(
             dict(
@@ -561,7 +545,6 @@ class ForwardBatch:
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
 
-                # TODO test this can be removed
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 gathered_buffer=None,

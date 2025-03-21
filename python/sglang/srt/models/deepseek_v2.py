@@ -1378,9 +1378,6 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
-        print(
-            f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model.forward execute normal layers START {hidden_states.shape=} {input_ids.shape=} {forward_batch.forward_mode=}',
-            flush=True)
         normal_num_layers = (
             self.first_k_dense_replace
             if forward_batch.can_run_tbo
@@ -1428,9 +1425,6 @@ class DeepseekV2Model(nn.Module):
             - 20
         )
         with configure_deep_gemm_num_sms(num_sms=chosen_num_sms):
-            print(
-                f'hi [{get_tensor_model_parallel_rank()}] DeepseekV2Model._forward_tbo_layers really run START {hidden_states.shape=} {forward_batch.forward_mode=}',
-                flush=True)
             return two_batch_overlap.model_forward_execute_two_batch(
                 inputs=dict(
                     positions=positions,

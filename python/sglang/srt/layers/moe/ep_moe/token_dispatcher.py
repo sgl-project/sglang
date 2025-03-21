@@ -49,7 +49,6 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
         or _buffer_normal.num_nvl_bytes < num_nvl_bytes
         or _buffer_normal.num_rdma_bytes < num_rdma_bytes
     ):
-        print('hi get_buffer_normal create a new buffer', flush=True)
         _buffer_normal = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer_normal
 
@@ -212,8 +211,6 @@ class DeepEPDispatcher:
         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         self.num_max_dispatch_tokens_per_rank = 128
 
-        self.current_stage = None
-
         if not use_deepep:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
@@ -298,12 +295,6 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_start BEGIN '
-        #       f'{hidden_states.shape=} {topk_idx.shape=} {topk_weights.shape=} {num_experts=} {forward_mode=}',
-        #       flush=True)
-        assert self.current_stage is None
-        self.current_stage = 'dispatch_start'
-
         self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
         # Todo: enable low latency dispatch
@@ -335,11 +326,6 @@ class DeepEPDispatcher:
         return event, handle, topk_idx, topk_weights, hidden_states
 
     def dispatch_stage_wait(self, state):
-        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] dispatch_stage_wait BEGIN',
-        #       flush=True)
-        assert self.current_stage == 'dispatch_start'
-        self.current_stage = 'dispatch_wait'
-
         event, handle, topk_idx, topk_weights, hidden_states = state
 
         if self.async_finish:
@@ -474,11 +460,6 @@ class DeepEPDispatcher:
     def combine_stage_start(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ):
-        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_start BEGIN',
-        #       flush=True)
-        assert self.current_stage == 'dispatch_wait'
-        self.current_stage = 'combine_start'
-
         # Todo: enable low latency combine
         if True:  # not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
@@ -494,11 +475,6 @@ class DeepEPDispatcher:
         return event, hidden_states
 
     def combine_stage_wait(self, state):
-        # print(f'hi [{get_tensor_model_parallel_rank()}] DeepEPDispatcher[{self.debug_name}] combine_stage_wait BEGIN',
-        #       flush=True)
-        assert self.current_stage == 'combine_start'
-        self.current_stage = None
-
         event, hidden_states = state
 
         if self.async_finish:
