@@ -525,6 +525,7 @@ def v1_generate_request(
                 "min_new_tokens": request.min_tokens,
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
+                "stop_regex": request.stop_regex,
                 "top_p": request.top_p,
                 "top_k": request.top_k,
                 "min_p": request.min_p,
@@ -947,6 +948,7 @@ def v1_chat_generate_request(
                         encoded = encoded[1:]
                     prompt_ids += encoded
                 stop = request.stop
+                stop_regex = request.stop_regex
                 image_data = None
                 modalities = []
             else:
@@ -955,6 +957,7 @@ def v1_chat_generate_request(
                 image_data = conv.image_data
                 modalities = conv.modalities
                 stop = conv.stop_str or []
+                stop_regex = []
                 if request.stop:
                     if isinstance(request.stop, str):
                         stop.append(request.stop)
@@ -965,6 +968,7 @@ def v1_chat_generate_request(
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
             stop = request.stop
+            stop_regex = request.stop_regex
             image_data = None
             modalities = []
         input_ids.append(prompt_ids)
@@ -979,6 +983,7 @@ def v1_chat_generate_request(
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
+            "stop_regex": stop_regex,
             "top_p": request.top_p,
             "top_k": request.top_k,
             "min_p": request.min_p,
