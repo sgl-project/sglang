@@ -257,7 +257,9 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_decode():
             if self.use_mab:
                 batch_size = batch.batch_size()
-                self.select_mab_strategy(batch_size)
+                strategy = self.select_mab_strategy(batch_size)
+                self.mab_last_pull["batch_size"] = batch_size
+                self.mab_last_pull["mab_strategy"] = strategy
 
             batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
             batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
@@ -605,7 +607,7 @@ class EAGLEWorker(TpModelWorker):
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        # Change from self.topk to self.max_topk, so that it can support MAB with different topk values
+        # Always get max_topk candidates to match CUDA graph buffer size
         draft_input.topk_p, draft_input.topk_index = fast_topk(
             probs, self.max_topk, dim=-1
         )
@@ -652,6 +654,7 @@ class EAGLEWorker(TpModelWorker):
 
         self.draft_attn_backend = resources.draft_attn_backend
         self.cuda_graph_runner = resources.draft_cuda_graph_runner
+        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.target_worker.model_runner.attn_backend = resources.target_attn_backend
         self.target_worker.model_runner.cuda_graph_runner = (
             resources.target_cuda_graph_runner
@@ -677,10 +680,6 @@ class EAGLEWorker(TpModelWorker):
 
         # Apply the selected strategy
         self.set_mab_strategy(selected_strategy)
-
-        # Record the selected strategy for this batch
-        self.mab_last_pull["mab_strategy"] = selected_strategy
-        self.mab_last_pull["batch_size"] = batch_size
 
         return selected_strategy
 
@@ -757,12 +756,12 @@ class EAGLEWorker(TpModelWorker):
 
         # Set up resources for all strategies
         for mab_strategy in self.mab_strategies:
+            if mab_strategy == self.default_mab_strategy:
+                continue
+            
             logging.info(f"Initializing MAB strategy {mab_strategy} resources")
             self.update_speculative_args(mab_strategy)
             self.max_topk = max(self.max_topk, self.topk)
-
-            if mab_strategy == self.default_mab_strategy:
-                continue
 
             # Initialize draft worker resources
             with self.draft_tp_context(self.draft_model_runner.tp_group):
