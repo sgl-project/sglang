@@ -1382,7 +1382,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
         local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
 
-        print(f'hi [{get_tensor_model_parallel_rank()}] scheduler {local_can_run_tbo_aggregated=} {forward_mode_same=}')
+        print(
+            f'hi [{get_tensor_model_parallel_rank()}] scheduler {local_can_run_tbo_aggregated=} {forward_mode_same=} {global_info[:, 0, 5].tolist()=}')
         can_run_tbo = local_can_run_tbo_aggregated and forward_mode_same
 
         if local_batch is None and max(global_num_tokens) > 0:
