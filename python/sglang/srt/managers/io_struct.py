@@ -649,8 +649,9 @@ class ProfileReqType(Enum):
 
 
 class ExpertDistributionReq(Enum):
-    RESET = 1
-    DUMP_RECORD = 2
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
 
 
 @dataclass

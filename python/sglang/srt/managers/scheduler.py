@@ -1898,8 +1898,10 @@ class Scheduler(
             )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        if recv_req == ExpertDistributionReq.RESET:
-            expert_distribution_recorder.reset()
+        if recv_req == ExpertDistributionReq.START_RECORD:
+            expert_distribution_recorder.start_record()
+        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+            expert_distribution_recorder.stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
             expert_distribution_recorder.dump_record()
         else:

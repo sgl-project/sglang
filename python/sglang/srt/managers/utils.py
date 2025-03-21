@@ -1,9 +1,10 @@
 import logging
 from http import HTTPStatus
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from collections import defaultdict
 import json
 import time
+import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
@@ -60,19 +61,34 @@ class ExpertDistributionRecorder:
         # the length of the tuple is topk's k value
         self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(list)
         self._current_layer_id = None
+        self._record = False
 
     def set_current_layer(self, layer_idx):
         self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
-        topk_ids_list = topk_ids.cpu().numpy().tolist()
+        if not self._record:
+            return
+        topk_ids_list = topk_ids.to('cpu', non_blocking=True).numpy().tolist()
+        torch.cuda.synchronize()
         for i in topk_ids_list:
             self._expert_distribution_record[self._current_layer_id].append(tuple(i))
 
     def reset(self):
+        """Reset the expert distribution recorder."""
         self._expert_distribution_record.clear()
 
+    def start_record(self):
+        """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
+        self.reset()
+        self._record = True
+
+    def stop_record(self):
+        """Stop recording the expert distribution. Set the recording flag to False."""
+        self._record = False
+
     def dump_record(self):
+        """Dump the expert distribution record to a file. Reset the recorder after dumping."""
         results = {}
         for layer_idx, layer_record in self._expert_distribution_record.items():
             results[layer_idx] = defaultdict(lambda: defaultdict(int))
@@ -81,3 +97,4 @@ class ExpertDistributionRecorder:
                     results[layer_idx][k_idx][expert_idx] += 1
         with open(f"expert_distribution_{time.time()}.json", 'w') as fd:
             json.dump(results, fd)
+        self.reset()

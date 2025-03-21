@@ -343,12 +343,22 @@ async def stop_profile_async():
     )
 
 
-@app.api_route("/reset_expert_distribution_record", methods=["GET", "POST"])
-async def reset_expert_distribution_record_async():
-    """Reset expert distribution recording."""
-    _global_state.tokenizer_manager.reset_expert_distribution_record()
+@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+async def start_expert_distribution_record_async():
+    """Start recording the expert distribution. Clear the previous record if any."""
+    _global_state.tokenizer_manager.start_expert_distribution_record()
     return Response(
-        content="Reset expert distribution recording.\n",
+        content="Start recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+async def stop_expert_distribution_record_async():
+    """Stop recording the expert distribution."""
+    _global_state.tokenizer_manager.stop_expert_distribution_record()
+    return Response(
+        content="Stop recording the expert distribution.\n",
         status_code=200,
     )
 

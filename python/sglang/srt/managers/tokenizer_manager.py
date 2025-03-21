@@ -638,8 +638,12 @@ class TokenizerManager:
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
 
-    def reset_expert_distribution_record(self):
-        req = ExpertDistributionReq.RESET
+    def start_expert_distribution_record(self):
+        req = ExpertDistributionReq.START_RECORD
+        self.send_to_scheduler.send_pyobj(req)
+
+    def stop_expert_distribution_record(self):
+        req = ExpertDistributionReq.STOP_RECORD
         self.send_to_scheduler.send_pyobj(req)
 
     def dump_expert_distribution_record(self):
