@@ -49,10 +49,14 @@ class SamplingParams:
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
-        boosted_tokens: Optional[List[int]] = None,
-        max_boost_fraction: float = 0.0,
-        ramp_tokens: int = 0,
-        boost_type: str = "linear",
+        min_reasoning_penalty: float = 0.0,
+        max_reasoning_penalty: float = 0.0,
+        num_reasoning_penalty_steps: int = 0,
+        stop_reasoning: Optional[Union[str, List[str]]] = None,
+        stop_reasoning_token_ids: Optional[List[int]] = None,
+        ngram_penalty: float = 0.0,
+        ngram_n: int = 32,
+        ngram_lookback_window: int = 512,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
@@ -78,11 +82,18 @@ class SamplingParams:
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
-        self.boosted_tokens = boosted_tokens if boosted_tokens is not None else []
-        self.max_boost_fraction = max_boost_fraction
-        self.ramp_tokens = ramp_tokens
-        self.boost_type = boost_type
+        self.min_reasoning_penalty = min_reasoning_penalty
+        self.max_reasoning_penalty = max_reasoning_penalty
+        self.num_reasoning_penalty_steps = num_reasoning_penalty_steps
+        self.stop_reasoning_strs = stop_reasoning
+        self.stop_reasoning_token_ids = stop_reasoning_token_ids
         self.custom_params = custom_params
+        self.ngram_penalty = ngram_penalty
+        self.ngram_n = ngram_n
+        self.ngram_lookback_window = ngram_lookback_window
+
+        print('sampling params init')
+        print("temperature: ", self.temperature)
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
@@ -91,6 +102,16 @@ class SamplingParams:
             self.top_k = 1
         if self.top_k == -1:
             self.top_k = 1 << 30  # whole vocabulary
+
+        if self.stop_reasoning_token_ids is None:
+            self.stop_reasoning_token_ids = set()
+        else:
+            self.stop_reasoning_token_ids = set(self.stop_reasoning_token_ids)
+        
+        if self.stop_reasoning_strs is None:
+            self.stop_reasoning_strs = set()
+        else:
+            self.stop_reasoning_strs = set(self.stop_reasoning_strs)
 
     def verify(self):
         if self.temperature < 0.0:
@@ -124,13 +145,9 @@ class SamplingParams:
                 f"min_new_tokens must be in (0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
             )
-        if self.ramp_tokens < 0:
+        if self.num_reasoning_penalty_steps is not None and self.num_reasoning_penalty_steps < 0:
             raise ValueError(
-                f"ramp_tokens must be non-negative, got {self.ramp_tokens}."
-            )
-        if self.boost_type not in ["linear", "heaviside", "tanh"]:
-            raise ValueError(
-                f"boost_type must be one of ['linear', 'heaviside', 'tanh'], got {self.boost_type}."
+                f"num_reasoning_penalty_steps must be non-negative, got {self.num_reasoning_penalty_steps}."
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
@@ -168,7 +185,17 @@ class SamplingParams:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
 
-        # Process boosted tokens
-        for i, boosted in enumerate(self.boosted_tokens):
-            if isinstance(boosted, str) and tokenizer is not None:
-                self.boosted_tokens[i] = tokenizer.encode(boosted, add_special_tokens=False)[0]
+        # Process stop reasoning
+        #print('stop_reasoning_strs: ', self.stop_reasoning_strs)
+        #print('stop_reasoning_token_ids: ', self.stop_reasoning_token_ids)
+        #assert False, 'test'
+        
+        if len(self.stop_reasoning_strs) > 0:
+            for stop_str in self.stop_reasoning_strs:
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)[0]
+                    print('stop_str_ids: ', stop_str_ids)
+                    self.stop_reasoning_token_ids.add(stop_str_ids)
+                else:
+                    raise ValueError("tokenizer is required for stop_reasoning_strs")
+        

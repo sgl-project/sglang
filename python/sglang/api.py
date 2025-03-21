@@ -93,10 +93,14 @@ def gen(
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
-    boosted_tokens: Optional[List[int]] = None,
-    max_boost_fraction: Optional[float] = None,
-    ramp_tokens: Optional[int] = None,
-    boost_type: Optional[str] = None,
+    min_reasoning_penalty: Optional[float] = 0.0,
+    max_reasoning_penalty: Optional[float] = 0.0,
+    num_reasoning_penalty_steps: Optional[int] = 0,
+    stop_reasoning: Optional[Union[str, List[str]]] = None,
+    stop_reasoning_token_ids: Optional[List[int]] = None,
+    ngram_penalty: Optional[float] = 0.0,
+    ngram_n: Optional[int] = 32,
+    ngram_lookback_window: Optional[int] = 512,
 ):
     """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
 
@@ -135,10 +139,14 @@ def gen(
         dtype,
         regex,
         json_schema,
-        boosted_tokens,
-        max_boost_fraction,
-        ramp_tokens,
-        boost_type,
+        min_reasoning_penalty,
+        max_reasoning_penalty,
+        num_reasoning_penalty_steps,
+        stop_reasoning,
+        stop_reasoning_token_ids,
+        ngram_penalty,
+        ngram_n,
+        ngram_lookback_window,
     )
 
 

@@ -459,6 +459,7 @@ class TokenizerManager:
         created_time: Optional[float] = None,
     ):
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        print('state: ', state)
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
 
