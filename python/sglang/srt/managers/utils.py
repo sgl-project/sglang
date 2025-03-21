@@ -56,15 +56,10 @@ class ExpertDistributionRecorder:
         return cls.instance
 
     def __init__(self):
-        # the length of the first list is the number of layers
-        # the length of the second list is the number of tokens
+        # the length of the list is the number of tokens
         # the length of the tuple is topk's k value
-        self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(list)
-        self._current_layer_id = None
+        self._expert_distribution_record: List[Tuple[int]] = []
         self._record = False
-
-    def set_current_layer(self, layer_idx):
-        self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
         if not self._record:
@@ -72,7 +67,7 @@ class ExpertDistributionRecorder:
         topk_ids_list = topk_ids.to('cpu', non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
         for i in topk_ids_list:
-            self._expert_distribution_record[self._current_layer_id].append(tuple(i))
+            self._expert_distribution_record.append(tuple(i))
 
     def reset(self):
         """Reset the expert distribution recorder."""
@@ -89,12 +84,12 @@ class ExpertDistributionRecorder:
 
     def dump_record(self):
         """Dump the expert distribution record to a file. Reset the recorder after dumping."""
-        results = {}
-        for layer_idx, layer_record in self._expert_distribution_record.items():
-            results[layer_idx] = defaultdict(lambda: defaultdict(int))
-            for token_record in layer_record:
-                for k_idx, expert_idx in enumerate(token_record):
-                    results[layer_idx][k_idx][expert_idx] += 1
-        with open(f"expert_distribution_{time.time()}.json", 'w') as fd:
-            json.dump(results, fd)
+        results = defaultdict(int)
+        for token_record in self._expert_distribution_record:
+            for expert_idx in token_record:
+                results[expert_idx] += 1
+        with open(f"expert_distribution_{time.time()}.csv", 'w') as fd:
+            fd.write("expert_id,count\n")
+            for expert_idx, count in results.items():
+                fd.write(f"{expert_idx},{count}\n")
         self.reset()
