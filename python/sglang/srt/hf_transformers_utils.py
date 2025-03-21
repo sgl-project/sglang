@@ -35,8 +35,6 @@ from sglang.srt.configs import (
     DbrxConfig,
     DeepseekVL2Config,
     ExaoneConfig,
-    Gemma3Config,
-    Gemma3TextConfig,
     MultiModalityConfig,
 )
 from sglang.srt.connector import create_remote_connector
@@ -48,8 +46,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
-    Gemma3Config.model_type: Gemma3Config,
-    Gemma3TextConfig.model_type: Gemma3TextConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
