@@ -11,6 +11,7 @@ import re
 from typing import Optional
 
 import pandas
+
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
     ANSWER_PATTERN_MULTICHOICE,
@@ -100,7 +101,6 @@ class MMLUEval(Eval):
                 )
             ]
             response_text = sampler(prompt_messages)
-            print(f'hi MMLUEval {prompt_messages=} {response_text=}', flush=True)
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
             extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == row["Answer"] else 0.0
