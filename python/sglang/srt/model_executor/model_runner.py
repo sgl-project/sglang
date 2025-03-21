@@ -840,6 +840,10 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashInferMLAAttnBackend(self)
+        elif self.server_args.attention_backend == "cudnn":
+            from sglang.srt.layers.attention.cudnn_backend import CuDNNAttnBackend
+
+            self.attn_backend = CuDNNAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"

@@ -254,6 +254,12 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if self.attention_backend == "cudnn":
+            logger.warning(
+                "Cuda graph is disabled because of using cudnn attention backend"
+            )
+            self.disable_cuda_graph = True
+
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -728,7 +734,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native"],
+            choices=["flashinfer", "triton", "torch_native", "cudnn"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
