@@ -267,6 +267,7 @@ def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
             tp_cpu_group=model_runner.tp_group.cpu_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+            enable_two_batch_overlap=model_runner.server_args.enable_two_batch_overlap,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             speculative_num_draft_tokens=None,
         )
