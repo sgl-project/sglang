@@ -117,7 +117,7 @@ class TestFlashAttentionBackend(unittest.TestCase):
     def test_forward_decode(self):
         # For decode, we only have one token per sequence
         decode_len = 1
-
+        curr_seq_len = self.seq_len + decode_len
         # Create inputs for the current token
         q = torch.randn(
             self.batch_size * decode_len,
@@ -166,24 +166,24 @@ class TestFlashAttentionBackend(unittest.TestCase):
             ),
             out_cache_loc=torch.arange(
                 self.batch_size * self.seq_len,
-                self.batch_size * (self.seq_len + decode_len),
+                self.batch_size * curr_seq_len,
                 device="cuda",
             ),
-            seq_lens_sum=self.batch_size * self.seq_len,
+            seq_lens_sum=self.batch_size * curr_seq_len,
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.arange(self.batch_size, device="cuda"),
-            seq_lens=torch.tensor([self.seq_len] * self.batch_size, device="cuda"),
+            seq_lens=torch.tensor([curr_seq_len] * self.batch_size, device="cuda"),
             attn_backend=self.backend,
         )
 
         # Add req_to_token_pool to forward_batch
         forward_batch.req_to_token_pool = MockReqToTokenPool(
-            self.batch_size, self.seq_len, "cuda"
+            self.batch_size, curr_seq_len, "cuda"
         )
 
         # Initialize KV cache pool
         kv_cache_size = self.batch_size * (
-            self.seq_len + decode_len
+            curr_seq_len
         )  # Include space for new token
         forward_batch.token_to_kv_pool = MHATokenToKVPool(
             size=kv_cache_size,

@@ -158,6 +158,7 @@ class FlashAttentionBackend(AttentionBackend):
         max_seq_len_k = seqlens_in_batch.max().item()
 
         # torch.distributed.breakpoint()
+        # breakpoint()
         o, _ = flash_attn_varlen_func(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k=key_cache.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -202,6 +203,8 @@ class FlashAttentionBackend(AttentionBackend):
         # o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def prepare_kv_cache(self, forward_batch: ForwardBatch, layer: RadixAttention):
+        # torch.distributed.breakpoint()
+        # breakpoint()
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache_pool, value_cache_pool = kv_cache[0], kv_cache[1]
 
