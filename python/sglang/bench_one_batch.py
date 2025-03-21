@@ -263,7 +263,7 @@ def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
         Scheduler.prepare_dp_attn_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=TODO,
+            attn_tp_size=1,
             tp_cpu_group=model_runner.tp_group.cpu_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
