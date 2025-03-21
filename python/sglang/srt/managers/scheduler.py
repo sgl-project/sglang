@@ -32,8 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
@@ -115,6 +113,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -340,8 +339,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -1070,10 +1069,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1098,9 +1097,9 @@ class Scheduler(SchedulerOutputProcessorMixin):
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                                                               self.running_batch is not None
+                                                               and not self.running_batch.is_empty()
+                                                           )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1326,8 +1325,8 @@ class Scheduler(SchedulerOutputProcessorMixin):
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1353,7 +1352,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
             )
         else:
             local_tbo_split_seq_index = None
-        can_run_tbo = local_tbo_split_seq_index is not None
+        local_can_run_tbo = local_tbo_split_seq_index is not None
 
         local_info = torch.tensor(
             [
@@ -1361,12 +1360,13 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
-                can_run_tbo,
+                local_can_run_tbo,
+                local_batch.forward_mode.value if local_batch is not None else -1,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 5),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1378,7 +1378,10 @@ class Scheduler(SchedulerOutputProcessorMixin):
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
-        can_run_tbo = min(global_info[:, 0, 4].tolist())
+        can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+
+        can_run_tbo = can_run_tbo_aggregated and forward_mode_same
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1808,6 +1811,10 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
+
+
+def _is_all_same(x):
+    return all(value == x[0] for value in x)
 
 
 def run_scheduler_process(
