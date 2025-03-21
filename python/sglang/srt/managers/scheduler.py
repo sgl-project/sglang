@@ -36,6 +36,7 @@ from sglang.global_config import global_config
 from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -1378,10 +1379,11 @@ class Scheduler(SchedulerOutputProcessorMixin):
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
-        can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
         forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
 
-        can_run_tbo = can_run_tbo_aggregated and forward_mode_same
+        print(f'hi [{get_tensor_model_parallel_rank()}] scheduler {local_can_run_tbo_aggregated=} {forward_mode_same=}')
+        can_run_tbo = local_can_run_tbo_aggregated and forward_mode_same
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
