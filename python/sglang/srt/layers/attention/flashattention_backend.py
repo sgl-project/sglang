@@ -85,12 +85,21 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
         # Use Flash Attention for prefill
+        prefix_lens = forward_batch.extend_prefix_lens
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
         seqlens_in_batch = forward_batch.seq_lens
-        # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
-        cu_seqlens_q = torch.nn.functional.pad(
+        cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
-        cu_seqlens_k = cu_seqlens_q
+        # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        if not extend_no_prefix:
+            cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            k, v, _ = self.prepare_kv_cache(forward_batch, layer)
+        else:
+            cu_seqlens_q = cu_seqlens_k
         max_seq_len_q = seqlens_in_batch.max().item()
         max_seq_len_k = max_seq_len_q
 
