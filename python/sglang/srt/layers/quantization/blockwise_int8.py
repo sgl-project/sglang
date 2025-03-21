@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn import Module
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -13,13 +12,13 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -371,6 +370,8 @@ class BlockInt8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -395,7 +396,7 @@ class BlockInt8MoEMethod:
             layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=True,
+            inplace=inplace,
             activation=activation,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale_inv),
@@ -403,4 +404,5 @@ class BlockInt8MoEMethod:
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
+            no_combine=no_combine,
         )

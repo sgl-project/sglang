@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
 
 
@@ -323,6 +323,15 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
 
+    @root_validator(pre=True)
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
+
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
     min_p: float = 0.0
@@ -336,6 +345,8 @@ class ChatCompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    separate_reasoning: bool = True
+    stream_reasoning: bool = True
 
 
 class FunctionResponse(BaseModel):
@@ -356,6 +367,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
@@ -379,6 +391,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
@@ -399,10 +412,17 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
+class MultimodalEmbeddingInput(BaseModel):
+    text: Optional[str] = None
+    image: Optional[str] = None
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[List[int], List[List[int]], str, List[str]]
+    input: Union[
+        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+    ]
     model: str
     encoding_format: str = "float"
     dimensions: int = None

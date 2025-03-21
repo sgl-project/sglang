@@ -19,13 +19,14 @@ from data_utils import (
     process_single_sample,
 )
 from datasets import concatenate_datasets, load_dataset
+from tqdm import tqdm
 
 
 @dataclasses.dataclass
 class EvalArgs:
-    backend: str = "engine"
     seed: int = 42
     split: str = "validation"
+    # Default setting to make the benchmark available on A100 for most 7B models
     image_pixels_limit: int = 4300000
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
@@ -34,10 +35,10 @@ class EvalArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-        parser.add_argument("--backend", type=str, default=EvalArgs.backend)
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )
+
         parser.add_argument(
             "--image-pixels-limit", type=int, default=EvalArgs.image_pixels_limit
         )
@@ -87,6 +88,7 @@ def set_seed(seed_value):
 
 
 def prepare_samples(eval_args: EvalArgs):
+    print("preparing samples...")
     # Build prompts
     set_seed(eval_args.seed)
 
@@ -105,11 +107,12 @@ def prepare_samples(eval_args: EvalArgs):
     # run for each subject
     sub_dataset_list = []
 
-    for subject in CAT_SHORT2LONG.values():
+    for subject in tqdm(CAT_SHORT2LONG.values()):
         sub_dataset = load_dataset(
             eval_args.dataset_path, subject, split=eval_args.split
         )
         sub_dataset_list.append(sub_dataset)
+        # break
 
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
@@ -117,19 +120,31 @@ def prepare_samples(eval_args: EvalArgs):
     ## prepare images
     samples = []
     skip_count = 0
-    for i, sample in enumerate(dataset):
+
+    # use image file as input to ensure the consistency between sglang and hf
+    images_path = os.path.expanduser("~/.cache/mmmu/images")
+    os.makedirs(images_path, exist_ok=True)
+    print(f"Saving images to: {images_path}")
+
+    for i, sample in enumerate(tqdm(dataset)):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
+
         width, height = image.size
         if width * height >= eval_args.image_pixels_limit:
             skip_count += 1
             continue
+        image_path = f"{images_path}/image_{i}.png"
+        if not os.path.exists(image_path):
+            image.save(image_path)
+        sample["image_path"] = image_path
         samples.append(sample)
 
     print(
         f"skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
+    print("samples have been prepared")
     return samples
 
 
@@ -426,9 +441,26 @@ def calculate_ins_level_acc(results: Dict):
     return acc / ins_num
 
 
-def eval_result(output_path, answer_dict):
+def process_result(response, sample, answer_dict, out_samples):
+    if sample["question_type"] == "multiple-choice":
+        pred_ans = parse_multi_choice_response(
+            response, sample["all_choices"], sample["index2ans"]
+        )
+    else:  # open question
+        pred_ans = response
+
+    out_samples[sample["id"]] = pred_ans
+
+    # set ground truth answer
+    answer_dict[sample["id"]] = {
+        "question_type": sample["question_type"],
+        "ground_truth": sample["answer"],
+    }
+
+
+def eval_result(model_answer_path, answer_dict):
     print("Evaluating...")
-    output_dict = json.load(open(output_path))
+    output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
 
     # group by category
@@ -521,7 +553,7 @@ def eval_result(output_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
-    out = output_path
+    out = model_answer_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")

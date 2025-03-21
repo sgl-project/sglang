@@ -20,14 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Check clang-format
         uses: DoozyX/clang-format-lint-action@v0.18.1
         with:
           source: sgl-kernel
           extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 16
+          clangFormatVersion: 18
           style: file
 
   build-wheels:
@@ -95,9 +95,49 @@ jobs:
         run: |
           pip3 uninstall sgl-kernel -y
 
+  mla-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    needs: build-wheels
+    runs-on: 1-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - name: Install
+        run: |
+          bash scripts/ci_install_dependency.sh
+          pip3 uninstall sgl-kernel -y || true
+          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
+          pip3 list | grep sgl-kernel
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 test_mla_deepseek_v3.py
+
+      - name: Uninstall dependencies
+        run: |
+          pip3 uninstall sgl-kernel -y
+
   finish:
-    needs: [unit-test, lint]
+    needs: [unit-test, mla-test, lint]
     runs-on: ubuntu-latest
     steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

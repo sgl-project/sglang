@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -49,7 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -70,14 +70,14 @@ class LlamaMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -142,14 +142,14 @@ class LlamaAttention(nn.Module):
             self.total_num_kv_heads,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -166,6 +166,7 @@ class LlamaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -218,7 +219,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
+            prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
         )
         self.mlp = LlamaMLP(
@@ -226,7 +227,7 @@ class LlamaDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -263,6 +264,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -272,6 +274,7 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -282,6 +285,7 @@ class LlamaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -289,13 +293,16 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
         residual = None
+        aux_hidden_states = []
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -304,7 +311,11 @@ class LlamaModel(nn.Module):
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -332,7 +343,6 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLM(nn.Module):
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -358,18 +368,24 @@ class LlamaForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.model = LlamaModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -382,6 +398,8 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
+        self.capture_aux_hidden_states = False
+
     @torch.no_grad()
     def forward(
         self,
@@ -391,10 +409,19 @@ class LlamaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+        else:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -577,8 +604,22 @@ class LlamaForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
+    def set_eagle3_layers_to_capture(self):
+        self.capture_aux_hidden_states = True
+        num_layers = self.config.num_hidden_layers
+        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

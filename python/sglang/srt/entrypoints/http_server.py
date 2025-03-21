@@ -14,11 +14,12 @@
 """
 The entry point of inference server. (SRT = SGLang Runtime)
 
-This file implements HTTP APIs for the inferenc engine via fastapi.
+This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
 import dataclasses
+import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -55,6 +56,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SeparateReasoningReqInput,
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -75,6 +77,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file_content,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
@@ -257,6 +260,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
+@app.api_route("/generate_from_file", methods=["POST"])
+async def generate_from_file_request(file: UploadFile, request: Request):
+    """Handle a generate request, this is purely to work with input_embeds."""
+    content = await file.read()
+    input_embeds = json.loads(content.decode("utf-8"))
+
+    obj = GenerateReqInput(
+        input_embeds=input_embeds,
+        sampling_params={
+            "repetition_penalty": 1.2,
+            "temperature": 0.2,
+            "max_new_tokens": 512,
+        },
+    )
+
+    try:
+        ret = await _global_state.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"Error: {e}")
+        return _create_error_response(e)
+
+
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -281,7 +307,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.post("/flush_cache")
+@app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
     _global_state.tokenizer_manager.flush_cache()
@@ -438,8 +464,8 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     return Response(status_code=200)
 
 
-@app.post("/function_call")
-async def function_call_request(obj: ParseFunctionCallReq, request: Request):
+@app.post("/parse_function_call")
+async def parse_function_call_request(obj: ParseFunctionCallReq, request: Request):
     """
     A native API endpoint to parse function calls from a text.
     """
@@ -455,6 +481,26 @@ async def function_call_request(obj: ParseFunctionCallReq, request: Request):
         "calls": [
             call.model_dump() for call in calls
         ],  # Convert pydantic objects to dictionaries
+    }
+
+    return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/separate_reasoning")
+async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):
+    """
+    A native API endpoint to separate reasoning from a text.
+    """
+    # 1) Initialize the parser based on the request body
+    parser = ReasoningParser(model_type=obj.reasoning_parser)
+
+    # 2) Call the non-stream parsing method (non-stream)
+    reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+
+    # 3) Organize the response content
+    response_data = {
+        "reasoning_text": reasoning_text,
+        "text": normal_text,
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -492,7 +538,7 @@ def available_models():
 @app.post("/v1/files")
 async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
     return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_pth
+        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
     )
 
 
@@ -592,7 +638,7 @@ def launch_server(
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(
