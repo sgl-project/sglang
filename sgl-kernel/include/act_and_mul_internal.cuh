@@ -21,7 +21,7 @@ limitations under the License.
 #define kBytesToLoad (kBitsToLoad / 8)
 
 // Adapted from
-// [flashinfer::activation::act_and_mul_kernel](https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44)
+// [flashinfer::activation::act_and_mul_kernel](https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/include/flashinfer/activation.cuh#L29)
 
 namespace flashinfer {
 namespace activation {

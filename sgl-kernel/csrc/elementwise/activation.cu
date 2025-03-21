@@ -29,8 +29,8 @@
 #include "act_and_mul_internal.cuh"
 #endif
 
-namespace flashinfer {
-namespace activation {
+// [flashinfer
+// activation(https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44)
 
 template <typename T>
 __device__ __forceinline__ T silu(const T& x) {
@@ -74,9 +74,6 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
 #endif
 }
 
-}  // namespace activation
-}  // namespace flashinfer
-
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
@@ -88,7 +85,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::silu>
+    flashinfer::activation::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;
@@ -106,7 +103,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::gelu_tanh>
+    flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;
@@ -124,7 +121,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::gelu>
+    flashinfer::activation::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;
