@@ -52,13 +52,17 @@ void extend_attention_cpu(at::Tensor& q_extend, at::Tensor& k_extend, at::Tensor
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// quant
+std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+
 // gemm
 at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
     std::optional<at::Tensor>& bias, bool is_vnni);
 
 // igemm
-at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales,
-    std::optional<at::Tensor>& bias, bool is_vnni);
+at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
+    at::Tensor& scales1, at::Tensor& scales2,
+    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
 // fused moe
 at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
@@ -95,6 +99,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // weight prepack
   m.def("convert_weight_packed", &convert_weight_packed, "prepack weight to vnni format for intel AMX");
+
+  // quant
+  m.def("per_token_quant_int8_cpu", &per_token_quant_int8_cpu, "dynamic quantization for CPU");
 
   // gemm
   m.def("weight_packed_linear", &weight_packed_linear, "weight packed linear for intel AMX");

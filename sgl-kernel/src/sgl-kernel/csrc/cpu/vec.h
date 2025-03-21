@@ -53,6 +53,69 @@ inline float vec_reduce_max(const Vectorized<float>& a) {
 }
 #endif
 
+// https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
+template <typename scalar_t>
+inline void quantize_row_int8(uint8_t* __restrict__ Aq, float& As,
+    const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
+
+  float amax = 0.f; // absolute max
+  for (int64_t k = 0; k < K; ++k) {
+    const float val = static_cast<float>(A[k]);
+    amax = std::max(amax, std::abs(val));
+  }
+
+  amax = std::max(amax, eps);
+  const float scale = amax / 127;
+  const float inv_scale = 127 / amax;
+
+  for (int64_t k = 0; k < K; ++k) {
+    const float val = static_cast<float>(A[k]) * inv_scale;
+    Aq[k] = (uint8_t)(std::round(val)) + 128;
+  }
+  As = scale;
+}
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <>
+inline void quantize_row_int8<at::BFloat16>(uint8_t* __restrict__ Aq, float& As,
+    const at::BFloat16* __restrict__ A, int64_t K, float eps) {
+
+  const __m512 signBit = _mm512_set1_ps(-0.0f);
+  const __m512i off = _mm512_set1_epi32(128);
+
+  // K is 32x, no remainder
+  float amax = 0.f;
+  __m512 vamax0 = _mm512_set1_ps(0.f);
+  __m512 vamax1 = _mm512_set1_ps(0.f);
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    vamax0 = _mm512_max_ps(vamax0, _mm512_andnot_ps(signBit, va0));
+    vamax1 = _mm512_max_ps(vamax1, _mm512_andnot_ps(signBit, va1));
+  }
+  amax = _mm512_reduce_max_ps(_mm512_max_ps(vamax0, vamax1));
+  amax = std::max(amax, eps);
+  const float scale = amax / 127;
+  const float inv_scale = 127 / amax;
+  const __m512 vd = _mm512_set1_ps(inv_scale);
+
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    va0 = _mm512_mul_ps(va0, vd);
+    va1 = _mm512_mul_ps(va1, vd);
+    va0 = _mm512_roundscale_ps(va0, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    va1 = _mm512_roundscale_ps(va1, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m128i i0 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va0), off));
+    __m128i i1 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va1), off));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(Aq + k), _mm256_set_m128i(i1, i0));
+  }
+  As = scale;
+}
+#endif
+
 // TODO: debug print, remove me later
 template<typename scalar_t>
 void print_array(scalar_t* ptr, int size) {
