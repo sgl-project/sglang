@@ -12,14 +12,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from sglang.srt.utils import set_weight_attrs, get_device_capability
 from sglang.srt.layers.quantization.utils import check_marlin_supports_layer
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.awq import AWQConfig
 
-from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import (
     AWQMarlinConfig)
-from vllm.model_executor.layers.quantization.gptq_marlin import (
-    GPTQMarlinConfig)
-from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 
 
 logger = logging.getLogger(__name__)
