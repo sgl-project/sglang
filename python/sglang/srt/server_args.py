@@ -71,7 +71,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
-    schedule_conservativeness: float = 1.0
+    schedule_conservativeness: Optional[float] = None
     cpu_offload_gb: int = 0
     page_size: int = 1
 
@@ -222,12 +222,33 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+        if self.schedule_conservativeness is None:
+            self.schedule_conservativeness = 0.3 if self.enable_dp_attention else 1.0
+
+        # Data parallelism attention
+        if self.enable_dp_attention:
+            assert (
+                self.dp_size > 1
+            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
+            assert self.tp_size % self.dp_size == 0
+            # DeepEP MoE
+            if self.enable_deepep_moe:
+                self.ep_size = self.dp_size
+                logger.info(
+                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
+                )
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
             else:
                 self.chunked_prefill_size = 8192
+            if self.enable_dp_attention:
+                self.chunked_prefill_size //= self.dp_size
+                logger.warning(
+                    f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                )
 
         assert self.chunked_prefill_size % self.page_size == 0
 
@@ -273,24 +294,6 @@ class ServerArgs:
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
-        # Data parallelism attention
-        if self.enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
-            assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
-            logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
-            )
-            # DeepEP MoE
-            if self.enable_deepep_moe:
-                self.ep_size = self.dp_size
-                logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
-                )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1171,20 +1174,26 @@ class PortArgs:
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
-            port_base = int(dist_init_port) + 1
+            port_args = {}
+            for name in (
+                "tokenizer_ipc_name",
+                "detokenizer_ipc_name",
+                "rpc_ipc_name",
+            ):
+                port_args[name] = (
+                    f"tcp://{dist_init_host}:{dist_init_port + len(port_args)}"
+                )
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 2
+                scheduler_input_port = dist_init_port + len(
+                    port_args
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = dist_init_port + len(port_args) + 1 + dp_rank
 
             return PortArgs(
-                tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
+                **port_args,
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
             )
 
 
