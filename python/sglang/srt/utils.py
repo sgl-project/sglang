@@ -1043,6 +1043,13 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
+
+
 def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
