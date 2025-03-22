@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -17,7 +16,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:7000"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
