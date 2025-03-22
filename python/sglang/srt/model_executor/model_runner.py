@@ -21,6 +21,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -993,14 +994,16 @@ class ModelRunner:
             torch.cuda.synchronize()
             latency = time.time() - tic
 
-            data = dict(
+            data = json.dumps(dict(
                 latency=latency,
                 forward_mode=forward_batch.forward_mode.name,
                 batch_size=forward_batch.batch_size,
                 num_tokens=forward_batch.input_ids.shape[0],
                 tp_rank=self.tp_rank,
-            )
-            TODO
+            ))
+            path = Path(TODO)
+            with path.open('a') as fp:
+                fp.write(f'{data}\n')
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
