@@ -152,6 +152,7 @@ sources = [
     "src/sgl-kernel/csrc/cpu/gemm.cpp",
     "src/sgl-kernel/csrc/cpu/gemm_int8.cpp",
     "src/sgl-kernel/csrc/cpu/moe.cpp",
+    "src/sgl-kernel/csrc/cpu/moe_int8.cpp",
     "src/sgl-kernel/csrc/cpu/norm.cpp",
     "src/sgl-kernel/csrc/cpu/topk.cpp",
     "src/sgl-kernel/csrc/cpu/interface.cpp",

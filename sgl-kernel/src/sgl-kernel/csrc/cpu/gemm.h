@@ -11,11 +11,6 @@
 constexpr int block_size_m() { return 2 * TILE_M; }
 constexpr int block_size_n() { return 2 * TILE_N; }
 
-//template <typename T> constexpr int vnni_blk();
-//template <> constexpr int vnni_blk<at::BFloat16>() { return 2; }
-//template <> constexpr int vnni_blk<at::Half>() { return 2; }
-//template <> constexpr int vnni_blk<int8_t>() { return 4; }
-
 // define threshold using brgemm (intel AMX)
 template <typename T> inline bool can_use_brgemm(int M);
 template <> inline bool can_use_brgemm<at::BFloat16>(int M) { return M > 4; }
@@ -43,6 +38,33 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
 
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
+
+// moe implementations for int8 w8a8
+template <typename scalar_t>
+void fused_experts_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    uint8_t* __restrict__ A_tmp,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
+
 
 // TODO: debug print, remove me later
 inline void print_16x32i(const __m512i x) {

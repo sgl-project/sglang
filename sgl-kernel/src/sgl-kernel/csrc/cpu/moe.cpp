@@ -483,7 +483,7 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t, typename packed_t>
+template <typename scalar_t>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -491,8 +491,8 @@ void fused_experts_kernel_impl(
     scalar_t* __restrict__ A_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const packed_t* __restrict__ packed_w1,
-    const packed_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ packed_w1,
+    const scalar_t* __restrict__ packed_w2,
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_ids,
     const int32_t* __restrict__ expert_ids,
@@ -515,12 +515,8 @@ void fused_experts_kernel_impl(
   // strides for w1: [E, 2N, K]
   TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
 
-  // K and N are packed for int8
-  const int64_t packed_K = get_row_size<packed_t>(K);
-  const int64_t packed_N = get_row_size<packed_t>(N);
-
-  const int64_t stride_e = 2 * N * packed_K;
-  const int64_t stride_n = packed_K;
+  const int64_t stride_e = 2 * N * K;
+  const int64_t stride_n = K;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
@@ -542,8 +538,8 @@ void fused_experts_kernel_impl(
 
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const packed_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
-      const packed_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -620,8 +616,8 @@ void fused_experts_kernel_impl(
   const int64_t IC = N;  // rename N as IC
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(OC, BLOCK_N);
-  const int64_t stride_e2 = OC * packed_N;
-  const int64_t stride_oc = packed_N;
+  const int64_t stride_e2 = OC * IC;
+  const int64_t stride_oc = IC;
 
   // parallel on [MB2, NB2]
   at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
@@ -649,7 +645,7 @@ void fused_experts_kernel_impl(
 
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const packed_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
 
       // 2.a gemm: C = A @ B
       if (use_brgemm) {
@@ -757,8 +753,8 @@ at::Tensor fused_experts_cpu(
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
   CHECK_EQ(w2.size(1), K);
-  CHECK_EQ(w1.size(2), packed_K);
-  CHECK_EQ(w2.size(2), packed_N);
+  CHECK_EQ(packed_w1.size(2), packed_K);
+  CHECK_EQ(packed_w2.size(2), packed_N);
 
   if (use_int8_w8a8) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
@@ -811,37 +807,84 @@ at::Tensor fused_experts_cpu(
   //   1. intermediate_cache1 : [M * topk, N]
   //   2. intermediate_cache2 : [M * topk, K]
   //   3. A_tmp : [T, BLOCK_M * K]
-  //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N] x 2
+  //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
   //
-  auto buffer2 = at::empty({M * topk * N + M * topk * K + num_threads * BLOCK_M * K +
-      num_threads * 2 * BLOCK_M * BLOCK_N * /* sizeof(float) / sizeof(scalar_t) */2},
-      hidden_states.options());
+  // for int8 w8a8:
+  //   5. Aq_tmp : [M, K] or [M * topk, N]
+  //   6. As_tmp : [M * topk]
+  //
+  int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
+      num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
+      num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+
+  if (use_int8_w8a8) {
+    buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
+  }
+
+  auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_kernel_impl", [&] {
-    scalar_t* __restrict__ intermediate_cache1 = buffer2.data_ptr<scalar_t>();
+    scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
     scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
-    scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
-    float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
 
-    fused_experts_kernel_impl<scalar_t, scalar_t>(
-        out_hidden_states.data_ptr<scalar_t>(),
-        intermediate_cache1,
-        intermediate_cache2,
-        A_tmp,
-        C_tmp,
-        hidden_states.data_ptr<scalar_t>(),
-        packed_w1.data_ptr<scalar_t>(),
-        packed_w2.data_ptr<scalar_t>(),
-        topk_weights.data_ptr<float>(),
-        sorted_ids,
-        expert_ids,
-        offsets,
-        M,
-        N,
-        K,
-        E,
-        topk,
-        num_tokens_post_pad);
+    if (use_int8_w8a8) {
+      uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
+      float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+      uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, M * topk * N)));
+
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      TORCH_CHECK(w1s.numel() == E * 2 * N);
+      TORCH_CHECK(w2s.numel() == E * K);
+
+      fused_experts_int8_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache1,
+          intermediate_cache2,
+          A_tmp,
+          C_tmp,
+          Aq_tmp,
+          As_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<int8_t>(),
+          packed_w2.data_ptr<int8_t>(),
+          w1s.data_ptr<float>(),
+          w2s.data_ptr<float>(),
+          topk_weights.data_ptr<float>(),
+          sorted_ids,
+          expert_ids,
+          offsets,
+          M,
+          N,
+          K,
+          E,
+          topk,
+          num_tokens_post_pad);
+    } else {
+      scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
+      float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+
+      fused_experts_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache1,
+          intermediate_cache2,
+          A_tmp,
+          C_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<scalar_t>(),
+          packed_w2.data_ptr<scalar_t>(),
+          topk_weights.data_ptr<float>(),
+          sorted_ids,
+          expert_ids,
+          offsets,
+          M,
+          N,
+          K,
+          E,
+          topk,
+          num_tokens_post_pad);
+    }
   });
   return out_hidden_states;
 }
