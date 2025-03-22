@@ -141,7 +141,7 @@ class _StageExecutor:
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
-        self._stage_state = {}
+        self._stage_state = _StateDict()
         self._stage_output = inputs
 
     def next(self):
@@ -177,3 +177,14 @@ class _StageExecutor:
     @property
     def num_stages(self):
         return len(self._stages)
+
+
+class _StateDict:
+    def __init__(self):
+        self._data = {}
+
+    def __setattr__(self, key, value):
+        self._data[key] = value
+
+    def __getattr__(self, item):
+        return self._data[item]
