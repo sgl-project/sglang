@@ -428,9 +428,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_substage_combine_wait(self, state):
-        state["hidden_states_from_combine"] = self.tbo_deepep_dispatchers[
-            state["tbo_subbatch_index"]
-        ].combine_stage_wait(state["state_combine"])
+        dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
+        state.hidden_states_from_combine = dispatcher.combine_stage_wait(state.state_combine)
 
     def _forward_tbo_substage_shared(self, state):
         state["shared_output"] = self._forward_deepep_shared_output(
