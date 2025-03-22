@@ -985,7 +985,11 @@ class ModelRunner:
 
     @contextmanager
     def _benchmark_forward(self):
-        yield
+        TODO
+        try:
+            yield
+        finally:
+            TODO
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
