@@ -19,13 +19,12 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from sglang.srt import fine_grained_benchmark
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -963,7 +962,7 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with self._benchmark_forward(forward_batch) if self.fine_grained_benchmark_dir else nullcontext():
+        with fine_grained_benchmark.maybe_benchmark(forward_batch):
             if (
                 forward_batch.forward_mode.is_cuda_graph()
                 and self.cuda_graph_runner
@@ -983,28 +982,6 @@ class ModelRunner:
                 return self.forward_idle(forward_batch)
             else:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
-
-    @contextmanager
-    def _benchmark_forward(self, forward_batch: ForwardBatch):
-        torch.cuda.synchronize()
-        tic = time.time()
-        try:
-            yield
-        finally:
-            torch.cuda.synchronize()
-            latency = time.time() - tic
-
-            data = json.dumps(dict(
-                start_time=tic,
-                latency=latency,
-                forward_mode=forward_batch.forward_mode.name,
-                batch_size=forward_batch.batch_size,
-                num_tokens=forward_batch.input_ids.shape[0],
-                tp_rank=self.tp_rank,
-            ))
-            path = Path(self.fine_grained_benchmark_dir) / f'TP{self.tp_rank}.jsonl'
-            with path.open('a') as fp:
-                fp.write(f'{data}\n')
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
