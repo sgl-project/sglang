@@ -129,13 +129,6 @@ def run_one_case(
 
     _ = response.json()
 
-    if fine_grained_benchmark.is_enabled():
-        import pandas as pd
-        fine_grained_output = fine_grained_benchmark.read_output()
-        df = pd.DataFrame(fine_grained_output)
-        df['throughput'] = df['num_tokens'] / df['latency']
-        print(df[df['tp_rank'] == 0].drop(['start_time', 'tp_rank'], axis=1))
-
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
 
@@ -143,6 +136,13 @@ def run_one_case(
     print(f"latency: {latency:.2f} s")
     print(f"output throughput: {output_throughput:.2f} token/s")
     print(f"(input + output) throughput: {overall_throughput:.2f} token/s")
+
+    if fine_grained_benchmark.is_enabled():
+        import pandas as pd
+        fine_grained_output = fine_grained_benchmark.read_output()
+        df = pd.DataFrame(fine_grained_output)
+        df['throughput'] = df['num_tokens'] / df['latency']
+        print(df[df['tp_rank'] == 0].drop(['start_time', 'tp_rank'], axis=1))
 
     if result_filename:
         with open(result_filename, "a") as fout:
