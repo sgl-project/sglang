@@ -29,3 +29,5 @@ pip install cuda-python nvidia-cuda-nvrtc-cu12
 pip install timm
 
 pip install sgl-kernel==0.0.5.post3 --force-reinstall
+
+pip uninstall vllm -y || true

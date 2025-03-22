@@ -22,7 +22,11 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.layers.quantization import (
+    BASE_QUANTIZATION_METHODS,
+    QUANTIZATION_METHODS,
+    VLLM_AVAILABLE,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -235,7 +239,12 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        supported_quantization = [*QUANTIZATION_METHODS]
+        # Select supported quantization methods based on vllm availability
+        if VLLM_AVAILABLE:
+            supported_quantization = [*QUANTIZATION_METHODS]
+        else:
+            supported_quantization = [*BASE_QUANTIZATION_METHODS]
+
         rocm_supported_quantization = [
             "awq",
             "gptq",
@@ -273,7 +282,11 @@ class ModelConfig:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
+            # Only iterate through currently available quantization methods
+            available_methods = (
+                QUANTIZATION_METHODS if VLLM_AVAILABLE else BASE_QUANTIZATION_METHODS
+            )
+            for _, method in available_methods.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
                 )

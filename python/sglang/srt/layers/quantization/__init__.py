@@ -26,6 +26,8 @@ try:
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
+    from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -45,7 +47,6 @@ except ImportError:
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -55,8 +56,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,
-    "gptq_marlin": GPTQMarlinConfig,
-    "gptq": GPTQConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
 }
@@ -78,6 +77,8 @@ if VLLM_AVAILABLE:
         "bitsandbytes": BitsAndBytesConfig,
         "qqq": QQQConfig,
         "experts_int8": ExpertsInt8Config,
+        "gptq_marlin": GPTQMarlinConfig,
+        "gptq": GPTQConfig,
     }
     QUANTIZATION_METHODS.update(VLLM_QUANTIZATION_METHODS)
 
