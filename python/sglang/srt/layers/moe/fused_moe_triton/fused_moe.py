@@ -27,6 +27,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
 
 
 logger = logging.getLogger(__name__)
@@ -35,10 +36,10 @@ padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
+    import deep_gemm
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
@@ -489,6 +490,217 @@ def moe_align_block_size(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
+@triton.jit
+def _mask_kernel(
+    input_ptr,
+    mask_ptr,
+    output_ptr,
+    acc_ptr,
+    element_0,
+    element_1,
+    input_stride_0,
+    input_stride_1,
+    output_stride_0,
+    output_stride_1,
+    BLOCK_SIZE_0: tl.constexpr,
+    BLOCK_SIZE_1: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_1 = tl.cdiv(element_1, BLOCK_SIZE_1)
+    pid_0 = pid // num_pid_1
+    pid_1 = pid % num_pid_1
+
+    block_start = pid_0 * BLOCK_SIZE_0
+    acc_vals = tl.load(acc_ptr + pid_0)
+    next_vals = tl.load(acc_ptr + pid_0 + 1)
+
+    offset_0 = block_start + tl.arange(0, BLOCK_SIZE_0)
+    offset_0 = offset_0[:, None]
+    mask_vals = tl.load(mask_ptr + offset_0, mask=offset_0 < element_0, other=0)
+    output_offset_0 = acc_vals + tl.arange(0, BLOCK_SIZE_0)
+    output_offset_0 = output_offset_0[:, None]
+
+    # for m in tl.range(0, tl.cdiv(element_1, BLOCK_SIZE_1)):
+    offset_1 = pid_1 * BLOCK_SIZE_1 + tl.arange(0, BLOCK_SIZE_1)
+    offset_1 = offset_1[None, :]
+
+    input_mask = (offset_0 < element_0) & mask_vals & (offset_1 < element_1)
+    input_mask = tl.cast(input_mask, tl.int1)
+    input_vals = tl.load(
+        input_ptr + offset_0 * input_stride_0 + offset_1 * input_stride_1,
+        mask=input_mask,
+        other=0,
+    )
+
+    output_mask = (
+        mask_vals & (output_offset_0 < next_vals) & (offset_1 < element_1)
+    ) != 0
+    output_mask = tl.cast(output_mask, tl.int1)
+    tl.store(
+        output_ptr + output_offset_0 * output_stride_0 + offset_1 * output_stride_1,
+        input_vals,
+        mask=output_mask,
+    )
+
+
+@triton.jit
+def _pre_mask_kernel(
+    mask_ptr,
+    out_ptr,
+    mask_len,
+    out_len,
+    padded_len: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = tl.arange(0, padded_len)
+    mask = (offsets < mask_len) & (offsets < (pid + 1) * BLOCK_SIZE)
+    mask_vals = tl.load(mask_ptr + offsets, mask=mask, other=0)
+    mask_vals = tl.cast(mask_vals, tl.int16)
+    mask_sum = tl.sum(mask_vals)
+    tl.store(out_ptr + pid + 1, mask_sum, mask=pid + 1 < out_len)
+
+
+def triton_mask(input: torch.Tensor, mask: torch.Tensor, output: torch.Tensor):
+    assert input.shape[0] == mask.shape[0]
+
+    if len(input.shape) == 1:
+        input = input[:, None]
+        output = output[:, None]
+        BLOCK_SIZE_N = 1
+    else:
+        BLOCK_SIZE_N = 128
+
+    assert input.shape[1] == output.shape[1]
+
+    M = input.shape[0]
+    N = input.shape[1]
+    BLOCK_SIZE_M = 32
+
+    acc_len = triton.cdiv(M, BLOCK_SIZE_M) + 1
+    padded_len = triton.next_power_of_2(triton.cdiv(M, BLOCK_SIZE_M) * BLOCK_SIZE_M)
+    mask_acc = torch.zeros(acc_len, device=mask.device, dtype=torch.int)
+    pre_grid = (triton.cdiv(M, BLOCK_SIZE_M),)
+    _pre_mask_kernel[pre_grid](
+        mask,
+        mask_acc,
+        M,
+        acc_len,
+        padded_len,
+        BLOCK_SIZE_M,
+    )
+
+    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    _mask_kernel[grid](
+        input,
+        mask,
+        output,
+        mask_acc,
+        M,
+        N,
+        input.stride(0),
+        input.stride(1),
+        output.stride(0),
+        output.stride(1),
+        BLOCK_SIZE_0=BLOCK_SIZE_M,
+        BLOCK_SIZE_1=BLOCK_SIZE_N,
+    )
+
+
+@triton.jit
+def _triton_stage1(
+    a_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    M,
+    K,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_cm,
+    stride_ck,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    top_k: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
+    pid_m = pid // num_pid_k
+    pid_k = pid % num_pid_k
+    # load token ids
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id, mask=offs_token_id < M)
+    # load a
+    token_mask = offs_token < num_valid_tokens
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+    a_mask = token_mask[:, None] & (offs_k[None, :] < K)
+    a = tl.load(
+        a_ptrs,
+        mask=a_mask,
+        other=0.0,
+    )
+    # store a
+    c_ptrs = c_ptr + stride_cm * offs_token_id[:, None] + stride_ck * offs_k[None, :]
+    c_mask = (offs_token_id[:, None] < M) & (offs_k[None, :] < K)
+    tl.store(c_ptrs, a, mask=c_mask)
+
+
+def triton_apply_token_ids_stage1(
+    A: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    out: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    top_k: int,
+):
+    M = sorted_token_ids.shape[0]
+    K = A.shape[1]
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_K = 128
+
+    assert M == out.shape[0] and K == out.shape[1]
+
+    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(K, BLOCK_SIZE_K),)
+    _triton_stage1[grid](
+        A,
+        out,
+        sorted_token_ids,
+        M,
+        K,
+        num_valid_tokens,
+        A.stride(0),
+        A.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_K,
+        top_k,
+    )
+
+
+def apply_token_ids_new(A, A_scale, idx, topk, invalid_val):
+    TOPKM = topk * A.shape[0]
+
+    A_ = torch.empty((idx.shape[0], A.shape[1]), device=A.device, dtype=A.dtype)
+    triton_apply_token_ids_stage1(A, idx, A_, invalid_val, topk)
+
+    A_scale_ = torch.empty(
+        (idx.shape[0], A_scale.shape[1]), device=A_scale.device, dtype=A_scale.dtype
+    )
+    triton_apply_token_ids_stage1(A_scale, idx, A_scale_, invalid_val, topk)
+
+    idx_inverse = torch.empty(TOPKM, device=idx.device, dtype=idx.dtype)
+    idx_inverse.fill_(-1)
+    idx_mask = torch.empty_like(idx_inverse)
+    triton_mask(idx, idx != invalid_val, idx_mask)
+
+    idx_inverse[idx_mask] = torch.arange(TOPKM, device=idx.device, dtype=idx.dtype)
+
+    return A_, A_scale_, idx_inverse
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -564,43 +776,86 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    fused_moe_kernel[grid](
-        A,
-        B,
-        C,
-        A_scale,
-        B_scale,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        B.shape[1],
-        B.shape[2] - padded_size,
-        sorted_token_ids.shape[0],
-        topk_ids.numel(),
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        C.stride(2),
-        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        even_Ks=even_Ks,
-        **config,
-    )
+    if _is_cuda and use_fp8_w8a8 and _enable_jit_deepgemm:
+        invalid_ids = topk_ids.numel()
+        M = (sorted_token_ids.shape[0] // config["BLOCK_SIZE_M"]) * config[
+            "BLOCK_SIZE_M"
+        ]
+        clipped_token_ids = torch.empty(
+            M, device=sorted_token_ids.device, dtype=sorted_token_ids.dtype
+        )
+        clipped_token_ids.copy_(sorted_token_ids[:M])
+
+        A, A_scale, idx_inverse = apply_token_ids_new(
+            A, A_scale, clipped_token_ids, top_k, invalid_ids
+        )
+
+        expert_ids_ = torch.empty(M, device=expert_ids.device, dtype=expert_ids.dtype)
+        expert_M = M // config["BLOCK_SIZE_M"]
+        expert_ids_.copy_(
+            torch.repeat_interleave(
+                expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
+            )
+        )
+        expert_ids_[clipped_token_ids == invalid_ids] = 0
+
+        C_2d = torch.empty(
+            (A.shape[0], B.shape[1]),
+            device=C.device,
+            dtype=C.dtype,
+        )
+
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (A, A_scale), (B, B_scale), C_2d, expert_ids_
+        )
+
+        C_ = torch.empty(
+            (C.shape[0] * C.shape[1], C.shape[2]), device=C.device, dtype=C.dtype
+        )
+        triton_mask(C_2d, clipped_token_ids != invalid_ids, C_)
+        C_ = C_[idx_inverse].view(C.shape)
+
+        if mul_routed_weight:
+            C_ *= topk_weights[:, :, None]
+        C.copy_(C_)
+    else:
+        fused_moe_kernel[grid](
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.shape[1],
+            B.shape[2] - padded_size,
+            sorted_token_ids.shape[0],
+            topk_ids.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            even_Ks=even_Ks,
+            **config,
+        )
 
 
 def get_config_file_name(
@@ -1006,6 +1261,8 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
+    if _is_cuda:
+        config["BLOCK_SIZE_M"] = deep_gemm.get_m_alignment_for_contiguous_layout()
 
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
