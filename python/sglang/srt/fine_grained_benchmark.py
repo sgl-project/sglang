@@ -35,12 +35,14 @@ def benchmark(forward_batch: 'ForwardBatch', tp_rank: int):
 
 
 def _write_output(forward_batch, latency, start_time, tp_rank):
+    num_tokens = forward_batch.input_ids.shape[0]
     data = json.dumps(dict(
         start_time=start_time,
         latency=latency,
+        throughput=num_tokens / latency,
         forward_mode=forward_batch.forward_mode.name,
         batch_size=forward_batch.batch_size,
-        num_tokens=forward_batch.input_ids.shape[0],
+        num_tokens=num_tokens,
         tp_rank=tp_rank,
     ))
     path = Path(_dir_output) / f'TP{tp_rank}.jsonl'
