@@ -1001,7 +1001,7 @@ class ModelRunner:
                 num_tokens=forward_batch.input_ids.shape[0],
                 tp_rank=self.tp_rank,
             ))
-            path = Path(TODO)
+            path = Path(self.fine_grained_benchmark_dir) / f'TP{self.tp_rank}.jsonl'
             with path.open('a') as fp:
                 fp.write(f'{data}\n')
 
