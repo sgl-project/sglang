@@ -173,8 +173,9 @@ class MultiModalityDataPaddingPatternImageTokens(MultiModalityDataPaddingPattern
 def embed_mm_inputs(
     mm_input: MultiModalInputs,
     input_ids: torch.Tensor,
+    input_embeds: Optional[torch.Tensor],
     input_embedding: nn.Embedding,
-    image_embedding_func,
+    mm_data_embedding_func,
 ) -> Optional[torch.Tensor]:
     """
     Calculate the image embeddings if necessary, then scatter the result with
@@ -207,7 +208,7 @@ def embed_mm_inputs(
     else:
         # print(f"Getting image feature")
 
-        image_embedding = image_embedding_func(mm_input)
+        image_embedding = mm_data_embedding_func(mm_input)
 
         # assert image_embedding.shape[0] == input_ids.shape[0], f"{image_embedding.shape[0]} vs input_ids.shape[0]"
 
@@ -301,7 +302,7 @@ def general_mm_embed_routine(
             mm_input=image,
             input_ids=input_ids,
             input_embedding=embed_tokens,
-            image_embedding_func=image_embedding_func,
+            mm_data_embedding_func=image_embedding_func,
         )
         # once used, image_inputs is useless
         # just being defensive here

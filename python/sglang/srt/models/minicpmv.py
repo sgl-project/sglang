@@ -52,7 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
-    embed_image_embedding,
+    embed_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultiModalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -763,31 +763,6 @@ class MiniCPMVBaseModel(nn.Module):
         valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
         return valid_pairs_tensor
 
-    def get_embedding(
-        self,
-        input_ids: torch.Tensor,
-        image_inputs: Optional[MiniCPMVImageInputs],
-    ) -> torch.Tensor:
-        inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
-        if image_inputs is None:  # No image
-            pass
-        else:
-            if image_inputs["type"] == "image_embeds":
-                vision_hidden_states = (
-                    image_inputs["data"]
-                    .type(inputs_embeds.dtype)
-                    .to(inputs_embeds.device)
-                )
-            else:
-                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
-            inputs_embeds = embed_image_embedding(
-                inputs_embeds=inputs_embeds,
-                image_embedding=vision_hidden_states,
-                image_bounds=image_inputs["image_bounds"],
-            )
-
-        return inputs_embeds
-
     def _parse_and_validate_inputs(
         self,
         input_ids: torch.Tensor,
@@ -841,6 +816,9 @@ class MiniCPMVBaseModel(nn.Module):
             type="pixel_values",
         )
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.llm.get_input_embedding()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -854,30 +832,21 @@ class MiniCPMVBaseModel(nn.Module):
         ):
             inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
         else:
-            # image embedding for minicpmv can't be merged, since it use infos like max_patches of the current batch
-            for image_input in forward_batch.mm_inputs:
-                if image_input is None:
-                    continue
-                kwargs.update(
-                    {
-                        "pixel_values": image_input.pixel_values,
-                        "tgt_sizes": image_input.tgt_sizes,
-                        "im_start_id": image_input.im_start_id,
-                        "im_end_id": image_input.im_end_id,
-                        "slice_start_id": image_input.slice_start_id,
-                        "slice_end_id": image_input.slice_end_id,
-                        "pad_values": image_input.pad_values,
-                    }
-                )
-                image_inputs = self._parse_and_validate_inputs(input_ids, **kwargs)
-                # Clamp input ids. This is because the input_ids for the image tokens are
-                # filled with the hash values of the image for the prefix matching in the radix attention.
-                # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-                input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-                inputs_embeds = self.get_embedding(input_ids, image_inputs)
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            image_inputs = forward_batch.merge_mm_inputs()
+            inputs_embeds = embed_mm_inputs(
+                image_input=image_inputs,
+                input_ids=input_ids,
+                input_embedding=self.get_input_embeddings(),
+                mm_data_embedding_func=self.get_image_features,
+                placeholder_token_ids=[image_inputs.im_token_id]
+                + image_inputs.pad_values,
+            )
 
         hidden_states = self.llm.model(
-            input_ids=input_ids,
+            input_ids=None,
             positions=positions,
             forward_batch=forward_batch,
             input_embeds=inputs_embeds,
@@ -920,7 +889,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_vision_hidden_states(self, data: MiniCPMVImageInputs) -> torch.Tensor:
+    def get_image_features(self, image_inputs: MultiModalInputs) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -1030,12 +999,12 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return vision_embedding
 
-    def get_vision_hidden_states(
+    def get_image_features(
         self,
-        data: MiniCPMVImageInputs,
+        image_inputs: MultiModalInputs,
     ) -> torch.Tensor:
-        pixel_values = data["data"]
-        tgt_sizes = data["tgt_sizes"]
+        pixel_values = image_inputs.pixel_values
+        tgt_sizes = image_inputs.tgt_sizes
 
         device = self.vpm.embeddings.position_embedding.weight.device
         dtype = self.vpm.embeddings.position_embedding.weight.dtype
@@ -1068,17 +1037,17 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         # Get all special token IDs
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
-        slice_start_id: int = mm_inputs.slice_start_id
-        slice_end_id: int = mm_inputs.slice_end_id
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
         pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6}

@@ -395,7 +395,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         inputs_embeds = general_mm_embed_routine(
             input_ids=llm_input_ids,
-            positions=positions,
             forward_batch=forward_batch,
             embed_tokens=self.get_input_embeddings(),
             image_embedding_func=self.get_image_feature,

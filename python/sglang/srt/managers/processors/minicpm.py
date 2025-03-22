@@ -109,6 +109,7 @@ class MiniCPMImageProcessor(BaseProcessor):
             audio_start_id = tokenizer.audio_start_id
             audio_end_id = tokenizer.audio_end_id
 
+        im_token_id = tokenizer.unk_token_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
 
@@ -156,6 +157,7 @@ class MiniCPMImageProcessor(BaseProcessor):
             "audio_features": res["audio_features"],
             "audio_bounds": res["audio_bounds"],
             "audio_feature_lens": res["audio_feature_lens"],
+            "im_token_id": im_token_id,
             "im_start_id": tokenizer.im_start_id,
             "im_end_id": tokenizer.im_end_id,
             "slice_start_id": slice_start_id,
