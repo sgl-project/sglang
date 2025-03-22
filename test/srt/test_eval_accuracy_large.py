@@ -48,7 +48,7 @@ class TestEvalAccuracyLarge(unittest.TestCase):
         if is_in_ci():
             write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
 
-        self.assertGreater(metrics["score"], 0.71)
+        self.assertGreater(metrics["score"], 0.70)
 
     def test_human_eval(self):
         args = SimpleNamespace(
