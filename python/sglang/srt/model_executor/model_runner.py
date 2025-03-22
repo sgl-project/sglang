@@ -19,12 +19,12 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -159,7 +159,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -884,7 +884,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -961,25 +961,30 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        if (
-            forward_batch.forward_mode.is_cuda_graph()
-            and self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(forward_batch)
-        ):
-            return self.cuda_graph_runner.replay(
-                forward_batch, skip_attn_backend_init=skip_attn_backend_init
-            )
+        with self._benchmark_forward():
+            if (
+                forward_batch.forward_mode.is_cuda_graph()
+                and self.cuda_graph_runner
+                and self.cuda_graph_runner.can_run(forward_batch)
+            ):
+                return self.cuda_graph_runner.replay(
+                    forward_batch, skip_attn_backend_init=skip_attn_backend_init
+                )
 
-        if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch)
-        elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(
-                forward_batch, skip_attn_backend_init=skip_attn_backend_init
-            )
-        elif forward_batch.forward_mode.is_idle():
-            return self.forward_idle(forward_batch)
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+            if forward_batch.forward_mode.is_decode():
+                return self.forward_decode(forward_batch)
+            elif forward_batch.forward_mode.is_extend():
+                return self.forward_extend(
+                    forward_batch, skip_attn_backend_init=skip_attn_backend_init
+                )
+            elif forward_batch.forward_mode.is_idle():
+                return self.forward_idle(forward_batch)
+            else:
+                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+    @contextmanager
+    def _benchmark_forward(self):
+        yield
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
