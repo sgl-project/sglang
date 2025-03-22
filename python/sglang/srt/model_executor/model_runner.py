@@ -388,6 +388,12 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
+        # Set KV cache dtype for RadixAttention if the model uses it
+        if hasattr(self.model, "set_kv_cache_dtype"):
+            self.model.set_kv_cache_dtype(self.server_args.kv_cache_dtype)
+            logger.info(
+                f"Set KV cache dtype to {self.server_args.kv_cache_dtype} for {type(self.model).__name__}"
+            )
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):

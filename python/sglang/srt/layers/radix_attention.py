@@ -54,7 +54,9 @@ class RadixAttention(nn.Module):
         self.is_cross_attention = is_cross_attention
         self.k_scale = None
         self.v_scale = None
-        # self.kv_cache_dtype = "auto"
+        self.k_scale_float = None
+        self.v_scale_float = None
+        self.kv_cache_dtype = "auto"
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
