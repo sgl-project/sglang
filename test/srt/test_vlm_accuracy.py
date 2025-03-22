@@ -16,6 +16,7 @@ from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_device
 
 
 # Test the logits output between HF and SGLang
@@ -23,7 +24,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = get_device()
         cls.model_path = ""
         cls.chat_template = ""
         cls.processor = ""
@@ -162,7 +163,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         )
         cls.chat_template = "minicpmv"
 
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = get_device()
         cls.model = AutoModel.from_pretrained(
             cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
         ).eval()

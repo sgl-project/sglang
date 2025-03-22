@@ -7,14 +7,19 @@ from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.utils import get_device
 
 
 class TestFusedMOE(unittest.TestCase):
     NUM_EXPERTS = [8, 64]
     TOP_KS = [2, 6]
 
+    @classmethod
+    def setUpClass(cls):
+        cls.device = get_device()
+
     @staticmethod
-    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
+    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01, device="cuda"):
         """Create a random CUDA tensor
 
         Args:
@@ -26,7 +31,7 @@ class TestFusedMOE(unittest.TestCase):
         Returns:
             torch.Tensor: Randomly initialized CUDA tensor
         """
-        return torch.empty(shape, dtype=dtype, device="cuda").normal_(mean, std)
+        return torch.empty(shape, dtype=dtype, device=device).normal_(mean, std)
 
     def get_tolerance(self, dtype):
         """Get tolerance values for different data types
@@ -67,21 +72,32 @@ class TestFusedMOE(unittest.TestCase):
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = torch.cuda.get_device_capability()
-            if not (capability[0] >= 9 or capability == (8, 9)):
-                return
+            if torch.cuda.is_available():
+                capability = torch.cuda.get_device_capability()
+                if not (capability[0] >= 9 or capability == (8, 9)):
+                    return
 
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
+            a = self.create_random_cuda_tensor((m, k), dtype, device=self.device)
+            w1 = self.create_random_cuda_tensor(
+                (e, 2 * n, k), dtype, device=self.device
+            )
+            w2 = self.create_random_cuda_tensor((e, k, n), dtype, device=self.device)
             w1 = w1.to(torch.float8_e4m3fn)
             w2 = w2.to(torch.float8_e4m3fn)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            score = self.create_random_cuda_tensor((m, e), dtype, device=self.device)
 
-            w1_scale = self.create_random_cuda_tensor(e, torch.float32)
-            w2_scale = self.create_random_cuda_tensor(e, torch.float32)
-            a1_scale = self.create_random_cuda_tensor(1, torch.float32)
-            a2_scale = self.create_random_cuda_tensor(1, torch.float32)
+            w1_scale = self.create_random_cuda_tensor(
+                e, torch.float32, device=self.device
+            )
+            w2_scale = self.create_random_cuda_tensor(
+                e, torch.float32, device=self.device
+            )
+            a1_scale = self.create_random_cuda_tensor(
+                1, torch.float32, device=self.device
+            )
+            a2_scale = self.create_random_cuda_tensor(
+                1, torch.float32, device=self.device
+            )
 
             sglang_output = fused_moe(
                 a,
@@ -114,10 +130,12 @@ class TestFusedMOE(unittest.TestCase):
             torch.testing.assert_close(sglang_output, vllm_output, rtol=rtol, atol=atol)
 
         else:
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            a = self.create_random_cuda_tensor((m, k), dtype, device=self.device)
+            w1 = self.create_random_cuda_tensor(
+                (e, 2 * n, k), dtype, device=self.device
+            )
+            w2 = self.create_random_cuda_tensor((e, k, n), dtype, device=self.device)
+            score = self.create_random_cuda_tensor((m, e), dtype, device=self.device)
 
             triton_output = fused_moe(a, w1, w2, score, topk, renormalize=False)
             torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
