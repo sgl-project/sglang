@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -14,7 +15,7 @@ _dir_output = os.environ.get('SGLANG_FINE_GRAINED_BENCHMARK_DIR')
 
 
 def maybe_benchmark(forward_batch: 'ForwardBatch', tp_rank: int):
-    return benchmark(forward_batch) if _dir_output else nullcontext()
+    return benchmark(forward_batch, tp_rank) if _dir_output else nullcontext()
 
 
 @contextmanager
@@ -41,3 +42,12 @@ def _write_output(forward_batch, latency, start_time, tp_rank):
     path = Path(_dir_output) / f'TP{tp_rank}.jsonl'
     with path.open('a') as fp:
         fp.write(f'{data}\n')
+
+
+def clear_output():
+    shutil.rmtree(_dir_output, ignore_errors=True)
+    Path(_dir_output).mkdir(parents=True, exist_ok=True)
+
+
+def read_output():
+    return TODO
