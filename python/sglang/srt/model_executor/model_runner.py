@@ -995,6 +995,7 @@ class ModelRunner:
             latency = time.time() - tic
 
             data = json.dumps(dict(
+                start_time=tic,
                 latency=latency,
                 forward_mode=forward_batch.forward_mode.name,
                 batch_size=forward_batch.batch_size,
