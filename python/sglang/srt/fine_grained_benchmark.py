@@ -11,7 +11,15 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_dir_output = os.environ.get('SGLANG_FINE_GRAINED_BENCHMARK_DIR')
+
+def _compute_dir_output():
+    dir_raw = os.environ.get('SGLANG_FINE_GRAINED_BENCHMARK_DIR')
+    if not dir_raw:
+        return None
+    return str(Path(dir_raw) / 'fine_grained_benchmark')
+
+
+_dir_output = _compute_dir_output()
 
 
 def is_enabled():
