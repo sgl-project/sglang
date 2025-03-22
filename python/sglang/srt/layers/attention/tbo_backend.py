@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -198,19 +197,14 @@ def _init_forward_metadata_cuda_graph_split(
     assert spec_info is None, "spec_info is not supported yet"
 
     ans = dict(
+        bs=output_bs,
+        req_pool_indices=req_pool_indices[seq_slice],
+        seq_lens=seq_lens[seq_slice],
         # directly forward
         forward_mode=forward_mode,
         # ignore
         encoder_lens=None,
         spec_info=None,
-    )
-
-    ans.update(
-        dict(
-            bs=output_bs,
-            req_pool_indices=req_pool_indices[seq_slice],
-            seq_lens=seq_lens[seq_slice],
-        )
     )
 
     if fn_name == "init_forward_metadata_capture_cuda_graph":

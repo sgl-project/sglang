@@ -3,7 +3,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -18,12 +17,14 @@ def compute_split_seq_index(
     if forward_mode.is_extend():
         assert extend_lens is not None
         split_seq_index = _split_array_by_half_sum(extend_lens)
+        num_seqs = len(extend_lens)
     elif forward_mode.is_decode():
         split_seq_index = num_tokens // 2
+        num_seqs = num_tokens
     else:
         raise NotImplementedError
 
-    if split_seq_index == 0 or split_seq_index == num_tokens:
+    if split_seq_index == 0 or split_seq_index == num_seqs:
         return None
 
     return split_seq_index
@@ -70,8 +71,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-                forward_batch.tbo_children
-            )
+            forward_batch.tbo_children
+        )
         ]
     )
 
