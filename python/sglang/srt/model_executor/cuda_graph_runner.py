@@ -124,8 +124,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             # capture less.
             capture_bs = list(range(1, 9)) + list(range(9, 33, 2)) + [64, 96, 128, 160]
 
-    if _is_hip:
-        capture_bs += [i * 8 for i in range(21, 33)]
+        if _is_hip:
+            capture_bs += [i * 8 for i in range(21, 33)]
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
