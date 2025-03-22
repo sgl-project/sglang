@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -122,6 +122,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.fine_grained_benchmark_dir = server_args.fine_grained_benchmark_dir
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -961,7 +962,7 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with self._benchmark_forward():
+        with self._benchmark_forward() if self.fine_grained_benchmark_dir else nullcontext():
             if (
                 forward_batch.forward_mode.is_cuda_graph()
                 and self.cuda_graph_runner
