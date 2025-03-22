@@ -38,6 +38,6 @@ def _write_output(forward_batch, latency, start_time, tp_rank):
         num_tokens=forward_batch.input_ids.shape[0],
         tp_rank=tp_rank,
     ))
-    path = Path(_dir_output) / f'TPtp_rank}.jsonl'
+    path = Path(_dir_output) / f'TP{tp_rank}.jsonl'
     with path.open('a') as fp:
         fp.write(f'{data}\n')
