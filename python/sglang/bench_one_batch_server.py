@@ -111,7 +111,6 @@ def run_one_case(
     output_len: int,
     run_name: str,
     result_filename: str,
-    profile: bool,
 ):
     input_ids = [
         [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
@@ -120,8 +119,6 @@ def run_one_case(
 
     if fine_grained_benchmark.is_enabled():
         fine_grained_benchmark.clear_output()
-    if profile:
-        requests.post(url + "/start_profile").raise_for_status()
 
     tic = time.time()
     response = requests.post(
@@ -139,8 +136,6 @@ def run_one_case(
 
     _ = response.json()
 
-    if profile:
-        requests.post(url + "/stop_profile").raise_for_status()
     if fine_grained_benchmark.is_enabled():
         fine_grained_output = fine_grained_benchmark.read_output()
         print(f'{fine_grained_output=}')  # TODO
@@ -182,11 +177,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             output_len=16,
             run_name="",
             result_filename="",
-            profile=False,
         )
 
     # benchmark
     try:
+        if bench_args.profile:
+            requests.post(base_url + "/start_profile").raise_for_status()
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
@@ -197,8 +193,9 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 ol,
                 bench_args.run_name,
                 bench_args.result_filename,
-                bench_args.profile,
             )
+        if bench_args.profile:
+            requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
