@@ -25,6 +25,7 @@ from sglang.srt.managers.utils import ExpertDistributionRecorder
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
+
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

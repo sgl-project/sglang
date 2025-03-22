@@ -1,9 +1,10 @@
-import logging
-from http import HTTPStatus
-from typing import Optional, List, Tuple, Dict
-from collections import defaultdict
 import json
+import logging
 import time
+from collections import defaultdict
+from http import HTTPStatus
+from typing import Dict, List, Optional, Tuple
+
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
@@ -47,11 +48,12 @@ def validate_input_length(
 
     return None
 
+
 # global expert distribution recording
 class ExpertDistributionRecorder:
     # This class is a singleton class
     def __new__(cls):
-        if not hasattr(cls, 'instance'):
+        if not hasattr(cls, "instance"):
             cls.instance = super(ExpertDistributionRecorder, cls).__new__(cls)
         return cls.instance
 
@@ -64,7 +66,7 @@ class ExpertDistributionRecorder:
     def record_new_token(self, topk_ids):
         if not self._record:
             return
-        topk_ids_list = topk_ids.to('cpu', non_blocking=True).numpy().tolist()
+        topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
         for i in topk_ids_list:
             self._expert_distribution_record.append(tuple(i))
@@ -88,7 +90,7 @@ class ExpertDistributionRecorder:
         for token_record in self._expert_distribution_record:
             for expert_idx in token_record:
                 results[expert_idx] += 1
-        with open(f"expert_distribution_{time.time()}.csv", 'w') as fd:
+        with open(f"expert_distribution_{time.time()}.csv", "w") as fd:
             fd.write("expert_id,count\n")
             for expert_idx, count in results.items():
                 fd.write(f"{expert_idx},{count}\n")

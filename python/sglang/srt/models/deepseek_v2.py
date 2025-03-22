@@ -80,6 +80,7 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as ops
 
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
