@@ -4,10 +4,12 @@ Currently, this repository contains the code to reproduce the following scores.
 
 | Datasets                 | SGLang   | QwQ-32B-official |
 |--------------------------|----------|------------------|
-| AIME24                   | 75.4     | 79.5             |
+| AIME24                   | 79.74    | 79.5             |
 | AIME25                   |          | 69.5             |
 | LiveCodeBench 2408-2502  | 61.9     | 63.4             |
 | IFeval(Strict Prompt Acc)|          | 83.9             |
+
+Kindly remind
 
 ## Download repo
 ```
