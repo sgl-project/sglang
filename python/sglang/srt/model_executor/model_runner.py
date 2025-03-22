@@ -962,7 +962,7 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with self._benchmark_forward() if self.fine_grained_benchmark_dir else nullcontext():
+        with self._benchmark_forward(forward_batch) if self.fine_grained_benchmark_dir else nullcontext():
             if (
                 forward_batch.forward_mode.is_cuda_graph()
                 and self.cuda_graph_runner
@@ -984,7 +984,7 @@ class ModelRunner:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     @contextmanager
-    def _benchmark_forward(self):
+    def _benchmark_forward(self, forward_batch: ForwardBatch):
         torch.cuda.synchronize()
         tic = time.time()
         try:
@@ -992,6 +992,14 @@ class ModelRunner:
         finally:
             torch.cuda.synchronize()
             latency = time.time() - tic
+
+            data = dict(
+                latency=latency,
+                forward_mode=forward_batch.forward_mode.name,
+                batch_size=forward_batch.batch_size,
+                num_tokens=forward_batch.input_ids.shape[0],
+                tp_rank=self.tp_rank,
+            )
             TODO
 
     def _preprocess_logits(
