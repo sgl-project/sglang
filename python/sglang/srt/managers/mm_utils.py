@@ -219,7 +219,8 @@ def embed_image_inputs(
             )
 
             # TODO: chunked prefill will split special tokens from input_ids into several passes, failing the embedding
-            # a fix may be cache the unfinished image embedding and consumed image tokens for future reuse
+            # a fix may be cache the unfinished image embedding for future reuse, determine the tokens to embed with
+            # extend_start_loc and extend_seq_lens
             if num_image_tokens_in_input_ids > num_image_tokens_in_embedding:
                 chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
                 if chunked_prefill_size != -1:

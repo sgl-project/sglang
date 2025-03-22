@@ -1,4 +1,3 @@
-from collections import OrderedDict
 from typing import Type
 
 from transformers import (
@@ -8,13 +7,6 @@ from transformers import (
     PretrainedConfig,
     ProcessorMixin,
 )
-
-
-def remove_if_exists(mapping, key):
-    if key in mapping:
-        if isinstance(mapping, OrderedDict):
-            mapping.pop(key)
-            mapping.popitem(key)
 
 
 def register_image_processor(

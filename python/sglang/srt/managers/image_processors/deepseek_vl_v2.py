@@ -81,6 +81,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
         res = await self._process_images(
             base_output.all_frames, base_output.input_text, max_req_input_len
         )
+        images_seq_mask = res["images_seq_mask"]
         images_spatial_crop = res["images_spatial_crop"]
         batched_images_spatial_crop = []
         batched_images_spatial_crop.append(images_spatial_crop)
@@ -92,6 +93,7 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             "im_token_id": res["im_token_id"],
             "image_hashes": base_output.image_hashes,
             "image_sizes": image_sizes,
+            "images_emb_mask": images_seq_mask,
             "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
         }

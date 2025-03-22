@@ -816,6 +816,42 @@ class MiniCPMVBaseModel(nn.Module):
             type="pixel_values",
         )
 
+    def get_embedding(
+        self,
+        input_ids: torch.Tensor,
+        image_inputs: Optional[MiniCPMVImageInputs],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        vlm_embedding: torch.Tensor = self.llm.get_input_embeddings(input_ids)
+
+        if image_inputs is None:  # No image
+            vision_hidden_states = torch.tensor([], device=input_ids.device)
+        else:
+            if image_inputs["type"] == "image_embeds":
+                vision_hidden_states = (
+                    image_inputs["data"]
+                    .type(vlm_embedding.dtype)
+                    .to(vlm_embedding.device)
+                )
+            else:
+                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
+            # See NOTE in _parse_and_validate_inputs
+            image_bounds = image_inputs["image_bounds"]
+            if len(image_bounds) > 0:
+                image_indices = torch.stack(
+                    [
+                        torch.arange(start, end, dtype=torch.long)
+                        for start, end in image_bounds.tolist()
+                    ]
+                ).to(vlm_embedding.device)
+
+                vlm_embedding.scatter_(
+                    0,
+                    image_indices.view(-1, 1).repeat(1, vlm_embedding.shape[-1]),
+                    vision_hidden_states.view(-1, vision_hidden_states.shape[-1]),
+                )
+
+        return vlm_embedding, vision_hidden_states
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.llm.get_input_embedding()
 
@@ -1003,7 +1039,9 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         self,
         image_inputs: ImageInputs,
     ) -> torch.Tensor:
+        # list of tensors
         pixel_values = image_inputs.pixel_values
+
         tgt_sizes = image_inputs.tgt_sizes
 
         device = self.vpm.embeddings.position_embedding.weight.device

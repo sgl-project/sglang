@@ -170,7 +170,7 @@ class ImageInputs:
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
     # deepseek vl2 related
-    image_seq_mask: Optional[List[torch.Tensor]] = None
+    images_emb_mask: Optional[List[torch.Tensor]] = None
     image_spatial_crop: Optional[List[torch.Tensor]] = None
 
     # The id of the single-image placeholder token
@@ -183,9 +183,6 @@ class ImageInputs:
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
     tgt_sizes: Optional[list] = None
-
-    # denotes the number of valid image tokens in each image
-    images_emb_mask: Optional[torch.BoolTensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -206,7 +203,7 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
-            "image_seq_mask",
+            "images_emb_mask",
             "image_spatial_crop",
             "im_token_id",
             "im_start_id",
@@ -214,7 +211,6 @@ class ImageInputs:
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
-            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -226,6 +222,12 @@ class ImageInputs:
             or isinstance(ret.pixel_values, np.ndarray)
             or isinstance(ret.pixel_values, list)
         )
+
+        # if ret.images_emb_mask is None:
+        #     ret.images_emb_mask = []
+        # if not isinstance(ret.images_emb_mask, list):
+        #     ret.images_emb_mask = [ret.images_emb_mask]
+        # assert isinstance(ret.images_emb_mask, list)
 
         return ret
 
@@ -246,15 +248,15 @@ class ImageInputs:
         # args would be stacked along first dim
         # usually these are already tensors
         stack_args = [
-            "audio_features",
             # TODO: merge with image_grid_thws, basically the same thing
             "tgt_sizes",
             "image_spatial_crop",
         ]
         for arg in stack_args:
-            if getattr(self, arg, None) is not None:
-                setattr(self, arg, getattr(other, arg))
+            if getattr(self, arg, None) is None:
+                setattr(self, arg, getattr(other, arg, None))
             elif getattr(other, arg, None) is not None:
+                # self and other both not None
                 setattr(
                     self,
                     arg,
@@ -282,9 +284,7 @@ class ImageInputs:
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",
-            # "image_grid_thws",
-            "image_seq_mask",
-            "tgt_sizes",
+            "images_emb_mask",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)

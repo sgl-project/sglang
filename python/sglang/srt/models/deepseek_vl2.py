@@ -11,10 +11,6 @@ from sglang.srt.configs.deepseekvl2 import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
-    general_mm_embed_routine,
-)
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -192,9 +188,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         language_config = config.language_config
         self.language_model = DeepseekV2ForCausalLM(language_config)
 
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.language_model.model.embed_tokens
-
     def _init_vision_module(
         self, vision_config, quant_config: Optional[QuantizationConfig]
     ) -> nn.Module:
@@ -202,9 +195,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         try:
             import timm
         except ImportError:
-            raise ImportError(
-                "To use this model, Please install timm==1.0.15"
-            ) from ImportError
+            raise ImportError("Please install timm") from ImportError
 
         model = timm.create_model(
             "vit_so400m_patch14_siglip_384.webli",
@@ -224,20 +215,29 @@ class DeepseekVL2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ):
+        input_embeds = self.language_model.model.embed_tokens(input_ids)
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_image_inputs()
+        ):
+            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().numpy()
+            for idx, image in enumerate(forward_batch.image_inputs):
+                if image is None:
+                    continue
+                start_idx = extend_start_loc_cpu[idx]
+                end_idx = start_idx + extend_seq_lens_cpu[idx]
+                images_emb_mask = image.images_emb_mask.to(device="cuda")
+                image_features = self.get_image_feature(image)
+                input_embeds[start_idx:end_idx] = input_embeds[
+                    start_idx:end_idx
+                ].masked_scatter(images_emb_mask.unsqueeze(-1), image_features)
 
-        inputs_embeds = general_mm_embed_routine(
+        outputs = self.language_model.forward(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            image_embedding_func=self.get_image_feature,
-        )
-
-        outputs = self.language_model.forward(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=inputs_embeds,
+            input_embeds=input_embeds,
         )
 
         return outputs
@@ -263,11 +263,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        helper = MultiModalityDataPaddingPatternImageTokens(
-            image_token_id=image_inputs.im_token_id
-        )
-
-        input_ids = helper.pad_input_tokens(input_ids, image_inputs)
         return input_ids
 
     def get_image_feature(self, image_input: ImageInputs):
