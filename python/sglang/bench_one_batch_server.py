@@ -60,7 +60,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
 
     @classmethod
