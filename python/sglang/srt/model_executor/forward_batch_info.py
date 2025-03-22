@@ -39,11 +39,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultiModalInputs
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -176,7 +177,8 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For multimodal
-    mm_inputs: Optional[List[MultiModalInputs]] = None
+    mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_special_tokens: Optional[MultimodalSpecialTokens] = None
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -332,7 +334,7 @@ class ForwardBatch:
 
         return ret
 
-    def merge_mm_inputs(self) -> Optional[MultiModalInputs]:
+    def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all image inputs in the batch into a single MultiModalInputs object.
 
@@ -340,32 +342,43 @@ class ForwardBatch:
             if none, current batch contains no image input
 
         """
-        if not self.image_inputs or all(x is None for x in self.image_inputs):
+        if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
 
         # Filter out None values
-        valid_inputs = [x for x in self.image_inputs if x is not None]
+        valid_inputs = [x for x in self.mm_inputs if x is not None]
 
         # Start with the first valid image input
         merged = valid_inputs[0]
 
         # Merge remaining inputs
-        for img_input in valid_inputs[1:]:
-            merged.merge(img_input)
+        for mm_input in valid_inputs[1:]:
+            merged.merge(mm_input)
 
         if isinstance(merged.pixel_values, np.ndarray):
             merged.pixel_values = torch.from_numpy(merged.pixel_values)
+        if isinstance(merged.audio_features, np.ndarray):
+            merged.audio_features = torch.from_numpy(merged.audio_features)
 
         return merged
 
-    def contains_mm_inputs(self) -> bool:
+    def contains_image_inputs(self) -> bool:
         """ """
-        if self.image_inputs is None:
-            return True
+        if self.mm_inputs is None:
+            return False
         return any(
-            image_input.pixel_values is not None and image_input.pixel_values is not []
-            for image_input in self.image_inputs
-            if image_input is not None
+            mm_input.pixel_values is not None and mm_input.pixel_values != []
+            for mm_input in self.mm_inputs
+            if mm_input is not None
+        )
+
+    def contains_audio_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input.audio_features is not None and mm_input.audio_features != []
+            for mm_input in self.mm_inputs
+            if mm_input is not None
         )
 
     def _compute_mrope_positions(
@@ -412,15 +425,15 @@ class ForwardBatch:
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
                             image_grid_thw=multimodal_inputs.image_grid_thws,
-                            video_grid_thw=image_inputs.video_grid_thws,
-                            image_token_id=image_inputs.im_token_id,
-                            video_token_id=image_inputs.video_token_id,
+                            video_grid_thw=multimodal_inputs.video_grid_thws,
+                            image_token_id=multimodal_inputs.im_token_id,
+                            video_token_id=multimodal_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
                             vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
                             seq_len=len(self.input_ids),
-                            second_per_grid_ts=image_inputs.second_per_grid_ts,
+                            second_per_grid_ts=multimodal_inputs.second_per_grid_ts,
                             tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )

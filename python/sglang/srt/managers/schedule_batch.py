@@ -144,11 +144,11 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 @dataclasses.dataclass
-class MultiModalInputs:
+class MultimodalInputs:
     """The image related inputs."""
 
     pixel_values: Union[torch.Tensor, np.array]
-    image_hashes: Optional[list] = None
+    data_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     image_pad_len: Optional[list] = None
@@ -182,11 +182,13 @@ class MultiModalInputs:
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
+    # [num_images, 2 (w, h)]
     tgt_sizes: Optional[list] = None
 
     # denotes the number of valid image tokens in each image
     images_emb_mask: Optional[torch.BoolTensor] = None
 
+    # audio
     audio_start_id: Optional[torch.Tensor] = None
     audio_end_id: Optional[torch.Tensor] = None
     audio_features: Optional[List[torch.Tensor]] = None
@@ -194,16 +196,16 @@ class MultiModalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        ret = MultiModalInputs(
+        ret = MultimodalInputs(
             pixel_values=obj["pixel_values"],
-            image_hashes=obj["image_hashes"],
+            data_hashes=obj["data_hashes"],
         )
 
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        ret.pad_values = [x % (1 << 30) for x in ret.image_hashes]
+        ret.pad_values = [x % (1 << 30) for x in ret.data_hashes]
 
         optional_args = [
             "image_sizes",
@@ -238,7 +240,7 @@ class MultiModalInputs:
 
         return ret
 
-    def merge(self, other: MultiModalInputs):
+    def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
         """
@@ -252,6 +254,22 @@ class MultiModalInputs:
             ), f"{self.pixel_values.shape[1:]} vs {other.pixel_values.shape[1:]}"
             self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
+        # args would be stacked along first dim
+        stack_args = [
+            "audio_features",
+            # TODO: merge with image_grid_thws, basically the same thing
+            "tgt_sizes",
+        ]
+        for arg in stack_args:
+            if getattr(self, arg, None) is not None:
+                setattr(self, arg, getattr(other, arg))
+            elif getattr(other, arg, None) is not None:
+                setattr(
+                    self,
+                    arg,
+                    torch.cat([getattr(self, arg), getattr(other, arg)], dim=0),
+                )
+
         if self.image_grid_thws is None:
             self.image_grid_thws = other.image_grid_thws
         elif other.image_grid_thws is not None:
@@ -263,8 +281,9 @@ class MultiModalInputs:
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        self.image_hashes += other.data_hashes
-        self.pad_values = [x % (1 << 30) for x in self.image_hashes]
+        self.data_hashes += other.data_hashes
+        self.pad_values = [x % (1 << 30) for x in self.data_hashes]
+
         # args needed to be merged
         optional_args = [
             "image_sizes",
@@ -272,13 +291,12 @@ class MultiModalInputs:
             "image_pad_len",
             "aspect_ratio_ids",
             "aspect_ratio_mask",
-            # "image_grid_thws",
             "image_seq_mask",
             "image_spatial_crop",
-            "tgt_sizes",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
+                print(f"{arg=}")
                 setattr(self, arg, getattr(self, arg) + getattr(other, arg))
         # other args would be kept intact
 
@@ -358,7 +376,7 @@ class Req:
         self.decoded_text = ""
 
         # For multimodal inputs
-        self.multimodal_inputs: Optional[MultiModalInputs] = None
+        self.multimodal_inputs: Optional[MultimodalInputs] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -1468,7 +1486,7 @@ class ModelWorkerBatch:
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 
     # For multimodal
-    multimodal_inputs: Optional[List[MultiModalInputs]]
+    multimodal_inputs: Optional[List[MultimodalInputs]]
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]

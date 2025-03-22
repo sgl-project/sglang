@@ -45,7 +45,7 @@ class BaseMultiModalProcessorOutput:
 
 
 @dataclasses.dataclass
-class MultiModalEmbedTokens:
+class MultimodalSpecialTokens:
     image_token: Optional[str] = None
     video_token: Optional[str] = None
     audio_token: Optional[str] = None
@@ -143,7 +143,7 @@ class BaseProcessor(ABC):
     def load_mm_data(
         self,
         input_ids: list[int],
-        multimodal_tokens: MultiModalEmbedTokens,
+        multimodal_tokens: MultimodalSpecialTokens,
         max_req_input_len: int,
         image_data: Optional[list] = None,
         audio_data: Optional[list] = None,

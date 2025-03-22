@@ -29,7 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -235,12 +235,10 @@ class DeepseekVL2ForCausalLM(nn.Module):
     ):
 
         input_embeds = self.language_model.model.embed_tokens(input_ids)
-        if forward_batch.forward_mode.is_extend() and forward_batch.image_inputs != [
-            None
-        ]:
+        if forward_batch.forward_mode.is_extend() and forward_batch.mm_inputs != [None]:
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().numpy()
-            for idx, image in enumerate(forward_batch.image_inputs):
+            for idx, image in enumerate(forward_batch.mm_inputs):
                 if image is None:
                     continue
                 start_idx = extend_start_loc_cpu[idx]
@@ -286,7 +284,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         return input_ids
 
     def prepare_inputs_embeds(

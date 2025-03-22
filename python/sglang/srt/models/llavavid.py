@@ -22,7 +22,7 @@ from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -57,7 +57,7 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         pad_values = image_inputs.pad_values
         new_image_feature_len = self.image_feature_len
 

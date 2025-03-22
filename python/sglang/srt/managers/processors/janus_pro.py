@@ -3,7 +3,7 @@ from typing import List, Union
 
 from sglang.srt.managers.processors.base_processor import (
     BaseProcessor,
-    MultiModalEmbedTokens,
+    MultimodalSpecialTokens,
     get_global_processor,
 )
 from sglang.srt.models.deepseek_janus_pro import MultiModalityCausalLM
@@ -63,7 +63,9 @@ class JanusProProcessor(BaseProcessor):
         base_out = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
-            multimodal_tokens=MultiModalEmbedTokens(image_token="<image_placeholder>"),
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token="<image_placeholder>"
+            ),
             max_req_input_len=max_req_input_len,
         )
         images = base_out.images
@@ -75,7 +77,7 @@ class JanusProProcessor(BaseProcessor):
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": res["pixel_values"],
             "images_emb_mask": res["images_emb_mask"],
-            "image_hashes": base_out.data_hashes,
+            "data_hashes": base_out.data_hashes,
             "im_start_id": res["im_start_id"],
             "im_end_id": res["im_end_id"],
             "im_token_id": res["im_token_id"],

@@ -1,4 +1,3 @@
-import asyncio
 from typing import List, Union
 
 from transformers.utils import logging
@@ -6,7 +5,10 @@ from transformers.utils import logging
 from sglang.srt.managers.multimodal_processor import (
     BaseProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.processors.base_processor import get_global_processor
+from sglang.srt.managers.processors.base_processor import (
+    MultimodalSpecialTokens,
+    get_global_processor,
+)
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
@@ -45,7 +47,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             "pixel_values": pixel_values,
         }
 
-    async def process_images_async(
+    async def process_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,
@@ -60,22 +62,22 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
+        base_output = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
-            image_token=image_token,
+            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
             discard_alpha_channel=True,
         )
 
         ret = await self._process_single_image(
-            input_text=base_output.input_text, images=base_output.all_frames
+            input_text=base_output.input_text, images=base_output.images
         )
 
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.image_hashes,
+            "data_hashes": base_output.data_hashes,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }

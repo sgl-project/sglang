@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from sglang.srt.managers.schedule_batch import (
-    MultiModalInputs,
+    MultimodalInputs,
     global_server_args_dict,
     logger,
 )
@@ -26,7 +26,7 @@ class MultiModalityDataPaddingPattern:
 
     @abstractmethod
     def pad_input_tokens(
-        self, input_ids: List[int], image_inputs: MultiModalInputs
+        self, input_ids: List[int], image_inputs: MultimodalInputs
     ) -> List[int]:
         """
         Pad the input ids sequence containing data tokens, and replace them with pad_values
@@ -44,7 +44,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         self.data_token_id_pairs = data_token_pairs
 
     def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultiModalInputs
+        self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
         This function will replace the data-tokens inbetween with pad_values accordingly
@@ -108,7 +108,7 @@ class MultModalityDataPaddingPatternSingleToken(MultiModalityDataPaddingPattern)
         self.num_data_token_calc_func = num_data_token_calc_func
 
     def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultiModalInputs
+        self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
         """
         This function will follow the procedure of:
@@ -171,11 +171,11 @@ class MultiModalityDataPaddingPatternImageTokens(MultiModalityDataPaddingPattern
 
 
 def embed_mm_inputs(
-    mm_input: MultiModalInputs,
+    mm_input: MultimodalInputs,
     input_ids: torch.Tensor,
-    input_embeds: Optional[torch.Tensor],
     input_embedding: nn.Embedding,
     mm_data_embedding_func,
+    placeholder_token_ids: List[int] = None,
 ) -> Optional[torch.Tensor]:
     """
     Calculate the image embeddings if necessary, then scatter the result with
@@ -187,7 +187,7 @@ def embed_mm_inputs(
     if mm_input is None:
         return None
 
-    placeholder_token_ids = mm_input.pad_values
+    placeholder_token_ids = placeholder_token_ids or mm_input.pad_values
 
     # boolean masking the special tokens
     special_image_mask = torch.isin(
@@ -195,22 +195,14 @@ def embed_mm_inputs(
         torch.tensor(placeholder_token_ids, device=input_ids.device),
     ).unsqueeze(-1)
 
-    print(f"{input_ids=}")
-    print(f"{special_image_mask=}")
-
     num_image_tokens_in_input_ids = special_image_mask.sum()
-
-    print(f"{num_image_tokens_in_input_ids=}")
 
     if num_image_tokens_in_input_ids == 0:
         # unexpected
         inputs_embeds = input_embedding(input_ids)
     else:
         # print(f"Getting image feature")
-
         image_embedding = mm_data_embedding_func(mm_input)
-
-        # assert image_embedding.shape[0] == input_ids.shape[0], f"{image_embedding.shape[0]} vs input_ids.shape[0]"
 
         # print(f"image_embedding: {image_embedding.shape}")
 
@@ -284,20 +276,21 @@ def embed_image_embedding(
 
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
-    positions: torch.Tensor,
     forward_batch: ForwardBatch,
     embed_tokens: nn.Embedding,
-    image_embedding_func: Callable[[MultiModalInputs], torch.Tensor],
+    image_embedding_func: Callable[[MultimodalInputs], torch.Tensor],
 ):
     """
     a general wrapper function to get final input embeds from multimodal models
     with a language model as causal model
     """
-    if forward_batch.forward_mode.is_decode() or not forward_batch.contains_mm_inputs():
+    if (
+        forward_batch.forward_mode.is_decode()
+        or not forward_batch.contains_image_inputs()
+    ):
         inputs_embeds = embed_tokens(input_ids)
     else:
         image = forward_batch.merge_mm_inputs()
-        print(f"num images: {len(image.image_hashes)}")
         inputs_embeds = embed_mm_inputs(
             mm_input=image,
             input_ids=input_ids,
@@ -306,17 +299,12 @@ def general_mm_embed_routine(
         )
         # once used, image_inputs is useless
         # just being defensive here
-        forward_batch.image_inputs = None
+        forward_batch.mm_inputs = None
     return inputs_embeds
 
 
 def get_multimodal_data_bounds(
-    input_ids: torch.Tensor,
-    pad_values: List[int],
-    data_start_id: int,
-    data_end_id: int,
-    slice_start_id: Optional[torch.Tensor] = None,
-    slice_end_id: Optional[torch.Tensor] = None,
+    input_ids: torch.Tensor, pad_values: List[int], token_pairs: List[Tuple[int, int]]
 ) -> torch.Tensor:
     """
     Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
@@ -326,11 +314,17 @@ def get_multimodal_data_bounds(
     """
     # All the images in the batch should share the same special image
     # bound token ids.
-    start_cond = input_ids == data_start_id
-    end_cond = input_ids == data_end_id
-    if slice_start_id is not None:
-        start_cond |= input_ids == slice_start_id
-        end_cond |= input_ids == slice_end_id
+    start_tokens = [s for s, _e in token_pairs]
+    end_tokens = [e for _s, e in token_pairs]
+
+    assert all(isinstance(t, int) for t in start_tokens)
+    assert all(isinstance(t, int) for t in end_tokens)
+
+    # print(input_ids)
+    start_cond = torch.isin(
+        input_ids, torch.tensor(start_tokens, device=input_ids.device)
+    )
+    end_cond = torch.isin(input_ids, torch.tensor(end_tokens, device=input_ids.device))
 
     (data_start_tokens,) = torch.where(start_cond)
     data_start_tokens += 1

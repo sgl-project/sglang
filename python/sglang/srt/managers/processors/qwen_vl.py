@@ -10,7 +10,7 @@ from sglang.srt.managers.multimodal_processor import (
     BaseProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.managers.processors.base_processor import (
-    MultiModalEmbedTokens,
+    MultimodalSpecialTokens,
     get_global_processor,
 )
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -82,7 +82,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         base_output = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
-            multimodal_tokens=MultiModalEmbedTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
         )
 
@@ -178,7 +178,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.data_hashes,
+            "data_hashes": base_output.data_hashes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
             "video_grid_thws": video_grid_thws,

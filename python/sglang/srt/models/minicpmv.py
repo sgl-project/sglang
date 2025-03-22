@@ -54,7 +54,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     embed_mm_inputs,
 )
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -828,7 +828,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         if (
             forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_mm_inputs()
+            or not forward_batch.contains_image_inputs()
         ):
             inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
         else:
@@ -837,7 +837,7 @@ class MiniCPMVBaseModel(nn.Module):
             # There values are useless because their embeddings will be replaced by vision embeddings anyway.
             image_inputs = forward_batch.merge_mm_inputs()
             inputs_embeds = embed_mm_inputs(
-                image_input=image_inputs,
+                mm_input=image_inputs,
                 input_ids=input_ids,
                 input_embedding=self.get_input_embeddings(),
                 mm_data_embedding_func=self.get_image_features,
@@ -889,7 +889,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_image_features(self, image_inputs: MultiModalInputs) -> torch.Tensor:
+    def get_image_features(self, image_inputs: MultimodalInputs) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -1001,7 +1001,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
 
     def get_image_features(
         self,
-        image_inputs: MultiModalInputs,
+        image_inputs: MultimodalInputs,
     ) -> torch.Tensor:
         pixel_values = image_inputs.pixel_values
         tgt_sizes = image_inputs.tgt_sizes
@@ -1037,7 +1037,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id

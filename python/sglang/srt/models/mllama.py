@@ -32,7 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -796,7 +796,7 @@ class MllamaForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         pixel_values = image_inputs.pixel_values
         pad_values = image_inputs.pad_values
 

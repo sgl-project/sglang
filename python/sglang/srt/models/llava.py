@@ -31,7 +31,7 @@ from transformers import (
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
@@ -46,7 +46,7 @@ from sglang.srt.utils import add_prefix
 
 
 class LlavaBaseForCausalLM(nn.Module):
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 
         # hardcode for spatial_unpad + anyres

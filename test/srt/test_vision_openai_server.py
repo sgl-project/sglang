@@ -271,22 +271,17 @@ class TestOpenAIVisionServer(unittest.TestCase):
         # messages = self.prepare_video_messages_video_direct(file_path)
         messages = self.prepare_video_messages(file_path)
 
-        video_request = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="default",
             messages=messages,
             temperature=0,
             max_tokens=1024,
-            stream=True,
+            stream=False,
         )
 
-        print("-" * 30)
-        video_response = ""
-        for chunk in video_request:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                video_response += content
-                print(content, end="", flush=True)
-        print("-" * 30)
+        video_response = response.choices[0].message.content
+
+        print(f"Video response:\n{video_response}")
 
         # Add assertions to validate the video response
         assert "iPod" in video_response or "device" in video_response, video_response
@@ -411,7 +406,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
         return messages
 
-    def get_audio_response(self, url: str, prompt):
+    def get_audio_response(self, url: str, prompt, category):
         audio_file_path = self.get_or_download_file(url)
         client = openai.Client(api_key="sk-123456", base_url=self.base_url)
 
@@ -426,6 +421,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         )
 
         print("-" * 30)
+        print(f"audio {category} response:\n")
         audio_response = ""
         for chunk in audio_request:
             if chunk.choices[0].delta.content is not None:
@@ -446,6 +442,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         audio_response = self.get_audio_response(
             AUDIO_TRUMP_SPEECH_URL,
             "Please describe what does the person say in the audio.",
+            category="speech",
         )
         assert "thank you" in audio_response
         assert "it's a privilege to be here" in audio_response
@@ -458,10 +455,11 @@ class TestOpenAIVisionServer(unittest.TestCase):
         audio_response = self.get_audio_response(
             AUDIO_BIRD_SONG_URL,
             "Please listen to the audio snippet carefully and transcribe the content.",
+            "ambient",
         )
         assert "bird" in audio_response
 
-    def test_audio_completion(self):
+    def test_audio_chat_completion(self):
         pass
 
 
@@ -612,7 +610,6 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
                 "minicpmv",
                 "--mem-fraction-static",
                 "0.4",
-                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
@@ -635,11 +632,12 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "minicpmo",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_audio_completion(self):
+    def test_audio_chat_completion(self):
         self._test_audio_speech_completion()
         self._test_audio_ambient_completion()
 

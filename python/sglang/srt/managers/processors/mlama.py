@@ -53,7 +53,7 @@ class MllamaImageProcessor(BaseProcessor):
             images = load_image(image_data[0])[0]
 
         image_inputs = await self._process_single_image(images, input_text)
-        image_inputs["image_hashes"] = [hash(str(image_data))]
+        image_inputs["data_hashes"] = [hash(str(image_data))]
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
         return image_inputs

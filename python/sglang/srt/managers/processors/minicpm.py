@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.managers.processors.base_processor import (
     BaseProcessor,
-    MultiModalEmbedTokens,
+    MultimodalSpecialTokens,
     get_global_processor,
 )
 from sglang.srt.models.minicpmo import MiniCPMO
@@ -81,7 +81,7 @@ class MiniCPMImageProcessor(BaseProcessor):
             max_req_input_len=max_req_input_len,
             audio_data=audio_data,
             image_data=image_data,
-            multimodal_tokens=MultiModalEmbedTokens(
+            multimodal_tokens=MultimodalSpecialTokens(
                 image_token=self.image_token, audio_token=self.audio_token
             ),
         )
@@ -144,13 +144,16 @@ class MiniCPMImageProcessor(BaseProcessor):
                 tgt_sizes_flat += [tgt_n]
 
         pixel_values = pixel_values_flat
-        tgt_sizes = torch.stack(tgt_sizes_flat)
+        if len(tgt_sizes_flat) == 0:
+            tgt_sizes = None
+        else:
+            tgt_sizes = torch.stack(tgt_sizes_flat)
 
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "pixel_values": pixel_values,
             "tgt_sizes": tgt_sizes,
-            "image_hashes": base_output.data_hashes,
+            "data_hashes": base_output.data_hashes,
             "modalities": request_obj.modalities or ["image"],
             "audio_start_id": audio_start_id,
             "audio_end_id": audio_end_id,

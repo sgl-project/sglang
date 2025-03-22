@@ -14,7 +14,6 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
-import types
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -34,23 +33,21 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.activations import ACT2FN
-from transformers.cache_utils import DynamicCache, EncoderDecoderCache, StaticCache
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
-from transformers.models.paligemma.modeling_paligemma import (
-    _prepare_4d_causal_attention_mask_with_cache_position,
-)
 from transformers.models.whisper.modeling_whisper import (
     WHISPER_ATTENTION_CLASSES,
     WhisperConfig,
     WhisperEncoder,
 )
 
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     embed_mm_inputs,
+    get_multimodal_data_bounds,
 )
-from sglang.srt.managers.schedule_batch import MultiModalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -60,7 +57,7 @@ from sglang.srt.models.minicpmv import (
     Resampler2_5,
 )
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import get_multimodal_data_bounds, logger
+from sglang.srt.utils import logger
 
 try:
     from vector_quantize_pytorch import GroupedResidualFSQ
@@ -1271,39 +1268,6 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 `(last_hidden_state, hidden_states, attentions)`, with `hidden_states` and `attentions`
                 only present if their respective `output_*` arguments are set to `True`.
 
-        Example:
-            >>> from transformers import AutoFeatureExtractor, WhisperConfig, WhisperForConditionalGeneration
-            >>> import torch
-
-            >>> # Load a feature extractor and a Whisper model
-            >>> feature_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-tiny.en")
-            >>> model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
-
-            >>> # Assume you have audio (list of floats or numpy array) loaded from a file
-            >>> # Then extract the mel features:
-            >>> input_features = feature_extractor(audio, sampling_rate=16000, return_tensors="pt").input_features
-
-            >>> # Forward pass
-            >>> outputs = model.encoder(
-            ...     input_features=input_features,
-            ...     output_hidden_states=True,
-            ...     output_attentions=True,
-            ...     use_cache=True
-            ... )
-
-            >>> # Retrieve the last hidden state
-            >>> last_hidden_state = outputs.last_hidden_state
-            >>> print(last_hidden_state.shape)
-            torch.Size([batch_size, seq_length, hidden_size])
-
-            >>> # Retrieve the intermediate hidden states if output_hidden_states=True
-            >>> all_encoder_hidden_states = outputs.hidden_states
-
-            >>> # Retrieve attention weights if output_attentions=True
-            >>> all_encoder_attentions = outputs.attentions
-
-            >>> # Retrieve updated past key values if use_cache=True
-            >>> encoder_cache = outputs.past_key_values
         """
         output_attentions = (
             output_attentions
@@ -1447,91 +1411,6 @@ class MultiModalProjector(nn.Module):
         return hidden_states
 
 
-# Copy and modified from transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation
-def prepare_inputs_for_generation(
-    self,
-    input_ids,
-    past_key_values=None,
-    attention_mask=None,
-    inputs_embeds=None,
-    cache_position=None,
-    position_ids=None,
-    use_cache=True,
-    **kwargs,
-):
-    if past_key_values is not None:
-        if isinstance(past_key_values, Cache):
-            cache_length = past_key_values.get_seq_length()
-            past_length = past_key_values.seen_tokens
-        else:
-            cache_length = past_length = past_key_values[0][0].shape[2]
-
-        # Keep only the unprocessed tokens:
-        # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-        # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-        # input)
-        if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-            input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-        # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-        # input_ids based on the past_length.
-        elif past_length < input_ids.shape[1]:
-            input_ids = input_ids[:, past_length:]
-        # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-    if attention_mask is not None and position_ids is None:
-        # create position_ids on the fly for batch generation
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        if past_key_values:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
-
-            # This clo≠clo≠clone call is needed to avoid recapturing cuda graphs with →rch.comπ≤→rch.comπ≤torch.compile's  mode=reduce−overheadmode=reduce-overheadmode="reduce-overhead, as otherwise the input positionidspositionidsposition_ids would have various stride during the decoding. Here, simply using .contiguous().contiguous().contiguous() is not sufficient as in the batch size = 1 case, positionidspositionidsposition_ids is already contiguous but with varying stride which retriggers a capture.
-            position_ids = position_ids.clone(memory_format=torch.contiguous_format)
-
-    # if ∈putsembeds∈putsembedsinputs_embeds are passed, we only want to use them in the 1st generation step
-    if inputs_embeds is not None and cache_position[0] == 0:
-        model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
-    else:
-        # The clone here is for the same reason as for positionidspositionidsposition_ids.
-        model_inputs = {
-            "input_ids": input_ids.clone(memory_format=torch.contiguous_format),
-            "inputs_embeds": None,
-        }
-
-    if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-        if model_inputs["inputs_embeds"] is not None:
-            batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-            device = model_inputs["inputs_embeds"].device
-        else:
-            batch_size, sequence_length = model_inputs["input_ids"].shape
-            device = model_inputs["input_ids"].device
-
-        dtype = self.lm_head.weight.dtype
-        min_dtype = torch.finfo(dtype).min
-
-        attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=past_key_values.get_max_length(),
-            dtype=dtype,
-            device=device,
-            min_dtype=min_dtype,
-            cache_position=cache_position,
-            batch_size=batch_size,
-        )
-
-    model_inputs.update(
-        {
-            "position_ids": position_ids,
-            # "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-            "attention_mask": attention_mask,
-        }
-    )
-    return model_inputs
-
-
 class MiniCPMO(MiniCPMVBaseModel):
     def __init__(
         self,
@@ -1541,16 +1420,12 @@ class MiniCPMO(MiniCPMVBaseModel):
         super().__init__(config=config, quant_config=quant_config)
 
         self.llm = self.init_llm(config=config, quant_config=quant_config)
-        # patch llm
-        self.llm.prepare_inputs_for_generation = types.MethodType(
-            prepare_inputs_for_generation, self.llm
-        )
 
         self.embed_dim = self.llm.config.hidden_size
 
         # init vision module
         if self.config.init_vision:
-            print("vision-understanding enabled")
+            # print("vision-understanding enabled")
             self.vpm = self.init_vision_module(config=config, quant_config=quant_config)
             self.vision_dim = self.vpm.embed_dim
             self.resampler = self.init_resampler(self.embed_dim, self.vision_dim)
@@ -1558,7 +1433,7 @@ class MiniCPMO(MiniCPMVBaseModel):
         # init audio module
         self.config.init_audio = True
         if self.config.init_audio:
-            print("audio-understanding enabled")
+            # print("audio-understanding enabled")
             self.apm = self.init_audio_module()
             audio_output_dim = int(self.apm.config.encoder_ffn_dim // 4)
             self.audio_avg_pooler = nn.AvgPool1d(
@@ -1571,8 +1446,9 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         # init tts module
         self.config.init_tts = False
+        logger.info("TTS is disabled for now")
         if self.config.init_tts:
-            print("tts enabled")
+            # print("tts enabled")
             assert (
                 _tts_deps
             ), "please make sure vector_quantize_pytorch and vocos are installed."
@@ -1635,7 +1511,7 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         return resampler.to(device="cuda", dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultiModalInputs):
+    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id
@@ -1663,7 +1539,7 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         return input_lengths_after_cnn, input_lengths_after_pooling
 
-    def get_audio_embedding_streaming(self, multimodal_input: MultiModalInputs):
+    def get_audio_embedding_streaming(self, multimodal_input: MultimodalInputs):
         r"""
         Extract audio embeddings in a streaming manner using cached key-value pairs.
 
@@ -1765,12 +1641,6 @@ class MiniCPMO(MiniCPMVBaseModel):
         Returns:
             torch.Tensor: mask
 
-        Examples:
-            >>> subsequent_chunk_mask(4, 2)
-            [[1, 1, 0, 0],
-            [1, 1, 0, 0],
-            [1, 1, 1, 1],
-            [1, 1, 1, 1]]
         """
         ret = torch.zeros(size, size, device=device, dtype=torch.bool)
         for i in range(size):
@@ -1782,7 +1652,7 @@ class MiniCPMO(MiniCPMVBaseModel):
             ret[i, start:ending] = True
         return ret
 
-    def get_audio_embedding(self, multimodal_input: MultiModalInputs, chunk_length=-1):
+    def get_audio_embedding(self, multimodal_input: MultimodalInputs, chunk_length=-1):
         r"""
         Extract full audio embeddings with optional chunk-based attention.
 
@@ -1889,8 +1759,8 @@ class MiniCPMO(MiniCPMVBaseModel):
     def get_omni_embedding(
         self,
         input_ids,
-        multimodal_input: MultiModalInputs,
-        input_embeddings,
+        multimodal_input: MultimodalInputs,
+        input_embeds: torch.Tensor,
         forward_mode: ForwardMode,
         chunk_length=-1,
         stream_input=False,
@@ -1898,43 +1768,44 @@ class MiniCPMO(MiniCPMVBaseModel):
         """
         Args:
             multimodal_input:
-            input_embeddings:
+            input_embeds:
             chunk_length: whisper use full attention or chunk attention
             stream_input: use streaming audio embedding
         Returns:
             final embeddings with audio feature
         """
-        input_embeddings = input_embeddings.unsqueeze(0)
+        input_embeds = input_embeds.unsqueeze(0)
         if not forward_mode.is_decode() and multimodal_input.audio_features is not None:
+            audio_bounds = get_multimodal_data_bounds(
+                input_ids=input_ids,
+                pad_values=multimodal_input.pad_values,
+                token_pairs=[
+                    (multimodal_input.audio_start_id, multimodal_input.audio_end_id)
+                ],
+            )
+            if audio_bounds.numel() == 0:
+                return input_embeds
+            audio_bounds = audio_bounds.unsqueeze(0)
+
+            bs = len(input_embeds)
+
             if stream_input:
                 audio_embeddings = self.get_audio_embedding_streaming(multimodal_input)
             else:
                 audio_embeddings = self.get_audio_embedding(
                     multimodal_input, chunk_length
                 )
-            audio_bounds = get_multimodal_data_bounds(
-                input_ids=input_ids,
-                pad_values=multimodal_input.pad_values,
-                data_start_id=multimodal_input.audio_start_id,
-                data_end_id=multimodal_input.audio_end_id,
-            )
-            audio_bounds = audio_bounds.unsqueeze(0)
-
-            bs = len(input_embeddings)
-            if audio_bounds.numel() == 0:
-                return input_embeddings
-
-            assert len(audio_embeddings) == len(input_embeddings)
+            assert len(audio_embeddings) == len(input_embeds)
             if len(audio_embeddings) > 0:
                 if self.config.chunk_input:
                     for i in range(bs):
                         audio_embs = torch.cat(audio_embeddings[i], dim=0).to(
-                            device=input_embeddings.device, dtype=input_embeddings.dtype
+                            device=input_embeds.device, dtype=input_embeds.dtype
                         )
                         audio_start_pos = 0
                         for bound in audio_bounds[i]:
                             audio_len = bound[1] - bound[0]
-                            input_embeddings[0, bound[0] : bound[1]] = audio_embs[
+                            input_embeds[0, bound[0] : bound[1]] = audio_embs[
                                 audio_start_pos : audio_start_pos + audio_len, :
                             ]
                             audio_start_pos += audio_len
@@ -1945,18 +1816,53 @@ class MiniCPMO(MiniCPMVBaseModel):
                         for embs, bound in zip(audio_embs, bounds):
                             audio_indices = torch.arange(
                                 bound[0], bound[1], dtype=torch.long
-                            ).to(input_embeddings.device)
+                            ).to(input_embeds.device)
 
                             if embs.shape[0] != len(audio_indices):
                                 raise ValueError(
                                     f"Shape mismatch: Trying to assign embeddings of shape {embs.shape} "
                                     f"to input indices of length {len(audio_indices)}"
                                 )
-                            input_embeddings[i, audio_indices] = embs.to(
-                                input_embeddings.dtype
-                            )
+                            input_embeds[i, audio_indices] = embs.to(input_embeds.dtype)
+        input_embeds = input_embeds.squeeze(0)
+        return input_embeds
 
-        return input_embeddings
+    def get_image_features(
+        self,
+        image_inputs: MultimodalInputs,
+    ) -> torch.Tensor:
+        pixel_values = image_inputs.pixel_values
+        tgt_sizes = image_inputs.tgt_sizes
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+        all_pixel_values_lst = [
+            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
+        ]
+
+        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
+        assert isinstance(max_patches, int)
+
+        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+            all_pixel_values_lst, batch_first=True, padding_value=0.0
+        )
+        B, L, _ = all_pixel_values.shape
+        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+        patch_attn_mask = torch.zeros(
+            (B, 1, max_patches), dtype=torch.bool, device=device
+        )
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+        vision_embedding = self.vpm(
+            all_pixel_values.type(dtype),
+            patch_attention_mask=patch_attn_mask,
+            tgt_sizes=tgt_sizes,
+        )
+        return self.resampler(vision_embedding, tgt_sizes)
 
     def forward(
         self,
@@ -1965,16 +1871,12 @@ class MiniCPMO(MiniCPMVBaseModel):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-
+        inputs_embeds = None
+        # TODO(mick): optimize the logic here: clamp, merge and embedding should happens at most once
         if (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_mm_inputs()
+            not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_image_inputs()
         ):
-            inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
-        else:
-            # Clamp input ids. This is because the input_ids for the image tokens are
-            # filled with the hash values of the image for the prefix matching in the radix attention.
-            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
             mm_inputs = forward_batch.merge_mm_inputs()
             inputs_embeds = embed_mm_inputs(
                 mm_input=mm_inputs,
@@ -1984,20 +1886,28 @@ class MiniCPMO(MiniCPMVBaseModel):
                 placeholder_token_ids=[mm_inputs.im_token_id] + mm_inputs.pad_values,
             )
 
-        if self.config.init_audio and (
-            forward_batch.forward_mode != ForwardMode
-            or forward_batch.contains_mm_inputs()
+        input_ids = input_ids.clamp(
+            min=0, max=self.get_input_embeddings().num_embeddings - 1
+        )
+        if inputs_embeds is None:
+            inputs_embeds = self.llm.get_input_embeddings(input_ids)
+
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and self.config.init_audio
+            and forward_batch.contains_audio_inputs()
         ):
             mm_input = forward_batch.merge_mm_inputs()
             inputs_embeds = self.get_omni_embedding(
-                input_ids,
-                mm_input,
+                input_ids=input_ids,
+                multimodal_input=mm_input,
+                input_embeds=inputs_embeds,
                 forward_mode=forward_batch.forward_mode,
-                input_embeddings=inputs_embeds,
                 chunk_length=self.config.audio_chunk_length,
                 stream_input=False,
             )
-            inputs_embeds = inputs_embeds.squeeze(0)
+
+        forward_batch.mm_inputs = None
 
         hidden_states = self.llm.model(
             input_ids=None,
