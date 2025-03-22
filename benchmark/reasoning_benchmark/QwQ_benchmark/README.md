@@ -9,7 +9,7 @@ Currently, this repository contains the code to reproduce the following scores.
 | LiveCodeBench 2408-2502  | 61.9     | 63.4             |
 | IFeval(Strict Prompt Acc)|          | 83.9             |
 
-Kindly remind that there will be some variance when evaluating the benchmark. The result of using SGLang falls in the reasonable range of QwQ official result.
+Kindly remind that, even with `n_samples` set the same as QwQ officially recommended, there's still some deviation in the results. For less deviation in the results please increase `n_samples` to a higher value.
 
 ## Download repo
 ```
