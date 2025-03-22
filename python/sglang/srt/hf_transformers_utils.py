@@ -217,11 +217,28 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ):
+    # pop 'revision' from kwargs if present.
+    revision = kwargs.pop("revision", tokenizer_revision)
+
+    # Load the model config to check model type.
+    config = AutoConfig.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
+
+    # fix: for Qwen2-VL model, inject default 'size' if not provided.
+    if config.model_type in {"qwen2_vl"}:
+        if "size" not in kwargs:
+            # Defaults based on your processor (adjust if needed)
+            kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,
         trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
+        revision=revision,
         **kwargs,
     )
 
