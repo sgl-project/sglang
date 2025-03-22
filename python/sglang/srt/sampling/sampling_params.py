@@ -49,6 +49,14 @@ class SamplingParams:
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
+        min_reasoning_penalty: float = 0.0,
+        max_reasoning_penalty: float = 0.0,
+        num_reasoning_penalty_steps: int = 0,
+        stop_reasoning: Optional[Union[str, List[str]]] = None,
+        stop_reasoning_token_ids: Optional[List[int]] = None,
+        ngram_penalty: float = 0.0,
+        ngram_n: int = 32,
+        ngram_lookback_window: int = 512,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
@@ -74,7 +82,18 @@ class SamplingParams:
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
+        self.min_reasoning_penalty = min_reasoning_penalty
+        self.max_reasoning_penalty = max_reasoning_penalty
+        self.num_reasoning_penalty_steps = num_reasoning_penalty_steps
+        self.stop_reasoning_strs = stop_reasoning
+        self.stop_reasoning_token_ids = stop_reasoning_token_ids
         self.custom_params = custom_params
+        self.ngram_penalty = ngram_penalty
+        self.ngram_n = ngram_n
+        self.ngram_lookback_window = ngram_lookback_window
+
+        print('sampling params init')
+        print("temperature: ", self.temperature)
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -83,6 +102,16 @@ class SamplingParams:
             self.top_k = 1
         if self.top_k == -1:
             self.top_k = 1 << 30  # whole vocabulary
+
+        if self.stop_reasoning_token_ids is None:
+            self.stop_reasoning_token_ids = set()
+        else:
+            self.stop_reasoning_token_ids = set(self.stop_reasoning_token_ids)
+        
+        if self.stop_reasoning_strs is None:
+            self.stop_reasoning_strs = set()
+        else:
+            self.stop_reasoning_strs = set(self.stop_reasoning_strs)
 
     def verify(self):
         if self.temperature < 0.0:
@@ -115,6 +144,10 @@ class SamplingParams:
             raise ValueError(
                 f"min_new_tokens must be in [0, max_new_tokens], got "
                 f"{self.min_new_tokens}."
+            )
+        if self.num_reasoning_penalty_steps is not None and self.num_reasoning_penalty_steps < 0:
+            raise ValueError(
+                f"num_reasoning_penalty_steps must be non-negative, got {self.num_reasoning_penalty_steps}."
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
@@ -151,3 +184,18 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+        # Process stop reasoning
+        #print('stop_reasoning_strs: ', self.stop_reasoning_strs)
+        #print('stop_reasoning_token_ids: ', self.stop_reasoning_token_ids)
+        #assert False, 'test'
+        
+        if len(self.stop_reasoning_strs) > 0:
+            for stop_str in self.stop_reasoning_strs:
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)[0]
+                    print('stop_str_ids: ', stop_str_ids)
+                    self.stop_reasoning_token_ids.add(stop_str_ids)
+                else:
+                    raise ValueError("tokenizer is required for stop_reasoning_strs")
+        

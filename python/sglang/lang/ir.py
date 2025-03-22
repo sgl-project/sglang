@@ -37,6 +37,16 @@ class SglSamplingParams:
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
     regex: Optional[str] = None
+    # for token boosting
+    min_reasoning_penalty: Optional[float] = 0.0
+    max_reasoning_penalty: Optional[float] = 0.0
+    num_reasoning_penalty_steps: Optional[int] = 0
+    stop_reasoning: Optional[Union[str, List[str]]] = None
+    stop_reasoning_token_ids: Optional[List[int]] = None
+    # for n-gram penalty
+    ngram_penalty: Optional[float] = 0.0
+    ngram_n: Optional[int] = 32
+    ngram_lookback_window: Optional[int] = 512
 
     def clone(self):
         return SglSamplingParams(
@@ -57,6 +67,16 @@ class SglSamplingParams:
             self.top_logprobs_num,
             self.return_text_in_logprobs,
             self.json_schema,
+            self.dtype,
+            self.regex,
+            self.min_reasoning_penalty,
+            self.max_reasoning_penalty,
+            self.num_reasoning_penalty_steps,
+            self.stop_reasoning,
+            self.stop_reasoning_token_ids,
+            self.ngram_penalty,
+            self.ngram_n,
+            self.ngram_lookback_window,
         )
 
     def to_openai_kwargs(self):
@@ -132,6 +152,14 @@ class SglSamplingParams:
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
+            "min_reasoning_penalty": self.min_reasoning_penalty,
+            "max_reasoning_penalty": self.max_reasoning_penalty,
+            "num_reasoning_penalty_steps": self.num_reasoning_penalty_steps,
+            "stop_reasoning": self.stop_reasoning,
+            "stop_reasoning_token_ids": self.stop_reasoning_token_ids,
+            "ngram_penalty": self.ngram_penalty,
+            "ngram_n": self.ngram_n,
+            "ngram_lookback_window": self.ngram_lookback_window,
         }
 
 
@@ -175,6 +203,14 @@ class SglFunction:
         stream: bool = False,
         backend=None,
         use_thread: bool = True,
+        min_reasoning_penalty: Optional[float] = None,
+        max_reasoning_penalty: Optional[float] = None,
+        num_reasoning_penalty_steps: Optional[int] = None,
+        stop_reasoning: Optional[Union[str, List[str]]] = None,
+        stop_reasoning_token_ids: Optional[List[int]] = None,
+        ngram_penalty: Optional[float] = None,
+        ngram_n: Optional[int] = None,
+        ngram_lookback_window: Optional[int] = None,
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
@@ -201,6 +237,14 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            min_reasoning_penalty=min_reasoning_penalty,
+            max_reasoning_penalty=max_reasoning_penalty,
+            num_reasoning_penalty_steps=num_reasoning_penalty_steps,
+            stop_reasoning=stop_reasoning,
+            stop_reasoning_token_ids=stop_reasoning_token_ids,
+            ngram_penalty=ngram_penalty,
+            ngram_n=ngram_n,
+            ngram_lookback_window=ngram_lookback_window,
         )
         backend = backend or global_config.default_backend
         return run_program(
@@ -236,6 +280,14 @@ class SglFunction:
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
         generator_style: bool = False,
+        min_reasoning_penalty: Optional[float] = 0.0,
+        max_reasoning_penalty: Optional[float] = 0.0,
+        num_reasoning_penalty_steps: Optional[int] = 0,
+        stop_reasoning: Optional[Union[str, List[str]]] = None,
+        stop_reasoning_token_ids: Optional[List[int]] = None,
+        ngram_penalty: Optional[float] = None,
+        ngram_n: Optional[int] = None,
+        ngram_lookback_window: Optional[int] = None,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -278,6 +330,14 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            min_reasoning_penalty=min_reasoning_penalty,
+            max_reasoning_penalty=max_reasoning_penalty,
+            num_reasoning_penalty_steps=num_reasoning_penalty_steps,
+            stop_reasoning=stop_reasoning,
+            stop_reasoning_token_ids=stop_reasoning_token_ids,
+            ngram_penalty=ngram_penalty,
+            ngram_n=ngram_n,
+            ngram_lookback_window=ngram_lookback_window,
         )
         backend = backend or global_config.default_backend
         return run_program_batch(
@@ -465,6 +525,14 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        min_reasoning_penalty: Optional[float] = None,
+        max_reasoning_penalty: Optional[float] = None,
+        num_reasoning_penalty_steps: Optional[int] = None,
+        stop_reasoning: Optional[Union[str, List[str]]] = None,
+        stop_reasoning_token_ids: Optional[List[int]] = None,
+        ngram_penalty: Optional[float] = None,
+        ngram_n: Optional[int] = None,
+        ngram_lookback_window: Optional[int] = None,
     ):
         """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
@@ -489,6 +557,14 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
             json_schema=json_schema,
+            min_reasoning_penalty=min_reasoning_penalty,
+            max_reasoning_penalty=max_reasoning_penalty,
+            num_reasoning_penalty_steps=num_reasoning_penalty_steps,
+            stop_reasoning=stop_reasoning,
+            stop_reasoning_token_ids=stop_reasoning_token_ids,
+            ngram_penalty=ngram_penalty,
+            ngram_n=ngram_n,
+            ngram_lookback_window=ngram_lookback_window,
         )
 
     def __repr__(self):

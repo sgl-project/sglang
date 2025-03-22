@@ -538,6 +538,11 @@ def v1_generate_request(
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
                 "skip_special_tokens": request.skip_special_tokens,
+                "stop_reasoning": request.stop_reasoning,
+                "stop_reasoning_token_ids": request.stop_reasoning_token_ids,
+                "ngram_penalty": request.ngram_penalty,
+                "ngram_n": request.ngram_n,
+                "ngram_lookback_window": request.ngram_lookback_window,
             }
         )
         return_logprobs.append(request.logprobs is not None)
@@ -1019,6 +1024,14 @@ def v1_chat_generate_request(
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
+            "stop_reasoning_token_ids": request.stop_reasoning_token_ids,
+            "stop_reasoning": request.stop_reasoning,
+            "ngram_penalty": request.ngram_penalty,
+            "ngram_n": request.ngram_n,
+            "ngram_lookback_window": request.ngram_lookback_window,
+            "min_reasoning_penalty": request.min_reasoning_penalty,
+            "max_reasoning_penalty": request.max_reasoning_penalty,
+            "num_reasoning_penalty_steps": request.num_reasoning_penalty_steps,
         }
 
         if request.response_format and request.response_format.type == "json_schema":
@@ -1266,9 +1279,11 @@ async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
     request_json = await raw_request.json()
+    # print('request_json: ', request_json)
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    # print('adapted_request: ', adapted_request)
 
     if adapted_request.stream:
         parser_dict = {}

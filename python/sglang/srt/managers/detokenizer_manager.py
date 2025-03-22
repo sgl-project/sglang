@@ -127,8 +127,10 @@ class DetokenizerManager:
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
-            assert len(output) > 0
-            return output[:-1]
+            if len(output) > 0:
+                return output[:-1]
+            else:
+                return output
         return output
 
     def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
