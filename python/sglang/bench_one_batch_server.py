@@ -74,6 +74,9 @@ def launch_server_internal(server_args):
 
 
 def launch_server_process(server_args: ServerArgs):
+    if fine_grained_benchmark.is_enabled():
+        os.environ['SGLANG_ENABLE_COLOCATED_BATCH_GEN'] = 'true'
+
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
