@@ -24,6 +24,7 @@ from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 @dataclass
 class FlashAttentionMetadata:
     """Metadata for decode operations to avoid redundant computations."""
+
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
     max_seq_len_k: int = 0
@@ -74,7 +75,7 @@ class FlashAttentionBackend(AttentionBackend):
         device = seqlens_in_batch.device
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-        ) 
+        )
         # Precompute maximum sequence length
         metadata.max_seq_len_k = seqlens_in_batch.max().item()
         # Precompute page table
@@ -97,7 +98,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
             metadata.max_seq_len_q = seqlens_in_batch.max().item()
         self.forward_metadata = metadata
-
 
     def forward_extend(
         self,
