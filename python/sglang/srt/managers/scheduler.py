@@ -358,6 +358,7 @@ class Scheduler(
                                          self.init_new_token_ratio - self.min_new_token_ratio
                                      ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
+        self._blocked = False
 
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
@@ -584,6 +585,8 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._blocked:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -606,6 +609,8 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._blocked:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1696,9 +1701,9 @@ class Scheduler(
 
     def handle_block_request(self, recv_req: BlockReqInput):
         if recv_req.type == BlockReqType.BLOCK:
-            TODO
+            self._blocked = True
         elif recv_req.type == BlockReqType.UNBLOCK:
-            TODO
+            self._blocked = False
         else:
             raise NotImplementedError(f'{recv_req=}')
 
