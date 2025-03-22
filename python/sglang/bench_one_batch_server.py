@@ -17,11 +17,10 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple, Optional
+from typing import Tuple
 
 import numpy as np
 import requests
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -127,7 +126,7 @@ def run_one_case(
     _ = response.json()
 
     fine_grained_output = fine_grained_benchmark.read_output()
-    TODO
+    print(f'{fine_grained_output=}')  # TODO
 
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
