@@ -185,6 +185,9 @@ class _StateDict:
         self._data = {}
 
     def __setattr__(self, key, value):
+        if key == '_data':
+            super().__setattr__(key, value)
+            return
         assert (
             key not in self._data
         ), f"`{key}` already exist, are you sure you want to override it?"
