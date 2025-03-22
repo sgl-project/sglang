@@ -271,6 +271,19 @@ class MHATokenToKVPool(KVCache):
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
 
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [
+            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [
+            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i).nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
+        ] + [self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
     # Todo: different memory layout
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
