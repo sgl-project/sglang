@@ -1,8 +1,9 @@
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple, Any
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -71,8 +72,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
-        )
+                forward_batch.tbo_children
+            )
         ]
     )
 
@@ -184,7 +185,9 @@ class _StateDict:
         self._data = {}
 
     def __setattr__(self, key, value):
-        assert key not in self._data, f'`{key}` already exist, are you sure you want to override it?'
+        assert (
+            key not in self._data
+        ), f"`{key}` already exist, are you sure you want to override it?"
         self._data[key] = value
 
     def __getattr__(self, item):
