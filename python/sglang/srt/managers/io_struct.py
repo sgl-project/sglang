@@ -83,11 +83,11 @@ class GenerateReqInput:
 
     def normalize_batch_and_arguments(self):
         if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
+                self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
+                self.text is not None
+                and self.input_ids is not None
+                and self.input_embeds is not None
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
@@ -738,3 +738,13 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockerReqInput:
+    type: BlockReqType
