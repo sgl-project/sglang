@@ -17,11 +17,10 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple
+from typing import Tuple, Optional
 
 import numpy as np
 import requests
-
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -95,12 +94,13 @@ def launch_server_process(server_args: ServerArgs):
 
 
 def run_one_case(
-    url: str,
-    batch_size: int,
-    input_len: int,
-    output_len: int,
-    run_name: str,
-    result_filename: str,
+        url: str,
+        batch_size: int,
+        input_len: int,
+        output_len: int,
+        run_name: str,
+        result_filename: str,
+        fine_grained_benchmark_dir: Optional[str],
 ):
     input_ids = [
         [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
@@ -159,12 +159,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             output_len=16,
             run_name="",
             result_filename="",
+            fine_grained_benchmark_dir=server_args.fine_grained_benchmark_dir,
         )
 
     # benchmark
     try:
         for bs, il, ol in itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
+                bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
             run_one_case(
                 base_url,
@@ -173,6 +174,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 ol,
                 bench_args.run_name,
                 bench_args.result_filename,
+                server_args.fine_grained_benchmark_dir,
             )
     finally:
         if proc:
