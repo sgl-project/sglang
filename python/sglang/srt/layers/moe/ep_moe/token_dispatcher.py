@@ -348,7 +348,7 @@ class DeepEPDispatcher:
         if True:  # not forward_mode.is_decode():
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.zeros(
+                output = torch.empty(
                     (num_tokens, hidden_states.shape[1]),
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
