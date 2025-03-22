@@ -21,6 +21,7 @@ from typing import Tuple
 
 import numpy as np
 import requests
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -75,7 +76,7 @@ def launch_server_internal(server_args):
 
 def launch_server_process(server_args: ServerArgs):
     if fine_grained_benchmark.is_enabled():
-        os.environ['SGLANG_ENABLE_COLOCATED_BATCH_GEN'] = 'true'
+        os.environ["SGLANG_ENABLE_COLOCATED_BATCH_GEN"] = "true"
 
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
@@ -139,10 +140,11 @@ def run_one_case(
 
     if fine_grained_benchmark.is_enabled():
         import pandas as pd
+
         fine_grained_output = fine_grained_benchmark.read_output()
         df = pd.DataFrame(fine_grained_output)
-        df['throughput'] = df['num_tokens'] / df['latency']
-        print(df[df['tp_rank'] == 0].drop(['start_time', 'tp_rank'], axis=1))
+        df["throughput"] = df["num_tokens"] / df["latency"]
+        print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
 
     if result_filename:
         with open(result_filename, "a") as fout:
@@ -156,7 +158,7 @@ def run_one_case(
                 "overall_throughput": round(overall_throughput, 2),
             }
             if fine_grained_benchmark.is_enabled():
-                res['fine_grained_output'] = fine_grained_output
+                res["fine_grained_output"] = fine_grained_output
             fout.write(json.dumps(res) + "\n")
 
 
