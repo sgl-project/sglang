@@ -50,8 +50,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.multi_modality_padding import (
+from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
+    embed_image_inputs,
 )
 from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -399,7 +400,7 @@ class Idefics2VisionTransformer(nn.Module):
         )
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         return self.embeddings
 
     def compute_cu_seqlens(self, tgt_sizes: torch.Tensor) -> torch.Tensor:
@@ -762,42 +763,6 @@ class MiniCPMVBaseModel(nn.Module):
         valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
         return valid_pairs_tensor
 
-    def get_embedding(
-        self,
-        input_ids: torch.Tensor,
-        image_inputs: Optional[MiniCPMVImageInputs],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        vlm_embedding: torch.Tensor = self.llm.get_input_embeddings(input_ids)
-
-        if image_inputs is None:  # No image
-            vision_hidden_states = torch.tensor([], device=input_ids.device)
-        else:
-            if image_inputs["type"] == "image_embeds":
-                vision_hidden_states = (
-                    image_inputs["data"]
-                    .type(vlm_embedding.dtype)
-                    .to(vlm_embedding.device)
-                )
-            else:
-                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
-            # See NOTE in _parse_and_validate_inputs
-            image_bounds = image_inputs["image_bounds"]
-            if len(image_bounds) > 0:
-                image_indices = torch.stack(
-                    [
-                        torch.arange(start, end, dtype=torch.long)
-                        for start, end in image_bounds.tolist()
-                    ]
-                ).to(vlm_embedding.device)
-
-                vlm_embedding.scatter_(
-                    0,
-                    image_indices.view(-1, 1).repeat(1, vlm_embedding.shape[-1]),
-                    vision_hidden_states.view(-1, vision_hidden_states.shape[-1]),
-                )
-
-        return vlm_embedding, vision_hidden_states
-
     def _parse_and_validate_inputs(
         self,
         input_ids: torch.Tensor,
@@ -836,46 +801,6 @@ class MiniCPMVBaseModel(nn.Module):
                 type="image_embeds",
             )
 
-        if not isinstance(pixel_values, (torch.Tensor, list)):
-            raise ValueError(
-                "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
-            )
-
-        if not isinstance(tgt_sizes, (torch.Tensor, list)):
-            raise ValueError(
-                "Incorrect type of target sizes. " f"Got type: {type(tgt_sizes)}"
-            )
-
-        if len(pixel_values) != len(tgt_sizes):
-            raise ValueError(
-                "Inconsistent batch lengths, found: "
-                f"{len(pixel_values)} vs. {len(tgt_sizes)}"
-            )
-
-        pixel_values_flat: List[torch.Tensor] = []
-        tgt_sizes_flat: List[torch.Tensor] = []
-        for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
-            if len(pixel_b) != len(tgt_b):
-                raise ValueError(
-                    "Inconsistent N lengths, found: " f"{len(pixel_b)} vs {len(tgt_b)}"
-                )
-
-            for pixel_n, tgt_n in zip(pixel_b, tgt_b):
-                pixel_values_flat += pixel_n
-                tgt_sizes_flat += tgt_n
-
-        # NOTE: Input IDs does not contain image tokens during memory profiling,
-        # so we allow it to be empty
-        if len(pixel_values_flat) != len(tgt_sizes_flat):
-            raise ValueError(
-                "Inconsistent flattened lengths, found: "
-                f"{len(pixel_values_flat)} vs. "
-                f"{len(tgt_sizes_flat)}"
-            )
-
-        if len(pixel_values_flat) == 0:
-            return None
-
         image_bounds = self._get_image_bounds(
             input_ids=input_ids,
             pad_values=pad_values,
@@ -886,10 +811,49 @@ class MiniCPMVBaseModel(nn.Module):
         )
         return MiniCPMVImagePixelInputs(
             image_bounds=image_bounds.to(device=input_ids.device),
-            data=pixel_values_flat,
-            tgt_sizes=torch.stack(tgt_sizes_flat),
+            data=pixel_values,
+            tgt_sizes=tgt_sizes,
             type="pixel_values",
         )
+
+    def get_embedding(
+        self,
+        input_ids: torch.Tensor,
+        image_inputs: Optional[MiniCPMVImageInputs],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        vlm_embedding: torch.Tensor = self.llm.get_input_embeddings(input_ids)
+
+        if image_inputs is None:  # No image
+            vision_hidden_states = torch.tensor([], device=input_ids.device)
+        else:
+            if image_inputs["type"] == "image_embeds":
+                vision_hidden_states = (
+                    image_inputs["data"]
+                    .type(vlm_embedding.dtype)
+                    .to(vlm_embedding.device)
+                )
+            else:
+                vision_hidden_states = self.get_vision_hidden_states(image_inputs)
+            # See NOTE in _parse_and_validate_inputs
+            image_bounds = image_inputs["image_bounds"]
+            if len(image_bounds) > 0:
+                image_indices = torch.stack(
+                    [
+                        torch.arange(start, end, dtype=torch.long)
+                        for start, end in image_bounds.tolist()
+                    ]
+                ).to(vlm_embedding.device)
+
+                vlm_embedding.scatter_(
+                    0,
+                    image_indices.view(-1, 1).repeat(1, vlm_embedding.shape[-1]),
+                    vision_hidden_states.view(-1, vision_hidden_states.shape[-1]),
+                )
+
+        return vlm_embedding, vision_hidden_states
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.llm.get_input_embedding()
 
     def forward(
         self,
@@ -899,58 +863,29 @@ class MiniCPMVBaseModel(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         if (
-            forward_batch.image_inputs is not None
-            and len(forward_batch.image_inputs) > 0
-            and forward_batch.image_inputs[0] is not None
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
         ):
-            # TODO: bath
-            kwargs.update(
-                {
-                    "pixel_values": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.pixel_values
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "tgt_sizes": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.tgt_sizes
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "im_start_id": forward_batch.image_inputs[0].im_start_id,
-                    "im_end_id": forward_batch.image_inputs[0].im_end_id,
-                    "slice_start_id": forward_batch.image_inputs[0].slice_start_id,
-                    "slice_end_id": forward_batch.image_inputs[0].slice_end_id,
-                    "pad_values": forward_batch.image_inputs[0].pad_values,
-                }
+            inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
+        else:
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            image_inputs = forward_batch.merge_image_inputs()
+            inputs_embeds = embed_image_inputs(
+                image_input=image_inputs,
+                input_ids=input_ids,
+                input_embedding=self.get_input_embeddings(),
+                image_embedding_func=self.get_image_features,
+                placeholder_token_ids=[image_inputs.im_token_id]
+                + image_inputs.pad_values,
             )
 
-        image_inputs = self._parse_and_validate_inputs(input_ids, **kwargs)
-
-        # Clamp input ids. This is because the input_ids for the image tokens are
-        # filled with the hash values of the image for the prefix matching in the radix attention.
-        # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-        input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-
-        vlm_embeddings, _ = self.get_embedding(input_ids, image_inputs)
-
-        # always pass the input via `inputs_embeds`
-        # to make sure the computation graph is consistent
-        # for `torch.compile` integration
-        input_ids = None
-
         hidden_states = self.llm.model(
-            input_ids=input_ids,
+            input_ids=None,
             positions=positions,
             forward_batch=forward_batch,
-            input_embeds=vlm_embeddings,
+            input_embeds=inputs_embeds,
         )
 
         return self.logits_processor(
@@ -990,7 +925,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_vision_hidden_states(self, data: MiniCPMVImageInputs) -> torch.Tensor:
+    def get_image_features(self, image_inputs: ImageInputs) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -1100,12 +1035,14 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return vision_embedding
 
-    def get_vision_hidden_states(
+    def get_image_features(
         self,
-        data: MiniCPMVImageInputs,
+        image_inputs: ImageInputs,
     ) -> torch.Tensor:
-        pixel_values = data["data"]
-        tgt_sizes = data["tgt_sizes"]
+        # list of tensors
+        pixel_values = image_inputs.pixel_values
+
+        tgt_sizes = image_inputs.tgt_sizes
 
         device = self.vpm.embeddings.position_embedding.weight.device
         dtype = self.vpm.embeddings.position_embedding.weight.dtype
