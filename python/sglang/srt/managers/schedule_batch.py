@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -68,6 +70,7 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "device": ServerArgs.device,
@@ -588,6 +591,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
 
     # For processing logprobs
@@ -1346,6 +1350,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            tbo_split_seq_index=self.tbo_split_seq_index,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             decode_seq_lens=decode_seq_lens,
             extend_num_tokens=self.extend_num_tokens,
@@ -1422,6 +1427,7 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
+    tbo_split_seq_index: Optional[int]
     can_run_dp_cuda_graph: bool
 
     # For decode

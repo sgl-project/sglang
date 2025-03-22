@@ -156,6 +156,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_two_batch_overlap: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_torch_compile: bool = False
@@ -942,6 +943,11 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
+            "--enable-two-batch-overlap",
+            action="store_true",
+            help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
             "--enable-ep-moe",
             action="store_true",
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
@@ -1205,10 +1211,10 @@ class PortArgs:
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
                 scheduler_input_port = (
-                    port_base + 2
+                    port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = port_base + 3 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",

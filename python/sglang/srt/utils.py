@@ -55,14 +55,12 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from packaging.version import Version, parse
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -1706,3 +1704,15 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    import deep_gemm
+
+    original_num_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(original_num_sms)
