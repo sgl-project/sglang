@@ -985,10 +985,13 @@ class ModelRunner:
 
     @contextmanager
     def _benchmark_forward(self):
-        TODO
+        torch.cuda.synchronize()
+        tic = time.time()
         try:
             yield
         finally:
+            torch.cuda.synchronize()
+            latency = time.time() - tic
             TODO
 
     def _preprocess_logits(
