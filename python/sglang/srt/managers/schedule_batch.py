@@ -878,6 +878,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
+            if req.is_retracted:
+                req.already_computed = 0
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
