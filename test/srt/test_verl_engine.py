@@ -1,3 +1,4 @@
+import asyncio
 import multiprocessing
 import multiprocessing as mp
 import os
@@ -207,6 +208,9 @@ def _run_subprocess(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
 
+        if tp_rank == 0:
+            _execute_async_generate(engine=engine)
+
         for enable_batch in [False, True]:
             if enable_batch:
                 fn = SRTRunner.batch_forward_generation_raw
@@ -279,6 +283,18 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
+
+
+def _execute_async_generate(engine):
+    loop = asyncio.get_event_loop()
+    output = loop.run_until_complete(
+        engine.async_generate(
+            prompt=_PROMPTS,
+            sampling_params=dict(max_new_tokens=_MAX_NEW_TOKENS, temperature=0.0),
+        )
+    )
+    print(f"execute_async_generate output={output}")
+    assert output[0]["text"].startswith("6"), f"{output=}"
 
 
 # TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
