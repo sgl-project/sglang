@@ -243,6 +243,24 @@ class ImageInputs:
             ), f"{self.pixel_values.shape[1:]} vs {other.pixel_values.shape[1:]}"
             self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
+        # args would be stacked along first dim
+        # usually these are already tensors
+        stack_args = [
+            "audio_features",
+            # TODO: merge with image_grid_thws, basically the same thing
+            "tgt_sizes",
+            "image_spatial_crop",
+        ]
+        for arg in stack_args:
+            if getattr(self, arg, None) is not None:
+                setattr(self, arg, getattr(other, arg))
+            elif getattr(other, arg, None) is not None:
+                setattr(
+                    self,
+                    arg,
+                    torch.cat([getattr(self, arg), getattr(other, arg)], dim=0),
+                )
+
         if self.image_grid_thws is None:
             self.image_grid_thws = other.image_grid_thws
         elif other.image_grid_thws is not None:
@@ -266,12 +284,12 @@ class ImageInputs:
             "aspect_ratio_mask",
             # "image_grid_thws",
             "image_seq_mask",
-            "image_spatial_crop",
             "tgt_sizes",
         ]
         for arg in optional_args:
-            if getattr(self, arg, None) is not None:
-                setattr(self, arg, getattr(self, arg) + getattr(other, arg))
+            self_arg = getattr(self, arg, None)
+            if self_arg is not None:
+                setattr(self, arg, self_arg + getattr(other, arg))
         # other args would be kept intact
 
 
