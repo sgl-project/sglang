@@ -26,13 +26,6 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-try:
-    from outlines.fsm.json_schema import convert_json_schema_to_str
-except ImportError:
-    # Before outlines 0.0.47, convert_json_schema_to_str is under
-    # outlines.integrations.utils
-    from outlines.integrations.utils import convert_json_schema_to_str
-
 from sglang.srt.code_completion_parser import (
     generate_completion_prompt_from_request,
     is_completion_template_defined,
@@ -79,7 +72,7 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.utils import get_exception_traceback
+from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
