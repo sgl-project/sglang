@@ -16,25 +16,22 @@
 # COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
 import asyncio
-import math
-from typing import List, Union
 
 import torch
-from PIL import Image, ImageOps
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.processors.base_processor import (
+    BaseProcessor,
+    MultimodalSpecialTokens,
     get_global_processor,
 )
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
-class DeepseekVL2ImageProcessor(BaseImageProcessor):
+class DeepseekVL2ImageProcessor(BaseProcessor):
+    models = [DeepseekVL2ForCausalLM]
+
     def __init__(self, hf_config, server_args, _processor):
-        # with contextlib.suppress(ValueError):
-        #     AutoProcessor.register("DeepseekVLV2Processor", DeepseekVLV2Processor)
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<image>"
 
@@ -58,10 +55,9 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
             image_inputs = self._process_images_task(
                 image_data, input_text, max_req_input_len
             )
-
         return image_inputs
 
-    async def process_images_async(
+    async def process_data_async(
         self, image_data, input_ids, request_obj, max_req_input_len, *args, **kwargs
     ):
         if not image_data:
@@ -70,15 +66,17 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
         if not isinstance(image_data, list):
             image_data = [image_data]
 
-        images, image_hashes, image_sizes = [], [], []
+        images, data_hashes, image_sizes = [], [], []
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
-            input_ids, image_data, image_token, max_req_input_len
+        base_output = self.load_mm_data(
+            input_ids,
+            image_data=image_data,
+            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            max_req_input_len=max_req_input_len,
         )
-        base_output.all_frames = [img.convert("RGB") for img in base_output.all_frames]
         res = await self._process_images(
-            base_output.all_frames, base_output.input_text, max_req_input_len
+            base_output.images, base_output.input_text, max_req_input_len
         )
         pixel_values = res["images"]
         input_ids = res["input_ids"]
@@ -91,14 +89,9 @@ class DeepseekVL2ImageProcessor(BaseImageProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "pixel_values": pixel_values,
-            "image_hashes": image_hashes,
+            "data_hashes": data_hashes,
             "image_sizes": image_sizes,
             "image_seq_mask": images_seq_mask,
             "image_spatial_crop": batched_images_spatial_crop,
             "modalities": request_obj.modalities or ["image"],
         }
-
-
-ImageProcessorMapping = {
-    DeepseekVL2ForCausalLM: DeepseekVL2ImageProcessor,
-}
