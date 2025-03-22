@@ -190,6 +190,9 @@ class PagedTokenToKVPoolAllocator:
     def available_size(self):
         return len(self.free_pages) * self.page_size
 
+    def get_kvcache(self):
+        return self._kvcache
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,

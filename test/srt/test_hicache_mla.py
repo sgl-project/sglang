@@ -20,7 +20,12 @@ class TestHierarchicalMLA(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code", "--enable-hierarchical-cache"],
+            other_args=[
+                "--trust-remote-code",
+                "--enable-hierarchical-cache",
+                "--page-size",
+                "32",
+            ],
         )
 
     @classmethod
