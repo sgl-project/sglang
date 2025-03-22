@@ -46,6 +46,7 @@ from transformers.models.whisper.modeling_whisper import (
 )
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternTokenPairs
 from sglang.srt.managers.schedule_batch import MultiModalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -1631,54 +1632,21 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         return resampler.to(device="cuda", dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], multimodal_data: MultiModalInputs):
-        new_input_ids = []
-        last_idx = 0
-        region_idx = -1
-        multimodal_data.image_offsets = []
+    def pad_input_ids(self, input_ids: List[int], mm_input: MultiModalInputs):
+        # Get all special token IDs
+        im_start_id: int = mm_input.im_start_id
+        im_end_id: int = mm_input.im_end_id
+        slice_start_id: int = mm_input.slice_start_id
+        slice_end_id: int = mm_input.slice_end_id
 
-        im_start_id = multimodal_data.im_start_id
-        im_end_id = multimodal_data.im_end_id
-        slice_start_id = multimodal_data.slice_start_id
-        slice_end_id = multimodal_data.slice_end_id
-        audio_start_id = multimodal_data.audio_start_id
-        audio_end_id = multimodal_data.audio_end_id
-
-        start_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x in {im_start_id, slice_start_id, audio_start_id}
+        media_token_pairs = [
+            (im_start_id, im_end_id),
+            (slice_start_id, slice_end_id),
+            (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
-        end_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x in {im_end_id, slice_end_id, audio_end_id}
-        ]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        if len(start_indices) != len(end_indices):
-            return input_ids
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            new_input_ids.extend(input_ids[last_idx : start_idx + 1])
-            token_id = input_ids[start_idx]
-            if token_id == im_start_id or token_id == audio_start_id:
-                region_idx += 1
-            if region_idx >= len(multimodal_data.pad_values):
-                region_idx = len(multimodal_data.pad_values) - 1
-            pad_value = multimodal_data.pad_values[region_idx]
-
-            num_tokens = end_idx - start_idx - 1
-
-            pad_ids = [pad_value] * num_tokens
-
-            new_input_ids.extend(pad_ids)
-
-            last_idx = end_idx
-
-        new_input_ids.extend(input_ids[last_idx:])
-
-        assert len(input_ids) == len(new_input_ids), "Length validation fails"
-        return new_input_ids
+        return pattern.pad_input_tokens(input_ids, mm_input)
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
@@ -1994,9 +1962,7 @@ class MiniCPMO(MiniCPMVBaseModel):
         forward_batch: ForwardBatch,
         **data: Any,
     ) -> torch.Tensor:
-        image_inputs = self.get_image_pixel_inputs(
-            input_ids, forward_batch.multimodal_inputs
-        )
+        image_inputs = self.get_image_pixel_inputs(input_ids, forward_batch.mm_inputs)
 
         # Clamp input ids. This is because the input_ids for the image tokens are
         # filled with the hash values of the image for the prefix matching in the radix attention.
@@ -2009,12 +1975,12 @@ class MiniCPMO(MiniCPMVBaseModel):
 
         if (
             self.config.init_audio
-            and forward_batch.multimodal_inputs is not None
-            and forward_batch.multimodal_inputs[0] is not None
+            and forward_batch.mm_inputs is not None
+            and forward_batch.mm_inputs[0] is not None
         ):
             vllm_embeddings = self.get_omni_embedding(
                 input_ids,
-                forward_batch.multimodal_inputs[0],
+                forward_batch.mm_inputs[0],
                 forward_mode=forward_batch.forward_mode,
                 input_embeddings=vllm_embeddings,
                 chunk_length=self.config.audio_chunk_length,

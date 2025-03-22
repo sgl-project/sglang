@@ -176,7 +176,7 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For multimodal
-    multimodal_inputs: Optional[List[MultiModalInputs]] = None
+    mm_inputs: Optional[List[MultiModalInputs]] = None
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -242,7 +242,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            multimodal_inputs=batch.multimodal_inputs,
+            mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
@@ -332,9 +332,9 @@ class ForwardBatch:
 
         return ret
 
-    def merge_image_inputs(self) -> Optional[ImageInputs]:
+    def merge_mm_inputs(self) -> Optional[MultiModalInputs]:
         """
-        Merge all image inputs in the batch into a single ImageInputs object.
+        Merge all image inputs in the batch into a single MultiModalInputs object.
 
         Returns:
             if none, current batch contains no image input
@@ -358,7 +358,7 @@ class ForwardBatch:
 
         return merged
 
-    def contains_image_inputs(self) -> bool:
+    def contains_mm_inputs(self) -> bool:
         """ """
         if self.image_inputs is None:
             return True

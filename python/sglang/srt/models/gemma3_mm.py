@@ -32,7 +32,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultiModalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -179,7 +179,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.post_init()
 
     def pad_input_ids(
-        self, input_ids: List[int], image_inputs: ImageInputs
+        self, input_ids: List[int], image_inputs: MultiModalInputs
     ) -> List[int]:
         """Pad input IDs with image tokens."""
         # Get special token IDs
@@ -262,7 +262,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_image_feature(self, image_input: ImageInputs):
+    def get_image_feature(self, image_input: MultiModalInputs):
         """
         Projects the last hidden state from the vision model into language model space.
 
@@ -284,7 +284,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
-        image_input: ImageInputs,
+        image_input: MultiModalInputs,
     ) -> torch.Tensor:
         if input_ids is None:
             raise ValueError("Unimplemented")

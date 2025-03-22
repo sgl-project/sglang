@@ -54,7 +54,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     embed_image_embedding,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultiModalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -850,12 +850,12 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         if (
             forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
+            or not forward_batch.contains_mm_inputs()
         ):
             inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
         else:
             # image embedding for minicpmv can't be merged, since it use infos like max_patches of the current batch
-            for image_input in forward_batch.image_inputs:
+            for image_input in forward_batch.mm_inputs:
                 if image_input is None:
                     continue
                 kwargs.update(
@@ -1068,17 +1068,17 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultiModalInputs):
         # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
+        im_start_id: int = mm_inputs.im_start_id
+        im_end_id: int = mm_inputs.im_end_id
+        slice_start_id: int = mm_inputs.slice_start_id
+        slice_end_id: int = mm_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
         pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return pattern.pad_input_tokens(input_ids, image_inputs)
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6}

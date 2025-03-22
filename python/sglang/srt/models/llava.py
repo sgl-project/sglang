@@ -134,7 +134,7 @@ class LlavaBaseForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        image_inputs = forward_batch.multimodal_inputs
+        image_inputs = forward_batch.mm_inputs
 
         if forward_batch.forward_mode.is_extend():
             # Clamp input ids. This is because the input_ids for the image tokens are

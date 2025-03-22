@@ -13,7 +13,7 @@ from decord import VideoReader, cpu
 from openai import BadRequestError
 from PIL import Image
 
-from sglang.srt.utils import load_audio, load_image
+from sglang.srt.utils import load_audio, load_image, logger
 
 global global_processor
 
@@ -159,12 +159,14 @@ class BaseProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-        if isinstance(image_token, int):
-            image_token_str = self._processor.tokenizer.convert_ids_to_tokens(
-                image_token
+        if isinstance(multimodal_tokens.image_token, int):
+            multimodal_tokens.image_token = (
+                self._processor.tokenizer.convert_ids_to_tokens(
+                    multimodal_tokens.image_token
+                )
             )
         else:
-            image_token_str = image_token
+            multimodal_tokens.image_token = multimodal_tokens.image_token
 
         if isinstance(input_ids, list) and return_text:
             assert len(input_ids) and isinstance(input_ids[0], int)
@@ -191,9 +193,6 @@ class BaseProcessor(ABC):
         scaling_factor = min(1.0, MAX_NUM_FRAMES / max(1, total_frame_count))
 
         assert len(image_data) == len(estimated_frames_list)
-
-        print(f"input text: {input_text}")
-        print(f"text_parts: {text_parts}")
 
         image_index, audio_index = 0, 0
         hashes, image_sizes, images, audios = [], [], [], []
@@ -252,7 +251,6 @@ class BaseProcessor(ABC):
                     new_text += text_part
 
             except Exception as e:
-
                 logger.error(f"An exception occurred while loading images: {e}")
                 raise BadRequestError(
                     f"An exception occurred while loading images: {e}"
@@ -277,7 +275,7 @@ class DummyProcessor(BaseProcessor):
         return None
 
 
-def init_global_processor(sglang_processor: BaseProcessor, server_args: ServerArgs):
+def init_global_processor(sglang_processor: BaseProcessor, server_args):
     """
     Init the global processor for multimodal models."""
     global global_processor

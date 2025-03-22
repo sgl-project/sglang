@@ -1959,7 +1959,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    def get_image_feature(self, image_input: ImageInputs) -> torch.Tensor:
+    def get_image_feature(self, image_input: MultiModalInputs) -> torch.Tensor:
         pixel_values = image_input.pixel_values
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(

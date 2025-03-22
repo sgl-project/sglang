@@ -815,7 +815,7 @@ class MllamaForConditionalGeneration(nn.Module):
 
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
-        for i, im in enumerate(forward_batch.multimodal_inputs):
+        for i, im in enumerate(forward_batch.mm_inputs):
             if not forward_batch.encoder_cached[i] and im is not None:
                 max_num_images = max(max_num_images, im.pixel_values.shape[1])
                 max_num_tiles = max(max_num_tiles, im.pixel_values.shape[2])
@@ -842,7 +842,7 @@ class MllamaForConditionalGeneration(nn.Module):
             )
             i = 0
             encoder_lens_need = []
-            for k, im in enumerate(forward_batch.multimodal_inputs):
+            for k, im in enumerate(forward_batch.mm_inputs):
                 if forward_batch.encoder_cached[k] or im is None:
                     continue
 

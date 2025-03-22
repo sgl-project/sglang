@@ -238,7 +238,7 @@ class MultiModalInputs:
 
         return ret
 
-    def merge(self, other: ImageInputs):
+    def merge(self, other: MultiModalInputs):
         """
         merge image inputs when requests are being merged
         """

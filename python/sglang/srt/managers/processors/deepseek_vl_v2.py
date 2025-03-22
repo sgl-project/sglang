@@ -19,14 +19,14 @@
 
 import torch
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
 from sglang.srt.managers.image_processors.base_image_processor import (
     get_global_processor,
 )
+from sglang.srt.managers.processors.base_processor import BaseProcessor
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
-class DeepseekVL2ImageProcessor(BaseImageProcessor):
+class DeepseekVL2ImageProcessor(BaseProcessor):
     models = [DeepseekVL2ForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor):

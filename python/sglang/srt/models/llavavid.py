@@ -112,7 +112,7 @@ class LlavaVidForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        image_inputs = forward_batch.multimodal_inputs
+        image_inputs = forward_batch.mm_inputs
         if forward_batch.forward_mode.is_extend():
             bs = forward_batch.batch_size
 

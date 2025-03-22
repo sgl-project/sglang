@@ -481,7 +481,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         pattern = MultiModalDataPaddingPatternTokenPairs(media_token_pairs)
         return pattern.pad_input_tokens(input_ids, multi_modal_inputs)
 
-    def get_image_feature(self, image_input: ImageInputs) -> torch.Tensor:
+    def get_image_feature(self, image_input: MultiModalInputs) -> torch.Tensor:
         pixel_values = image_input.pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_input.image_grid_thws)
         return image_embeds
@@ -520,7 +520,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
         if not (
             forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
+            or not forward_batch.contains_mm_inputs()
         ):
             if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
                 assert positions.ndim == 2 and positions.size(0) == 3, (

@@ -3,12 +3,10 @@ from typing import List, Union
 
 from transformers.utils import logging
 
-from sglang.srt.managers.image_processor import (
-    BaseImageProcessor as SGLangBaseImageProcessor,
+from sglang.srt.managers.multimodal_processor import (
+    BaseProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.image_processors.base_image_processor import (
-    get_global_processor,
-)
+from sglang.srt.managers.processors.base_processor import get_global_processor
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 
 # Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
@@ -16,7 +14,7 @@ from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 logger = logging.get_logger(__name__)
 
 
-class Gemma3SGLangImageProcessor(SGLangBaseImageProcessor):
+class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
     models = [Gemma3ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):

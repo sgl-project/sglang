@@ -6,18 +6,19 @@ from typing import List, Union
 import torch
 from PIL import Image
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.multimodal_processor import (
+    BaseProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.managers.processors.base_processor import (
+    MultiModalEmbedTokens,
     get_global_processor,
 )
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternTokenPairs
-from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
 
 # Compatible with Qwen2VL and Qwen2_5VL
-class Qwen2_5VLImageProcessor(BaseImageProcessor):
+class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -170,7 +171,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         )
 
         print(
-            f"image processor for {base_output.image_hashes.__len__()} images took: {time.time() - start}"
+            f"image processor for {base_output.data_hashes.__len__()} images took: {time.time() - start}"
         )
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         video_grid_thws = None
