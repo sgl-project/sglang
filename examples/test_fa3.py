@@ -45,8 +45,10 @@ def single2():
     assert "washington" in answer, f"answer: {state['answer']}"
 
 if __name__ == "__main__":
+    
     # model_path = "/shared/public/models/meta-llama/Llama-3.2-3B-Instruct"
-    model_path = "/shared/public/models/meta-llama/Llama-3.2-1B-Instruct"
+    # model_path = "/shared/public/models/meta-llama/Llama-3.2-1B-Instruct"
+    model_path = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B/48d6d0fc4e02fb1269b36940650a1b7233035cbb/"
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     runtime = sgl.Runtime(model_path=model_path,
