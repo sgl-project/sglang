@@ -540,12 +540,14 @@ class TokenizerManager:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             # Send all requests
+            self._send_block_request(BlockReqType.BLOCK)  # TODO only conditionally
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
+            self._send_block_request(BlockReqType.UNBLOCK)  # TODO only conditionally
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
