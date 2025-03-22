@@ -50,4 +50,9 @@ def clear_output():
 
 
 def read_output():
-    return TODO
+    return [
+        json.loads(row)
+        for path in sorted(list(Path(_dir_output).glob('*.jsonl')))
+        for row in path.read_text().split('\n')
+        if row
+    ]
