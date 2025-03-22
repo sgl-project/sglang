@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -135,6 +137,9 @@ class TestEvalFP8ModelOptQuantAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
+    @unittest.skipIf(
+        torch.version.hip is not None, "modelopt quantization unsupported on ROCm"
+    )
     def test_mmlu_offline_only(self):
         """Test with offline quantization only."""
         self._run_test(
