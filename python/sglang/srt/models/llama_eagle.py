@@ -143,4 +143,8 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
                 super().load_weights([(name, loaded_weight)])
 
 
-EntryClass = [LlamaForCausalLMEagle]
+class LlamaForCausalLMHass(LlamaForCausalLMEagle):
+    pass
+
+
+EntryClass = [LlamaForCausalLMEagle, LlamaForCausalLMHass]
