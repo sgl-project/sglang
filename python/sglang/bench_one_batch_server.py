@@ -152,6 +152,8 @@ def run_one_case(
                 "output_throughput": round(output_throughput, 2),
                 "overall_throughput": round(overall_throughput, 2),
             }
+            if fine_grained_benchmark.is_enabled():
+                res['fine_grained_output'] = fine_grained_output
             fout.write(json.dumps(res) + "\n")
 
 
