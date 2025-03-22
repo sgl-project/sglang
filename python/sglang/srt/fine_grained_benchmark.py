@@ -4,7 +4,7 @@ import shutil
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, Dict
 
 import torch
 
@@ -49,7 +49,7 @@ def clear_output():
     Path(_dir_output).mkdir(parents=True, exist_ok=True)
 
 
-def read_output():
+def read_output() -> List[Dict[str, Any]]:
     return [
         json.loads(row)
         for path in sorted(list(Path(_dir_output).glob('*.jsonl')))
