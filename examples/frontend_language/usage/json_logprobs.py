@@ -1,5 +1,4 @@
 # NOTE: Currently this can only be run through HTTP requests.
-import json
 from concurrent.futures import ThreadPoolExecutor
 
 from json_decode import character_regex
@@ -13,6 +12,7 @@ base_url = "http://localhost:30000"
 prompt = "is a character in Harry Potter. Please fill in the following information about this character.\n"
 
 
+"""TODO: Add docstring."""
 def openai_api_request(name):
     data = {
         "model": "",

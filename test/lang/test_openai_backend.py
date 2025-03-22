@@ -25,7 +25,8 @@ class TestOpenAIBackend(unittest.TestCase):
     chat_vision_backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.instruct_backend = OpenAI("gpt-3.5-turbo-instruct")
         cls.chat_backend = OpenAI("gpt-3.5-turbo")
         cls.chat_vision_backend = OpenAI("gpt-4-turbo")

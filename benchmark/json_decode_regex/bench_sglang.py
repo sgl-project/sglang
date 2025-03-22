@@ -14,6 +14,7 @@ REGEX_LIST = r"\[(" + REGEX_STR + ", )*" + REGEX_STR + r"\]"
 
 # fmt: off
 @sgl.function
+"""TODO: Add docstring."""
 def json_warm_up(s):
     s += "The information about Hogwarts is in the following JSON format.\n"
     with s.var_scope("json_output"):

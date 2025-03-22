@@ -38,7 +38,8 @@ class LocalVertexEndpoint:
     def __init__(self) -> None:
         self.base_url = "http://127.0.0.1:30000"
 
-    def predict(self, instances: List[dict], parameters: Optional[dict] = None):
+    """TODO: Add docstring."""
+def predict(self, instances: List[dict], parameters: Optional[dict] = None):
         response = requests.post(
             self.base_url + "/vertex_generate",
             json={

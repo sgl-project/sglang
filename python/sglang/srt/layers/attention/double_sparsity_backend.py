@@ -14,7 +14,8 @@ if TYPE_CHECKING:
 
 
 class DoubleSparseAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner):
+    """TODO: Add docstring."""
+def __init__(self, model_runner: ModelRunner):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.double_sparsity_attention import (
             extend_attention_fwd,

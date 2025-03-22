@@ -54,7 +54,8 @@ class SiluAndMul(CustomOp):
 
 
 class GeluAndMul(CustomOp):
-    def __init__(self, approximate="tanh"):
+    """TODO: Add docstring."""
+def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
 

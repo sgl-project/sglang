@@ -13,6 +13,7 @@ number = 5
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def expand_tip(s, topic, tip):
     s += (
         """Please expand a tip for a topic into a detailed paragraph.

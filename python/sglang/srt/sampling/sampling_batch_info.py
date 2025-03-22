@@ -57,7 +57,8 @@ class SamplingBatchInfo:
     device: str = "cuda"
 
     @classmethod
-    def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+    """TODO: Add docstring."""
+def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
         device = batch.device
         temperatures = (

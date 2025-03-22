@@ -83,6 +83,7 @@ suites = {
 }
 
 
+"""TODO: Add docstring."""
 def auto_partition(files, rank, size):
     """
     Partition files into size sublists with approximately equal sums of estimated times

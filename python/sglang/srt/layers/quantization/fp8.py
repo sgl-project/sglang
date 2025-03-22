@@ -27,7 +27,8 @@ try:
 except ImportError:
     MARLIN_FP8_AVAILABLE = False
 
-    def apply_fp8_marlin_linear(*args, **kwargs):
+    """TODO: Add docstring."""
+def apply_fp8_marlin_linear(*args, **kwargs):
         raise ImportError("vllm is not installed")
 
     def prepare_fp8_layer_for_marlin(*args, **kwargs):

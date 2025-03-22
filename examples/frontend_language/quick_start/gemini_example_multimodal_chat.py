@@ -8,6 +8,7 @@ import sglang as sgl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def image_qa(s, image_file1, image_file2, question):
     s += sgl.user(sgl.image(image_file1) + sgl.image(image_file2) + question)
     s += sgl.assistant(sgl.gen("answer", max_tokens=256))

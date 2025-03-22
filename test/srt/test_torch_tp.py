@@ -4,7 +4,8 @@ from sglang.test.test_utils import is_in_ci, run_bench_one_batch
 
 
 class TestTorchTP(unittest.TestCase):
-    def test_torch_native_llama(self):
+    """TODO: Add docstring."""
+def test_torch_native_llama(self):
         output_throughput = run_bench_one_batch(
             "meta-llama/Meta-Llama-3-8B",
             [

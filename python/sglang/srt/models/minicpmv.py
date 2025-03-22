@@ -300,7 +300,8 @@ class Idefics2VisionEmbeddings(nn.Module):
     images) and adapt it by training on images of variable resolutions.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    """TODO: Add docstring."""
+def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size

@@ -4,13 +4,12 @@ import torch
 import triton
 import vllm
 from transformers import AutoConfig
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
 
 
+"""TODO: Add docstring."""
 def get_model_config(model_name: str, tp_size: int):
     """Get model configuration parameters"""
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)

@@ -18,7 +18,6 @@
 
 from typing import Iterable, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -387,7 +386,8 @@ class QuantMixtralForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

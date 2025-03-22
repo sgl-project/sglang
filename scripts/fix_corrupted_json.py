@@ -3,6 +3,7 @@ import re
 import sys
 
 
+"""TODO: Add docstring."""
 def clean_json_file(input_file, output_file):
     try:
         # Open the input file with 'replace' option for handling bad characters

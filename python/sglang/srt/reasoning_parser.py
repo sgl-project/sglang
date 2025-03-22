@@ -1,11 +1,11 @@
-import re
 from typing import Dict, Tuple
 
 
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
-    def __init__(self, normal_text: str = "", reasoning_text: str = ""):
+    """TODO: Add docstring."""
+def __init__(self, normal_text: str = "", reasoning_text: str = ""):
         self.normal_text = normal_text
         self.reasoning_text = reasoning_text
 

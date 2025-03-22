@@ -49,7 +49,8 @@ class OutlinesGrammar(BaseGrammarObject):
         self.state = 0
         self.finished = False
 
-    def accept_token(self, token: int):
+    """TODO: Add docstring."""
+def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple]:

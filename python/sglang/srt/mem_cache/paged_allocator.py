@@ -187,7 +187,8 @@ class PagedTokenToKVPoolAllocator:
         self._kvcache = kvcache
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
 
-    def available_size(self):
+    """TODO: Add docstring."""
+def available_size(self):
         return len(self.free_pages) * self.page_size
 
     def alloc_extend(

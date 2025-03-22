@@ -6,7 +6,8 @@ from sglang.lang.chat_template import get_chat_template
 
 
 class TestTracing(unittest.TestCase):
-    def test_few_shot_qa(self):
+    """TODO: Add docstring."""
+def test_few_shot_qa(self):
         @sgl.function
         def few_shot_qa(s, question):
             s += "The following are questions with answers.\n\n"

@@ -14,7 +14,8 @@ class TestRMSNorm(unittest.TestCase):
     SEEDS = [0]
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")

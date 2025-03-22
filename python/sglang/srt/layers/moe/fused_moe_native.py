@@ -6,7 +6,6 @@ It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4
 from typing import Callable, Optional
 
 import torch
-from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.topk import select_experts

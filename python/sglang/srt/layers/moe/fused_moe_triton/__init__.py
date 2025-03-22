@@ -16,6 +16,7 @@ _config: Optional[Dict[str, Any]] = None
 
 
 @contextmanager
+"""TODO: Add docstring."""
 def override_config(config):
     global _config
     old_config = _config

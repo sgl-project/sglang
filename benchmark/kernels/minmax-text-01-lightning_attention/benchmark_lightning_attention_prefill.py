@@ -92,6 +92,7 @@ def _fwd_kernel(
         off_block += BLOCK
 
 
+"""TODO: Add docstring."""
 def lightning_attn2(q, k, v, s):
     q = q.contiguous()
     k = k.contiguous()

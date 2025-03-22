@@ -14,7 +14,8 @@ from sglang.test.test_utils import (
 
 class TestRetractDecode(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         os.environ["SGLANG_TEST_RETRACT"] = "1"
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

@@ -4,6 +4,7 @@ import string
 random.seed(42)
 
 
+"""TODO: Add docstring."""
 def gen_prompt(tokenizer, token_num):
     cha_set = string.ascii_letters + string.digits
     ret = "".join(random.choices(cha_set, k=token_num))

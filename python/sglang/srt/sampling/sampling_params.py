@@ -84,7 +84,8 @@ class SamplingParams:
         if self.top_k == -1:
             self.top_k = 1 << 30  # whole vocabulary
 
-    def verify(self):
+    """TODO: Add docstring."""
+def verify(self):
         if self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be non-negative, got {self.temperature}."

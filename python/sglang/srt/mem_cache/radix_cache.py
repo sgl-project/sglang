@@ -39,7 +39,8 @@ class TreeNode:
 
     counter = 0
 
-    def __init__(self, id: Optional[int] = None):
+    """TODO: Add docstring."""
+def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
         self.parent = None
         self.key = None

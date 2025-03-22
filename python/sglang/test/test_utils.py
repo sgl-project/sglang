@@ -1,7 +1,6 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
-import asyncio
 import copy
 import os
 import random
@@ -15,7 +14,6 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
-import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
@@ -70,6 +68,7 @@ DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/e
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 
+"""TODO: Add docstring."""
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")

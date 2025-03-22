@@ -20,7 +20,8 @@ from sglang.test.test_utils import (
 
 class TestNightlyHumanEval(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         if is_in_ci():
             cls.model_groups = [([DEFAULT_MODEL_NAME_FOR_TEST], False, False)]
         else:

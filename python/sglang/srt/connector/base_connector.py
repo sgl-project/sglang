@@ -20,7 +20,8 @@ class BaseConnector(ABC):
     <connector_type://<host>:<port>/<model_name>/files/<filename>
     """
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    """TODO: Add docstring."""
+def __init__(self, url: str, device: torch.device = "cpu"):
         self.url = url
         self.device = device
         self.closed = False

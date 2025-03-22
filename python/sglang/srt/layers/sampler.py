@@ -27,7 +27,8 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 
 
 class Sampler(nn.Module):
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         super().__init__()
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
         self.tp_sync_group = get_tensor_model_parallel_group().device_group

@@ -1,7 +1,6 @@
 from typing import List, Optional
 
 from sglang_router_rs import PolicyType
-from sglang_router_rs import Router as _Router
 
 
 class Router:

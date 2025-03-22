@@ -42,6 +42,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
 @torch.no_grad()
+"""TODO: Add docstring."""
 def vlm_text_with_image(args):
     # Load the processor and model for ImageTextToText tasks
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)

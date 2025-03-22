@@ -19,7 +19,6 @@ from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
@@ -60,6 +59,7 @@ def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -
     return schema_str
 
 
+"""TODO: Add docstring."""
 def get_exception_traceback():
     etype, value, tb = sys.exc_info()
     err_str = "".join(traceback.format_exception(etype, value, tb))

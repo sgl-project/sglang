@@ -8,6 +8,7 @@ import torch
 
 
 @lru_cache(maxsize=None)
+"""TODO: Add docstring."""
 def _cache_from_str(json_str: str):
     """Deserialize a json string to a Callable object.
     This function is cached to avoid redundant deserialization.

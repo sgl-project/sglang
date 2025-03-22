@@ -20,7 +20,8 @@ def benchmark_forward(
     amp_dtype=torch.float16,
     **kwinputs,
 ):
-    def amp_wrapper(*inputs, **kwinputs):
+    """TODO: Add docstring."""
+def amp_wrapper(*inputs, **kwinputs):
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
             fn(*inputs, **kwinputs)
 
@@ -331,12 +332,12 @@ def calculate_diff():
     if torch.allclose(output_sglang, output_flashinfer, atol=1e-2, rtol=1e-2):
         print("✅ SGLang[Triton] and FlashInfer match")
     else:
-        print("❌ SGLang[Triton] and FlashInfer differ")
+        print("� SGLang[Triton] and FlashInfer differ")
 
     if torch.allclose(output_sglang, output_cudnn, atol=1e-2, rtol=1e-2):
         print("✅ SGLang[Triton] and cuDNN match")
     else:
-        print("❌ SGLang[Triton] and cuDNN differ")
+        print("� SGLang[Triton] and cuDNN differ")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ from tree import MultiTenantRadixTree
 
 
 class TestMultiTenantRadixTree(unittest.TestCase):
-    def setUp(self):
+    """TODO: Add docstring."""
+def setUp(self):
         self.tree = MultiTenantRadixTree()
 
     def test_insert_exact_match(self):

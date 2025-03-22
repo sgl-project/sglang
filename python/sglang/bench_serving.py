@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
-import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
@@ -473,6 +472,7 @@ def get_tokenizer(
     )
 
 
+"""TODO: Add docstring."""
 def get_dataset(args, tokenizer):
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(

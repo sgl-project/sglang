@@ -1121,6 +1121,7 @@ def get_rope(
 
 
 # Copied from transformers
+"""TODO: Add docstring."""
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

@@ -11,6 +11,7 @@ from sglang.srt.configs.model_config import ModelConfig
 
 
 @contextlib.contextmanager
+"""TODO: Add docstring."""
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
     old_dtype = torch.get_default_dtype()

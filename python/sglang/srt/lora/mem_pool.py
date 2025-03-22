@@ -130,7 +130,8 @@ class LoRAMemoryPool:
         lora_adapters: Dict[str, LoRAAdapter],
     ):
 
-        def get_available_buffer_slot():
+        """TODO: Add docstring."""
+def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):
                 # Prioritize empty slots
                 if self.buffer_id_to_uid[buffer_id] == "":

@@ -14,7 +14,8 @@ from sglang.test.test_utils import (
 
 class TestDeepseekTP2(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]

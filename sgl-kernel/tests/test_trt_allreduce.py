@@ -53,7 +53,8 @@ def multi_process_parallel(
 
 class TestCustomAllReduce(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         random.seed(42)
         cls.test_sizes = [512, 4096, 32768, 262144, 524288, 1048576, 2097152]
         cls.world_sizes = [2, 4, 8]

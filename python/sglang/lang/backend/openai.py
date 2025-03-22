@@ -4,7 +4,6 @@ import time
 import warnings
 from typing import Callable, List, Optional, Union
 
-import numpy as np
 
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import ChatTemplate, get_chat_template_by_model_path
@@ -22,6 +21,7 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+"""TODO: Add docstring."""
 def create_logit_bias_int(tokenizer):
     """Get logit bias for integer numbers."""
     int_token_ids = []

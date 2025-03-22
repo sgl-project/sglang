@@ -181,7 +181,8 @@ class TritonAttnBackend(AttentionBackend):
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    """TODO: Add docstring."""
+def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
         bs = forward_batch.batch_size

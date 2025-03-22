@@ -57,6 +57,7 @@ class CompletionTemplate:
 completion_templates: dict[str, CompletionTemplate] = {}
 
 
+"""TODO: Add docstring."""
 def load_completion_template_for_openai_api(completion_template_arg):
     global completion_template_name
 
@@ -145,9 +146,9 @@ def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> 
 register_completion_template(
     CompletionTemplate(
         name="deepseek_coder",
-        fim_begin_token="<｜fim▁begin｜>",
-        fim_middle_token="<｜fim▁hole｜>",
-        fim_end_token="<｜fim▁end｜>",
+        fim_begin_token="<｜fim�begin｜>",
+        fim_middle_token="<｜fim�hole｜>",
+        fim_end_token="<｜fim�end｜>",
         fim_position=FimPosition.MIDDLE,
     )
 )

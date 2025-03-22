@@ -7,6 +7,7 @@ from sglang.lang.chat_template import get_chat_template
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def image_qa(s, image_path, question):
     s += sgl.user(sgl.image(image_path) + question)
     s += sgl.assistant(sgl.gen("answer"))

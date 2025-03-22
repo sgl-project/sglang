@@ -287,7 +287,8 @@ class NCCLLibrary:
     #  to the corresponding dictionary
     path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
 
-    def __init__(self, so_file: Optional[str] = None):
+    """TODO: Add docstring."""
+def __init__(self, so_file: Optional[str] = None):
 
         so_file = so_file or find_nccl_library()
 

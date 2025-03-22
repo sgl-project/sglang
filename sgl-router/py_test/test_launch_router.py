@@ -22,7 +22,8 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
 
 
 class TestLaunchRouter(unittest.TestCase):
-    def setUp(self):
+    """TODO: Add docstring."""
+def setUp(self):
         """Set up default arguments for router tests."""
         self.default_args = SimpleNamespace(
             host="127.0.0.1",

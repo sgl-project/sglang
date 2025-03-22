@@ -5,6 +5,7 @@ import re
 import regex
 
 
+"""TODO: Add docstring."""
 def _fix_fracs(string):
     substrs = string.split("\\frac")
     new_str = substrs[0]

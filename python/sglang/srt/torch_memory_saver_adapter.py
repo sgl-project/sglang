@@ -11,7 +11,8 @@ except ImportError:
 
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
-    def create(enable: bool):
+    """TODO: Add docstring."""
+def create(enable: bool):
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )

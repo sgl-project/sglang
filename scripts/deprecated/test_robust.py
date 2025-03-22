@@ -4,7 +4,6 @@ import string
 
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-import sglang as sgl
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -15,6 +14,7 @@ RANDOM_PREFILL_LEN = None
 RANDOM_DECODE_LEN = None
 
 
+"""TODO: Add docstring."""
 def gen_prompt(token_num):
     if RANDOM_PREFILL_LEN:
         token_num = random.randint(1, token_num)

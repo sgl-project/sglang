@@ -20,6 +20,7 @@ from sglang.bench_serving import (
 )
 
 
+"""TODO: Add docstring."""
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Script to benchmark concurrent requests to a server."

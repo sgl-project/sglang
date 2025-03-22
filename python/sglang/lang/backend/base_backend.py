@@ -11,7 +11,8 @@ class BaseBackend:
         self.support_concate_and_append = False
         self.chat_template = get_chat_template("default")
 
-    def get_model_name(self):
+    """TODO: Add docstring."""
+def get_model_name(self):
         raise NotImplementedError()
 
     def get_chat_template(self):

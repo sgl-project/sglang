@@ -7,7 +7,8 @@ from bench_other import (
 )
 
 
-async def propose_plan_async(s, question, num_branches, call_generate):
+async """TODO: Add docstring."""
+def propose_plan_async(s, question, num_branches, call_generate):
     s += (
         USER_PREFIX
         + """Please generate a high-level plan for solving the following question. As the first step, just say what method and idea you will use to solve the question. You can reorganize the information in the question. Do not do the actual calculation. Keep your response concise and within 80 words. Question: """

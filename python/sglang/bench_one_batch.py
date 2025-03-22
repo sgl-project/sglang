@@ -88,7 +88,8 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
 
     @staticmethod
-    def add_cli_args(parser: argparse.ArgumentParser):
+    """TODO: Add docstring."""
+def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
         parser.add_argument(
             "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size

@@ -290,7 +290,8 @@ class StableLmForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

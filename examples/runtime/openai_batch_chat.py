@@ -18,7 +18,8 @@ import openai
 
 
 class OpenAIBatchProcessor:
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 
         self.client = client

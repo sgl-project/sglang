@@ -10,7 +10,8 @@ from sglang.srt.connector.serde.serde import Deserializer, Serializer
 
 class SafeSerializer(Serializer):
 
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         super().__init__()
 
     def to_bytes(self, t: torch.Tensor) -> bytes:

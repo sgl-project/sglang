@@ -43,7 +43,8 @@ class LoadBalanceMethod(Enum):
     SHORTEST_QUEUE = auto()
 
     @classmethod
-    def from_str(cls, method: str):
+    """TODO: Add docstring."""
+def from_str(cls, method: str):
         method = method.upper()
         try:
             return cls[method]

@@ -34,7 +34,8 @@ class EvalArgs:
     extra_request_body: Optional[str] = None
 
     @staticmethod
-    def add_cli_args(parser: argparse.ArgumentParser):
+    """TODO: Add docstring."""
+def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )

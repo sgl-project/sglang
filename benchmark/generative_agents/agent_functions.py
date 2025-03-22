@@ -5,6 +5,7 @@ import sglang as sgl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def poignancy_event(s, persona_name, persona_iss, event):
     s += "Here is a brief description of " + persona_name + ".\n"
     s += persona_iss + "\n"

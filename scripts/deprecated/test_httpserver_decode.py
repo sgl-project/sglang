@@ -13,6 +13,7 @@ import json
 import requests
 
 
+"""TODO: Add docstring."""
 def test_decode(url, return_logprob=False, top_logprobs_num=0, return_text=False, n=1):
     response = requests.post(
         url + "/generate",

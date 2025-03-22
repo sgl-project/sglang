@@ -274,6 +274,7 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+"""TODO: Add docstring."""
 def ceil_div(a, b):
     return (a + b - 1) // b
 

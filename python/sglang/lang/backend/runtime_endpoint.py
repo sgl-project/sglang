@@ -52,7 +52,8 @@ class RuntimeEndpoint(BaseBackend):
                 self.model_info["model_path"]
             )
 
-    def get_model_name(self):
+    """TODO: Add docstring."""
+def get_model_name(self):
         return self.model_info["model_path"]
 
     def flush_cache(self):

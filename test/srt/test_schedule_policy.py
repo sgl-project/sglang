@@ -12,7 +12,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 class TestSchedulePolicy(unittest.TestCase):
 
-    def setUp(self):
+    """TODO: Add docstring."""
+def setUp(self):
         self.tree_cache = RadixCache(None, None, False)
 
     def test_init_with_cache_aware_policy(self):

@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.testing
 from sgl_kernel import awq_dequantize
-from vllm import _custom_ops as ops
 
 
 def vllm_awq_dequantize(
@@ -21,6 +20,7 @@ def sglang_awq_dequantize(
     return awq_dequantize(qweight, scales, qzeros)
 
 
+"""TODO: Add docstring."""
 def calculate_diff(qweight_row: int, qweight_col: int):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
@@ -53,7 +53,7 @@ def calculate_diff(qweight_row: int, qweight_col: int):
     ):
         print("✅ All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("� Implementations differ")
 
 
 qweight_row_range = [3584, 18944, 128, 256, 512, 1024]

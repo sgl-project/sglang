@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, config: LoRAConfig, base_hf_config: AutoConfig):
+    """TODO: Add docstring."""
+def __init__(self, config: LoRAConfig, base_hf_config: AutoConfig):
         super().__init__()
         self.config: LoRAConfig = config
         self.base_hf_config: AutoConfig = base_hf_config

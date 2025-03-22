@@ -210,7 +210,8 @@ class TestLoRABackend(unittest.TestCase):
             "Batch processing version of run_backend is not implemented yet."
         )
 
-    def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    """TODO: Add docstring."""
+def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters
             prompts = (

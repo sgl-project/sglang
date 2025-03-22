@@ -44,6 +44,7 @@ from sglang.srt.utils import add_prefix, make_layers
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
+"""TODO: Add docstring."""
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 

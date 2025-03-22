@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 class RedisConnector(BaseKVConnector):
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    """TODO: Add docstring."""
+def __init__(self, url: str, device: torch.device = "cpu"):
         import redis
 
         super().__init__(url, device)

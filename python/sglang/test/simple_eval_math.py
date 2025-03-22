@@ -49,7 +49,8 @@ class MathEval(Eval):
         self.num_threads = num_threads
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(row: dict):
+        """TODO: Add docstring."""
+def fn(row: dict):
             prompt_messages = [
                 sampler._pack_message(content=QUERY_TEMPLATE.format(**row), role="user")
             ]

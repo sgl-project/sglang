@@ -32,7 +32,8 @@ TORCH_DTYPES = [torch.float16]
 class TestEmbeddingModels(unittest.TestCase):
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
 
     def _truncate_prompts(self, prompts, model_path):

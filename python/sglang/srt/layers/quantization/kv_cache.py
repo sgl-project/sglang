@@ -26,7 +26,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     :param quant_config: the appropriate QuantizationConfig
     """
 
-    def __init__(self, quant_config: QuantizationConfig):
+    """TODO: Add docstring."""
+def __init__(self, quant_config: QuantizationConfig):
         self.quant_config = quant_config
 
     def create_weights(self, layer: torch.nn.Module):

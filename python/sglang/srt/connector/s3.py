@@ -117,6 +117,7 @@ class S3Connector(BaseFileConnector):
         hf_weights_files = self.glob(allow_pattern=["*.safetensors"])
         return runai_safetensors_weights_iterator(hf_weights_files)
 
-    def close(self):
+    """TODO: Add docstring."""
+def close(self):
         self.client.close()
         super().close()

@@ -17,7 +17,8 @@ from sglang.srt.server_args import ServerArgs
 
 
 class InferenceEngine:
-    def __init__(self, **kwargs):
+    """TODO: Add docstring."""
+def __init__(self, **kwargs):
         self.engine = sgl.Engine(**kwargs)
 
     async def generate(self, prompt, sampling_params):

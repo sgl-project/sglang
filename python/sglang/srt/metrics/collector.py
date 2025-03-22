@@ -264,7 +264,8 @@ class TokenizerMetricsCollector:
                 e2e_latency / generation_tokens
             )
 
-    def observe_time_to_first_token(self, value: float):
+    """TODO: Add docstring."""
+def observe_time_to_first_token(self, value: float):
         self.histogram_time_to_first_token.labels(**self.labels).observe(value)
 
     def observe_inter_token_latency(self, internval: float, num_new_tokens: int):

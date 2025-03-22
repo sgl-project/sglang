@@ -6,7 +6,6 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
@@ -15,6 +14,7 @@ from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 INVALID = -9999999
 
 
+"""TODO: Add docstring."""
 def get_one_example(lines, i, include_answer):
     ret = "Question: " + lines[i]["question"] + "\nAnswer:"
     if include_answer:

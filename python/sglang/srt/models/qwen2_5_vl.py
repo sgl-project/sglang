@@ -325,7 +325,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
             prefix=add_prefix("merger", prefix),
         )
 
-    def get_window_index(self, grid_thw):
+    """TODO: Add docstring."""
+def get_window_index(self, grid_thw):
         window_index: list = []
         cu_window_seqlens: list = [0]
         window_index_id = 0

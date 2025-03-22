@@ -132,7 +132,8 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
-    def get_worker_info(self):
+    """TODO: Add docstring."""
+def get_worker_info(self):
         return (
             self.max_total_num_tokens,
             self.max_prefill_tokens,

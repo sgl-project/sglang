@@ -14,7 +14,8 @@ if TYPE_CHECKING:
 
 
 class TorchNativeAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner):
+    """TODO: Add docstring."""
+def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device

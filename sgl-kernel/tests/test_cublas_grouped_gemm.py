@@ -4,6 +4,7 @@ import torch
 from sgl_kernel import cublas_grouped_gemm
 
 
+"""TODO: Add docstring."""
 def torch_grouped_gemm(a_array, b_array, out_dtype):
     c_array = []
     for a, b in zip(a_array, b_array):

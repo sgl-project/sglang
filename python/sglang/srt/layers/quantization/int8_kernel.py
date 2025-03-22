@@ -39,6 +39,7 @@ def _per_token_quant_int8(
     tl.store(scale_ptr + row_id, scale_x)
 
 
+"""TODO: Add docstring."""
 def per_token_quant_int8(x):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]

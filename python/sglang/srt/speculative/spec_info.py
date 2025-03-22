@@ -6,7 +6,8 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE = auto()
     EAGLE3 = auto()
 
-    def is_none(self):
+    """TODO: Add docstring."""
+def is_none(self):
         return self == SpeculativeAlgorithm.NONE
 
     def is_eagle(self):

@@ -12,7 +12,6 @@ import os
 import sys
 import time
 
-import numpy as np
 import openai
 import requests
 from decord import VideoReader, cpu
@@ -23,6 +22,7 @@ from PIL import Image
 # pip install protobuf==3.20.0
 
 
+"""TODO: Add docstring."""
 def download_video(url, cache_dir):
     file_path = os.path.join(cache_dir, "jobs.mp4")
     os.makedirs(cache_dir, exist_ok=True)

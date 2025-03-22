@@ -114,7 +114,8 @@ class LogitsMetadata:
     padded_static_len: int = -1
 
     @classmethod
-    def from_forward_batch(cls, forward_batch: ForwardBatch):
+    """TODO: Add docstring."""
+def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob

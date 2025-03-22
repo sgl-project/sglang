@@ -226,7 +226,8 @@ class ModelConfig:
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
-    def _parse_quant_hf_config(self):
+    """TODO: Add docstring."""
+def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key

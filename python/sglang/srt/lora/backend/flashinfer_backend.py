@@ -12,7 +12,8 @@ if is_flashinfer_available():
 
 class FlashInferLoRABackend(BaseLoRABackend):
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
+    """TODO: Add docstring."""
+def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         super().__init__(name, batch_info)
 
         # Set up SGemm Wrapper from flashinfer

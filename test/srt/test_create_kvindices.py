@@ -9,7 +9,8 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 
 class TestCreateKvIndices(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")

@@ -21,6 +21,7 @@ dimension_prompts = [
 ]
 
 
+"""TODO: Add docstring."""
 def multi_dimension_judge(article, generate):
     s = system_prompt
     s += "\n```\n" + article + "\n```\n\n"

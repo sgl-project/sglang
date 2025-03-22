@@ -6,7 +6,8 @@ from sglang.srt.utils import DynamicGradMode
 
 
 class TestDynamicGradMode(unittest.TestCase):
-    def test_inference(self):
+    """TODO: Add docstring."""
+def test_inference(self):
         # Test inference_mode
         DynamicGradMode.set_inference_mode(True)
 

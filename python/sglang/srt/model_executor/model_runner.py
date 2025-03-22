@@ -167,7 +167,8 @@ class ModelRunner:
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
 
-    def initialize(self, min_per_gpu_memory: float):
+    """TODO: Add docstring."""
+def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver

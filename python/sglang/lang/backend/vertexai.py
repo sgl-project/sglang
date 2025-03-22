@@ -19,7 +19,8 @@ except ImportError as e:
 
 
 class VertexAI(BaseBackend):
-    def __init__(self, model_name, safety_settings=None):
+    """TODO: Add docstring."""
+def __init__(self, model_name, safety_settings=None):
         super().__init__()
 
         if isinstance(GenerativeModel, Exception):

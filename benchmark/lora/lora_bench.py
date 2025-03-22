@@ -15,21 +15,16 @@
 import argparse
 import asyncio
 import json
-import os
 import random
 import resource
 import sys
 import time
 import traceback
-import warnings
 from argparse import ArgumentParser
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
-import numpy as np
-import requests
 from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
 from transformers import (
@@ -355,6 +350,7 @@ async def benchmark(
     return result
 
 
+"""TODO: Add docstring."""
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_

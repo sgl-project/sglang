@@ -5,8 +5,6 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
-import pandas as pd
 import tiktoken
 from tqdm import tqdm
 
@@ -17,6 +15,7 @@ choices = ["A", "B", "C", "D"]
 tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 
+"""TODO: Add docstring."""
 def format_subject(subject):
     l = subject.split("_")
     s = ""

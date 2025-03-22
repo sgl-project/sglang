@@ -14,7 +14,8 @@ from sglang.test.test_utils import (
 
 class TestBenchServing(unittest.TestCase):
 
-    def test_offline_throughput_default(self):
+    """TODO: Add docstring."""
+def test_offline_throughput_default(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             num_prompts=500,

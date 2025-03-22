@@ -82,7 +82,8 @@ class HumanEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         instruction = "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n"
 
-        def find_code(completion):
+        """TODO: Add docstring."""
+def find_code(completion):
             pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
             matches = pattern.findall(completion)
             extracted_answer = matches[0] if len(matches) >= 1 else completion

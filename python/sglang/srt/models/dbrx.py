@@ -421,7 +421,8 @@ class DbrxForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [
             (
                 "ws" if weight_name in ["w1", "v1"] else "w2s",

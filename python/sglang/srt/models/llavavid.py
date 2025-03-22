@@ -57,7 +57,8 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    """TODO: Add docstring."""
+def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         pad_values = image_inputs.pad_values
         new_image_feature_len = self.image_feature_len
 

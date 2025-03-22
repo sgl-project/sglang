@@ -33,7 +33,8 @@ TORCH_DTYPES = [torch.float16]
 
 class TestQmeQwenModels(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
 
     def assert_close_embeddings(self, model, prefill_tolerance, torch_dtype):

@@ -55,7 +55,8 @@ class EagleDraftInput:
 
     all_padding_lens: Optional[torch.Tensor] = None
 
-    def prepare_for_extend(self, batch: ScheduleBatch):
+    """TODO: Add docstring."""
+def prepare_for_extend(self, batch: ScheduleBatch):
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 

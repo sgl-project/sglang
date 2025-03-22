@@ -15,7 +15,8 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 
 class MiniLoadBalancer:
-    def __init__(self, prefill_servers, decode_servers):
+    """TODO: Add docstring."""
+def __init__(self, prefill_servers, decode_servers):
         self.prefill_servers = prefill_servers
         self.decode_servers = decode_servers
 

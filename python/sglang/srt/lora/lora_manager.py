@@ -72,7 +72,8 @@ class LoRAManager:
         self.init_loras()
         self.init_lora_memory_pool()
 
-    def init_loras(self):
+    """TODO: Add docstring."""
+def init_loras(self):
         # Config of each LoRA adapter
         self.configs: Dict[str, LoRAConfig] = {}
 

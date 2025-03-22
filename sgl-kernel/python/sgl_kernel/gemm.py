@@ -10,6 +10,7 @@ def awq_dequantize(
     return torch.ops.sgl_kernel.awq_dequantize(qweight, scales, qzeros)
 
 
+"""TODO: Add docstring."""
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.int8_scaled_mm(
         mat_a,

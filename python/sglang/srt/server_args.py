@@ -189,7 +189,8 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
 
-    def __post_init__(self):
+    """TODO: Add docstring."""
+def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path

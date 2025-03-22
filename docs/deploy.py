@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 
 
+"""TODO: Add docstring."""
 def run_cmd(cmd):
     print(cmd)
     os.system(cmd)

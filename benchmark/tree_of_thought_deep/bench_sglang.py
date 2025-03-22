@@ -5,9 +5,7 @@ import re
 import time
 from collections import Counter
 
-import numpy as np
 
-import sglang as sgl
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -17,6 +15,7 @@ from sglang.utils import dump_state_text, read_jsonl
 INVALID = -9999999
 
 
+"""TODO: Add docstring."""
 def get_answer_value(answer_str):
     answer_str = answer_str.replace(",", "")
     numbers = re.findall(r"\d+", answer_str)

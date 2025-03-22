@@ -8,6 +8,7 @@ from sglang_router import Router
 from sglang_router_rs import PolicyType
 
 
+"""TODO: Add docstring."""
 def setup_logger():
     logger = logging.getLogger("router")
     logger.setLevel(logging.INFO)

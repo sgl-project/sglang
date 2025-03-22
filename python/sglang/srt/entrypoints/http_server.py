@@ -33,7 +33,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 from contextlib import asynccontextmanager
 
-import numpy as np
 import orjson
 import requests
 import uvicorn
@@ -104,6 +103,7 @@ class _GlobalState:
 _global_state: Optional[_GlobalState] = None
 
 
+"""TODO: Add docstring."""
 def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state

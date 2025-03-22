@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 
+"""TODO: Add docstring."""
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
     A = A.to(torch.float32)

@@ -10,7 +10,8 @@ from sglang.srt.utils import is_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_scaled_fp8_quant_per_tensor(dtype) -> None:
 
-    def quantize_ref_per_tensor(tensor, inv_scale):
+    """TODO: Add docstring."""
+def quantize_ref_per_tensor(tensor, inv_scale):
         # The reference implementation that fully aligns to
         # the kernel being tested.
         finfo = torch.finfo(torch.float8_e4m3fn)

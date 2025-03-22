@@ -3,6 +3,7 @@ import torch
 from sgl_kernel import lightning_attention_decode
 
 
+"""TODO: Add docstring."""
 def naive_lightning_attention_decode(q, k, v, past_kv, slope):
     """Naive implementation of lightning attention decode"""
     original_dtype = q.dtype

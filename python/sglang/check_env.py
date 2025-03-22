@@ -12,6 +12,7 @@ import torch
 from sglang.srt.utils import is_hip
 
 
+"""TODO: Add docstring."""
 def is_cuda_v2():
     return torch.version.cuda is not None
 

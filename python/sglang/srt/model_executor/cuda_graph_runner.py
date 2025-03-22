@@ -13,7 +13,6 @@
 # ==============================================================================
 """Run the model with cuda graph and torch.compile."""
 
-from __future__ import annotations
 
 import bisect
 import os
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+"""TODO: Add docstring."""
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):

@@ -304,7 +304,8 @@ class GPTQMarlinConfig(QuantizationConfig):
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 
     @classmethod
-    def is_gptq_marlin_compatible(cls, quant_config: Dict[str, Any]):
+    """TODO: Add docstring."""
+def is_gptq_marlin_compatible(cls, quant_config: Dict[str, Any]):
         if not VLLM_AVAILABLE:
             return False
 

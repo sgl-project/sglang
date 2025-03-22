@@ -4,12 +4,11 @@ import json
 import re
 import time
 
-import numpy as np
 
-import sglang as sgl
 from sglang.utils import download_and_cache_file, read_jsonl
 
 
+"""TODO: Add docstring."""
 def test_few_shot_qa():
     @sgl.function
     def few_shot_qa(s, question):

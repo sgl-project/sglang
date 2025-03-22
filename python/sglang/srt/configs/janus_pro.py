@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 
-import numpy as np
 import PIL
 import torch
 from PIL.Image import Image
@@ -24,7 +23,8 @@ from sglang.srt.mm_utils import expand2square
 
 
 class DictToObject(dict):
-    def __init__(self, dictionary):
+    """TODO: Add docstring."""
+def __init__(self, dictionary):
         super(self).__init__(dictionary)
 
         for key, value in dictionary.items():
@@ -331,7 +331,7 @@ class VLChatProcessor(ProcessorMixin):
         image_tag: str = "<image_placeholder>",
         image_start_tag: str = "<begin_of_image>",
         image_end_tag: str = "<end_of_image>",
-        pad_tag: str = "<｜▁pad▁｜>",
+        pad_tag: str = "<｜�pad�｜>",
         num_image_tokens: int = 576,
         add_special_token: bool = False,
         sft_format: str = "deepseek",

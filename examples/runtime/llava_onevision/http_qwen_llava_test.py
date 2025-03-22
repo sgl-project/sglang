@@ -22,7 +22,8 @@ import requests
 from llava.conversation import conv_qwen
 
 
-async def send_request(url, data, delay=0):
+async """TODO: Add docstring."""
+def send_request(url, data, delay=0):
     await asyncio.sleep(delay)
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=data) as resp:

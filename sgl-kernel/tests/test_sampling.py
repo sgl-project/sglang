@@ -8,6 +8,7 @@ import torch
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
+"""TODO: Add docstring."""
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
     if p == 0.1:

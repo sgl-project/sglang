@@ -12,6 +12,7 @@ from sglang.utils import dump_state_text, read_jsonl
 number = 5
 
 
+"""TODO: Add docstring."""
 def expand_tip(topic, tip, generate):
     s = (
         """Please expand a tip for a topic into a detailed paragraph.

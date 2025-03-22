@@ -311,7 +311,8 @@ class PrefillAdder:
             )
 
     @property
-    def rem_total_tokens(self):
+    """TODO: Add docstring."""
+def rem_total_tokens(self):
         return (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()

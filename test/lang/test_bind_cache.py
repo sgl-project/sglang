@@ -8,7 +8,8 @@ class TestBind(unittest.TestCase):
     backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.backend = sgl.Runtime(model_path=DEFAULT_MODEL_NAME_FOR_TEST)
         sgl.set_default_backend(cls.backend)
 

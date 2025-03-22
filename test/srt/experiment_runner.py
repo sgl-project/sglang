@@ -98,7 +98,8 @@ def stream_output(
 ) -> queue.Queue:
     output_queue = queue.Queue()
 
-    def stream_pipe(pipe, prefix):
+    """TODO: Add docstring."""
+def stream_pipe(pipe, prefix):
         for line in iter(pipe.readline, ""):
             if prefix == "CLIENT":
                 output_queue.put(line.rstrip())
@@ -307,7 +308,7 @@ def format_results(results: List[TaskResult]) -> str:
 
     for result in results:
         output.append(f"## {result.name}")
-        output.append(f"**Status**: {'✅ Success' if result.success else '❌ Failed'}")
+        output.append(f"**Status**: {'✅ Success' if result.success else '� Failed'}")
         output.append(f"**Runtime**: {result.runtime:.2f} seconds")
         output.append(f"**Timestamp**: {result.timestamp}")
         output.append("\n**Output**:\n```")

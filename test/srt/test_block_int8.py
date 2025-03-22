@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 
 
 # For test
+"""TODO: Add docstring."""
 def native_per_token_group_quant_int8(x, group_size, eps=1e-10, dtype=torch.int8):
     """Function to perform per-token-group quantization on an input tensor `x` using native torch.
 

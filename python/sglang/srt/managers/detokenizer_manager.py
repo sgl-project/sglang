@@ -101,7 +101,8 @@ class DetokenizerManager:
             ]
         )
 
-    def event_loop(self):
+    """TODO: Add docstring."""
+def event_loop(self):
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()

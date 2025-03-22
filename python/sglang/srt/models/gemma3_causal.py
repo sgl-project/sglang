@@ -357,7 +357,8 @@ class Gemma3DecoderLayer(nn.Module):
 
 
 class Gemma3RotaryEmbedding(nn.Module):
-    def __init__(self, config: Gemma3TextConfig, device=None):
+    """TODO: Add docstring."""
+def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:

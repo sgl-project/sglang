@@ -315,7 +315,8 @@ class Conversation:
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
-    def set_system_message(self, system_message: str):
+    """TODO: Add docstring."""
+def set_system_message(self, system_message: str):
         """Set the system message."""
         self.system_message = system_message
 
@@ -643,8 +644,8 @@ register_conv_template(
         offset=0,
         sep_style=SeparatorStyle.DeepSeekVL2,
         sep="\n\n",
-        sep2="<｜end▁of▁sentence｜>",
-        stop_str=["User:", "<｜end▁of▁sentence｜>"],
+        sep2="<｜end�of�sentence｜>",
+        stop_str=["User:", "<｜end�of�sentence｜>"],
     )
 )
 
@@ -698,9 +699,9 @@ register_conv_template(
         system_template="{system_message}.",
         roles=("User", "Assistant"),
         sep="\n\n",
-        sep2="<｜end▁of▁sentence｜>",
+        sep2="<｜end�of�sentence｜>",
         sep_style=SeparatorStyle.ADD_COLON_TWO,
-        stop_str=["<|User|>", "<｜end▁of▁sentence｜>"],
+        stop_str=["<|User|>", "<｜end�of�sentence｜>"],
         image_token="<image_placeholder>",
     )
 )

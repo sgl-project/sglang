@@ -128,7 +128,8 @@ class VerlEngine:
                     flush_cache=tensor_index == len(named_tensors) - 1,
                 )
 
-    def release_memory_occupation(self):
+    """TODO: Add docstring."""
+def release_memory_occupation(self):
         if self._tp_rank == 0:
             self._engine.release_memory_occupation()
 

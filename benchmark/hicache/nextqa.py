@@ -28,7 +28,8 @@ def video_frames(video_path, max_frames) -> int:
 
 
 class Video:
-    def __init__(self, video_path, num_frames):
+    """TODO: Add docstring."""
+def __init__(self, video_path, num_frames):
         self.path = video_path
         self.num_frames = num_frames
 

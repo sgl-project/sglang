@@ -10,7 +10,6 @@ import time
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-import sglang as sgl
 from sglang import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 
@@ -32,6 +31,7 @@ def generate_random_string(token_length: int) -> str:
     return decoded_string
 
 
+"""TODO: Add docstring."""
 def generate_unique_prefix(base_text, index):
     return str(index) + base_text[len(str(index)) :]
 

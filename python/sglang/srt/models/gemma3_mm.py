@@ -59,7 +59,8 @@ class Gemma3ImagePixelInputs(TypedDict):
 class Gemma3MultiModalProjector(nn.Module):
     """Projector for Gemma3 multimodal."""
 
-    def __init__(self, config: Gemma3Config):
+    """TODO: Add docstring."""
+def __init__(self, config: Gemma3Config):
         super().__init__()
 
         self.mm_input_projection_weight = nn.Parameter(

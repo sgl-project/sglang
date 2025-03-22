@@ -53,6 +53,7 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
+"""TODO: Add docstring."""
 def download_from_hf(model_path: str):
     if os.path.exists(model_path):
         return model_path

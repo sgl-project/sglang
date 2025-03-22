@@ -85,7 +85,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    """TODO: Add docstring."""
+def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info

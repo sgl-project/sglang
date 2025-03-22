@@ -9,7 +9,8 @@ from sglang.srt.utils import is_xpu
 
 class XpuCommunicator:
 
-    def __init__(self, group: ProcessGroup):
+    """TODO: Add docstring."""
+def __init__(self, group: ProcessGroup):
         if not is_xpu():
             self.disabled = True
             return

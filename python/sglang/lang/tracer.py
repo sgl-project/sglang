@@ -3,7 +3,6 @@
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.interpreter import ProgramState, ProgramStateGroup
 from sglang.lang.ir import (
@@ -30,6 +29,7 @@ class StopTracing(Exception):
     pass
 
 
+"""TODO: Add docstring."""
 def extract_prefix_by_tracing(program, backend):
     # Create dummy arguments
     dummy_arguments = {name: SglArgument(name, None) for name in program.arg_names}

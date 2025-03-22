@@ -117,6 +117,7 @@ def grouped_matmul_kernel(
         last_problem_end = last_problem_end + num_tiles
 
 
+"""TODO: Add docstring."""
 def triton_perf_fn(group_A, group_B, group_C, dtype):
     # We put the process of matrix lengths and pointers here out of fairness,
     # since cublas_grouped_gemm kernel also does these work.

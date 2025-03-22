@@ -32,7 +32,8 @@ from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
 class DeepseekVL2ImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         # with contextlib.suppress(ValueError):
         #     AutoProcessor.register("DeepseekVLV2Processor", DeepseekVLV2Processor)
         super().__init__(hf_config, server_args, _processor)

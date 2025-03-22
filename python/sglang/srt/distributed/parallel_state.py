@@ -55,7 +55,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -296,7 +296,8 @@ class GroupCoordinator:
             )
 
     @property
-    def first_rank(self):
+    """TODO: Add docstring."""
+def first_rank(self):
         """Return the global rank of the first process in the group"""
         return self.ranks[0]
 

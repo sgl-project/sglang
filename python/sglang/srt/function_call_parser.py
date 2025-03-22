@@ -77,7 +77,8 @@ class StreamingParseResult:
 class BaseFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         # initialize properties used for state when parsing tool calls in
         self._buffer = ""
         # streaming mode

@@ -16,7 +16,8 @@ class TestVertexAIBackend(unittest.TestCase):
     backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.backend = VertexAI("gemini-1.5-pro-001")
 
     def test_few_shot_qa(self):

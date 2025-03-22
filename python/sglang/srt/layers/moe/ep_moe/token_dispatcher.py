@@ -5,7 +5,6 @@ try:
 except ImportError:
     use_deepep = False
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -22,6 +21,7 @@ _buffer_normal = None
 _buffer_low_latency = None
 
 
+"""TODO: Add docstring."""
 def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     """
     Copy from DeepEP example usage in model inference prefilling.

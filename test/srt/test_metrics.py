@@ -12,7 +12,8 @@ from sglang.test.test_utils import (
 
 
 class TestEnableMetrics(unittest.TestCase):
-    def test_metrics_enabled(self):
+    """TODO: Add docstring."""
+def test_metrics_enabled(self):
         """Test that metrics endpoint returns data when enabled"""
         process = popen_launch_server(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

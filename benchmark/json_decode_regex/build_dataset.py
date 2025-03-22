@@ -32,6 +32,7 @@ city_names = [
 ]
 
 
+"""TODO: Add docstring."""
 def get_content(city_name):
     content = str(wikipedia.page(city_name).content)
     content = content.replace("\n\n", "\n")

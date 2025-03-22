@@ -10,7 +10,8 @@ _is_hip = is_hip()
 
 
 class CustomOp(nn.Module):
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 

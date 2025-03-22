@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEDraftCudaGraphRunner:
-    def __init__(self, eagle_worker: EAGLEWorker):
+    """TODO: Add docstring."""
+def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.model_runner

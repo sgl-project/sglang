@@ -26,7 +26,8 @@ from sglang.test.test_utils import (
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"

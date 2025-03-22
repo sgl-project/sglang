@@ -54,7 +54,8 @@ class XGrammarGrammar(BaseGrammarObject):
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
 
-    def accept_token(self, token: int):
+    """TODO: Add docstring."""
+def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:

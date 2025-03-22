@@ -1,12 +1,11 @@
 import itertools
-from typing import Optional, Tuple
 
 import pytest
 import torch
 from sgl_kernel import awq_dequantize
-from vllm import _custom_ops as ops
 
 
+"""TODO: Add docstring."""
 def reverse_awq_order(t: torch.Tensor):
     bits = 4
     AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]

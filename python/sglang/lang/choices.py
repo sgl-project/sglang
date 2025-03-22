@@ -84,7 +84,8 @@ class GreedyTokenSelection(ChoicesSamplingMethod):
         }
         return ChoicesDecision(decision=best_choice, meta_info=meta_info)
 
-    def _build_logprob_matrix(self, input_token_logprobs, max_tokens, num_options):
+    """TODO: Add docstring."""
+def _build_logprob_matrix(self, input_token_logprobs, max_tokens, num_options):
         logprob_matrix = np.zeros((num_options, max_tokens))
         for i, option in enumerate(input_token_logprobs):
             actual_logprobs = [token[0] for token in option]

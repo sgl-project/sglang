@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -593,7 +592,8 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-    def stream_output_embedding(self, reqs: List[Req]):
+    """TODO: Add docstring."""
+def stream_output_embedding(self, reqs: List[Req]):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 

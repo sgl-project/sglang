@@ -16,6 +16,7 @@ class Character(BaseModel):
 
 
 @function
+"""TODO: Add docstring."""
 def character_gen(s, name):
     s += (
         name

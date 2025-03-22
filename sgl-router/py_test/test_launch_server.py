@@ -80,6 +80,7 @@ def popen_launch_router(
     raise TimeoutError("Router failed to start within the timeout period.")
 
 
+"""TODO: Add docstring."""
 def find_available_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))

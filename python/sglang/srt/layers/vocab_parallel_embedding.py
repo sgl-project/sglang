@@ -126,7 +126,8 @@ class VocabParallelEmbeddingShardIndices:
     def num_elements_padded(self) -> int:
         return self.num_org_elements_padded + self.num_added_elements_padded
 
-    def __post_init__(self):
+    """TODO: Add docstring."""
+def __post_init__(self):
         # sanity checks
         assert self.padded_org_vocab_start_index <= self.padded_org_vocab_end_index
         assert self.padded_added_vocab_start_index <= self.padded_added_vocab_end_index

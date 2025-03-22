@@ -11,7 +11,8 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
     Frequency penalizer penalizes tokens based on their frequency in the output.
     """
 
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
+    """TODO: Add docstring."""
+def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
         self.orchestrator = orchestrator
         self._is_prepared = False
 

@@ -8,6 +8,7 @@ from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
 
 
+"""TODO: Add docstring."""
 def parse_digits(num):
     # format: 234.23 || 23%
     num = regex.sub(",", "", str(num))

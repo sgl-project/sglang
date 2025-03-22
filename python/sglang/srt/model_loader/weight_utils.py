@@ -24,7 +24,6 @@ from typing import (
 import filelock
 import gguf
 import huggingface_hub.constants
-import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
@@ -46,6 +45,7 @@ logger = logging.getLogger(__name__)
 temp_dir = tempfile.gettempdir()
 
 
+"""TODO: Add docstring."""
 def enable_hf_transfer():
     """automatically activates hf_transfer"""
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:

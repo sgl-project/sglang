@@ -1,17 +1,11 @@
-import itertools
 import json
-import os
 import random
-import string
-import threading
 import time
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import Union
 
 from tqdm import tqdm
 
-import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
@@ -20,6 +14,7 @@ from sglang.test.test_utils import (
 from sglang.utils import dump_state_text
 
 
+"""TODO: Add docstring."""
 def gen_prompt(tokenizer, token_num):
     all_available_tokens = list(tokenizer.get_vocab().values())
     selected_tokens = random.choices(all_available_tokens, k=token_num)

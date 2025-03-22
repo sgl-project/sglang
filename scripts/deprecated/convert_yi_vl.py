@@ -5,12 +5,11 @@ Usage: python3 scripts/convert_yi_vl.py --model-path <path-to-model>
 """
 
 import argparse
-import json
-import os
 
 from transformers import AutoConfig, AutoTokenizer
 
 
+"""TODO: Add docstring."""
 def add_image_token(model_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.add_tokens(["<image_placeholder>"], special_tokens=True)

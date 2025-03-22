@@ -6,7 +6,8 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 class TestSRTEngineWithQuantArgs(unittest.TestCase):
 
-    def test_1_quantization_args(self):
+    """TODO: Add docstring."""
+def test_1_quantization_args(self):
 
         # we only test fp8 because other methods are currenly depend on vllm. We can add other methods back to test after vllm depency is resolved.
         quantization_args_list = [

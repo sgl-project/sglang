@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
 
+"""TODO: Add docstring."""
 def main(model, tp_size, dtype: str, batches):
     method = fused_moe
 

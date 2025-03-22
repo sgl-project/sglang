@@ -111,7 +111,8 @@ class CudaRTLibrary:
     #  to the corresponding dictionary
     path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
 
-    def __init__(self, so_file: Optional[str] = None):
+    """TODO: Add docstring."""
+def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
             so_file = find_loaded_library("libcudart")
             assert so_file is not None, "libcudart is not loaded in the current process"

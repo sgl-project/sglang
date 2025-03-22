@@ -8,6 +8,7 @@ import torch
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
+"""TODO: Add docstring."""
 def test_fused_silu_mul(dim, batch_size, seq_len):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
     y_ref = x[..., dim:] * torch.nn.functional.silu(x[..., :dim])

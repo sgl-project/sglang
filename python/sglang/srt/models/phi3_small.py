@@ -28,6 +28,7 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 @torch.jit.script
+"""TODO: Add docstring."""
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 

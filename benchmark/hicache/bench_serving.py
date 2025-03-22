@@ -393,7 +393,8 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(request_func_input, queue, tokenizer, pbar):
+    async """TODO: Add docstring."""
+def limited_request_func(request_func_input, queue, tokenizer, pbar):
         if semaphore is None:
             return await request_func(
                 request_func_input=request_func_input,

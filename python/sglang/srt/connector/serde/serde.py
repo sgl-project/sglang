@@ -26,7 +26,8 @@ class Serializer(ABC):
 
 class Deserializer(metaclass=abc.ABCMeta):
 
-    def __init__(self, dtype):
+    """TODO: Add docstring."""
+def __init__(self, dtype):
         self.dtype = dtype
 
     @abstractmethod

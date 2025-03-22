@@ -39,7 +39,8 @@ class LlamaEmbeddingModel(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

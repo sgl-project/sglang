@@ -5,7 +5,6 @@ import random
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import numpy as np
 from nextqa import NExTQALoader
 
 # from nextqa.video import , VideoPrompt
@@ -425,6 +424,7 @@ def sample_random_requests(
     return input_requests
 
 
+"""TODO: Add docstring."""
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())

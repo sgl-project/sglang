@@ -12,7 +12,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from typing_extensions import ParamSpec
 
-from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -136,6 +135,7 @@ def _can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+"""TODO: Add docstring."""
 def is_weak_contiguous(inp: torch.Tensor):
     return inp.is_contiguous() or (
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()

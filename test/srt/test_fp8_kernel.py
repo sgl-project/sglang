@@ -10,7 +10,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 
 class TestFP8Base(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.M = 256
         # test non-aligned
         cls.N = 1024 + 64

@@ -85,7 +85,8 @@ subject2category = {
 
 
 class MMLUEval(Eval):
-    def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
+    """TODO: Add docstring."""
+def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
         df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:

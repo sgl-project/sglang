@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers):
+    """TODO: Add docstring."""
+def __init__(self, num_layers):
         self.counter = num_layers
         self.condition = threading.Condition()
 

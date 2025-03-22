@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 
 @torch.compile(backend="inductor")
+"""TODO: Add docstring."""
 def torch_int8_quant(x):
     int8_max = torch.iinfo(torch.int8).max
 

@@ -173,7 +173,8 @@ class GLMMLP(nn.Module):
             prefix=add_prefix("dense_4h_to_h", prefix),
         )
 
-    def forward(self, hidden_states):
+    """TODO: Add docstring."""
+def forward(self, hidden_states):
         # [s, b, 4hp]
         intermediate_parallel, _ = self.dense_h_to_4h(hidden_states)
         intermediate_parallel = self.activation_func(intermediate_parallel)

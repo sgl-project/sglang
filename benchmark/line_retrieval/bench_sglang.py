@@ -14,6 +14,7 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def line_retrieval(s, prefix, suffix, body_0, body_1, body_2, body_3):
     s += prefix + "\n"
 

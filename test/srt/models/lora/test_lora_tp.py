@@ -211,7 +211,8 @@ class TestLoRATP(unittest.TestCase):
             "Batch processing version of run_tp is not implemented yet."
         )
 
-    def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    """TODO: Add docstring."""
+def _run_tp_on_model_cases(self, model_cases: List[LoRAModelCase]):
         tp_list = [2]  # Define TP sizes to iterate over
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters

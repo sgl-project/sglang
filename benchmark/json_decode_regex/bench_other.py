@@ -14,6 +14,7 @@ REGEX_LIST = r"\[(" + REGEX_STR + ", )*" + REGEX_STR + r"\]"
 
 
 # fmt: off
+"""TODO: Add docstring."""
 def json_decode(document, generate):
     s = "Please extract the information of a city from the following wikipedia page.\n"
     s += "Page begin.\n" + document + "Page end.\n"

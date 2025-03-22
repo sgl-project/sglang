@@ -15,7 +15,8 @@ from sglang.test.test_utils import (
 
 class TestW8A8(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

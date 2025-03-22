@@ -15,6 +15,7 @@ from safetensors.torch import save_file
 from transformers import AutoConfig
 
 
+"""TODO: Add docstring."""
 def get_nextn_layer_id(config):
     if not hasattr(config, "num_hidden_layers"):
         raise ValueError("'num_hidden_layers' not found in model config.")

@@ -12,7 +12,8 @@ from sglang.test.test_utils import (
 
 class TestQwen2(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "Qwen/Qwen2-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

@@ -174,7 +174,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id

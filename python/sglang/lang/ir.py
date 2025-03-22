@@ -38,7 +38,8 @@ class SglSamplingParams:
     dtype: Optional[str] = None
     regex: Optional[str] = None
 
-    def clone(self):
+    """TODO: Add docstring."""
+def clone(self):
         return SglSamplingParams(
             self.max_new_tokens,
             self.min_new_tokens,

@@ -7,6 +7,7 @@ from sglang import OpenAI, function, gen, set_default_backend
 
 
 @function(num_api_spec_tokens=64)
+"""TODO: Add docstring."""
 def gen_character_spec(s):
     s += "Construct a character within the following format:\n"
     s += "Name: Steve Jobs.\nBirthday: February 24, 1955.\nJob: Apple CEO.\n"

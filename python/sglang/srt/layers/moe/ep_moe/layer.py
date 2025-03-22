@@ -53,7 +53,8 @@ _buffer = None
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, use_flashinfer: bool = False):
+    """TODO: Add docstring."""
+def __init__(self, device, use_flashinfer: bool = False):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer

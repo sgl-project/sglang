@@ -9,7 +9,8 @@ class TestAnthropicBackend(unittest.TestCase):
     backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.backend = Anthropic("claude-3-haiku-20240307")
         set_default_backend(cls.backend)
 

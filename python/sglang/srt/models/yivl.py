@@ -38,7 +38,8 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             "./", ""
         )  # Everything after "./"
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
         self.vision_tower = CLIPVisionModel.from_pretrained(
             self.config._name_or_path,

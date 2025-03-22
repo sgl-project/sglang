@@ -44,7 +44,8 @@ CONVS = [
 class TestRewardModels(unittest.TestCase):
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
 
     def assert_close_reward_scores(

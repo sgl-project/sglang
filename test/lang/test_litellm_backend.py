@@ -9,7 +9,8 @@ class TestAnthropicBackend(unittest.TestCase):
     chat_backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.chat_backend = LiteLLM("gpt-3.5-turbo")
         set_default_backend(cls.chat_backend)
 

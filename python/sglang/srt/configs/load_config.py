@@ -54,7 +54,8 @@ class LoadConfig:
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
 
-    def __post_init__(self):
+    """TODO: Add docstring."""
+def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
         if isinstance(model_loader_extra_config, str):
             self.model_loader_extra_config = json.loads(model_loader_extra_config)

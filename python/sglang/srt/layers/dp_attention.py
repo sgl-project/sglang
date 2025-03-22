@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import functools
 import logging
@@ -28,6 +27,7 @@ _DP_RANK = None
 _DP_SIZE = None
 
 
+"""TODO: Add docstring."""
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
     if not enable_dp_attention:
         return tp_rank, tp_size, 0

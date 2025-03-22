@@ -144,6 +144,7 @@ def sglang_per_token_group_quant_fp8(
     return x_q, x_s
 
 
+"""TODO: Add docstring."""
 def calculate_diff(batch_size, seq_len, group_size):
     dtype = torch.float16
     device = torch.device("cuda")
@@ -159,7 +160,7 @@ def calculate_diff(batch_size, seq_len, group_size):
     ) and torch.allclose(x_s_triton, x_s_sglang, rtol=1e-3, atol=1e-5):
         print("✅ All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("� Implementations differ")
 
 
 batch_size_range = [1, 2, 4, 8, 16, 32, 64]

@@ -317,7 +317,8 @@ class DecodeTransferQueue:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
+    """TODO: Add docstring."""
+def prepare_for_prebuilt_extend(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
         Adapted from .prepare_for_extend().

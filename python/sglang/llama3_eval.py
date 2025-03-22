@@ -10,9 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import httpx
-import numpy as np
 import openai
-import transformers
 from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm
@@ -85,6 +83,7 @@ class CustomAsyncHTTPXClient(httpx.AsyncClient):
         return await super().send(request, *args, **kwargs)
 
 
+"""TODO: Add docstring."""
 def get_client(provider):
     if provider not in "b10":
         if os.getenv("OPENAI_API_KEY") == None:

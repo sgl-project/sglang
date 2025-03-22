@@ -4,13 +4,13 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_select
 from sglang.utils import download_and_cache_file, read_jsonl
 
 
+"""TODO: Add docstring."""
 def get_one_example(lines, i, include_answer):
     ret = lines[i]["activity_label"] + ": " + lines[i]["ctx"] + " "
     if include_answer:

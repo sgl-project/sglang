@@ -25,7 +25,8 @@ def function(
     if func:
         return SglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
 
-    def decorator(func):
+    """TODO: Add docstring."""
+def decorator(func):
         return SglFunction(func, num_api_spec_tokens=num_api_spec_tokens)
 
     return decorator

@@ -2,13 +2,13 @@ import unittest
 
 import torch
 from sgl_kernel import int8_scaled_mm
-from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
     return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)
 
 
+"""TODO: Add docstring."""
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
     if bias is not None:

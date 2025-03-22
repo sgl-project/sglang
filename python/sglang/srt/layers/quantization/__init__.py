@@ -93,6 +93,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
 
 # Match dynamic rules with module name (prefix) and override quantize
 # config if module (prefix) matches a rule
+"""TODO: Add docstring."""
 def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):

@@ -133,6 +133,7 @@ html_static_path = ["_static"]
 html_css_files = ["css/custom_log.css"]
 
 
+"""TODO: Add docstring."""
 def setup(app):
     app.add_css_file("css/custom_log.css")
 

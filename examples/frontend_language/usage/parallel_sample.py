@@ -7,6 +7,7 @@ import sglang as sgl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def parallel_sample(s, question, n):
     s += (
         "Question: Compute 1 + 2 + 3\n"

@@ -1,5 +1,4 @@
-"""
-"""
+""" """
 
 import unittest
 from io import BytesIO
@@ -21,7 +20,8 @@ from sglang.srt.server_args import ServerArgs
 # Test the logits output between HF and SGLang
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = ""

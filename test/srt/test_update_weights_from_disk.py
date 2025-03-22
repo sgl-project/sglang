@@ -19,7 +19,8 @@ from sglang.test.test_utils import (
 # Engine Mode Tests (Single-configuration)
 ###############################################################################
 class TestEngineUpdateWeightsFromDisk(unittest.TestCase):
-    def setUp(self):
+    """TODO: Add docstring."""
+def setUp(self):
         self.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Initialize the engine in offline (direct) mode.
         self.engine = sgl.Engine(model_path=self.model)

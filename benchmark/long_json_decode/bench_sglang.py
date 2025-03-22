@@ -11,6 +11,7 @@ from sglang.utils import dump_state_text, read_jsonl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def json_decode(s, document):
     s += "Please extract the information of a city from the following wikipedia page.\n"
     s += "Page begin.\n" + document + "Page end.\n"

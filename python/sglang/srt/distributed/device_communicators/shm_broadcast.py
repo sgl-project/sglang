@@ -124,7 +124,8 @@ class ShmRingBuffer:
                     # and we should suppress the error
                     pass
 
-    def __reduce__(self):
+    """TODO: Add docstring."""
+def __reduce__(self):
         return (
             self.__class__,
             (

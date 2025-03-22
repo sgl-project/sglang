@@ -9,6 +9,7 @@ import sglang as sgl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def long_answer(s):
     s += sgl.user("What is the capital of the United States?")
     s += sgl.assistant(sgl.gen("answer", min_tokens=64, max_tokens=128))

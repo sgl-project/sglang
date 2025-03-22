@@ -27,7 +27,8 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         pass
 
     @classmethod

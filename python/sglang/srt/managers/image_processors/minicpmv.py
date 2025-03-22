@@ -9,7 +9,8 @@ from sglang.srt.models.minicpmv import MiniCPMV
 
 
 class MiniCPMVImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "(<image>./</image>)"
 

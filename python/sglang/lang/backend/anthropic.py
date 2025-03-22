@@ -14,7 +14,8 @@ except ImportError as e:
 
 
 class Anthropic(BaseBackend):
-    def __init__(self, model_name, *args, **kwargs):
+    """TODO: Add docstring."""
+def __init__(self, model_name, *args, **kwargs):
         super().__init__()
 
         if isinstance(anthropic, Exception):

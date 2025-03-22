@@ -1,9 +1,3 @@
-import collections
-import itertools
-import math
-import warnings
-from enum import Enum
-from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
@@ -16,8 +10,6 @@ from sglang.srt.configs.deepseekvl2 import (
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
 )
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -25,7 +17,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
@@ -121,7 +112,8 @@ class DeepseekVL2MlpProjector(nn.Module):
                 config.input_dim * 4, config.input_dim, quant_config=quant_config
             )
 
-    def forward(self, x):
+    """TODO: Add docstring."""
+def forward(self, x):
         if self.config.token_pooling:
             batch_size, wxh, channels = x.shape
             w = h = int(wxh**0.5)

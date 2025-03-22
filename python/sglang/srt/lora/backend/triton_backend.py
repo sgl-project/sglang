@@ -12,7 +12,8 @@ from sglang.srt.lora.utils import LoRABatchInfo
 
 class TritonLoRABackend(BaseLoRABackend):
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
+    """TODO: Add docstring."""
+def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         super().__init__(name, batch_info)
 
     def run_lora_a_sgemm(

@@ -10,6 +10,7 @@ CLEAR = "\033[1;0m"
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def cot_decoding(s, question, get_top_k, is_chat_model, verbose):
     """CoT Decoding: http://arxiv.org/abs/2402.10200"""
 

@@ -46,7 +46,8 @@ class TestEAGLEEngine(unittest.TestCase):
     }
     NUM_CONFIGS = 3
 
-    def setUp(self):
+    """TODO: Add docstring."""
+def setUp(self):
         self.prompt = "Today is a sunny day and I like"
         self.sampling_params = {"temperature": 0, "max_new_tokens": 8}
 

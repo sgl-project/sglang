@@ -12,7 +12,8 @@ from sglang.test.test_utils import (
 
 class TestGrok(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "lmzheng/grok-1"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

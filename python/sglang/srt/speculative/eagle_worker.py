@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
+"""TODO: Add docstring."""
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.

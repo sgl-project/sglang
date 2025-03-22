@@ -68,7 +68,8 @@ class PrefillBootstrapQueue:
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
 
-    def allocate_token_id(self, idx: int, token_id: int):
+    """TODO: Add docstring."""
+def allocate_token_id(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
         output_id_buffer = self.metadata_buffers[0]
         output_id_buffer[idx] = token_id

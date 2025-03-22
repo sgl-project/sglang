@@ -33,10 +33,10 @@ import math
 import re
 from io import BytesIO
 
-import numpy as np
 from PIL import Image
 
 
+"""TODO: Add docstring."""
 def select_best_resolution(original_size, possible_resolutions):
     """
     Selects the best resolution from a list of possible resolutions based on the original size.

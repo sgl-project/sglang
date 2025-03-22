@@ -14,7 +14,8 @@ from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
 # Compatible with Qwen2VL and Qwen2_5VL
 class Qwen2_5VLImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id

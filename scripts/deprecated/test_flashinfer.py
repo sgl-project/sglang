@@ -194,6 +194,7 @@ def test_batch_decode_with_paged_kv_cache(
     assert torch.allclose(o, o_triton, rtol=1e-2, atol=2e-3)
 
 
+"""TODO: Add docstring."""
 def init_flashinfer(num_attention_heads, num_kv_heads):
     use_tensor_cores = should_use_tensor_core(
         torch.half, num_attention_heads, num_kv_heads

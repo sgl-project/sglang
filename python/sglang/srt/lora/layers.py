@@ -34,7 +34,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
 
-    def forward(self, x: torch.Tensor):
+    """TODO: Add docstring."""
+def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
 
     def set_lora_info(self, *args):

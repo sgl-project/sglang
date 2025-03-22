@@ -15,6 +15,7 @@ ASSISTANT_PREFIX = ""
 ASSISTANT_SUFFIX = " </s><s>"
 
 
+"""TODO: Add docstring."""
 def multi_document_qa(docs, question, generate):
     s = USER_PREFIX
     s += "Pleaes answer a question according to given documents.\n"

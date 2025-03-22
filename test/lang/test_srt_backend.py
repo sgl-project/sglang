@@ -29,7 +29,8 @@ class TestSRTBackend(unittest.TestCase):
     backend = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.backend = sgl.Runtime(
             model_path=DEFAULT_MODEL_NAME_FOR_TEST, cuda_graph_max_bs=4
         )

@@ -324,7 +324,8 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
 
     @root_validator(pre=True)
-    def set_tool_choice_default(cls, values):
+    """TODO: Add docstring."""
+def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
             if values.get("tools") is None:
                 values["tool_choice"] = "none"

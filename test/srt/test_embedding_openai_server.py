@@ -13,7 +13,8 @@ from sglang.test.test_utils import (
 
 class TestOpenAIServer(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "intfloat/e5-mistral-7b-instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"

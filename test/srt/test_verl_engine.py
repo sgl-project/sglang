@@ -74,7 +74,8 @@ ALL_OTHER_MODELS = [
 
 class TestVerlEngine(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
     def assert_fragment_e2e_execution(

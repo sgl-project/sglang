@@ -11,7 +11,8 @@ class GlobalConfig:
     many global runtime arguments as well.
     """
 
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         # Verbosity level
         # 0: do not output anything
         # 2: output final text after every run

@@ -6,7 +6,8 @@ class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
 
     @abstractmethod
-    def reset(self):
+    """TODO: Add docstring."""
+def reset(self):
         pass
 
     @abstractmethod

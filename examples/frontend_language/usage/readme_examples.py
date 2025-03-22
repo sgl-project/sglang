@@ -8,6 +8,7 @@ import sglang as sgl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def tool_use(s, question):
     s += "To answer this question: " + question + ". "
     s += (

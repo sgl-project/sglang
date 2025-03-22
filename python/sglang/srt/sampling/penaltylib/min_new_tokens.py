@@ -11,7 +11,8 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     Min new tokens penalizer penalizes tokens based on the length of the output.
     """
 
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
+    """TODO: Add docstring."""
+def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
         self.orchestrator = orchestrator
         self._is_prepared = False
 

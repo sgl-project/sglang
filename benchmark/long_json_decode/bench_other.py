@@ -10,6 +10,7 @@ from sglang.test.test_utils import add_common_other_args_and_parse, get_call_gen
 from sglang.utils import dump_state_text, read_jsonl
 
 
+"""TODO: Add docstring."""
 def json_decode(document, generate):
     s = "Please extract the information of a city from the following wikipedia page.\n"
     s += "Page begin.\n" + document + "Page end.\n"

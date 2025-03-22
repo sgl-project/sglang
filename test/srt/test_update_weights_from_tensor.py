@@ -4,10 +4,10 @@ import unittest
 
 import torch
 
-import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
+"""TODO: Add docstring."""
 def test_update_weights_from_tensor(tp_size):
     assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
     torch.cuda.empty_cache()

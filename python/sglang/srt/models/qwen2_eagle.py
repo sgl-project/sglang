@@ -133,7 +133,8 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
             )
         self.logits_processor = LogitsProcessor(config)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
             if "lm_head" not in name:
                 name = "model." + name

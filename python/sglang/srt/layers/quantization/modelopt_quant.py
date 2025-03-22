@@ -101,7 +101,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         quant_config (ModelOptFp8Config): The ModelOpt quantization configuration.
     """
 
-    def __init__(self, quant_config: ModelOptFp8Config):
+    """TODO: Add docstring."""
+def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()

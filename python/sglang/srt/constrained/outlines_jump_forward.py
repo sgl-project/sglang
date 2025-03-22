@@ -46,6 +46,7 @@ class JumpEdge:
 
 
 @disk_cache()
+"""TODO: Add docstring."""
 def init_state_to_jump_forward(regex_string):
     try:
         regex_pattern = interegular.parse_pattern(regex_string)
@@ -180,8 +181,8 @@ if __name__ == "__main__":
 
     outlines.caching.clear_cache()
     test_main(r"The google's DNS sever address is " + IP_REGEX)
-    test_main(r"霍格沃茨特快列车|霍比特人比尔博")
-    # 霍格: \xe9\x9c\x8d \xe6\xa0\xbc ...
-    # 霍比: \xe9\x9c\x8d \xe6\xaf\x94 ...
+    test_main(r"�格沃茨特快列车|�比特人比尔�")
+    # �格: \xe9\x9c\x8d \xe6\xa0\xbc ...
+    # �比: \xe9\x9c\x8d \xe6\xaf\x94 ...
 
     test_main(r"[-+]?[0-9]+[ ]*")

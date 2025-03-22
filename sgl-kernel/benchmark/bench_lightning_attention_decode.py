@@ -1,4 +1,3 @@
-import itertools
 import math
 
 import torch
@@ -7,6 +6,7 @@ import triton.language as tl
 from sgl_kernel import lightning_attention_decode
 
 
+"""TODO: Add docstring."""
 def next_power_of_2(n):
     return 2 ** (int(math.ceil(math.log(n, 2))))
 
@@ -204,7 +204,7 @@ def calculate_diff(batch_size):
     ):
         print("✅ All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("� Implementations differ")
 
 
 batch_size_range = [i for i in range(1, 65)]  # 1 to 128

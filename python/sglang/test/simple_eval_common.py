@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import jinja2
-import numpy as np
 import openai
 import requests
 from openai import OpenAI
@@ -71,7 +70,8 @@ class Eval:
 
 
 class LargerHttpxClient(httpx.Client):
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         timeout_config = httpx.Timeout(3600)
         limits = httpx.Limits(
             max_keepalive_connections=3600,

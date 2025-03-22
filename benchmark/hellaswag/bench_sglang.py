@@ -3,7 +3,6 @@ import json
 import os
 import time
 
-import numpy as np
 
 from sglang.api import set_default_backend
 from sglang.test.test_utils import (
@@ -13,6 +12,7 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 
+"""TODO: Add docstring."""
 def get_one_example(lines, i, include_answer):
     ret = lines[i]["activity_label"] + ": " + lines[i]["ctx"] + " "
     if include_answer:

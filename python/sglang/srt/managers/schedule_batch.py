@@ -83,7 +83,8 @@ logger = logging.getLogger(__name__)
 
 
 class BaseFinishReason:
-    def __init__(self, is_error: bool = False):
+    """TODO: Add docstring."""
+def __init__(self, is_error: bool = False):
         self.is_error = is_error
 
     def to_json(self):

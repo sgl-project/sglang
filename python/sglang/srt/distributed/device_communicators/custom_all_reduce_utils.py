@@ -11,8 +11,6 @@ import tempfile
 from itertools import product
 from typing import Dict, List, Optional, Sequence
 
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.utils import cuda_device_count_stateless
@@ -20,6 +18,7 @@ from sglang.srt.utils import cuda_device_count_stateless
 logger = logging.getLogger(__name__)
 
 
+"""TODO: Add docstring."""
 def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:

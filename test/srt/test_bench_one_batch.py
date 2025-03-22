@@ -11,7 +11,8 @@ from sglang.test.test_utils import (
 
 
 class TestBenchOneBatch(unittest.TestCase):
-    def test_bs1(self):
+    """TODO: Add docstring."""
+def test_bs1(self):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs", "2"]
         )

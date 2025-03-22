@@ -1,10 +1,8 @@
 import math
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torchvision.transforms as T
 from PIL import Image, ImageOps
 from transformers import (
     AutoProcessor,
@@ -14,6 +12,7 @@ from transformers import (
 )
 
 
+"""TODO: Add docstring."""
 def select_best_resolution(image_size, candidate_resolutions):
     # used for cropping
     original_width, original_height = image_size
@@ -102,7 +101,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         image_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize: bool = True,
         image_token: str = "<image>",
-        pad_token: str = "<｜▁pad▁｜>",
+        pad_token: str = "<｜�pad�｜>",
         add_special_token: bool = False,
         sft_format: str = "deepseek",
         mask_prompt: bool = True,

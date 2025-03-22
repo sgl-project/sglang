@@ -196,7 +196,8 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def send(self, tensor: torch.Tensor, dst: int, stream=None):
+    """TODO: Add docstring."""
+def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return
         assert tensor.device == self.device, (

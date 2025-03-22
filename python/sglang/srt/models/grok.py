@@ -692,7 +692,8 @@ class Grok1ForCausalLM(nn.Module):
 
         return hit_names
 
-    def get_num_params_analytical(self):
+    """TODO: Add docstring."""
+def get_num_params_analytical(self):
         cfg = self.config
         moe_intermediate_size = getattr(
             cfg,

@@ -25,6 +25,7 @@ if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
+"""TODO: Add docstring."""
 def _get_version():
     with open(root / "pyproject.toml") as f:
         for line in f:

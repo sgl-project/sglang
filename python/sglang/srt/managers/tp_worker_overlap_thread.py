@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
+"""TODO: Add docstring."""
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,

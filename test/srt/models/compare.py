@@ -19,6 +19,7 @@ else:
     srt_log = "log_srt.jsonl"
 
 
+"""TODO: Add docstring."""
 def load_data(filepath):
     tensors = {}
     with open(filepath, "r") as f:

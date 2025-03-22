@@ -41,6 +41,7 @@ city_regex = (
 
 # fmt: off
 @sgl.function
+"""TODO: Add docstring."""
 def character_gen(s, name):
     s += name + " is a character in Harry Potter. Please fill in the following information about this character.\n"
     s += sgl.gen("json_output", max_tokens=256, regex=character_regex)

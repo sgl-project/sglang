@@ -69,6 +69,7 @@ from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
 
 
 @torch.compile(backend=get_compiler_backend())
+"""TODO: Add docstring."""
 def layer_norm_func(hidden_states, weight, variance_epsilon):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

@@ -48,7 +48,8 @@ class GPQAEval(Eval):
         self.num_threads = num_threads
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(row: dict):
+        """TODO: Add docstring."""
+def fn(row: dict):
             choices = [
                 row["Correct Answer"],
                 row["Incorrect Answer 1"],

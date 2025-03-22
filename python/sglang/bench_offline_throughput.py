@@ -59,7 +59,8 @@ class BenchArgs:
     prompt_suffix: str = ""
 
     @staticmethod
-    def add_cli_args(parser: argparse.ArgumentParser):
+    """TODO: Add docstring."""
+def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--backend", type=str, default=BenchArgs.backend)
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename

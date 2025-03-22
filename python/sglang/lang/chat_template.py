@@ -56,6 +56,7 @@ chat_template_registry: Dict[str, ChatTemplate] = {}
 matching_function_registry: List[Callable] = []
 
 
+"""TODO: Add docstring."""
 def register_chat_template(template):
     chat_template_registry[template.name] = template
 
@@ -245,10 +246,10 @@ register_chat_template(
             ),
             "assistant": (
                 "<｜Assistant｜>",
-                "<｜end▁of▁sentence｜>",
+                "<｜end�of�sentence｜>",
             ),
         },
-        stop_str=("<｜end▁of▁sentence｜>",),
+        stop_str=("<｜end�of�sentence｜>",),
         image_token="<image_placeholder>\n",
     )
 )
@@ -298,7 +299,7 @@ register_chat_template(
         name="yi-vl",
         default_system_prompt=(
             "This is a chat between an inquisitive human and an AI assistant. Assume the role of the AI assistant. Read all the images carefully, and respond to the human's questions with informative, helpful, detailed and polite answers."
-            "这是一个好奇的人类和一个人工智能助手之间的对话。假设你扮演这个AI助手的角色。仔细阅读所有的图像，并对人类的问题做出信息丰富、有帮助、详细的和礼貌的回答。"
+            "这是一个好奇的人类和一个人工智能助手之间的对�。�设你扮演这个AI助手的角色。仔细阅读所有的图�，并对人类的问题�出信�丰富�有帮助�详细的和礼貌的回答。"
         ),
         role_prefix_and_suffix={
             "system": ("", "\n\n"),
@@ -391,10 +392,10 @@ register_chat_template(
             ),
             "assistant": (
                 "<｜Assistant｜>",
-                "<｜end▁of▁sentence｜>",
+                "<｜end�of�sentence｜>",
             ),
         },
-        stop_str=("<｜end▁of▁sentence｜>",),
+        stop_str=("<｜end�of�sentence｜>",),
     )
 )
 

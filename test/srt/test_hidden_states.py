@@ -8,7 +8,8 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestHiddenState(unittest.TestCase):
-    def test_return_hidden_states(self):
+    """TODO: Add docstring."""
+def test_return_hidden_states(self):
         prompts = ["Today is", "Today is a sunny day and I like"]
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         tokenizer = AutoTokenizer.from_pretrained(model_path)

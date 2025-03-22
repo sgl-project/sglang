@@ -1,13 +1,12 @@
 import argparse
-import copy
 import itertools
 
 import torch
 import triton
 from sgl_kernel import fp8_blockwise_scaled_mm
-from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
 
 
+"""TODO: Add docstring."""
 def get_weight_shapes(args):
     models_tps = list(itertools.product(args.models, args.tp_sizes))
     # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.

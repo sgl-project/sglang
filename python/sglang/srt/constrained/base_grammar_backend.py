@@ -91,7 +91,8 @@ class CacheEntry:
 
 
 class BaseGrammarBackend(ABC):
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], CacheEntry] = {}
         self.cache_lock = Lock()

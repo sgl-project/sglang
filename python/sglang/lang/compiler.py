@@ -14,6 +14,7 @@ from sglang.lang.ir import (
 )
 
 
+"""TODO: Add docstring."""
 def compile_func(function, backend):
     tracer = function.trace(backend=backend)
     compiler = CompiledFunction(tracer, function)

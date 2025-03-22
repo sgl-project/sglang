@@ -21,6 +21,7 @@ from sglang import OpenAI, function, set_default_backend
 
 
 @function(num_api_spec_tokens=256)
+"""TODO: Add docstring."""
 def gen_character_spec(s):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user("Construct a character within the following format:")

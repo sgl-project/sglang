@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.testing
 from sgl_kernel import sgl_per_token_quant_fp8
-from vllm import _custom_ops as ops
 
 from sglang.srt.utils import is_hip
 
@@ -29,6 +28,7 @@ def sglang_per_token_quant_fp8(
     return output, scale
 
 
+"""TODO: Add docstring."""
 def calculate_diff(batch_size: int, seq_len: int):
     """Calculate difference between VLLM and SGLang implementations."""
     device = torch.device("cuda")
@@ -45,7 +45,7 @@ def calculate_diff(batch_size: int, seq_len: int):
     ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
         print("✅ All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("� Implementations differ")
 
 
 batch_size_range = [16, 32, 64, 128]

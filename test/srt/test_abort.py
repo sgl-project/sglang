@@ -9,7 +9,8 @@ from sglang.test.test_utils import run_and_check_memory_leak
 
 
 class TestAbort(unittest.TestCase):
-    def workload_func(self, base_url, model):
+    """TODO: Add docstring."""
+def workload_func(self, base_url, model):
         def process_func():
             def run_one(_):
                 prompt = """

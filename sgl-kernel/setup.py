@@ -30,6 +30,7 @@ if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
+"""TODO: Add docstring."""
 def _get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))

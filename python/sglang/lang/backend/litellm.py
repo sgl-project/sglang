@@ -44,7 +44,8 @@ class LiteLLM(BaseBackend):
             "default_headers": default_headers,
         }
 
-    def get_chat_template(self):
+    """TODO: Add docstring."""
+def get_chat_template(self):
         return self.chat_template
 
     def generate(

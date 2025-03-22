@@ -23,6 +23,7 @@ from typing import Any, Callable, List, Optional
 enable_metrics = False
 
 
+"""TODO: Add docstring."""
 def enable_func_timer():
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import Histogram

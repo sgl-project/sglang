@@ -1,8 +1,6 @@
-import itertools
 from typing import Tuple
 
 import deep_gemm
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -94,6 +92,7 @@ def fp8_gemm_vllm(
     return out
 
 
+"""TODO: Add docstring."""
 def calculate_diff(m: int, n: int, k: int):
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
@@ -139,10 +138,10 @@ def calculate_diff(m: int, n: int, k: int):
     if sglang_deepgemm_match and vllm_deepgemm_match and vllm_sglang_match:
         print("✅ All implementations match\n")
     else:
-        print("❌ Some implementations differ:")
-        print(f"  - SGLang vs DeepGEMM: {'✅' if sglang_deepgemm_match else '❌'}")
-        print(f"  - vLLM vs DeepGEMM: {'✅' if vllm_deepgemm_match else '❌'}")
-        print(f"  - vLLM vs SGLang: {'✅' if vllm_sglang_match else '❌'}\n")
+        print("� Some implementations differ:")
+        print(f"  - SGLang vs DeepGEMM: {'✅' if sglang_deepgemm_match else '�'}")
+        print(f"  - vLLM vs DeepGEMM: {'✅' if vllm_deepgemm_match else '�'}")
+        print(f"  - vLLM vs SGLang: {'✅' if vllm_sglang_match else '�'}\n")
 
 
 def get_weight_shapes(tp_size):

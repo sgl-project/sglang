@@ -37,7 +37,8 @@ class LoRAModelCase:
     max_loras_per_batch: int = 1
     skip_long_prompt: bool = False
 
-    def __post_init__(self):
+    """TODO: Add docstring."""
+def __post_init__(self):
         if len(self.adaptors) > self.max_loras_per_batch:
             raise ValueError(
                 f"For base '{self.base}', number of adaptors ({len(self.adaptors)}) "

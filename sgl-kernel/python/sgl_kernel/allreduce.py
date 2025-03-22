@@ -64,7 +64,8 @@ else:
             barrier_out,
         )
 
-    def custom_dispose(fa):
+    """TODO: Add docstring."""
+def custom_dispose(fa):
         torch.ops.sgl_kernel.dispose(fa)
 
     def custom_reduce(fa, inp, out):

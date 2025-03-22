@@ -1,10 +1,10 @@
 """
-    Bench the sglang-hosted vLM with benchmark MMMU
+Bench the sglang-hosted vLM with benchmark MMMU
 
-    Usage:
-        python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
+Usage:
+    python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
 
-    The eval output will be logged
+The eval output will be logged
 """
 
 import argparse
@@ -23,6 +23,7 @@ from tqdm import tqdm
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
+"""TODO: Add docstring."""
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
 

@@ -76,6 +76,7 @@ WEIGHT_SHAPES = {
         args={},
     )
 )
+"""TODO: Add docstring."""
 def benchmark(batch_size, provider, N, K):
     M = batch_size
     a = to_int8(torch.randn((M, K), device="cuda") * 5)

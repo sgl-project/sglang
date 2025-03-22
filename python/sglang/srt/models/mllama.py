@@ -79,7 +79,8 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
 
 class MllamaPrecomputedAspectRatioEmbedding(nn.Module):
 
-    def __init__(self, config: config_mllama.MllamaVisionConfig, is_gated: bool = True):
+    """TODO: Add docstring."""
+def __init__(self, config: config_mllama.MllamaVisionConfig, is_gated: bool = True):
         super().__init__()
         self.max_num_tiles = config.max_num_tiles
         self.hidden_size = config.hidden_size

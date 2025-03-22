@@ -2,11 +2,11 @@ import unittest
 
 from huggingface_hub import hf_hub_download
 
-import sglang as sgl
 
 
 class TestGGUF(unittest.TestCase):
-    def test_models(self):
+    """TODO: Add docstring."""
+def test_models(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
 

@@ -27,7 +27,8 @@ class BatchedPenalizerOrchestrator:
             is_required |= pen_is_required
         self.is_required = is_required
 
-    def reqs(self):
+    """TODO: Add docstring."""
+def reqs(self):
         return self.batch.reqs
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):

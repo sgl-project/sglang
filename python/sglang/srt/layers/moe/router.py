@@ -308,7 +308,8 @@ class FusedMoeRouter:
         self.topk = topk
         self.moe_softcapping = moe_softcapping
 
-    def __call__(self, *args, **kwargs):
+    """TODO: Add docstring."""
+def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
     def forward(

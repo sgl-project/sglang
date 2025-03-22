@@ -34,7 +34,8 @@ class LoRAConfig:
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
 
-    def get_lora_config(self, dummy=False):
+    """TODO: Add docstring."""
+def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
         else:

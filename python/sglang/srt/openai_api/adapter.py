@@ -80,7 +80,8 @@ chat_template_name = None
 
 
 class FileMetadata:
-    def __init__(self, filename: str, purpose: str):
+    """TODO: Add docstring."""
+def __init__(self, filename: str, purpose: str):
         self.filename = filename
         self.purpose = purpose
 

@@ -32,7 +32,8 @@ class BaseLoRABackend:
                                  and the operation of scaling and adding will be fused into kernel
     """
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
+    """TODO: Add docstring."""
+def __init__(self, name: str, batch_info: LoRABatchInfo = None):
         self.name = name
         self.batch_info = batch_info
         self.fuse_output_scaling_add = get_fuse_output_scaling_add_from_name(name)

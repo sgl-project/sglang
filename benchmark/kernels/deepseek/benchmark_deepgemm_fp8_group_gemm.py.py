@@ -178,6 +178,7 @@ def fp8_gemm_group_triton_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+"""TODO: Add docstring."""
 def fp8_gemm_group_triton(a_tuple, b_tuple, c, num_groups):
     """
     Perform matrix multiplication with FP8 inputs and proper scaling.
@@ -308,11 +309,11 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
     if all_match:
         print("✅ All implementations match\n")
     else:
-        print("❌ Some implementations differ:")
+        print("� Some implementations differ:")
         print(
-            f"  - Torch vs DeepGEMM: {'✅' if deepgemm_torch_diff < DIFF_THRESHOLD else '❌'}"
-            f"  - Torch vs Triton: {'✅' if triton_torch_diff < DIFF_THRESHOLD else '❌'}"
-            f"  - DeepGEMM vs Triton: {'✅' if deepgemm_triton_diff < DIFF_THRESHOLD else '❌'}"
+            f"  - Torch vs DeepGEMM: {'✅' if deepgemm_torch_diff < DIFF_THRESHOLD else '�'}"
+            f"  - Torch vs Triton: {'✅' if triton_torch_diff < DIFF_THRESHOLD else '�'}"
+            f"  - DeepGEMM vs Triton: {'✅' if deepgemm_triton_diff < DIFF_THRESHOLD else '�'}"
         )
 
 

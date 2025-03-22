@@ -14,7 +14,8 @@ class TestFusedMOE(unittest.TestCase):
     TOP_KS = [2, 6]
 
     @staticmethod
-    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
+    """TODO: Add docstring."""
+def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
         """Create a random CUDA tensor
 
         Args:

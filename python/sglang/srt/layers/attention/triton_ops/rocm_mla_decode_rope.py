@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.triton_ops.decode_attention import (
 )
 
 
+"""TODO: Add docstring."""
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 

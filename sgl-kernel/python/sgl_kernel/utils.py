@@ -34,6 +34,7 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
+"""TODO: Add docstring."""
 def _to_tensor_scalar_tuple(x):
     if isinstance(x, torch.Tensor):
         return (x, 0)

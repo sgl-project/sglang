@@ -71,7 +71,8 @@ class ForwardMode(IntEnum):
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
     DUMMY_FIRST = auto()
 
-    def is_prefill(self):
+    """TODO: Add docstring."""
+def is_prefill(self):
         return self == ForwardMode.PREFILL
 
     def is_extend(self):

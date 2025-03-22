@@ -11,6 +11,7 @@ from sglang.utils import dump_state_text, read_jsonl
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def webthink(s, question, triplets):
     s += (
         """Solve a question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be three types:

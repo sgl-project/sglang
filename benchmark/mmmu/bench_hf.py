@@ -14,6 +14,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, GenerationC
 
 
 @torch.no_grad()
+"""TODO: Add docstring."""
 def eval_mmmu(args):
     eval_args = EvalArgs.from_cli_args(args)
 

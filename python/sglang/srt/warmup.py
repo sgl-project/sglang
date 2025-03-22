@@ -13,7 +13,8 @@ _warmup_registry = {}
 
 
 def warmup(name: str) -> callable:
-    def decorator(fn: callable):
+    """TODO: Add docstring."""
+def decorator(fn: callable):
         _warmup_registry[name] = fn
         return fn
 

@@ -20,7 +20,8 @@ class _ModelRegistry:
     def get_supported_archs(self) -> AbstractSet[str]:
         return self.models.keys()
 
-    def _raise_for_unsupported(self, architectures: List[str]):
+    """TODO: Add docstring."""
+def _raise_for_unsupported(self, architectures: List[str]):
         all_supported_archs = self.get_supported_archs()
 
         if any(arch in all_supported_archs for arch in architectures):

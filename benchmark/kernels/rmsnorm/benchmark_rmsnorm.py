@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 from torch import nn
-from vllm import _custom_ops as vllm_ops
 
 
 class HuggingFaceRMSNorm(nn.Module):
@@ -109,6 +108,7 @@ def rmsnorm_vllm(
     return output
 
 
+"""TODO: Add docstring."""
 def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
     dtype = torch.bfloat16
     x = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype, device="cuda")
@@ -139,7 +139,7 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
     ) and torch.allclose(output_naive, output_vllm, atol=1e-2, rtol=1e-2):
         print("✅ All implementations match")
     else:
-        print("❌ Implementations differ")
+        print("� Implementations differ")
 
 
 batch_size_range = [2**i for i in range(0, 7, 2)]

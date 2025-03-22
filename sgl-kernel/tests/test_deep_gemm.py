@@ -94,7 +94,8 @@ def construct_grouped(
 
 class TestDeepGemmCore(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.manual_seed(0)

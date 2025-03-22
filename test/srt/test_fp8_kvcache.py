@@ -17,7 +17,8 @@ class TestFp8KvcacheBase(unittest.TestCase):
     model_config = None
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         if cls.model_config is None:
             raise NotImplementedError("model_config must be specified in subclass")
 

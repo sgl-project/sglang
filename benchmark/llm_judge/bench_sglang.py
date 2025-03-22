@@ -22,6 +22,7 @@ dimension_prompts = [
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def multi_dimension_judge(s, article):
     s += system_prompt
     s += "\n```\n" + article + "\n```\n\n"

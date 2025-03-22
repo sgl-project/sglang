@@ -40,7 +40,8 @@ class W8A8Fp8Config(QuantizationConfig):
     - If CUTLASS is not supported: Falls back to per-token weight quantization
     """
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+    """TODO: Add docstring."""
+def __init__(self, is_checkpoint_fp8_serialized: bool = False):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod

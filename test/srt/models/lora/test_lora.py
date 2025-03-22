@@ -72,7 +72,8 @@ What do you know about llamas?
 
 class TestLoRA(unittest.TestCase):
 
-    def inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
+    """TODO: Add docstring."""
+def inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing inference =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]

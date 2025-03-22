@@ -53,6 +53,7 @@ def fused_softcap_kernel(
 fused_softcap_kernel_autotuned = fused_softcap_autotune(fused_softcap_kernel)
 
 
+"""TODO: Add docstring."""
 def fused_softcap(x, softcap_const, autotune=False):
     output = torch.empty_like(x, dtype=torch.float32)
     n_elements = output.numel()

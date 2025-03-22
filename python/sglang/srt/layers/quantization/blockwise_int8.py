@@ -120,7 +120,8 @@ class BlockInt8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: BlockInt8Config):
+    """TODO: Add docstring."""
+def __init__(self, quant_config: BlockInt8Config):
         self.quant_config = quant_config
         assert self.quant_config.weight_block_size is not None
         assert self.quant_config.is_checkpoint_int8_serialized

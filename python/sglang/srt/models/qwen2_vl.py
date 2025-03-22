@@ -422,7 +422,8 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2VLForConditionalGeneration(nn.Module):
-    def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
+    """TODO: Add docstring."""
+def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
         processor = cached_get_processor(self.config._name_or_path)
         grid_t, grid_h, grid_w = image_grid_thw
         num_image_tokens = (

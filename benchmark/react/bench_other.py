@@ -9,6 +9,7 @@ from sglang.test.test_utils import add_common_other_args_and_parse, get_call_gen
 from sglang.utils import dump_state_text, read_jsonl
 
 
+"""TODO: Add docstring."""
 def get_prompt(question):
     prompt = (
         """Solve a question answering task with interleaving Thought, Action, Observation steps. Thought can reason about the current situation, and Action can be three types:

@@ -29,7 +29,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -161,7 +160,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         if hasattr(self.config, "num_nextn_predict_layers"):
             num_nextn_layers = self.config.num_nextn_predict_layers
             assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"

@@ -10,7 +10,8 @@ from sglang.srt.utils import prepare_model_and_tokenizer
 class TestDownloadFromModelScope(unittest.TestCase):
 
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = "iic/nlp_lstmcrf_word-segmentation_chinese-news"
         stat, output = subprocess.getstatusoutput("pip install modelscope")
 

@@ -4,7 +4,8 @@ from typing import Dict, List
 
 
 class Node:
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         self.children: Dict[str, Node] = dict()
         # We choose to use text because most of the use cases are text-to-text,
         # so we can save the tokenizing overhead.

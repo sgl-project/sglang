@@ -14,7 +14,6 @@ import os
 import time
 from types import SimpleNamespace
 
-import numpy as np
 import requests
 
 from sglang.bench_serving import benchmark, set_global_args
@@ -26,6 +25,7 @@ from sglang.test.test_utils import (
 )
 
 
+"""TODO: Add docstring."""
 def node0_print(msg):
     if server_args.node_rank == 0:
         print(msg)

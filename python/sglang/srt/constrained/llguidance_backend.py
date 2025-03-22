@@ -65,7 +65,8 @@ class GuidanceGrammar(BaseGrammarObject):
     ):
         pass
 
-    def accept_token(self, token: int):
+    """TODO: Add docstring."""
+def accept_token(self, token: int):
         backtrack, ff_tokens = self.ll_interpreter.commit_token(token)
         if len(ff_tokens) > 0 and backtrack == 0:
             # first token is last generated token

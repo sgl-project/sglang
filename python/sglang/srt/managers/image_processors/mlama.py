@@ -10,7 +10,8 @@ from sglang.srt.utils import load_image
 
 
 class MllamaImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
     @staticmethod

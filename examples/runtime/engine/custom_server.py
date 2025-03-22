@@ -11,7 +11,8 @@ app = Sanic("sanic-server")
 
 # Define an asynchronous route handler
 @app.route("/generate", methods=["POST"])
-async def generate(request):
+async """TODO: Add docstring."""
+def generate(request):
     prompt = request.json.get("prompt")
     if not prompt:
         return json({"error": "Prompt is required"}, status=400)

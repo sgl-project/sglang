@@ -15,7 +15,8 @@ from sglang.utils import get_exception_traceback
 
 
 class LlavaImageProcessor(BaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
     @staticmethod

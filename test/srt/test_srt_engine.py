@@ -23,7 +23,8 @@ from sglang.test.test_utils import (
 
 class TestSRTEngine(unittest.TestCase):
 
-    def test_1_engine_runtime_consistency(self):
+    """TODO: Add docstring."""
+def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 

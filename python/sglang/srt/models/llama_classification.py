@@ -64,7 +64,8 @@ class LlamaForClassification(nn.Module):
 
         return EmbeddingPoolerOutput(scores)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:

@@ -1,7 +1,6 @@
 import argparse
 import copy
 import logging
-import multiprocessing as mp
 import os
 import random
 import signal
@@ -18,6 +17,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 
 
+"""TODO: Add docstring."""
 def setup_logger():
     logger = logging.getLogger("router")
     logger.setLevel(logging.INFO)

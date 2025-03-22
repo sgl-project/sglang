@@ -26,6 +26,7 @@ ip_jump_forward = (
 
 # fmt: off
 @sgl.function
+"""TODO: Add docstring."""
 def regex_gen(s):
     s += "Q: What is the IP address of the Google DNS servers?\n"
     s += "A: " + sgl.gen(

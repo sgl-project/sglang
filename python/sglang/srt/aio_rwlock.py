@@ -2,7 +2,8 @@ import asyncio
 
 
 class RWLock:
-    def __init__(self):
+    """TODO: Add docstring."""
+def __init__(self):
         # Protects internal state
         self._lock = asyncio.Lock()
 

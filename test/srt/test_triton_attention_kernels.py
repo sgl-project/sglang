@@ -19,7 +19,8 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 
 class TestTritonAttention(unittest.TestCase):
 
-    def _set_all_seeds(self, seed):
+    """TODO: Add docstring."""
+def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
         torch.manual_seed(seed)

@@ -30,7 +30,8 @@ class Pooler(nn.Module):
         normalize: Whether to normalize the pooled data.
     """
 
-    def __init__(self, pooling_type: PoolingType, normalize: bool):
+    """TODO: Add docstring."""
+def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
         self.normalize = normalize

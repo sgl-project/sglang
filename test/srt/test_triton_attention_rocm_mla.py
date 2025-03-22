@@ -14,7 +14,8 @@ from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
 
 class TestTritonAttentionMLA(unittest.TestCase):
 
-    def _set_all_seeds(self, seed):
+    """TODO: Add docstring."""
+def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
         torch.manual_seed(seed)

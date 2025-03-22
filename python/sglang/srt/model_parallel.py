@@ -73,7 +73,8 @@ class ColwiseParallelSharded(ColwiseParallel):
     """
 
     # Override the _partition_linear_fn in ColwiseParallel
-    def _partition_linear_fn(self, name, module, device_mesh):
+    """TODO: Add docstring."""
+def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)

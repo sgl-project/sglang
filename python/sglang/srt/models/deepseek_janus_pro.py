@@ -43,7 +43,6 @@ from torch import Tensor, _assert, nn
 from torch.nn.init import trunc_normal_
 from transformers import AutoModel, PreTrainedModel
 
-from sglang.srt.configs.janus_pro import *
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -101,6 +100,7 @@ def named_apply(
     return module
 
 
+"""TODO: Add docstring."""
 def VQ_16(**kwargs):
     return VQModel(
         ModelArgs(

@@ -19,7 +19,8 @@ from sglang.test.test_utils import (
 
 class TestEvalFP8Accuracy(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

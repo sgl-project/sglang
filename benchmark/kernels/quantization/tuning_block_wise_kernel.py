@@ -84,7 +84,8 @@ def w8a8_block_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    def grid(META):
+    """TODO: Add docstring."""
+def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )

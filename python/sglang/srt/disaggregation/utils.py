@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from collections import deque
 from enum import Enum
@@ -14,6 +13,7 @@ class DisaggregationMode(Enum):
     DECODE = "decode"
 
 
+"""TODO: Add docstring."""
 def poll_and_all_reduce(pollers, gloo_group):
     polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")

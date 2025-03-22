@@ -25,7 +25,8 @@ class GenerateAnswer(dspy.Signature):
 
 
 class RAG(dspy.Module):
-    def __init__(self, num_passages=3):
+    """TODO: Add docstring."""
+def __init__(self, num_passages=3):
         super().__init__()
 
         self.retrieve = dspy.Retrieve(k=num_passages)

@@ -613,7 +613,8 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    """TODO: Add docstring."""
+def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
         # Matrix multiply.

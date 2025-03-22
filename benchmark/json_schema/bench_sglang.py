@@ -17,6 +17,7 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def schema_gen(s, message: Tuple[str, str], json_schema: str):
     system, user = message
     s += sgl.system(system)

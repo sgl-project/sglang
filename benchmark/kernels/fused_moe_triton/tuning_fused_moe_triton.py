@@ -117,7 +117,8 @@ def benchmark_config(
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
-    def prepare(i: int):
+    """TODO: Add docstring."""
+def prepare(i: int):
         input_gating.copy_(gating_output[i])
 
     def run():

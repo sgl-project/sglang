@@ -16,6 +16,7 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
+"""TODO: Add docstring."""
 def reasoning_gen(s, question: str):
     s += sgl.user(
         question

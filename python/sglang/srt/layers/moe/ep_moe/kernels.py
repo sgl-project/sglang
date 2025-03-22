@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import is_cuda
 
@@ -104,6 +103,7 @@ def deepep_compute_src2dst_triton_kernel(
     tl.store(src2dst + src_id, dst_id - num_invalid, mask=mask)
 
 
+"""TODO: Add docstring."""
 def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)

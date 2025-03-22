@@ -2,12 +2,12 @@
 This example demonstrates how to provide tokenized ids to LLM as input instead of text prompt, i.e. a token-in-token-out workflow.
 """
 
-import sglang as sgl
 from sglang.srt.hf_transformers_utils import get_tokenizer
 
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 
 
+"""TODO: Add docstring."""
 def main():
     # Sample prompts.
     prompts = [

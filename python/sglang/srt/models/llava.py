@@ -46,7 +46,8 @@ from sglang.srt.utils import add_prefix
 
 
 class LlavaBaseForCausalLM(nn.Module):
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    """TODO: Add docstring."""
+def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
         image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
 
         # hardcode for spatial_unpad + anyres

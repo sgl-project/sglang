@@ -11,6 +11,7 @@ import json
 import requests
 
 
+"""TODO: Add docstring."""
 def send_one_prompt(args):
     if args.image:
         args.prompt = (

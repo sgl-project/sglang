@@ -4,12 +4,11 @@ import itertools
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-from vllm import _custom_ops as ops
 
 USE_RANDOM_PERM = False
 
 
+"""TODO: Add docstring."""
 def ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -209,7 +208,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print(f"✅ VLLM implementation works with {num_experts} experts!")
         vllm_works = True
     except RuntimeError as e:
-        print(f"❌ VLLM implementation failed with {num_experts} experts: {e}")
+        print(f"� VLLM implementation failed with {num_experts} experts: {e}")
         vllm_works = False
 
     if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
@@ -217,7 +216,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     ):
         print("✅ SGL and Triton implementations match")
     else:
-        print("❌ SGL and Triton implementations do not match")
+        print("� SGL and Triton implementations do not match")
         print("SGL expert_ids:", expert_ids_cuda)
         print("Triton expert_ids:", expert_ids_triton)
         print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
@@ -231,9 +230,9 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         print("✅ SGL and VLLM implementations match")
     else:
         if not vllm_works:
-            print("⚠️ VLLM comparison skipped due to failure")
+            print("⚠� VLLM comparison skipped due to failure")
         else:
-            print("❌ SGL and VLLM implementations do not match")
+            print("� SGL and VLLM implementations do not match")
             print("SGL expert_ids:", expert_ids_cuda)
             print("VLLM expert_ids:", expert_ids_vllm)
             print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
@@ -342,7 +341,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 quantiles=quantiles,
             )
         except RuntimeError as e:
-            print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
+            print(f"� VLLM benchmark failed with {num_experts} experts: {e}")
             # Return extreme values to indicate failure in the chart
             return float("inf"), float("inf"), float("inf")
 

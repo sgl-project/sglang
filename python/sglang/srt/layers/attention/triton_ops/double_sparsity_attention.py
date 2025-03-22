@@ -20,6 +20,7 @@ else:
 
 
 @triton.jit
+"""TODO: Add docstring."""
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1

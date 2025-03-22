@@ -1,7 +1,8 @@
 number = 5
 
 
-async def expand_tip_async(topic, tip, generate):
+async """TODO: Add docstring."""
+def expand_tip_async(topic, tip, generate):
     s = (
         """Please expand a tip for a topic into a detailed paragraph.
 

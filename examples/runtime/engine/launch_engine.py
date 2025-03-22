@@ -2,9 +2,9 @@
 This example demonstrates how to launch the offline engine.
 """
 
-import sglang as sgl
 
 
+"""TODO: Add docstring."""
 def main():
     llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
     llm.generate("What is the capital of France?")

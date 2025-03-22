@@ -1,6 +1,5 @@
 import itertools
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -9,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
-from sgl_kernel import lightning_attention_decode as sgl_lightning_attention_decode
 
 
 @triton.jit
@@ -76,6 +74,7 @@ def _decode_kernel(
     tl.store(Out + o_offset + e_idx, o.to(Out.dtype.element_ty), mask=e_mask)
 
 
+"""TODO: Add docstring."""
 def lightning_attn_decode(q, k, v, kv, s):
     """Triton implementation of Lightning Attention decode operation"""
     b, h, n, d = q.shape

@@ -50,6 +50,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+"""TODO: Add docstring."""
 def adjust_marlin_shard(param, shard_size, shard_offset):
     marlin_tile_size = getattr(param, "marlin_tile_size", None)
     if marlin_tile_size is None:

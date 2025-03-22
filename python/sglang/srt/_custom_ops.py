@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
 import logging
-import os
 from typing import List, Tuple
 
 import torch

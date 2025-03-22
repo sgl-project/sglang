@@ -15,7 +15,8 @@ class AttentionBackend(ABC):
     """The base class of attention backends"""
 
     @abstractmethod
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    """TODO: Add docstring."""
+def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 

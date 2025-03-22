@@ -14,7 +14,8 @@ from sglang.test.test_utils import (
 
 class TestDoubleSparsity(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    """TODO: Add docstring."""
+def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         dirpath = os.path.dirname(__file__)

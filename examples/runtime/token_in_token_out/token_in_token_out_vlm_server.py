@@ -13,7 +13,6 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_IMAGE_URL, is_in_ci
 from sglang.utils import print_highlight, terminate_process, wait_for_server
 
@@ -43,6 +42,7 @@ def get_input_ids() -> Tuple[list[int], list]:
     return inputs.input_ids[0].tolist(), image_data
 
 
+"""TODO: Add docstring."""
 def main():
     # Launch the server
     server_process, port = launch_server_cmd(

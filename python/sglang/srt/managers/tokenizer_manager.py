@@ -605,7 +605,8 @@ class TokenizerManager:
                     except StopAsyncIteration:
                         pass
 
-    def flush_cache(self):
+    """TODO: Add docstring."""
+def flush_cache(self):
         req = FlushCacheReq()
         self.send_to_scheduler.send_pyobj(req)
 

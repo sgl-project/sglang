@@ -65,7 +65,8 @@ class Qwen2ForRewardModel(nn.Module):
 
         return EmbeddingPoolerOutput(pooled_logits)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    """TODO: Add docstring."""
+def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Filter out lm_head weights of Qwen2ForCausalLM
         filtered_weights = [
             (name, w) for name, w in weights if not name.startswith("lm_head")

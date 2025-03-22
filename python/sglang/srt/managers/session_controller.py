@@ -19,7 +19,8 @@ from sglang.srt.managers.schedule_batch import Req
 
 
 class SessionReqNode:
-    def __init__(self, req, parent=None, childs=None):
+    """TODO: Add docstring."""
+def __init__(self, req, parent=None, childs=None):
         self.req = req
         self.parent = parent
         if parent is not None:

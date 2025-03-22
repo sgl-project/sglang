@@ -10,6 +10,7 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
+"""TODO: Add docstring."""
 def scale_shape(shape, group_shape):
     assert len(shape) == len(group_shape)
     return tuple(cdiv(shape[i], group_shape[i]) for i in range(len(group_shape)))

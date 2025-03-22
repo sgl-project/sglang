@@ -53,7 +53,8 @@ MOCK_CHOICES_INPUT_DATA = {
 
 class TestChoices(unittest.TestCase):
 
-    def test_token_length_normalized(self):
+    """TODO: Add docstring."""
+def test_token_length_normalized(self):
         """Confirm 'antidisestablishmentarianism' is selected due to high confidences for
         its later tokens resulting in highest token length normalized prompt logprob."""
         decision = token_length_normalized(**MOCK_CHOICES_INPUT_DATA)

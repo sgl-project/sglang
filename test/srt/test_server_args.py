@@ -5,7 +5,8 @@ from sglang.srt.server_args import prepare_server_args
 
 
 class TestPrepareServerArgs(unittest.TestCase):
-    def test_prepare_server_args(self):
+    """TODO: Add docstring."""
+def test_prepare_server_args(self):
         server_args = prepare_server_args(
             [
                 "--model-path",

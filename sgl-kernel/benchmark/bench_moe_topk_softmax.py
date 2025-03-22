@@ -1,12 +1,11 @@
 import itertools
 
-import pytest
 import torch
 import triton
 from sgl_kernel import topk_softmax
-from vllm import _custom_ops as vllm_custom_ops
 
 
+"""TODO: Add docstring."""
 def vllm_topk_softmax(gating_output, topk):
     num_tokens, num_experts = gating_output.shape
 
@@ -65,7 +64,7 @@ def calculate_diff(num_tokens, num_experts, topk):
         print("✅ VLLM and SGLang topk_softmax implementations match")
     else:
         print(
-            f"❌ Implementations differ: Weights diff={weights_diff}, Indices match={indices_match}"
+            f"� Implementations differ: Weights diff={weights_diff}, Indices match={indices_match}"
         )
 
 

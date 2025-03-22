@@ -29,6 +29,7 @@ def get_image_processor(
     )
 
 
+"""TODO: Add docstring."""
 def get_dummy_image_processor():
     return DummyImageProcessor()
 

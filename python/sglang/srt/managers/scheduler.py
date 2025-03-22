@@ -411,7 +411,8 @@ class Scheduler(
         )
         self.init_disaggregation()
 
-    def init_tokenizer(self):
+    """TODO: Add docstring."""
+def init_tokenizer(self):
         server_args = self.server_args
 
         self.model_config = ModelConfig(

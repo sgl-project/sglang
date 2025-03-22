@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
@@ -14,7 +13,8 @@ if TYPE_CHECKING:
 
 
 class ChunkCacheEntry:
-    def __init__(self, rid: str, value: torch.Tensor):
+    """TODO: Add docstring."""
+def __init__(self, rid: str, value: torch.Tensor):
         self.rid = rid
         self.value = value
 

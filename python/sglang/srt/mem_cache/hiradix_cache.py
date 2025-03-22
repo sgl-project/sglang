@@ -68,7 +68,8 @@ class HiRadixCache(RadixCache):
             req_to_token_pool, token_to_kv_pool_allocator, self.page_size, disable=False
         )
 
-    def reset(self):
+    """TODO: Add docstring."""
+def reset(self):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()

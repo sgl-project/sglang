@@ -17,7 +17,8 @@ logger = logging.get_logger(__name__)
 
 
 class Gemma3SGLangImageProcessor(SGLangBaseImageProcessor):
-    def __init__(self, hf_config, server_args, _processor):
+    """TODO: Add docstring."""
+def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<start_of_image>"
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
