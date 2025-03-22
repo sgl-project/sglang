@@ -97,7 +97,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_zmq_socket,
-    kill_process_tree,
+    kill_process_tree, get_bool_env_var,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -540,14 +540,16 @@ class TokenizerManager:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             # Send all requests
-            self._send_block_request(BlockReqType.BLOCK)  # TODO only conditionally
+            if _ENABLE_COLOCATED_BATCH_GEN:
+                self._send_block_request(BlockReqType.BLOCK)
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
-            self._send_block_request(BlockReqType.UNBLOCK)  # TODO only conditionally
+            if _ENABLE_COLOCATED_BATCH_GEN:
+                self._send_block_request(BlockReqType.UNBLOCK)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -1194,3 +1196,6 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
+
+
+_ENABLE_COLOCATED_BATCH_GEN = get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false")
