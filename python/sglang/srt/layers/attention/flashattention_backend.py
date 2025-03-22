@@ -22,25 +22,15 @@ from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
-class DecodeMetadata:
+class FlashAttentionMetadata:
     """Metadata for decode operations to avoid redundant computations."""
-
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
     max_seq_len_k: int = 0
     window_size: tuple = (-1, -1)
     page_table: torch.Tensor = None
     cache_seqlens_int32: torch.Tensor = None
-
-
-@dataclass
-class PrefillMetadata:
-    """Placeholder metadata class for prefill operations."""
-    cu_seqlens_q: torch.Tensor = None
-    cu_seqlens_k: torch.Tensor = None
     max_seq_len_q: int = 0
-    max_seq_len_k: int = 0
-    extend_no_prefix: bool = False
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -66,7 +56,7 @@ class FlashAttentionBackend(AttentionBackend):
         max_bs = model_runner.req_to_token_pool.size
 
         # Initialize metadata
-        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata: FlashAttentionMetadata = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
@@ -74,53 +64,39 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
         # Create metadata based on forward mode
+        metadata = FlashAttentionMetadata()
+        extend_seq_lens = forward_batch.extend_seq_lens
+        # Get sequence information
+        seqlens_in_batch = forward_batch.seq_lens
+        # Precompute int32 version of sequence lengths
+        metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+        batch_size = len(seqlens_in_batch)
+        device = seqlens_in_batch.device
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        ) 
+        # Precompute maximum sequence length
+        metadata.max_seq_len_k = seqlens_in_batch.max().item()
+        # Precompute page table
+        metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, : metadata.max_seq_len_k
+        ]
         if forward_batch.forward_mode == ForwardMode.DECODE:
-            metadata = DecodeMetadata()
-
-            # Get sequence information
-            seqlens_in_batch = forward_batch.seq_lens
-            batch_size = len(seqlens_in_batch)
-            device = seqlens_in_batch.device
-
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-
-            # Precompute maximum sequence length
-            metadata.max_seq_len_k = seqlens_in_batch.max().item()
-
-            # Precompute page table
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-
-            # Precompute int32 version of sequence lengths
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-
-            self.forward_metadata = metadata
         else:
-            metadata = PrefillMetadata()
-
-            extend_seq_lens = forward_batch.extend_seq_lens
-            metadata.extend_no_prefix = not any(forward_batch.extend_prefix_lens)
-            seqlens_in_batch = forward_batch.seq_lens
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
-            if not metadata.extend_no_prefix:
+            extend_no_prefix = not any(forward_batch.extend_prefix_lens)
+            # Precompute cumulative sequence lengths
+            if not extend_no_prefix:
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
             metadata.max_seq_len_q = seqlens_in_batch.max().item()
-            metadata.max_seq_len_k = metadata.max_seq_len_q
-            self.forward_metadata = metadata
+        self.forward_metadata = metadata
 
 
     def forward_extend(
@@ -147,37 +123,39 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Initialize metadata if needed
         if self.forward_metadata is None or not isinstance(
-            self.forward_metadata, PrefillMetadata
+            self.forward_metadata, FlashAttentionMetadata
         ):
             self.init_forward_metadata(forward_batch)
 
         # Use precomputed metadata
         metadata = self.forward_metadata
 
-        # Use Flash Attention for prefill
-        if not metadata.extend_no_prefix:
-            k, v = self.prepare_kv_cache_v2(forward_batch, layer)
-
-
-        o, _ = flash_attn_varlen_func(
+        # # Use Flash Attention for prefill
+        # Calculate window size (can be moved to metadata if layer properties don't change)
+        window_size = (
+            (layer.sliding_window_size - 1, 0)
+            if layer.sliding_window_size is not None
+            else (-1, -1)
+        )
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k=k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
-            v=v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+            k_cache=key_cache.unsqueeze(1),
+            v_cache=value_cache.unsqueeze(1),
+            page_table=metadata.page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
+            cu_seqlens_k_new=metadata.cu_seqlens_k,
             max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_seq_len_k,
             softmax_scale=layer.scaling,
-            causal=not layer.is_cross_attention,
-            window_size=(
-                (layer.sliding_window_size - 1, 0)
-                if layer.sliding_window_size is not None
-                else (-1, -1)
-            ),
+            causal=True,
+            window_size=window_size,
             softcap=layer.logit_cap,
             k_descale=layer.k_scale,
             v_descale=layer.v_scale,
         )
+
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
@@ -210,7 +188,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Initialize metadata if needed
         if self.forward_metadata is None or not isinstance(
-            self.forward_metadata, DecodeMetadata
+            self.forward_metadata, FlashAttentionMetadata
         ):
             self.init_forward_metadata(forward_batch)
 
@@ -254,61 +232,6 @@ class FlashAttentionBackend(AttentionBackend):
         # print(f"Time taken to run flash_attn_with_kvcache: {end_time - start_time} seconds")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-    def prepare_kv_cache(self, forward_batch: ForwardBatch, layer: RadixAttention):
-        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        key_cache_pool, value_cache_pool = kv_cache[0], kv_cache[1]
-
-        # QQ NOTE: need a faster way
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-        req_tokens = []
-        for seq_idx in range(seq_lens.shape[0]):
-            seq_len_kv = seq_lens[seq_idx]
-            req_pool_idx = req_pool_indices[seq_idx]
-            req_tokens.append(req_to_token[req_pool_idx, :seq_len_kv])
-        req_tokens = torch.concat(req_tokens)
-        key_cache = key_cache_pool[req_tokens]
-        value_cache = value_cache_pool[req_tokens]
-        cache_seqlens = seq_lens
-        return key_cache, value_cache, cache_seqlens
-
-    def prepare_kv_cache_v2(self, forward_batch: ForwardBatch, layer: RadixAttention):
-        """Optimized KV cache preparation.
-
-        Args:
-            forward_batch: ForwardBatch containing sequence information
-            layer: RadixAttention layer instance
-
-        Returns:
-            Tuple of (key_cache, value_cache)
-        """
-        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        # Get required tensors
-        seq_lens = forward_batch.seq_lens
-
-        # Create indices for batched indexing
-        batch_indices = torch.arange(seq_lens.size(0), device=seq_lens.device)
-        token_indices = torch.arange(seq_lens.max().item(), device=seq_lens.device)
-
-        # Create a mask for valid indices
-        mask = token_indices.unsqueeze(0) < seq_lens.unsqueeze(1)
-
-        # Get the req_pool_indices for each sequence
-        batch_req_indices = forward_batch.req_pool_indices[batch_indices].unsqueeze(1)
-
-        # Create token indices for all sequences
-        all_tokens = forward_batch.req_to_token_pool.req_to_token[
-            batch_req_indices, token_indices.unsqueeze(0)
-        ].masked_fill_(~mask, 0)
-
-        # Flatten and remove padding (invalid) tokens
-        valid_tokens = all_tokens[mask]
-
-        # Index into KV cache pools
-        return kv_cache[0][valid_tokens], kv_cache[1][valid_tokens]
 
     def init_cuda_graph_state(self, max_bs: int):
         """Initialize CUDA graph state for the attention backend."""
