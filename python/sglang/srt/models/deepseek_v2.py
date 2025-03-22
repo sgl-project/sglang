@@ -412,16 +412,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_substage_dispatch_wait(self, state):
+        dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         (
             state.recv_hidden_states_from_dispatch,
             _topk_idx,
             _topk_weights,
             state.tokens_per_expert_from_dispatch,
-        ) = self.tbo_deepep_dispatchers[
-            state.tbo_subbatch_index
-        ].dispatch_stage_wait(
-            state.state_dispatch
-        )
+        ) = dispatcher.dispatch_stage_wait(state.state_dispatch)
 
     def _forward_tbo_substage_combine_start(self, state):
         state.state_combine = self.tbo_deepep_dispatchers[
