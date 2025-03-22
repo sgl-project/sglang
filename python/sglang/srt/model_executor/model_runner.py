@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -122,7 +123,6 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.fine_grained_benchmark_dir = server_args.fine_grained_benchmark_dir
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -160,7 +160,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -885,7 +885,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
