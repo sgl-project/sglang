@@ -42,6 +42,8 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -67,6 +69,7 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
@@ -395,6 +398,24 @@ class Req:
         self.spec_verify_ct = 0
         self.lora_path = lora_path
 
+        # For disaggregation
+        self.bootstrap_host: str = "0.0.0.0"
+        self.bootstrap_room: Optional[int] = None
+        self.disagg_kv_sender: Optional[KVSender] = None
+
+        # used for warmup because we don't have a pair yet when init
+        self.skip_kv_transfer: bool = False
+        # the start index of the sent kv cache
+        # We want to send it chunk by chunk for chunked prefill.
+        # After every chunk forward, we do the following:
+        # kv_send(req.input_ids[req.start_send_idx:len(req.fill_ids)])
+        # start_send_idx = len(req.fill_ids)
+        self.start_send_idx: int = 0
+
+        self.metadata_buffer_index: int = -1
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -530,7 +551,7 @@ bid = 0
 
 
 @dataclasses.dataclass
-class ScheduleBatch:
+class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache

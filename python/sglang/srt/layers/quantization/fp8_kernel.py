@@ -26,10 +26,13 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
     get_device_name,
+    get_device_sm,
     is_cuda,
     is_hip,
     supports_custom_op,
 )
+
+_enable_jit_deepgemm = False
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -39,9 +42,12 @@ if _is_cuda:
     import deep_gemm  # `pip install "sgl-kernel>=0.0.4.post3"`
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
-logger = logging.getLogger(__name__)
+    sm_version = get_device_sm()
+    if sm_version >= 90 and int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "1")):
+        _enable_jit_deepgemm = True
 
-_enable_jit_deepgemm = int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "0"))
+
+logger = logging.getLogger(__name__)
 
 if supports_custom_op():
 
@@ -168,6 +174,7 @@ def per_token_group_quant_fp8(
     eps: float = 1e-10,
     dtype: torch.dtype = fp8_type_,
     column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -200,11 +207,20 @@ def per_token_group_quant_fp8(
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
-        x_s = torch.empty(
-            (x.shape[-1] // group_size,) + x.shape[:-1],
-            device=x.device,
-            dtype=torch.float32,
-        ).permute(-1, -2)
+        if scale_tma_aligned:
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x.shape[-2] + 3) // 4 * 4
+            x_s = torch.empty(
+                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
+        else:
+            x_s = torch.empty(
+                (x.shape[-1] // group_size,) + x.shape[:-1],
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
     else:
         x_s = torch.empty(
             x.shape[:-1] + (x.shape[-1] // group_size,),
@@ -761,7 +777,7 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if _is_cuda and C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+    if C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
