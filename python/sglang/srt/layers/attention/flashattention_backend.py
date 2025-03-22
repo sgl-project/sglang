@@ -162,6 +162,27 @@ class FlashAttentionBackend(AttentionBackend):
         # max tokens * num_kv_heads * head_size
         key_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
         value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+        batch_size = len(forward_batch.seq_lens)
+        max_seq_len = forward_batch.seq_lens.max().item()
+
+        batched_key_cache = torch.zeros(
+            (batch_size, max_seq_len, layer.tp_k_head_num, layer.head_dim),
+            dtype=key_cache.dtype,
+            device=key_cache.device,
+        )
+        batched_value_cache = torch.zeros(
+            (batch_size, max_seq_len, layer.tp_v_head_num, layer.head_dim),
+            dtype=value_cache.dtype,
+            device=value_cache.device,
+        )
+        # Fill the batched caches with the correct values
+        offset = 0
+        for i, seq_len in enumerate(forward_batch.seq_lens):
+            req_idx = forward_batch.req_pool_indices[i]
+            for j in range(seq_len):
+                token_idx = forward_batch.req_to_token_pool.req_to_token[req_idx, j]
+                batched_key_cache[i, j] = key_cache[token_idx]
+                batched_value_cache[i, j] = value_cache[token_idx]
 
         # Use Flash Attention for decode
         seqlens_in_batch = forward_batch.seq_lens
@@ -178,9 +199,11 @@ class FlashAttentionBackend(AttentionBackend):
 
         o, _ = flash_attn_with_kvcache(
             # q=q.unsqueeze(1),
-            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k_cache=key_cache.unsqueeze(1),
-            v_cache=value_cache.unsqueeze(1),
+            q=q.contiguous().view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ),  # Reshape to [batch_size, 1, num_heads, head_dim]
+            k_cache=batched_key_cache,  # Shape: [10, 1, 2, 8]
+            v_cache=batched_value_cache,  # Shape: [10, 1, 2, 8]
             page_table=forward_batch.req_to_token_pool.req_to_token.to(torch.int32),
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
             cu_seqlens_q=cu_seqlens_q,
