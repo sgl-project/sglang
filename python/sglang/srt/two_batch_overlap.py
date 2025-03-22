@@ -1,6 +1,6 @@
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple, Any
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -188,3 +188,10 @@ class _StateDict:
 
     def __getattr__(self, item):
         return self._data[item]
+
+    def update(self, values: Dict[str, Any]):
+        for k, v in values.items():
+            setattr(self, k, v)
+
+    def clear(self):
+        self._data.clear()
