@@ -453,6 +453,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
