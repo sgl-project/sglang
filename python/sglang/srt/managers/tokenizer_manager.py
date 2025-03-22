@@ -91,7 +91,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, BlockReqInput, BlockReqType,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -469,6 +469,9 @@ class TokenizerManager:
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+
+    def _send_block_request(self, type: BlockReqType):
+        self.send_to_scheduler.send_pyobj(BlockReqInput(type))
 
     async def _wait_one_response(
         self,
