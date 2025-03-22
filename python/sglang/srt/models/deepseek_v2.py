@@ -432,17 +432,17 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_from_combine = dispatcher.combine_stage_wait(state.state_combine)
 
     def _forward_tbo_substage_shared(self, state):
-        state["shared_output"] = self._forward_deepep_shared_output(
-            state["forward_batch"].forward_mode, state["hidden_states_for_moe_input"]
+        state.shared_output = self._forward_deepep_shared_output(
+            state.forward_batch.forward_mode, state.hidden_states_for_moe_input
         )
 
     def _forward_tbo_substage_compute_layer_output(self, state):
         output = dict(
-            positions=state["positions"],
-            hidden_states=state["hidden_states_from_combine"] + state["shared_output"],
-            forward_batch=state["forward_batch"],
-            residual=state["residual_after_post_attn_ln"],
-            tbo_subbatch_index=state["tbo_subbatch_index"],
+            positions=state.positions,
+            hidden_states=state.hidden_states_from_combine + state.shared_output,
+            forward_batch=state.forward_batch,
+            residual=state.residual_after_post_attn_ln,
+            tbo_subbatch_index=state.tbo_subbatch_index,
         )
         state.clear()
         return output
@@ -1322,10 +1322,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             and isinstance(self.mlp, DeepseekV2MoE)
         )
         hidden_states = self.self_attn.forward_absorb_stage_core(
-            state["self_attn_state"]
+            state.self_attn_state
         )
         hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, state["residual_after_input_ln"]
+            hidden_states, state.residual_after_input_ln
         )
         router_logits = self.mlp.gate(hidden_states)
         state.update(
