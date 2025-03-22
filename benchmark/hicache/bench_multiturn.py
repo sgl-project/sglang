@@ -4,8 +4,10 @@ import json
 import queue
 import random
 import re
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -109,7 +111,9 @@ async def async_request_sglang_generate(
     """
     Sends a streaming request to the server. Gathers text token-by-token.
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=600), read_bufsize=1024 * 1024
+    ) as session:
         headers = {}
         generated_text = ""
         ttft = 0.0
@@ -154,8 +158,9 @@ async def async_request_sglang_generate(
                     output.success = False
         except Exception as e:
             output.success = False
-            output.error = str(e)
-            print(f"Request failed: {e}")
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+            print(f"{output.error=}")
 
     if pbar:
         pbar.update(1)
@@ -221,7 +226,8 @@ class ReadyQueue:
 class WorkloadGenerator:
     def __init__(self, args):
         # Construct the base URL for requests
-        self.url = f"http://{args.host}:{args.port}/generate"
+        self.baseurl = f"http://{args.host}:{args.port}/"
+        self.url = self.baseurl + "generate"
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -257,6 +263,11 @@ class WorkloadGenerator:
         self.pbar = tqdm(total=args.num_clients * args.num_rounds)
         self.performance_metrics = {"ttft": [], "latency": []}
 
+        self.num_rounds = args.num_rounds
+        self.max_parallel = args.max_parallel
+        self.output_length = args.output_length
+        self.logfile = args.log_file
+
     async def handle_request(self, item):
         try:
             client_id, payload = item
@@ -270,7 +281,7 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
-                if self.sent_requests - self.completed_requests < args.max_parallel:
+                if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.ready_queue.pop()
                     if new_request:
                         asyncio.create_task(self.handle_request(new_request))
@@ -314,7 +325,7 @@ class WorkloadGenerator:
                 self.performance_metrics["latency"].append(response.latency)
                 self.completed_requests += 1
 
-                if self.client_records[client_id]["round"] < args.num_rounds:
+                if self.client_records[client_id]["round"] < self.num_rounds:
                     self.client_records[client_id][
                         "history"
                     ] += self.candidate_inputs.pop()
@@ -323,7 +334,7 @@ class WorkloadGenerator:
                             client_id,
                             gen_payload(
                                 self.client_records[client_id]["history"],
-                                args.output_length,
+                                self.output_length,
                             ),
                         )
                     )
@@ -383,14 +394,13 @@ class WorkloadGenerator:
             f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
 
-        metrics = get_metrics()
+        metrics = get_metrics(self.baseurl + "metrics")
         print("Metrics:", metrics)
         performance_data["metrics"] = metrics
-        log_to_jsonl_file(performance_data, args.log_file)
+        log_to_jsonl_file(performance_data, self.logfile)
 
 
-def get_metrics():
-    metrics_url = f"http://{args.host}:{args.port}/metrics"
+def get_metrics(metrics_url):
     metrics_response = requests.get(metrics_url)
     metrics_content = metrics_response.text
 
