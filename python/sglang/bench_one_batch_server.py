@@ -36,6 +36,7 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
+    profile: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -54,6 +55,12 @@ class BenchArgs:
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Use Torch Profiler. The endpoint must be launched with "
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -104,6 +111,7 @@ def run_one_case(
     output_len: int,
     run_name: str,
     result_filename: str,
+    profile: bool,
 ):
     input_ids = [
         [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
@@ -112,6 +120,8 @@ def run_one_case(
 
     if fine_grained_benchmark.is_enabled():
         fine_grained_benchmark.clear_output()
+    if profile:
+        requests.post(url + "/start_profile").raise_for_status()
 
     tic = time.time()
     response = requests.post(
@@ -129,6 +139,8 @@ def run_one_case(
 
     _ = response.json()
 
+    if profile:
+        requests.post(url + "/stop_profile").raise_for_status()
     if fine_grained_benchmark.is_enabled():
         fine_grained_output = fine_grained_benchmark.read_output()
         print(f'{fine_grained_output=}')  # TODO
@@ -170,6 +182,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             output_len=16,
             run_name="",
             result_filename="",
+            profile=False,
         )
 
     # benchmark
@@ -184,6 +197,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 ol,
                 bench_args.run_name,
                 bench_args.result_filename,
+                bench_args.profile,
             )
     finally:
         if proc:
