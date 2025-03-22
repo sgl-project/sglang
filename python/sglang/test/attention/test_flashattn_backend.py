@@ -198,6 +198,7 @@ class TestFlashAttentionBackend(unittest.TestCase):
 
         # Run forward_decode
         output = self.backend.forward_decode(q, k, v, layer, forward_batch)
+        output_ref = self.backend.forward_decode_v0(q, k, v, layer, forward_batch)
 
         # Verify output
         expected_shape = (self.batch_size, self.num_heads * self.head_dim)

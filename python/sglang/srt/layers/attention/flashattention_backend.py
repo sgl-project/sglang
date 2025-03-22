@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn_interface import flash_attn_varlen_func
+from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
@@ -123,6 +123,84 @@ class FlashAttentionBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ) -> torch.Tensor:
+        """Forward pass with FlashAttention.
+
+        Args:
+            q: shape = [num_tokens, num_heads, head_size]
+            k: shape = [num_tokens, num_kv_heads, head_size]
+            v: shape = [num_tokens, num_kv_heads, head_size]
+            layer: RadixAttention layer
+            forward_batch: ForwardBatch contains forward batch information
+            save_kv_cache: boolean value to indicate if the kv cache should be saved
+        Returns:
+            shape = [num_tokens, num_heads * head_size]
+        """
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        # Get KV cache
+        # key_cache, value_cache = self.prepare_kv_cache_v2(forward_batch, layer)
+
+        # max tokens * num_kv_heads * head_size
+        key_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+        value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+
+        # Use Flash Attention for decode
+        seqlens_in_batch = forward_batch.seq_lens
+        # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        # QQ NOTE: we fix to generate 1 token per req currently
+        cu_seqlens_q = torch.arange(
+            0, len(forward_batch.seq_lens) + 1, dtype=torch.int32, device=q.device
+        )
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        )
+        max_seq_len_q = 1
+        max_seq_len_k = seqlens_in_batch.max().item()
+
+        o, _ = flash_attn_with_kvcache(
+            # q=q.unsqueeze(1),
+            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache=key_cache.unsqueeze(1),
+            v_cache=value_cache.unsqueeze(1),
+            page_table=forward_batch.req_to_token_pool.req_to_token.to(torch.int32),
+            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k,
+            max_seqlen_q=max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=(
+                (layer.sliding_window_size - 1, 0)
+                if layer.sliding_window_size is not None
+                else (-1, -1)
+            ),
+            softcap=layer.logit_cap,
+            k_descale=layer.k_scale,
+            v_descale=layer.v_scale,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def forward_decode_v0(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
