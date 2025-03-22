@@ -279,5 +279,5 @@ class PagedTokenToKVPoolAllocator:
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
