@@ -130,8 +130,11 @@ def run_one_case(
     _ = response.json()
 
     if fine_grained_benchmark.is_enabled():
+        import pandas as pd
         fine_grained_output = fine_grained_benchmark.read_output()
-        print(f'{fine_grained_output=}')  # TODO
+        df = pd.DataFrame(fine_grained_output)
+        df['throughput'] = df['num_tokens'] / df['latency']
+        print(df[df['tp_rank'] == 0].drop(['start_time', 'tp_rank'], axis=1))
 
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
