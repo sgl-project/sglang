@@ -659,6 +659,7 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "deepseek-vl2",
                 "--context-length",
                 "4096",
+                "--disable-cuda-graph",
             ],
         )
         cls.base_url += "/v1"

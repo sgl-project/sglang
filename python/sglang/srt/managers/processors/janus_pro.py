@@ -60,7 +60,7 @@ class JanusProProcessor(BaseProcessor):
         if not isinstance(image_data, list):
             image_data = [image_data]
 
-        base_out = self.load_multimodal_data(
+        base_out = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
             multimodal_tokens=MultiModalEmbedTokens(image_token="<image_placeholder>"),

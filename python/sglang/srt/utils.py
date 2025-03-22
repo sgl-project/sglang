@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 import base64
 import builtins
 import ctypes
@@ -60,6 +61,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -502,6 +504,36 @@ def decode_video_base64(video_base64):
             0,
             0,
         )  # Return an empty array and size tuple if no frames were found
+
+
+def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+    # Use soundfile here, since librosa use it under the hood,
+    # and librosa will not support audio loading in the future
+    import soundfile as sf
+    from scipy.signal import resample
+
+    # print(f"loading {audio_file}")
+    # Load audio data
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    # Convert to mono if requested and audio is stereo
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
 
 
 def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
@@ -1705,6 +1737,32 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def is_remote_url(url: Union[str, Path]) -> bool:
+    """
+    Check if the URL is a remote URL of the format:
+    <connector_type>://<host>:<port>/<model_name>
+    """
+    if isinstance(url, Path):
+        return False
+
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    return m is not None
+
+
+def parse_connector_type(url: str) -> str:
+    """
+    Parse the connector type from the URL of the format:
+    <connector_type>://<path>
+    """
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    if m is None:
+        return ""
+
+    return m.group(1)
 
 
 def get_multimodal_data_bounds(

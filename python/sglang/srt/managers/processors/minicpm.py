@@ -76,7 +76,7 @@ class MiniCPMImageProcessor(BaseProcessor):
         if not isinstance(audio_data, list):
             audio_data = [audio_data]
 
-        base_output = self.load_multimodal_data(
+        base_output = self.load_mm_data(
             input_ids=input_ids,
             max_req_input_len=max_req_input_len,
             audio_data=audio_data,
@@ -161,9 +161,3 @@ class MiniCPMImageProcessor(BaseProcessor):
             "slice_start_id": slice_start_id,
             "slice_end_id": slice_end_id,
         }
-
-
-ProcessorMapping = {
-    MiniCPMV: MiniCPMImageProcessor,
-    MiniCPMO: MiniCPMImageProcessor,
-}

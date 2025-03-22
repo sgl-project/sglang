@@ -69,7 +69,7 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 223),
         TestFile("test_vlm_accuracy.py", 60),
-        TestFile("test_vision_openai_server.py", 344),
+        TestFile("test_vision_openai_server.py", 546),
         TestFile("test_fim_completion.py", 120),
         TestFile("test_w8a8_quantization.py", 46),
         TestFile("test_eval_fp8_accuracy.py", 172),

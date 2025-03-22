@@ -44,21 +44,19 @@ def import_processors():
                 for name, member in all_members
                 if member.__module__ == module.__name__
             ]
-            for cls in classes:
-                if isinstance(cls, BaseProcessor):
-                    for arch in getattr(cls, "model_archs"):
-                        PROCESSOR_MAPPING[cls] = arch
+            for cls in (cls for cls in classes if issubclass(cls, BaseProcessor)):
+                assert hasattr(cls, "models")
+                for arch in getattr(cls, "models"):
+                    PROCESSOR_MAPPING[arch] = cls
 
 
-# also register processors
-import_processors()
-
-
-def get_processor(hf_config, server_args: ServerArgs, processor) -> BaseProcessor:
+def get_mm_processor(hf_config, server_args: ServerArgs, processor) -> BaseProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
             return processor_cls(hf_config, server_args, processor)
     raise ValueError(
-        f"No processor registered for architecture: {hf_config.architectures}."
+        f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
     )
+
+    self.image_proce

@@ -19,10 +19,10 @@
 
 import torch
 
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.processors.base_processor import (
+    BaseProcessor,
     get_global_processor,
 )
-from sglang.srt.managers.processors.base_processor import BaseProcessor
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
@@ -51,11 +51,11 @@ class DeepseekVL2ImageProcessor(BaseProcessor):
         images, image_hashes, image_sizes = [], [], []
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
+        base_output = self.load_mm_data(
             input_ids, image_data, image_token, max_req_input_len
         )
         base_output.all_frames = [img.convert("RGB") for img in base_output.all_frames]
-        res = await self._process_images(
+        res = await self.process_images_async(
             base_output.all_frames, base_output.input_text, max_req_input_len
         )
         pixel_values = res["images"]

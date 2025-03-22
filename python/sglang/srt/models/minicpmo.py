@@ -1960,41 +1960,53 @@ class MiniCPMO(MiniCPMVBaseModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        **data: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
-        image_inputs = self.get_image_pixel_inputs(input_ids, forward_batch.mm_inputs)
-
-        # Clamp input ids. This is because the input_ids for the image tokens are
-        # filled with the hash values of the image for the prefix matching in the radix attention.
-        # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-        input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-
-        vllm_embeddings = self.get_vlm_embedding(
-            input_ids, image_inputs, forward_batch.forward_mode
-        )
-
         if (
-            self.config.init_audio
-            and forward_batch.mm_inputs is not None
-            and forward_batch.mm_inputs[0] is not None
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_mm_inputs()
         ):
+            inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
+        else:
+            # image embedding for minicpmv can't be merged, since it use infos like max_patches of the current batch
+            for image_input in forward_batch.mm_inputs:
+                if image_input is None:
+                    continue
+                kwargs.update(
+                    {
+                        "pixel_values": image_input.pixel_values,
+                        "tgt_sizes": image_input.tgt_sizes,
+                        "im_start_id": image_input.im_start_id,
+                        "im_end_id": image_input.im_end_id,
+                        "slice_start_id": image_input.slice_start_id,
+                        "slice_end_id": image_input.slice_end_id,
+                        "pad_values": image_input.pad_values,
+                    }
+                )
+                image_inputs = self._parse_and_validate_inputs(input_ids, **kwargs)
+                # Clamp input ids. This is because the input_ids for the image tokens are
+                # filled with the hash values of the image for the prefix matching in the radix attention.
+                # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+                input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+                inputs_embeds = self.get_embedding(input_ids, image_inputs)
+
+        if self.config.init_audio and (
+            forward_batch.forward_mode != ForwardMode
+            or forward_batch.contains_mm_inputs()
+        ):
+            mm_input = forward_batch.merge_mm_inputs()
             vllm_embeddings = self.get_omni_embedding(
                 input_ids,
-                forward_batch.mm_inputs[0],
+                mm_input,
                 forward_mode=forward_batch.forward_mode,
-                input_embeddings=vllm_embeddings,
+                input_embeddings=inputs_embeds,
                 chunk_length=self.config.audio_chunk_length,
                 stream_input=False,
             )
             vllm_embeddings = vllm_embeddings.squeeze(0)
 
-        # always pass the input via `inputs_embeds`
-        # to make sure the computation graph is consistent
-        # for `torch.compile` integration
-        input_ids = None
-
         hidden_states = self.llm.model(
-            input_ids=input_ids,
+            input_ids=None,
             positions=positions,
             forward_batch=forward_batch,
             input_embeds=vllm_embeddings,

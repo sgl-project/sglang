@@ -79,7 +79,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_multimodal_data(
+        base_output = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
             multimodal_tokens=MultiModalEmbedTokens(image_token=image_token),

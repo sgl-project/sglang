@@ -59,7 +59,7 @@ class MultiModalEmbedTokens:
 
 
 class BaseProcessor(ABC):
-    model_archs = []
+    models = []
 
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
@@ -140,7 +140,7 @@ class BaseProcessor(ABC):
         frames = [Image.fromarray(v.astype("uint8")) for v in frames]
         return frames
 
-    def load_multimodal_data(
+    def load_mm_data(
         self,
         input_ids: list[int],
         multimodal_tokens: MultiModalEmbedTokens,
