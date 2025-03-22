@@ -21,11 +21,11 @@ from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,
     AutoModel,
+    Gemma3TextConfig,
     PretrainedConfig,
     PreTrainedModel,
 )
 
-from sglang.srt.configs.gemma3 import Gemma3TextConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
