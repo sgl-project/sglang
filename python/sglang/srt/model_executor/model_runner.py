@@ -122,7 +122,6 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.fine_grained_benchmark_dir = server_args.fine_grained_benchmark_dir
 
         # Model-specific adjustment
         self.model_specific_adjustment()
