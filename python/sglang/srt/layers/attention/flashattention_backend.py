@@ -36,6 +36,11 @@ class DecodeMetadata:
 @dataclass
 class PrefillMetadata:
     """Placeholder metadata class for prefill operations."""
+    cu_seqlens_q: torch.Tensor = None
+    cu_seqlens_k: torch.Tensor = None
+    max_seq_len_q: int = 0
+    max_seq_len_k: int = 0
+    extend_no_prefix: bool = False
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -97,6 +102,26 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
 
             self.forward_metadata = metadata
+        else:
+            metadata = PrefillMetadata()
+
+            extend_seq_lens = forward_batch.extend_seq_lens
+            metadata.extend_no_prefix = not any(forward_batch.extend_prefix_lens)
+            seqlens_in_batch = forward_batch.seq_lens
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+            # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+            if not metadata.extend_no_prefix:
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+            metadata.max_seq_len_q = seqlens_in_batch.max().item()
+            metadata.max_seq_len_k = metadata.max_seq_len_q
+            self.forward_metadata = metadata
+
 
     def forward_extend(
         self,
@@ -120,32 +145,28 @@ class FlashAttentionBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Initialize metadata if needed
+        if self.forward_metadata is None or not isinstance(
+            self.forward_metadata, PrefillMetadata
+        ):
+            self.init_forward_metadata(forward_batch)
+
+        # Use precomputed metadata
+        metadata = self.forward_metadata
+
         # Use Flash Attention for prefill
-        extend_seq_lens = forward_batch.extend_seq_lens
-        extend_no_prefix = not any(forward_batch.extend_prefix_lens)
-        seqlens_in_batch = forward_batch.seq_lens
-        cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-        )
-        # cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
-        if not extend_no_prefix:
-            cu_seqlens_q = torch.nn.functional.pad(
-                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
+        if not metadata.extend_no_prefix:
             k, v = self.prepare_kv_cache_v2(forward_batch, layer)
-        else:
-            cu_seqlens_q = cu_seqlens_k
-        max_seq_len_q = seqlens_in_batch.max().item()
-        max_seq_len_k = max_seq_len_q
+
 
         o, _ = flash_attn_varlen_func(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k=k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
             v=v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seq_len_q,
-            max_seqlen_k=max_seq_len_k,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=metadata.max_seq_len_k,
             softmax_scale=layer.scaling,
             causal=not layer.is_cross_attention,
             window_size=(
