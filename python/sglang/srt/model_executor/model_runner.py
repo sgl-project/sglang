@@ -962,7 +962,7 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with fine_grained_benchmark.maybe_benchmark(forward_batch):
+        with fine_grained_benchmark.maybe_benchmark(forward_batch, self.tp_rank):
             if (
                 forward_batch.forward_mode.is_cuda_graph()
                 and self.cuda_graph_runner
