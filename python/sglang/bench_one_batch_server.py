@@ -107,7 +107,8 @@ def run_one_case(
         for _ in range(batch_size)
     ]
 
-    fine_grained_benchmark.clear_output()
+    if fine_grained_benchmark.is_enabled():
+        fine_grained_benchmark.clear_output()
 
     tic = time.time()
     response = requests.post(
@@ -125,8 +126,9 @@ def run_one_case(
 
     _ = response.json()
 
-    fine_grained_output = fine_grained_benchmark.read_output()
-    print(f'{fine_grained_output=}')  # TODO
+    if fine_grained_benchmark.is_enabled():
+        fine_grained_output = fine_grained_benchmark.read_output()
+        print(f'{fine_grained_output=}')  # TODO
 
     output_throughput = batch_size * output_len / latency
     overall_throughput = batch_size * (input_len + output_len) / latency
