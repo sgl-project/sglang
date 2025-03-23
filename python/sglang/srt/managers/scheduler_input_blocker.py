@@ -14,6 +14,7 @@
 from enum import Enum, auto
 from typing import List, Optional, Any
 
+import torch
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 
 
@@ -60,6 +61,14 @@ class SchedulerInputBlocker:
         self._change_state(original=_State.BLOCKED, target=_State.AWAITING_GLOBAL_UNBLOCK)
 
     def _maybe_fulfill_awaiting_global_unblock(self):
+        if self._noop:
+            local_fulfill = True
+        else:
+            local_fulfill = TODO
+
+        global_fulfill = torch.distributed.all_reduce(torch.tensor(local_fulfill),
+                                                      torch.distributed.ReduceOp.MIN).item()
+
         TODO
 
     def _change_state(self, original: "_State", target: "_State"):
