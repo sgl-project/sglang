@@ -1881,7 +1881,7 @@ class Scheduler(
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
-        if "CUDA_PROFILER" in activities:
+        if "CUDA_PROFILER" in self.torch_profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
         logger.info(
