@@ -42,7 +42,6 @@ class FlashAttentionBackend(AttentionBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
     ):
-        # print("FlashAttentionBackend init Biao!!!")
         super().__init__()
 
         # Parse constants
@@ -54,13 +53,12 @@ class FlashAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        max_bs = model_runner.req_to_token_pool.size
-
         # Initialize metadata
         self.forward_metadata: FlashAttentionMetadata = None
+        self.max_context_len = model_runner.model_config.context_len
+        self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
-        self.prefill_cuda_graph_metadata = {}  # For verify
-        self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
@@ -121,12 +119,6 @@ class FlashAttentionBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Initialize metadata if needed
-        if self.forward_metadata is None or not isinstance(
-            self.forward_metadata, FlashAttentionMetadata
-        ):
-            self.init_forward_metadata(forward_batch)
-
         # Use precomputed metadata
         metadata = self.forward_metadata
 
@@ -168,9 +160,6 @@ class FlashAttentionBackend(AttentionBackend):
         save_kv_cache=True,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention using precomputed metadata."""
-        # import time
-        # start_time = time.time()
-
         # Save KV cache if needed
         if k is not None and v is not None and save_kv_cache:
             cache_loc = (
@@ -186,12 +175,6 @@ class FlashAttentionBackend(AttentionBackend):
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache, value_cache = kv_cache[0], kv_cache[1]
 
-        # Initialize metadata if needed
-        if self.forward_metadata is None or not isinstance(
-            self.forward_metadata, FlashAttentionMetadata
-        ):
-            self.init_forward_metadata(forward_batch)
-
         # Use precomputed metadata
         metadata = self.forward_metadata
 
@@ -204,10 +187,6 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-
-        # end_time = time.time()
-        # print(f"Time taken to prepare tensors: {end_time - start_time} seconds")
-        # start_time = time.time()
 
         # Run attention with precomputed values
         o = flash_attn_with_kvcache(
@@ -227,16 +206,23 @@ class FlashAttentionBackend(AttentionBackend):
             v_descale=layer.v_scale,
         )
 
-        # torch.cuda.synchronize()
-        # end_time = time.time()
-        # print(f"Time taken to run flash_attn_with_kvcache: {end_time - start_time} seconds")
-
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
-        """Initialize CUDA graph state for the attention backend."""
-        pass  # Flash Attention Backend currently doesn't support CUDA graph
-
+        """Initialize CUDA graph state for the attention backend.
+        
+        Args:
+            max_bs (int): Maximum batch size to support in CUDA graphs
+            
+        This creates fixed-size tensors that will be reused during CUDA graph replay
+        to avoid memory allocations.
+        """        
+        # Initialize fixed size tensors for decode operations
+        self.decode_cuda_graph_metadata = {          
+            # Page table for token mapping (batch_size, max_context_len)
+            "page_table": torch.zeros(max_bs, self.max_context_len,  dtype=torch.int32, device=self.device),
+        }
+        
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -245,25 +231,55 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
-        pass  # Flash Attention Backend currently doesn't support CUDA graph
+        metadata = FlashAttentionMetadata()
+        # Get sequence information
+        metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+        batch_size = len(seq_lens)
+        device = seq_lens.device
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+        ) 
+        # Precompute maximum sequence length
+        metadata.max_seq_len_k = seq_lens.max().item()
+        # Precompute page table
+        metadata.page_table = self.decode_cuda_graph_metadata["page_table"][req_pool_indices, :]
+        if forward_mode == ForwardMode.DECODE:
+            # Precompute cumulative sequence lengths
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+        else:
+            raise ValueError("Do not support Prefill Mode cuda graph")
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_kv_heads: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
-        pass  # Flash Attention Backend currently doesn't support CUDA graph
+        # """Initialize forward metadata for replaying CUDA graph."""
+        seqlens_in_batch = seq_lens[:bs]
+        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+        device = seqlens_in_batch.device
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        ) 
+        # Precompute maximum sequence length
+        metadata.max_seq_len_k = seqlens_in_batch.max().item()
+        metadata.page_table.fill_(0)  # QQ NOTE: since we do inplace so need a clear to avoid pollution by previous round?
+        metadata.page_table[:, : metadata.max_seq_len_k].copy_(self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k])
+        self.forward_decode_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
