@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -640,7 +640,7 @@ class ProfileReqInput:
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
-    activities: Optional[List[str]] = None
+    activities: Optional[List[Literal['CPU', 'GPU', 'MEM']]] = None
 
 
 class ProfileReqType(Enum):
