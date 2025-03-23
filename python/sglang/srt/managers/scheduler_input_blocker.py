@@ -34,7 +34,7 @@ class SchedulerInputBlocker:
 
         global_arrived_unblock_barrier = self._compute_global_unblock_barrier()
         if self._state == _State.GLOBAL_UNBLOCK_BARRIER and global_arrived_unblock_barrier:
-            self._handle_arrive_unblock_barrier()
+            output_reqs += self._handle_arrive_unblock_barrier()
 
         if not self._noop:
             return output_reqs
@@ -73,7 +73,9 @@ class SchedulerInputBlocker:
 
     def _handle_arrive_unblock_barrier(self):
         self._change_state(original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED)
-        TODO
+        output_reqs = [*self._pending_reqs]
+        self._pending_reqs.clear()
+        return output_reqs
 
     def _change_state(self, original: "_State", target: "_State"):
         assert self._state == original, f"{self._state=} {original=} {target=}"
