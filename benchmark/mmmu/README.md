@@ -24,6 +24,6 @@ Benchmark Results:
 |-------------------------|--------|-------------|
 | Qwen2-VL-7B-Instruct   | 0.476  | -            |
 | Qwen2.5-VL-7B-Instruct | 0.477  | 0.504        |
-| MiniCPM-V-2.6          | 0.386  | —            |
+| MiniCPM-V-2.6          | 0.435  | —            |
 | Deepseek-Janus-Pro-7B  | 0.373  | -            |
 | Gemma-3-it-4B          | 0.41   | 0.403        |
