@@ -98,6 +98,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -124,7 +125,7 @@ from sglang.srt.utils import (
     pyspy_dump_schedulers,
     set_gpu_proc_affinity,
     set_random_seed,
-    suppress_other_loggers,
+    suppress_other_loggers, ENABLE_COLOCATED_BATCH_GEN,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -356,8 +357,8 @@ class Scheduler(
             1.0,
         )
         self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+                                         self.init_new_token_ratio - self.min_new_token_ratio
+                                     ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -370,6 +371,8 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
+
+        self.input_blocker = SchedulerInputBlocker() if ENABLE_COLOCATED_BATCH_GEN else None
 
         # Init profiler
         self.torch_profiler = None
@@ -1232,10 +1235,10 @@ class Scheduler(
             if (
                 self.lora_paths
                 and len(
-                    lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
-                    | set([req.lora_path])
-                )
+                lora_set
+                | set([req.lora_path for req in adder.can_run_list])
+                | set([req.lora_path])
+            )
                 > self.max_loras_per_batch
             ):
                 self.running_batch.batch_is_full = True
@@ -1260,9 +1263,9 @@ class Scheduler(
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (
-                            self.running_batch is not None
-                            and not self.running_batch.is_empty()
-                        )
+                                                               self.running_batch is not None
+                                                               and not self.running_batch.is_empty()
+                                                           )
                     else:
                         self.running_batch.batch_is_full = True
                 break
@@ -1466,8 +1469,8 @@ class Scheduler(
                     # We should have at least 1 token for sample in every case.
                     max(extend_len - logprob_start_len, 1)
                     for logprob_start_len, extend_len in zip(
-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
-                    )
+                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
+                )
                 ]
             )
 
@@ -1942,7 +1945,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
