@@ -98,6 +98,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -114,6 +115,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    ENABLE_COLOCATED_BATCH_GEN,
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
@@ -369,6 +371,12 @@ class Scheduler(
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
+        )
+
+        self.input_blocker = (
+            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            if ENABLE_COLOCATED_BATCH_GEN
+            else None
         )
 
         # Init profiler
@@ -722,6 +730,9 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -1942,7 +1953,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
