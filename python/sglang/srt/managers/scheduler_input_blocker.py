@@ -14,6 +14,8 @@
 from enum import Enum, auto
 from typing import List, Optional, Any
 
+from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
+
 
 class SchedulerInputBlocker:
     def __init__(self):
@@ -21,6 +23,14 @@ class SchedulerInputBlocker:
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         TODO
+
+    def _execute_block_request(self, recv_req: BlockReqInput):
+        if recv_req.type == BlockReqType.BLOCK:
+            TODO
+        elif recv_req.type == BlockReqType.UNBLOCK:
+            TODO
+        else:
+            raise NotImplementedError(f"{recv_req=}")
 
 
 class _State(Enum):
