@@ -31,6 +31,8 @@ class SchedulerInputBlocker:
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
 
+        self._maybe_fulfill_awaiting_global_unblock()
+
         if not self._noop:
             return output_reqs
 
@@ -56,6 +58,9 @@ class SchedulerInputBlocker:
 
     def _execute_unblock_req(self):
         self._change_state(original=_State.BLOCKED, target=_State.AWAITING_GLOBAL_UNBLOCK)
+
+    def _maybe_fulfill_awaiting_global_unblock(self):
+        TODO
 
     def _change_state(self, original: "_State", target: "_State"):
         assert self._state == original, f"{self._state=} {original=} {target=}"
