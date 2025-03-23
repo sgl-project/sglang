@@ -726,6 +726,9 @@ class Scheduler(
         else:
             recv_reqs = None
 
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
+
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
                 work_reqs = [
