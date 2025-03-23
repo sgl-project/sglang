@@ -34,9 +34,10 @@ def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int):
 def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
     import nvtx
 
+    debug_name = f"forward-{forward_batch.forward_mode.name}-bs{forward_batch.batch_size}-tok{forward_batch.input_ids.shape[0]}"
     torch.cuda.synchronize()
     start_time = time.time()
-    with nvtx.annotate(f"forward-bs{forward_batch.batch_size}-tok{forward_batch.input_ids.shape[0]}"):
+    with nvtx.annotate(debug_name):
         try:
             yield
         finally:
