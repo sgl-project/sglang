@@ -115,11 +115,11 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
-    ENABLE_COLOCATED_BATCH_GEN,
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    enable_colocated_batch_gen,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -375,7 +375,7 @@ class Scheduler(
 
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
-            if ENABLE_COLOCATED_BATCH_GEN
+            if enable_colocated_batch_gen()
             else None
         )
 
