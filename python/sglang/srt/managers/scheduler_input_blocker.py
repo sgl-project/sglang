@@ -11,9 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from enum import Enum, auto
 from typing import List, Optional, Any
 
 
 class SchedulerInputBlocker:
+    def __init__(self):
+        self._state = _State.UNBLOCKED
+
     def handle(self, recv_reqs: Optional[List[Any]]):
         TODO
+
+
+class _State(Enum):
+    UNBLOCKED = auto()
+    BLOCKED = auto()
+    AWAITING_GLOBAL_UNBLOCK = auto()
