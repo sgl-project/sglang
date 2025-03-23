@@ -52,10 +52,14 @@ class SchedulerInputBlocker:
                 return []
 
     def _execute_block_req(self):
-        TODO
+        self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
 
     def _execute_unblock_req(self):
-        TODO
+        self._change_state(original=_State.BLOCKED, target=_State.AWAITING_GLOBAL_UNBLOCK)
+
+    def _change_state(self, original: "_State", target: "_State"):
+        assert self._state == original, f"{self._state=} {original=} {target=}"
+        self._state = target
 
 
 class _State(Enum):
