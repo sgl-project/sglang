@@ -45,6 +45,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
@@ -97,10 +98,11 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    ENABLE_COLOCATED_BATCH_GEN,
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
-    kill_process_tree, ENABLE_COLOCATED_BATCH_GEN,
+    kill_process_tree,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -947,8 +949,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                                       state.last_output_offset:
-                                       ]
+                        state.last_output_offset :
+                    ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]

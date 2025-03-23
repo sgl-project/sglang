@@ -12,9 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 from enum import Enum, auto
-from typing import List, Optional, Any
+from typing import Any, List, Optional
 
 import torch
+
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 
 
@@ -33,7 +34,10 @@ class SchedulerInputBlocker:
                 output_reqs += self._handle_recv_req(recv_req)
 
         global_arrived_unblock_barrier = self._compute_global_unblock_barrier()
-        if self._state == _State.GLOBAL_UNBLOCK_BARRIER and global_arrived_unblock_barrier:
+        if (
+            self._state == _State.GLOBAL_UNBLOCK_BARRIER
+            and global_arrived_unblock_barrier
+        ):
             output_reqs += self._handle_arrive_unblock_barrier()
 
         if not self._noop:
@@ -60,7 +64,9 @@ class SchedulerInputBlocker:
         self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
 
     def _execute_unblock_req(self):
-        self._change_state(original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER)
+        self._change_state(
+            original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER
+        )
 
     def _compute_global_unblock_barrier(self):
         if self._noop:
@@ -69,10 +75,13 @@ class SchedulerInputBlocker:
             local_arrived = self._state == _State.GLOBAL_UNBLOCK_BARRIER
 
         return torch.distributed.all_reduce(
-            torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN).item()
+            torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN
+        ).item()
 
     def _handle_arrive_unblock_barrier(self):
-        self._change_state(original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED)
+        self._change_state(
+            original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED
+        )
         output_reqs = [*self._pending_reqs]
         self._pending_reqs.clear()
         return output_reqs
