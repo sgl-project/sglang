@@ -203,6 +203,168 @@ class CuDNNBackend():
         graph.execute(variant_pack, workspace)
         return output
 
+class TorchNativeAttnBackend():
+    def __init__(self, ):
+        super().__init__()
+        self.forward_metadata = None
+
+
+
+    def _run_sdpa_forward_extend(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        """Run the extend forward by using torch native sdpa op.
+
+        Args:
+            query: [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_heads, head_size]
+            k_cache: [max_total_num_tokens, num_heads, head_size]
+            v_cache: [max_total_num_tokens, num_heads, head_size]
+            req_to_token: [max_num_reqs, max_context_len]
+            req_pool_indices: [num_seqs]
+            seq_lens: [num_seqs]
+            extend_prefix_lens: [num_seqs]
+            extend_seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+
+        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+
+        start_q, start_kv = 0, 0
+        for seq_idx in range(seq_lens.shape[0]):
+            # TODO: this loop process a sequence per iter, this is inefficient.
+            # Need optimize the performance later.
+
+            extend_seq_len_q = extend_seq_lens[seq_idx]
+            prefill_seq_len_q = extend_prefix_lens[seq_idx]
+
+            seq_len_kv = seq_lens[seq_idx]
+            end_q = start_q + extend_seq_len_q
+            end_kv = start_kv + seq_len_kv
+
+            per_req_query = query[:, start_q:end_q, :]
+            per_req_query_redudant = torch.empty(
+                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                dtype=per_req_query.dtype,
+                device=per_req_query.device,
+            )
+
+            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+
+            # get key and value from cache. per_req_tokens contains the kv cache
+            # index for each token in the sequence.
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            per_req_out_redudant = (
+                scaled_dot_product_attention(
+                    per_req_query_redudant.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            start_q, start_kv = end_q, end_kv
+        return output
+
+    def _run_sdpa_forward_decode(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        """Run the decode forward by using torch native sdpa op.
+
+        Args:
+            query: [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_heads, head_size]
+            k_cache: [max_total_num_tokens, num_heads, head_size]
+            v_cache: [max_total_num_tokens, num_heads, head_size]
+            req_to_token: [max_num_reqs, max_context_len]
+            req_pool_indices: [num_seqs]
+            seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+
+        start_q, start_kv = 0, 0
+        for seq_idx in range(seq_lens.shape[0]):
+            # TODO: this loop process a sequence per iter, this is inefficient.
+            # Need optimize the performance later.
+
+            seq_len_q = 1
+            seq_len_kv = seq_lens[seq_idx]
+            end_q = start_q + seq_len_q
+            end_kv = start_kv + seq_len_kv
+
+            per_req_query = query[:, start_q:end_q, :]
+
+            # get key and value from cache. per_req_tokens contains the kv cache
+            # index for each token in the sequence.
+            req_pool_idx = req_pool_indices[seq_idx]
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+
+            per_req_out = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            output[start_q:end_q, :, :] = per_req_out
+            start_q, start_kv = end_q, end_kv
+
+        return output
+
 
 
 def test_correctness():
@@ -241,6 +403,22 @@ def test_correctness():
         seq_lens=seq_lens,
         scaling=scaling
     )
+
+    torch_native_backend = TorchNativeAttnBackend()
+
+    torch_output = torch_native_backend._run_sdpa_forward_decode(
+        query=query,
+        output=output,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        scaling=scaling
+    )
+
+
+    torch.testing.assert_close(output,torch_output)
 
     # TODO correctness
     print(output)
