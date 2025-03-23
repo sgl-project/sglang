@@ -234,10 +234,10 @@ class DeepEPDispatcher:
             )
             self.recv_expert_count = recv_expert_count
 
-        return event, handle, topk_idx, topk_weights, hidden_states
+        return event, handle, topk_idx, topk_weights, hidden_states, num_experts
 
     def dispatch_stage_wait(self, state):
-        event, handle, topk_idx, topk_weights, hidden_states = state
+        event, handle, topk_idx, topk_weights, hidden_states, num_experts = state
 
         if self.async_finish:
             event.current_stream_wait()
