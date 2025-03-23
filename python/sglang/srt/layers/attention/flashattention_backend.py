@@ -124,8 +124,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         # # Use Flash Attention for prefill
         # Calculate window size (can be moved to metadata if layer properties don't change)
+        # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
+        # here is two side inclusive
         window_size = (
-            (layer.sliding_window_size - 1, 0)
+            (layer.sliding_window_size, 0)
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
@@ -182,12 +184,13 @@ class FlashAttentionBackend(AttentionBackend):
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
+        # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
+        # here is two side inclusive
         window_size = (
-            (layer.sliding_window_size - 1, 0)
+            (layer.sliding_window_size, 0)
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-
         # Run attention with precomputed values
         o = flash_attn_with_kvcache(
             q=q_reshaped,

@@ -870,8 +870,7 @@ class ModelRunner:
             self.attn_backend = FlashMLABackend(self)
         elif self.server_args.attention_backend == "flashattention":
             logger.warning(
-                "FlashAttention Backend is in Beta. "
-                "Cuda Graph, Sliding Window, and Speculative Decoding are not supported."
+                "FlashAttention Backend is in Beta. MLA and Speculative Decoding are not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
