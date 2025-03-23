@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 class SchedulerInputBlocker:
     def __init__(self):
         self._state = _State.UNBLOCKED
+        self._pending_reqs = []
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         output_reqs = []
@@ -38,7 +39,11 @@ class SchedulerInputBlocker:
             else:
                 raise NotImplementedError(f"{recv_req=}")
         else:
-            return TODO
+            if self._state == _State.UNBLOCKED:
+                return [recv_req]
+            else:
+                self._pending_reqs.append(recv_req)
+                return []
 
     def _execute_block_request(self):
         TODO
