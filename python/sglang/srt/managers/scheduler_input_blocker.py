@@ -69,7 +69,8 @@ class SchedulerInputBlocker:
         global_arrived = torch.distributed.all_reduce(
             torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN).item()
 
-        if global_arrived:
+        if self._state == _State.GLOBAL_UNBLOCK_BARRIER and global_arrived:
+            self._change_state(original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED)
             TODO
 
     def _change_state(self, original: "_State", target: "_State"):
