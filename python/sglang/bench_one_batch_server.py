@@ -192,7 +192,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     # benchmark
     try:
         if bench_args.profile:
-            requests.post(base_url + "/start_profile", json={"activities": ["CUDA_PROFILER"]}).raise_for_status()
+            requests.post(base_url + "/start_profile",
+                          json={"activities": bench_args.profile_activities}).raise_for_status()
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
