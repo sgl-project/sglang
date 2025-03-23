@@ -45,10 +45,6 @@ class SchedulerInputBlocker:
             return output_reqs
 
     def _handle_recv_req(self, recv_req):
-        print(
-            f"hi [{get_tensor_model_parallel_rank()}] handle_recv_req START {type(recv_req)=}",
-            flush=True,
-        )
         if isinstance(recv_req, BlockReqInput):
             if recv_req.type == BlockReqType.BLOCK:
                 self._execute_block_req()
@@ -66,36 +62,20 @@ class SchedulerInputBlocker:
                 return []
 
     def _execute_block_req(self):
-        print(
-            f"hi [{get_tensor_model_parallel_rank()}] execute_block_req START",
-            flush=True,
-        )
         self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
 
     def _execute_unblock_req(self):
-        print(
-            f"hi [{get_tensor_model_parallel_rank()}] execute_unblock_req START",
-            flush=True,
-        )
         self._change_state(
             original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER
         )
 
     def _compute_global_unblock_barrier(self):
         local_arrived = self._noop or (self._state == _State.GLOBAL_UNBLOCK_BARRIER)
-        # print(f'hi [{get_tensor_model_parallel_rank()}] _compute_global_unblock_barrier START {local_arrived=}',
-        #       flush=True)
         global_arrived = torch.tensor(local_arrived).cuda()
         torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN)
-        # print(f'hi [{get_tensor_model_parallel_rank()}] _compute_global_unblock_barrier MIDDLE {global_arrived=}',
-        #       flush=True)
         return global_arrived.cpu().item()
 
     def _handle_arrive_unblock_barrier(self):
-        print(
-            f"hi [{get_tensor_model_parallel_rank()}] _handle_arrive_unblock_barrier START {[type(x) for x in self._pending_reqs]=}",
-            flush=True,
-        )
         self._change_state(
             original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED
         )
