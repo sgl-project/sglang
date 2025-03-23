@@ -9,7 +9,7 @@ Currently, this repository contains the code to reproduce the following scores.
 | LiveCodeBench 2408-2502  |  N/A     | 63.4             |
 | IFeval(Strict Prompt Acc)|  N/A     | 83.9             |
 
-Note that each benchmark would take hours to evaluate. `N/A` indicates that we do not have time and abundant compute resources to test. 
+Note that each benchmark would take hours to evaluate. `N/A` indicates that we do not have time and abundant compute resources to test.
 
 Kindly remind that, even with `n_samples` set the same as QwQ officially recommended, there's still some deviation in the results. For less deviation in the results please increase `n_samples` to a higher value.
 
