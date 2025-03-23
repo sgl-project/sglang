@@ -38,6 +38,7 @@ class BenchArgs:
     skip_warmup: bool = False
     profile: bool = False
     profile_activities: Tuple[str] = ("CUDA_PROFILER",)
+    profile_skip_cases: int = 0
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -65,6 +66,7 @@ class BenchArgs:
         parser.add_argument(
             "--profile-activities", type=str, nargs="+", default=BenchArgs.profile_activities
         )
+        parser.add_argument("--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -194,7 +196,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         for index, (bs, il, ol) in enumerate(itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         )):
-            if bench_args.profile and index == TODO:
+            if bench_args.profile and index == bench_args.profile_skip_cases:
                 requests.post(base_url + "/start_profile",
                               json={"activities": bench_args.profile_activities}).raise_for_status()
             run_one_case(
