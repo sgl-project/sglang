@@ -10,6 +10,3 @@
 [submodule "sgl-kernel/3rdparty/deepgemm"]
 	path = sgl-kernel/3rdparty/deepgemm
 	url = https://github.com/deepseek-ai/DeepGEMM
-[submodule "benchmark/reasoning_benchmark/QwQ_benchmark/QwQ"]
-	path = benchmark/reasoning_benchmark/QwQ_benchmark/QwQ
-	url = https://github.com/QwenLM/QwQ.git
