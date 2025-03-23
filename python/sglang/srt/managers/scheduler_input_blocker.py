@@ -64,10 +64,10 @@ class SchedulerInputBlocker:
         if self._noop:
             local_fulfill = True
         else:
-            local_fulfill = TODO
+            local_fulfill = self._state == _State.AWAITING_GLOBAL_UNBLOCK
 
-        global_fulfill = torch.distributed.all_reduce(torch.tensor(local_fulfill),
-                                                      torch.distributed.ReduceOp.MIN).item()
+        global_fulfill = torch.distributed.all_reduce(
+            torch.tensor(local_fulfill), torch.distributed.ReduceOp.MIN).item()
 
         TODO
 
