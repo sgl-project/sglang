@@ -22,15 +22,25 @@ class SchedulerInputBlocker:
         self._state = _State.UNBLOCKED
 
     def handle(self, recv_reqs: Optional[List[Any]]):
+        for recv_req in recv_reqs:
+            self._handle_recv_req(recv_req)
+
+    def _handle_recv_req(self, recv_req):
+        if isinstance(recv_req, BlockReqInput):
+            if recv_req.type == BlockReqType.BLOCK:
+                self._execute_block_request()
+            elif recv_req.type == BlockReqType.UNBLOCK:
+                self._execute_unblock_request()
+            else:
+                raise NotImplementedError(f"{recv_req=}")
+        else:
+            TODO
+
+    def _execute_block_request(self):
         TODO
 
-    def _execute_block_request(self, recv_req: BlockReqInput):
-        if recv_req.type == BlockReqType.BLOCK:
-            TODO
-        elif recv_req.type == BlockReqType.UNBLOCK:
-            TODO
-        else:
-            raise NotImplementedError(f"{recv_req=}")
+    def _execute_unblock_request(self):
+        TODO
 
 
 class _State(Enum):
