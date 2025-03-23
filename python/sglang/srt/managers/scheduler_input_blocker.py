@@ -32,7 +32,9 @@ class SchedulerInputBlocker:
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
 
-        self._maybe_fulfill_global_unblock_barrier()
+        global_arrived_unblock_barrier = self._compute_global_unblock_barrier()
+        if self._state == _State.GLOBAL_UNBLOCK_BARRIER and global_arrived_unblock_barrier:
+            self._handle_arrive_unblock_barrier()
 
         if not self._noop:
             return output_reqs
@@ -60,18 +62,18 @@ class SchedulerInputBlocker:
     def _execute_unblock_req(self):
         self._change_state(original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER)
 
-    def _maybe_fulfill_global_unblock_barrier(self):
+    def _compute_global_unblock_barrier(self):
         if self._noop:
             local_arrived = True
         else:
             local_arrived = self._state == _State.GLOBAL_UNBLOCK_BARRIER
 
-        global_arrived = torch.distributed.all_reduce(
+        return torch.distributed.all_reduce(
             torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN).item()
 
-        if self._state == _State.GLOBAL_UNBLOCK_BARRIER and global_arrived:
-            self._change_state(original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED)
-            TODO
+    def _handle_arrive_unblock_barrier(self):
+        self._change_state(original=_State.GLOBAL_UNBLOCK_BARRIER, target=_State.UNBLOCKED)
+        TODO
 
     def _change_state(self, original: "_State", target: "_State"):
         assert self._state == original, f"{self._state=} {original=} {target=}"
