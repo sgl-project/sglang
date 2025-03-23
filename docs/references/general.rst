@@ -12,3 +12,4 @@ General Guidance
    learn_more.md
    modelscope.md
    production_metrics.md
+   dynamo.md
