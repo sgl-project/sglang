@@ -75,3 +75,33 @@ To reveal the relationship, run the command 6 times and adjust the parameter `--
 python3 bench_sglang.py --parallel 64 --port 30000 --data-path Maxwell-Jia/AIME_2024 --question-key Problem --answer-key Answer --num-tries <num_tries>
 ```
 ![SE_num_tries](figure/SE_numtries.png)
+
+## Run benchmark of QwQ
+
+With SGLang, we reproduced the following scores.
+
+| Datasets                 | SGLang   | QwQ-32B-official |
+|--------------------------|----------|------------------|
+| AIME24                   | 79.74    | 79.5             |
+| AIME25                   |  N/A     | 69.5             |
+| LiveCodeBench 2408-2502  |  N/A     | 63.4             |
+| IFeval(Strict Prompt Acc)|  N/A     | 83.9             |
+
+Note that each benchmark would take hours to evaluate. `N/A` indicates that we do not have time and abundant compute resources to test.
+
+Kindly remind that, even with `n_samples` set the same as QwQ officially recommended, there's still some deviation in the results. For less deviation in the results please increase `n_samples` to a higher value.
+
+### Download repo
+```
+git clone https://github.com/QwenLM/QwQ.git
+
+```
+
+### Run benchmark
+```
+python -m sglang_router.launch_server --model-path Qwen/QwQ-32B --dp-size 4 --host=0.0.0.0 --port=30000
+```
+
+### Run Inference
+
+Following the `README.md` file in QwQ repo.
