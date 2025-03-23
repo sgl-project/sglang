@@ -400,13 +400,16 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
-        tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
-            forward_mode=self.capture_forward_mode,
-            num_tokens=num_tokens,
-            extend_lens=None,
-        )
-        # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-        assert tbo_split_seq_index is not None
+        if self.model_runner.server_args.enable_two_batch_overlap:
+            tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=self.capture_forward_mode,
+                num_tokens=num_tokens,
+                extend_lens=None,
+            )
+            # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+            assert tbo_split_seq_index is not None
+        else:
+            tbo_split_seq_index = None
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
