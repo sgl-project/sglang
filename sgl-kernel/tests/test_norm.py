@@ -130,4 +130,6 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

@@ -138,4 +138,6 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

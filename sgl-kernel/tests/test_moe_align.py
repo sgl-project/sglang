@@ -223,4 +223,6 @@ def test_moe_align_block_size_compare_implementations(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

@@ -64,4 +64,6 @@ def test_per_tensor_quant_compare_implementations(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))

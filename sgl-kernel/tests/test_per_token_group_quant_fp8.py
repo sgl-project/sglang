@@ -170,4 +170,6 @@ def test_per_token_group_quant_compare_implementations(batch_size, seq_len, grou
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))
