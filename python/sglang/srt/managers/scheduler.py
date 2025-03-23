@@ -55,8 +55,6 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BlockReqInput,
-    BlockReqType,
     CloseSessionReqInput,
     FlushCacheReq,
     GetInternalStateReq,
@@ -361,7 +359,6 @@ class Scheduler(
             self.init_new_token_ratio - self.min_new_token_ratio
         ) / global_config.default_new_token_ratio_decay_steps
         self.new_token_ratio = self.init_new_token_ratio
-        self._blocked = False
 
         # Init watchdog thread
         self.watchdog_timeout = server_args.watchdog_timeout
@@ -406,7 +403,6 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
-                (BlockReqInput, self.handle_block_request),
             ]
         )
 
@@ -588,8 +584,6 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            if self._blocked:
-                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -612,8 +606,6 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            if self._blocked:
-                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1702,14 +1694,6 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))
 
-    def handle_block_request(self, recv_req: BlockReqInput):
-        if recv_req.type == BlockReqType.BLOCK:
-            self._blocked = True
-        elif recv_req.type == BlockReqType.UNBLOCK:
-            self._blocked = False
-        else:
-            raise NotImplementedError(f"{recv_req=}")
-
     def save_remote_model(self, params):
         url = params["url"]
 
@@ -1958,6 +1942,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
