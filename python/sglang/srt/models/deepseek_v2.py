@@ -358,7 +358,8 @@ class DeepseekV2MoE(nn.Module):
         return (
             self.experts(
                 hidden_states=recv_hidden_states,
-                tokens_per_expert=tokens_per_expert,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
@@ -415,9 +416,8 @@ class DeepseekV2MoE(nn.Module):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         (
             state.recv_hidden_states_from_dispatch,
-            _topk_idx,
-            _topk_weights,
-            state.tokens_per_expert_from_dispatch,
+            _reorder_topk_ids,
+            _seg_indptr,
         ) = dispatcher.dispatch_stage_wait(state.state_dispatch)
 
     def _forward_tbo_substage_combine_start(self, state):
