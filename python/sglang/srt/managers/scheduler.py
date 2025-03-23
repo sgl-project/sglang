@@ -374,7 +374,7 @@ class Scheduler(
         )
 
         self.input_blocker = (
-            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
             if enable_colocated_batch_gen()
             else None
         )

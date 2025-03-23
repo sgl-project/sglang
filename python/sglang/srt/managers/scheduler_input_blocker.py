@@ -16,15 +16,18 @@ from typing import Any, List, Optional
 
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang import ServerArgs
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 
 
 class SchedulerInputBlocker:
-    def __init__(self, noop: bool):
+    def __init__(self, server_args: ServerArgs, noop: bool):
         self._state = _State.UNBLOCKED
         self._pending_reqs = []
         self._noop = noop
+        assert (
+            server_args.disable_overlap_schedule
+        ), "SchedulerInputBlocker requires overlap scheduler to be disabled"
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         assert (recv_reqs is None) == self._noop
