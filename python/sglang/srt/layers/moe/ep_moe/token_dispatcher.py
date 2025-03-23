@@ -218,11 +218,12 @@ class DeepEPDispatcher:
                 handle,
                 event,
             ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
-            self.tokens_per_expert = torch.tensor(
-                num_recv_tokens_per_expert_list,
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
+            # TODO move to below
+            # self.tokens_per_expert = torch.tensor(
+            #     num_recv_tokens_per_expert_list,
+            #     device=hidden_states.device,
+            #     dtype=torch.int64,
+            # )
         else:
             hidden_states, recv_expert_count, handle, event, hook = (
                 self.dispatch_low_latency(
@@ -232,15 +233,23 @@ class DeepEPDispatcher:
                     num_experts,
                 )
             )
+            # TODO move to below
             self.recv_expert_count = recv_expert_count
 
-        return event, handle, topk_idx, topk_weights, hidden_states, num_experts
+        return event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
 
     def dispatch_stage_wait(self, state):
-        event, handle, topk_idx, topk_weights, hidden_states, num_experts = state
+        event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = state
 
         if self.async_finish:
             event.current_stream_wait()
+
+        # TODO move from above
+        self.tokens_per_expert = torch.tensor(
+            num_recv_tokens_per_expert_list,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
 
         self.handle = handle
         self.topk_idx = topk_idx
