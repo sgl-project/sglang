@@ -373,7 +373,6 @@ class DefaultModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    logger.warning(f"{module.__class__.__name__}, {quant_method}")
                     # When quant methods need to process weights after loading
                     # (for repacking, quantizing, etc), they expect parameters
                     # to be on the global target device. This scope is for the

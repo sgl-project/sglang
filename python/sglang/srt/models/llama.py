@@ -185,8 +185,6 @@ class LlamaAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def set_kv_cache_dtype(self, kv_cache_dtype: str):
-        self.attn.kv_cache_dtype = kv_cache_dtype
 
 class LlamaDecoderLayer(nn.Module):
     def __init__(
@@ -238,9 +236,6 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-    
-    def set_kv_cache_dtype(self, kv_cache_dtype: str):
-        self.self_attn.set_kv_cache_dtype(kv_cache_dtype)
 
     def forward(
         self,
@@ -628,11 +623,6 @@ class LlamaForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         num_layers = self.config.num_hidden_layers
         self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
-    
-    def set_kv_cache_dtype(self, kv_cache_dtype: str):
-        for layer in self.model.layers:
-            if hasattr(layer, "set_kv_cache_dtype"):
-                layer.set_kv_cache_dtype(kv_cache_dtype)
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

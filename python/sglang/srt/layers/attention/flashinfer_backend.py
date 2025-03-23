@@ -6,7 +6,7 @@ Now there are two backends: FlashInfer and Triton.
 FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
-import logging
+
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -37,7 +37,7 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-logger = logging.getLogger(__name__)
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -83,6 +83,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -392,8 +393,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        k_scale = layer.k_scale_float if layer.kv_cache_dtype != "auto" else None
-        v_scale = layer.v_scale_float if layer.kv_cache_dtype != "auto" else None
+        k_scale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -462,8 +463,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        k_scale = layer.k_scale_float if layer.kv_cache_dtype != "auto" else None
-        v_scale = layer.v_scale_float if layer.kv_cache_dtype != "auto" else None
+        k_scale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
