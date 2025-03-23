@@ -5,7 +5,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import sgl_per_token_group_quant_8bit
+from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
 
 from sglang.srt.utils import is_hip
 
@@ -126,15 +126,6 @@ def sglang_per_token_group_quant_8bit(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if dst_dtype == torch.int8:
-        iinfo = torch.iinfo(dst_dtype)
-        max_8bit = iinfo.max
-        min_8bit = iinfo.min
-    else:
-        f8_info = torch.finfo(dst_dtype)
-        max_8bit = f8_info.max
-        min_8bit = f8_info.min
-
     x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
     x_s = torch.empty(
         x.shape[:-1] + (x.shape[-1] // group_size,),
@@ -142,7 +133,16 @@ def sglang_per_token_group_quant_8bit(
         dtype=torch.float32,
     )
 
-    sgl_per_token_group_quant_8bit(x, x_q, x_s, group_size, eps, min_8bit, max_8bit)
+    if dst_dtype == torch.int8:
+        iinfo = torch.iinfo(dst_dtype)
+        int8_max = iinfo.max
+        int8_min = iinfo.min
+        sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+    else:
+        f8_info = torch.finfo(dst_dtype)
+        fp8_max = f8_info.max
+        fp8_min = f8_info.min
+        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
 
