@@ -3,9 +3,9 @@ import logging
 import random
 import socket
 import time
-import pytest
 from typing import Any, List, Optional
 
+import pytest
 import ray
 import sgl_kernel.allreduce as custom_ops
 import torch
