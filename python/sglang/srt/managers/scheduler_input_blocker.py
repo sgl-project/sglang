@@ -62,14 +62,15 @@ class SchedulerInputBlocker:
 
     def _maybe_fulfill_global_unblock_barrier(self):
         if self._noop:
-            local_fulfill = True
+            local_arrived = True
         else:
-            local_fulfill = self._state == _State.GLOBAL_UNBLOCK_BARRIER
+            local_arrived = self._state == _State.GLOBAL_UNBLOCK_BARRIER
 
-        global_fulfill = torch.distributed.all_reduce(
-            torch.tensor(local_fulfill), torch.distributed.ReduceOp.MIN).item()
+        global_arrived = torch.distributed.all_reduce(
+            torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN).item()
 
-        TODO
+        if global_arrived:
+            TODO
 
     def _change_state(self, original: "_State", target: "_State"):
         assert self._state == original, f"{self._state=} {original=} {target=}"
