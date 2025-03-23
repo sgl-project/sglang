@@ -155,10 +155,8 @@ class Qwen3MoeAttention(nn.Module):
         max_position_embeddings: int = 8192,
         head_dim: Optional[int] = None,
         rms_norm_eps: float = 1e-06,
-        qkv_bias: bool = False,
+        attention_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
-        sliding_window=None,
-        max_window_layers=None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -189,7 +187,7 @@ class Qwen3MoeAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=qkv_bias,
+            bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -197,7 +195,7 @@ class Qwen3MoeAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=False,
+            bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -209,20 +207,12 @@ class Qwen3MoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-
-        self.sliding_window = (
-            sliding_window
-            if (sliding_window and self.layer_idx >= max_window_layers)
-            else None
-        )
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            sliding_window_size=self.sliding_window,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -272,7 +262,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # note: replace config.num_hidden_layers < 80 with True once its available in transformers 4.50.0
-        qkv_bias = getattr(config, "qkv_bias", config.num_hidden_layers < 80)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        rms_norm_eps = config.rms_norm_eps
+        attention_bias = config.attention_bias
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -281,10 +275,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
+            head_dim=head_dim,
+            rms_norm_eps=rms_norm_eps,
+            attention_bias=attention_bias,
             quant_config=quant_config,
-            qkv_bias=qkv_bias,
-            sliding_window=getattr(self.config, "sliding_window", None),
-            max_window_layers=config.max_window_layers,
             prefix=add_prefix("self_attn", prefix),
         )
 

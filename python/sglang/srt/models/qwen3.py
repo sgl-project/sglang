@@ -88,6 +88,7 @@ class Qwen3Attention(nn.Module):
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = None,
+        attention_bias: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -121,14 +122,14 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=False,
+            bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -201,6 +202,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
+            attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen3MLP(
