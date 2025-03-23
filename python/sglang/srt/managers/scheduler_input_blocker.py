@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 
 
@@ -69,14 +70,10 @@ class SchedulerInputBlocker:
         )
 
     def _compute_global_unblock_barrier(self):
-        if self._noop:
-            local_arrived = True
-        else:
-            local_arrived = self._state == _State.GLOBAL_UNBLOCK_BARRIER
-
-        return torch.distributed.all_reduce(
-            torch.tensor(local_arrived), torch.distributed.ReduceOp.MIN
-        ).item()
+        local_arrived = self._noop or (self._state == _State.GLOBAL_UNBLOCK_BARRIER)
+        global_arrived = torch.tensor(local_arrived).cuda()
+        torch.distributed.all_reduce(global_arrived, torch.distributed.ReduceOp.MIN)
+        return global_arrived.cpu().item()
 
     def _handle_arrive_unblock_barrier(self):
         self._change_state(
