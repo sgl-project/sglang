@@ -32,7 +32,7 @@ class SchedulerInputBlocker:
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
 
-        self._maybe_fulfill_awaiting_global_unblock()
+        self._maybe_fulfill_global_unblock_barrier()
 
         if not self._noop:
             return output_reqs
@@ -58,13 +58,13 @@ class SchedulerInputBlocker:
         self._change_state(original=_State.UNBLOCKED, target=_State.BLOCKED)
 
     def _execute_unblock_req(self):
-        self._change_state(original=_State.BLOCKED, target=_State.AWAITING_GLOBAL_UNBLOCK)
+        self._change_state(original=_State.BLOCKED, target=_State.GLOBAL_UNBLOCK_BARRIER)
 
-    def _maybe_fulfill_awaiting_global_unblock(self):
+    def _maybe_fulfill_global_unblock_barrier(self):
         if self._noop:
             local_fulfill = True
         else:
-            local_fulfill = self._state == _State.AWAITING_GLOBAL_UNBLOCK
+            local_fulfill = self._state == _State.GLOBAL_UNBLOCK_BARRIER
 
         global_fulfill = torch.distributed.all_reduce(
             torch.tensor(local_fulfill), torch.distributed.ReduceOp.MIN).item()
@@ -79,4 +79,4 @@ class SchedulerInputBlocker:
 class _State(Enum):
     UNBLOCKED = auto()
     BLOCKED = auto()
-    AWAITING_GLOBAL_UNBLOCK = auto()
+    GLOBAL_UNBLOCK_BARRIER = auto()
