@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
 """
 Support different attention backends.
 Now there are three backends: FlashInfer, Triton and FlashAttention.
@@ -18,7 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_with_kvcache
 
 
 @dataclass
@@ -45,7 +47,6 @@ class FlashAttentionBackend(AttentionBackend):
         super().__init__()
 
         # Parse constants
-        self.max_context_len = model_runner.model_config.context_len
         self.is_multimodal = model_runner.model_config.is_multimodal
 
         assert not (
@@ -64,6 +65,7 @@ class FlashAttentionBackend(AttentionBackend):
         """Initialize forward metadata to cache repetitive calculations."""
         # Create metadata based on forward mode
         metadata = FlashAttentionMetadata()
+
         extend_seq_lens = forward_batch.extend_seq_lens
         # Get sequence information
         seqlens_in_batch = forward_batch.seq_lens
@@ -213,19 +215,21 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int):
         """Initialize CUDA graph state for the attention backend.
-        
+
         Args:
             max_bs (int): Maximum batch size to support in CUDA graphs
-            
+
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
-        """        
+        """
         # Initialize fixed size tensors for decode operations
-        self.decode_cuda_graph_metadata = {          
+        self.decode_cuda_graph_metadata = {
             # Page table for token mapping (batch_size, max_context_len)
-            "page_table": torch.zeros(max_bs, self.max_context_len,  dtype=torch.int32, device=self.device),
+            "page_table": torch.zeros(
+                max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+            ),
         }
-        
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -244,11 +248,13 @@ class FlashAttentionBackend(AttentionBackend):
         device = seq_lens.device
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-        ) 
+        )
         # Precompute maximum sequence length
         metadata.max_seq_len_k = seq_lens.max().item()
         # Precompute page table
-        metadata.page_table = self.decode_cuda_graph_metadata["page_table"][req_pool_indices, :]
+        metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
+            req_pool_indices, :
+        ]
         if forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -277,11 +283,15 @@ class FlashAttentionBackend(AttentionBackend):
         device = seqlens_in_batch.device
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-        ) 
+        )
         # Precompute maximum sequence length
         metadata.max_seq_len_k = seqlens_in_batch.max().item()
-        metadata.page_table.fill_(0)  # QQ NOTE: since we do inplace so need a clear to avoid pollution by previous round?
-        metadata.page_table[:, : metadata.max_seq_len_k].copy_(self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k])
+        metadata.page_table.fill_(
+            0
+        )  # QQ NOTE: since we do inplace so need a clear to avoid pollution by previous round?
+        metadata.page_table[:, : metadata.max_seq_len_k].copy_(
+            self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
+        )
         self.forward_decode_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):

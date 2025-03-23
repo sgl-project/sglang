@@ -13,16 +13,28 @@ class MockModelRunner:
         "ModelConfig", (), {"context_len": 2048, "is_multimodal": False}
     )
     sliding_window_size = None
-    req_to_token_pool = type("TokenPool", (), {"size": 32})
 
     def __init__(self, device="cuda"):
         self.device = device
+        # Create a proper req_to_token_pool with the req_to_token attribute
+        self.req_to_token_pool = type(
+            "TokenPool",
+            (),
+            {
+                "size": 160,  # a typical max_bs * max_context_len for cuda graph decode
+                "req_to_token": torch.zeros(
+                    160, 2048, dtype=torch.int32, device=device
+                ),  # Add req_to_token attribute
+            },
+        )
 
 
 class MockReqToTokenPool:
     def __init__(self, batch_size, seq_len, device):
-        self.req_to_token = torch.arange(batch_size * seq_len, device=device).reshape(
-            batch_size, seq_len
+        self.req_to_token = (
+            torch.arange(batch_size * seq_len, device=device)
+            .reshape(batch_size, seq_len)
+            .to(torch.int32)
         )
 
 
@@ -124,8 +136,9 @@ class TestFlashAttentionBackend(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             req_pool_indices=torch.arange(self.batch_size, device=self.device),
             seq_lens=torch.tensor([self.seq_len] * self.batch_size, device=self.device),
-            extend_prefix_lens=torch.tensor([2] * self.batch_size, device=self.device),
-            extend_seq_lens=torch.tensor([2] * self.batch_size, device=self.device),
+            # 0 prefix, 4 extend
+            extend_prefix_lens=torch.tensor([0] * self.batch_size, device=self.device),
+            extend_seq_lens=torch.tensor([4] * self.batch_size, device=self.device),
             attn_backend=self.backend,
         )
 
@@ -136,6 +149,9 @@ class TestFlashAttentionBackend(unittest.TestCase):
         forward_batch.token_to_kv_pool = self._create_kv_pool(
             self.batch_size * self.seq_len
         )
+
+        # Initialize forward metadata before running the attention
+        self.backend.init_forward_metadata(forward_batch)
 
         # Run forward_extend
         output = self.backend.forward_extend(q, k, v, layer, forward_batch)
@@ -196,9 +212,11 @@ class TestFlashAttentionBackend(unittest.TestCase):
             layer.v_scale,
         )
 
+        # Initialize forward metadata before running the attention
+        self.backend.init_forward_metadata(forward_batch)
+
         # Run forward_decode
         output = self.backend.forward_decode(q, k, v, layer, forward_batch)
-        output_ref = self.backend.forward_decode_v0(q, k, v, layer, forward_batch)
 
         # Verify output
         expected_shape = (self.batch_size, self.num_heads * self.head_dim)
@@ -277,6 +295,9 @@ class TestFlashAttentionBackend(unittest.TestCase):
             layer.k_scale,
             layer.v_scale,
         )
+
+        # Initialize forward metadata before running the attention
+        self.backend.init_forward_metadata(forward_batch)
 
         # Run forward_extend
         output = self.backend.forward_extend(q, k, v, layer, forward_batch)
