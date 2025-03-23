@@ -34,15 +34,15 @@ def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int):
 def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
     import nvtx
 
-    with nvtx.annotate(f"forward-bs{forward_batch.batch_size}-tok{forward_batch.input_ids.shape[0]}"):
-        torch.cuda.synchronize()
-        start_time = time.time()
-        try:
+    torch.cuda.synchronize()
+    start_time = time.time()
+    try:
+        with nvtx.annotate(f"forward-bs{forward_batch.batch_size}-tok{forward_batch.input_ids.shape[0]}"):
             yield
-        finally:
-            torch.cuda.synchronize()
-            latency = time.time() - start_time
-            _write_output(forward_batch, latency, start_time, tp_rank)
+    finally:
+        torch.cuda.synchronize()
+        latency = time.time() - start_time
+        _write_output(forward_batch, latency, start_time, tp_rank)
 
 
 def _write_output(forward_batch, latency, start_time, tp_rank):
