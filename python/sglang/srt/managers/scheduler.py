@@ -1849,7 +1849,7 @@ class Scheduler(
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
 
-        if "CUDART" in activities:
+        if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
         if num_steps:
@@ -1881,7 +1881,7 @@ class Scheduler(
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
-        if "CUDART" in activities:
+        if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStop()
 
         logger.info(
