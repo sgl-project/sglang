@@ -21,6 +21,10 @@ class XpuCommunicator:
         dist.all_reduce(x, group=self.group)
         return x
 
+    # def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+    #     dist.reduce_scatter(x, group=self.group)
+    #     return x
+
     def gather(
         self, input_: torch.Tensor, rank_in_group: int, dst: int = 0, dim: int = -1
     ):

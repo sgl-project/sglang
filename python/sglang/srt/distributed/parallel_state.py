@@ -139,6 +139,25 @@ if supports_custom_op():
         fake_impl=outplace_all_reduce_fake,
     )
 
+    """
+    def inplace_reduce_scatter(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._reduce_scatter_in_place(output, input)
+
+    def inplace_reduce_scatter_fake(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="inplace_reduce_scatter",
+        op_func=inplace_reduce_scatter,
+        mutates_args=["tensor"],
+        fake_impl=inplace_reduce_scatter_fake,
+    )
+    """
+
     def reg_all_gather_into_tensor(
         output: torch.Tensor, input: torch.Tensor, group_name: str
     ) -> None:
@@ -438,7 +457,23 @@ class GroupCoordinator:
             pynccl_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
+    
 
+    def reduce_scatter(
+        self, 
+        input_: torch.Tensor, 
+        split_size_or_sections: Optional[Union[int, List[int]]] = None
+    ) -> None:
+
+        # NOTE: different backends support different features.
+        # pynccl: even scatter
+        # torch.dist:
+        #   reduce_scatter: uneven scatter
+        #   reduce_scatter_tensor: even scatter
+
+        # TODO(ch-wan)
+        pass 
+        
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:

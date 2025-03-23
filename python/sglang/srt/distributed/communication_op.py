@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 
 import torch
 import torch.distributed
@@ -11,6 +11,16 @@ from .parallel_state import get_tp_group
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
+
+
+def tensor_model_parallel_reduce_scatter(
+    input_: torch.Tensor, 
+    split_size_or_sections: Optional[Union[int, List[int]]] = None
+) -> torch.Tensor:
+    """Reduce-scatter the input tensor across model parallel group."""
+    # TODO(ch-wan)
+    pass
+    # return get_tp_group().reduce_scatter(input_, split_size_or_sections)
 
 
 def tensor_model_parallel_all_gather(

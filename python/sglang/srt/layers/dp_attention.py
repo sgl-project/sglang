@@ -249,3 +249,8 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+def tp_reduce_scatter(input_: torch.Tensor):
+    # TODO(ch-wan)
+    pass
+    # return get_attention_tp_group().reduce_scatter(input_)

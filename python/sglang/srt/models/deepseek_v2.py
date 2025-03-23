@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
+    tp_reduce_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -1061,30 +1062,31 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if global_server_args_dict["enable_deepep_moe"] and isinstance(self.mlp, DeepseekV2MoE):
+            return self.forward_ffn_deepep(hidden_states, forward_batch, residual)
+        else:
+            return self.forward_ffn_normal(hidden_states, forward_batch, residual)
+
+    def forward_ffn_normal(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
             if self.dp_size != 1:
-                if global_server_args_dict["enable_deepep_moe"] and isinstance(
-                    self.mlp, DeepseekV2MoE
-                ):
-                    if hidden_states.shape[0] != 0:
-                        hidden_states, residual = self.post_attention_layernorm(
-                            hidden_states, residual
-                        )
-                    hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
-                    return hidden_states, residual
-                else:
-                    if get_attention_tp_rank() == 0:
-                        hidden_states += residual
-                    hidden_states, local_hidden_states = (
-                        forward_batch.gathered_buffer,
-                        hidden_states,
-                    )
-                    dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                    dp_scatter(residual, hidden_states, forward_batch)
-                    hidden_states = self.post_attention_layernorm(hidden_states)
+                if get_attention_tp_rank() == 0:
+                    hidden_states += residual
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch)
+                hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states, residual = self.post_attention_layernorm(
@@ -1098,6 +1100,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
+        # TODO(ch-wan): ues reduce-scatter in MLP to avoid this scatter
         # Scatter
         if self.dp_size != 1:
             # important: forward batch.gathered_buffer is used both after scatter and after gather.
@@ -1108,6 +1111,25 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
 
+        return hidden_states, residual
+    
+    
+    def forward_ffn_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.dp_size != get_attention_tp_size():
+            # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
+            # can we reuse the buffer from dp attn?
+            raise NotImplementedError
+            # tp_reduce_scatter(hidden_states)
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
         return hidden_states, residual
 
 

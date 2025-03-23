@@ -28,6 +28,15 @@ class HpuCommunicator:
         dist.all_reduce(x, group=self.group)
         return x
 
+    def reduce_scatter(
+        self, 
+        x: torch.Tensor
+        split_size_or_sections: Optional[Union[int, List[int]]] = None
+    ) -> torch.Tensor:
+        htorch.core.mark_step()
+        dist.reduce_scatter(x, group=self.group)
+        return x
+
     def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         if dim < 0:
