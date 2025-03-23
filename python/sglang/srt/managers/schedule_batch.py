@@ -42,6 +42,8 @@ import triton.language as tl
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.disaggregation.conn import KVSender
+from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -49,7 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend, next_power_of_2
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -67,10 +69,12 @@ global_server_args_dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
+    "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
 }
@@ -158,9 +162,18 @@ class ImageInputs:
     # QWen2-VL related
     image_grid_thws: List[Tuple[int, int, int]] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Qwen2-VL video related
+    video_token_id: Optional[int] = None
+    video_grid_thws: List[Tuple[int, int, int]] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+
+    # deepseek vl2 related
+    image_seq_mask: Optional[List[torch.Tensor]] = None
+    image_spatial_crop: Optional[List[torch.Tensor]] = None
 
     # The id of the single-image placeholder token
     im_token_id: Optional[torch.Tensor] = None
+
     # All the images in the batch should share the same special image
     # bound token ids.
     im_start_id: Optional[int] = None
@@ -191,6 +204,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
             "im_token_id",
             "im_start_id",
             "im_end_id",
@@ -206,6 +221,9 @@ class ImageInputs:
         return ret
 
     def merge(self, other):
+        """
+        merge image inputs when requests are being merged
+        """
         assert self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
         self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
 
@@ -224,6 +242,8 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "image_seq_mask",
+            "image_spatial_crop",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
@@ -378,6 +398,24 @@ class Req:
         self.spec_verify_ct = 0
         self.lora_path = lora_path
 
+        # For disaggregation
+        self.bootstrap_host: str = "0.0.0.0"
+        self.bootstrap_room: Optional[int] = None
+        self.disagg_kv_sender: Optional[KVSender] = None
+
+        # used for warmup because we don't have a pair yet when init
+        self.skip_kv_transfer: bool = False
+        # the start index of the sent kv cache
+        # We want to send it chunk by chunk for chunked prefill.
+        # After every chunk forward, we do the following:
+        # kv_send(req.input_ids[req.start_send_idx:len(req.fill_ids)])
+        # start_send_idx = len(req.fill_ids)
+        self.start_send_idx: int = 0
+
+        self.metadata_buffer_index: int = -1
+        # The first output_id transferred from prefill instance.
+        self.transferred_output_id: Optional[int] = None
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -513,7 +551,7 @@ bid = 0
 
 
 @dataclasses.dataclass
-class ScheduleBatch:
+class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
@@ -840,6 +878,8 @@ class ScheduleBatch:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
 
+            if req.is_retracted:
+                req.already_computed = 0
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
@@ -1244,14 +1284,14 @@ class ScheduleBatch:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
 
-        self.req_pool_indices = torch.concat(
+        self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            self.output_ids = torch.concat([self.output_ids, other.output_ids])
+            self.output_ids = torch.cat([self.output_ids, other.output_ids])
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -1273,7 +1313,10 @@ class ScheduleBatch:
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            if global_server_args_dict["enable_flashinfer_mla"]:
+            if (
+                global_server_args_dict["enable_flashinfer_mla"]
+                or global_server_args_dict["enable_flashmla"]
+            ):
                 decode_seq_lens = self.seq_lens.cpu()
             else:
                 decode_seq_lens = None

@@ -5,9 +5,11 @@ Currently, this repository contains the code to reproduce the following scores.
 | Datasets                 | SGLang   | QwQ-32B-official |
 |--------------------------|----------|------------------|
 | AIME24                   | 79.74    | 79.5             |
-| AIME25                   |          | 69.5             |
-| LiveCodeBench 2408-2502  | 61.9     | 63.4             |
-| IFeval(Strict Prompt Acc)|          | 83.9             |
+| AIME25                   |  N/A     | 69.5             |
+| LiveCodeBench 2408-2502  |  N/A     | 63.4             |
+| IFeval(Strict Prompt Acc)|  N/A     | 83.9             |
+
+Note that each benchmark would take hours to evaluate. `N/A` indicates that we do not have time and abundant compute resources to test.
 
 Kindly remind that, even with `n_samples` set the same as QwQ officially recommended, there's still some deviation in the results. For less deviation in the results please increase `n_samples` to a higher value.
 
