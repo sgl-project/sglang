@@ -18,9 +18,10 @@ from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 
 
 class SchedulerInputBlocker:
-    def __init__(self):
+    def __init__(self, noop: bool):
         self._state = _State.UNBLOCKED
         self._pending_reqs = []
+        self._noop = noop
 
     def handle(self, recv_reqs: Optional[List[Any]]):
         output_reqs = []

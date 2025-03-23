@@ -32,8 +32,6 @@ import psutil
 import setproctitle
 import torch
 import zmq
-from torch.distributed import barrier
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
@@ -128,6 +126,7 @@ from sglang.srt.utils import (
     suppress_other_loggers, ENABLE_COLOCATED_BATCH_GEN,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from torch.distributed import barrier
 
 logger = logging.getLogger(__name__)
 
@@ -372,7 +371,7 @@ class Scheduler(
             enable=server_args.enable_memory_saver
         )
 
-        self.input_blocker = SchedulerInputBlocker() if ENABLE_COLOCATED_BATCH_GEN else None
+        self.input_blocker = SchedulerInputBlocker(noop=self.attn_tp_rank != 0) if ENABLE_COLOCATED_BATCH_GEN else None
 
         # Init profiler
         self.torch_profiler = None
