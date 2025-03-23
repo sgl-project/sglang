@@ -730,9 +730,9 @@ def _wait_and_warmup(
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [10, 11, 12]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
     else:
-        json_data["text"] = "The capital city of France is"
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -743,14 +743,13 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        for i in range(server_args.dp_size):
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
+        res = requests.post(
+            url + request_name,
+            json=json_data,
+            headers=headers,
+            timeout=600,
+        )
+        assert res.status_code == 200, f"{res}"
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
