@@ -197,6 +197,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         )):
             if bench_args.profile and index == bench_args.profile_skip_cases:
+                print('Execute start_profile')
                 requests.post(base_url + "/start_profile",
                               json={"activities": bench_args.profile_activities}).raise_for_status()
             run_one_case(
@@ -208,6 +209,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.result_filename,
             )
         if bench_args.profile:
+            print('Execute stop_profile')
             requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
