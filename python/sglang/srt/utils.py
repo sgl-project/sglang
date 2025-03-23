@@ -188,6 +188,10 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__()
 
 
+def enable_colocated_batch_gen():
+    return get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false")
+
+
 def enable_show_time_cost():
     global show_time_cost
     show_time_cost = True
