@@ -45,7 +45,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
@@ -101,7 +100,7 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
-    kill_process_tree,
+    kill_process_tree, ENABLE_COLOCATED_BATCH_GEN,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -544,7 +543,7 @@ class TokenizerManager:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             # Send all requests
-            if _ENABLE_COLOCATED_BATCH_GEN:
+            if ENABLE_COLOCATED_BATCH_GEN:
                 self._send_block_request(BlockReqType.BLOCK)
             for i in range(batch_size):
                 tmp_obj = obj[i]
@@ -552,7 +551,7 @@ class TokenizerManager:
                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj, request))
                 rids.append(tmp_obj.rid)
-            if _ENABLE_COLOCATED_BATCH_GEN:
+            if ENABLE_COLOCATED_BATCH_GEN:
                 self._send_block_request(BlockReqType.UNBLOCK)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -948,8 +947,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
@@ -1200,8 +1199,3 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
-
-
-_ENABLE_COLOCATED_BATCH_GEN = get_bool_env_var(
-    "SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false"
-)
