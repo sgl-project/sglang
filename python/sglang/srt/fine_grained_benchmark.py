@@ -34,7 +34,17 @@ def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int):
 def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
     import nvtx
 
-    debug_name = f"forward-{forward_batch.forward_mode.name}-bs{forward_batch.batch_size}-tok{forward_batch.input_ids.shape[0]}"
+    num_tokens = forward_batch.input_ids.shape[0]
+    global_num_tokens = sum(
+        forward_batch.global_num_tokens_cpu) if forward_batch.global_num_tokens_cpu is not None else None
+    debug_name = (
+        f"forward"
+        f"-{forward_batch.forward_mode.name}"
+        f"-bs{forward_batch.batch_size}"
+        f"-tok{num_tokens}"
+        f"-gtok{global_num_tokens}"
+    )
+
     torch.cuda.synchronize()
     start_time = time.time()
     with nvtx.annotate(debug_name):
@@ -43,25 +53,24 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
         finally:
             torch.cuda.synchronize()
             latency = time.time() - start_time
-            _write_output(forward_batch, latency, start_time, tp_rank)
+            debug_info = dict(
+                forward_mode=forward_batch.forward_mode.name,
+                throughput=num_tokens / latency,
+                latency=latency,
+                batch_size=forward_batch.batch_size,
+                num_tokens=num_tokens,
+                global_num_tokens=global_num_tokens,
+                # can_run_tbo=forward_batch.can_run_tbo, # TODO enable in tbo PR
+                start_time=start_time,
+                tp_rank=tp_rank,
+            )
+            _write_output(debug_info, tp_rank)
 
 
-def _write_output(forward_batch, latency, start_time, tp_rank):
-    num_tokens = forward_batch.input_ids.shape[0]
-    data = json.dumps(
-        dict(
-            forward_mode=forward_batch.forward_mode.name,
-            throughput=num_tokens / latency,
-            latency=latency,
-            start_time=start_time,
-            batch_size=forward_batch.batch_size,
-            num_tokens=num_tokens,
-            tp_rank=tp_rank,
-        )
-    )
+def _write_output(data, tp_rank):
     path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
     with path.open("a") as fp:
-        fp.write(f"{data}\n")
+        fp.write(f"{json.dumps(data)}\n")
 
 
 def clear_output():
