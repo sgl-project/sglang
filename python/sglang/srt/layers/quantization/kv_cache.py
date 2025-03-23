@@ -48,48 +48,43 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
-        # regardless whether the kv-scale is available in the checkpoint.
-        # No need to process kv scales after loading if we are going to
-        # calculate them on the fly.
-        if layer.kv_cache_dtype != "auto":
-            if layer.k_scale > 0.0 and layer.v_scale > 0.0:
-                # We prefer to use separate k_scale and v_scale if present
-                k_scale = layer.k_scale.to("cpu").tolist()
-                v_scale = layer.v_scale.to("cpu").tolist()
-                if _is_hip and self.is_fp8_fnuz():
-                    k_scale *= 2
-                    v_scale *= 2
-            elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-                # If no scales were loaded (both scales are invalid negative
-                # values), use the default value of 1.0
-                k_scale = 1.0
-                v_scale = 1.0
-            else:
-                # If we find a single kv_scale in the checkpoint, we remap
-                # kv_scale to k_scale during weight loading, and duplicate
-                # k_scale to v_scale here
-                assert layer.k_scale > 0.0
-                scale_to_duplicate = max(layer.k_scale, layer.v_scale)
-                k_scale = scale_to_duplicate.to("cpu").tolist()
-                v_scale = scale_to_duplicate.to("cpu").tolist()
-                if _is_hip and self.is_fp8_fnuz():
-                    k_scale *= 2
-                    v_scale *= 2
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            # We prefer to use separate k_scale and v_scale if present
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if _is_hip and self.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            # If no scales were loaded (both scales are invalid negative
+            # values), use the default value of 1.0
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            # If we find a single kv_scale in the checkpoint, we remap
+            # kv_scale to k_scale during weight loading, and duplicate
+            # k_scale to v_scale here
+            assert layer.k_scale > 0.0
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if _is_hip and self.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
 
-            if not isinstance(k_scale, float) or not isinstance(v_scale, float):
-                raise ValueError(
-                    "Only support per-tensor scaling factor " "for fp8 KV cache"
-                )
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError(
+                "Only support per-tensor scaling factor " "for fp8 KV cache"
+            )
 
-            # These are used in the final Attention.forward()
-            layer.k_scale.copy_(k_scale)
-            layer.v_scale.copy_(v_scale)
-            layer.k_scale_float = k_scale
-            layer.v_scale_float = v_scale
-            if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
-                logger.warning(
-                    "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
-                    "may cause accuracy issues. Please make sure k/v_scale "
-                    "scaling factors are available in the fp8 checkpoint."
-                )
+        # These are used in the final Attention.forward()
+        layer.k_scale.copy_(k_scale)
+        layer.v_scale.copy_(v_scale)
+        layer.k_scale_float = k_scale
+        layer.v_scale_float = v_scale
+        if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
+            logger.warning(
+                "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
+                "may cause accuracy issues. Please make sure k/v_scale "
+                "scaling factors are available in the fp8 checkpoint."
+            )

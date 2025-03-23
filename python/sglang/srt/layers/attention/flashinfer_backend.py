@@ -6,7 +6,7 @@ Now there are two backends: FlashInfer and Triton.
 FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
-
+import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -37,7 +37,7 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
-
+logger = logging.getLogger(__name__)
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -392,6 +392,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        k_scale = layer.k_scale_float if layer.kv_cache_dtype != "auto" else None
+        v_scale = layer.v_scale_float if layer.kv_cache_dtype != "auto" else None
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -408,7 +410,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale_float, layer.v_scale_float
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
 
             o = prefill_wrapper_paged.forward(
@@ -418,8 +420,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float_float,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -446,7 +448,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale_float, layer.v_scale_float
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -460,6 +462,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        k_scale = layer.k_scale_float if layer.kv_cache_dtype != "auto" else None
+        v_scale = layer.v_scale_float if layer.kv_cache_dtype != "auto" else None
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -473,7 +477,7 @@ class FlashInferAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale_float, layer.v_scale_float
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         o = decode_wrapper.forward(
@@ -481,8 +485,8 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
