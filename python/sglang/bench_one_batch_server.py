@@ -21,6 +21,7 @@ from typing import Tuple
 
 import numpy as np
 import requests
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -61,12 +62,17 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
-            "--profile-activities", type=str, nargs="+", default=BenchArgs.profile_activities
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=BenchArgs.profile_activities,
         )
-        parser.add_argument("--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases)
+        parser.add_argument(
+            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -193,13 +199,17 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     # benchmark
     try:
-        for index, (bs, il, ol) in enumerate(itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
-        )):
+        for index, (bs, il, ol) in enumerate(
+            itertools.product(
+                bench_args.batch_size, bench_args.input_len, bench_args.output_len
+            )
+        ):
             if bench_args.profile and index == bench_args.profile_skip_cases:
-                print('Execute start_profile')
-                requests.post(base_url + "/start_profile",
-                              json={"activities": bench_args.profile_activities}).raise_for_status()
+                print("Execute start_profile")
+                requests.post(
+                    base_url + "/start_profile",
+                    json={"activities": bench_args.profile_activities},
+                ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -209,7 +219,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.result_filename,
             )
         if bench_args.profile:
-            print('Execute stop_profile')
+            print("Execute stop_profile")
             requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:

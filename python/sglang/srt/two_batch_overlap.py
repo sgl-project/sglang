@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -71,8 +72,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
-        )
+                forward_batch.tbo_children
+            )
         ]
     )
 
@@ -152,8 +153,11 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        stage_name_brief = (stage.__name__.replace('_forward_tbo_stage_', '')
-                            .replace('prefill', 'P').replace('decode', 'D'))
+        stage_name_brief = (
+            stage.__name__.replace("_forward_tbo_stage_", "")
+            .replace("prefill", "P")
+            .replace("decode", "D")
+        )
         debug_name = f"{self._debug_name}{self._index}-{stage_name_brief}"
         if _ENABLE_PROFILE:
             ctx = nvtx.annotate(debug_name)
