@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -331,6 +332,32 @@ class ForwardBatch:
 
         return ret
 
+    def get_merged_image_inputs(self) -> Optional[ImageInputs]:
+        """
+        Merge all image inputs in the batch into a single ImageInputs object.
+
+        Returns:
+            if none, current batch contains no image input
+
+        """
+        if not self.image_inputs or all(x is None for x in self.image_inputs):
+            return None
+
+        # Filter out None values
+        valid_inputs = [x for x in self.image_inputs if x is not None]
+
+        # Start with the first valid image input
+        merged = valid_inputs[0]
+
+        # Merge remaining inputs
+        for img_input in valid_inputs[1:]:
+            merged.merge(img_input)
+
+        if isinstance(merged.pixel_values, np.ndarray):
+            merged.pixel_values = torch.from_numpy(merged.pixel_values)
+
+        return merged
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -375,15 +402,22 @@ class ForwardBatch:
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
                             image_grid_thw=image_inputs.image_grid_thws,
+                            video_grid_thw=image_inputs.video_grid_thws,
+                            image_token_id=image_inputs.im_token_id,
+                            video_token_id=image_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
+                            vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
+                            seq_len=len(self.input_ids),
+                            second_per_grid_ts=image_inputs.second_per_grid_ts,
+                            tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
 
-        self.mrope_positions = torch.concat(
+        self.mrope_positions = torch.cat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
         )
@@ -449,7 +483,7 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
-    positions = torch.concat(
+    positions = torch.cat(
         [
             torch.arange(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
