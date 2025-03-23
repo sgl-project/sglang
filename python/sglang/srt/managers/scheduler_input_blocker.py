@@ -31,10 +31,10 @@ class SchedulerInputBlocker:
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
             if recv_req.type == BlockReqType.BLOCK:
-                self._execute_block_request()
+                self._execute_block_req()
                 return []
             elif recv_req.type == BlockReqType.UNBLOCK:
-                self._execute_unblock_request()
+                self._execute_unblock_req()
                 return []
             else:
                 raise NotImplementedError(f"{recv_req=}")
@@ -45,10 +45,10 @@ class SchedulerInputBlocker:
                 self._pending_reqs.append(recv_req)
                 return []
 
-    def _execute_block_request(self):
+    def _execute_block_req(self):
         TODO
 
-    def _execute_unblock_request(self):
+    def _execute_unblock_req(self):
         TODO
 
 
