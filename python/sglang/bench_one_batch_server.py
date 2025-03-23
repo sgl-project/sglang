@@ -21,7 +21,6 @@ from typing import Tuple
 
 import numpy as np
 import requests
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -38,6 +37,7 @@ class BenchArgs:
     base_url: str = ""
     skip_warmup: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CUDA_PROFILER",)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -60,7 +60,10 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        )
+        parser.add_argument(
+            "--profile-activities", type=str, nargs="+", default=BenchArgs.profile_activities
         )
 
     @classmethod
@@ -189,7 +192,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     # benchmark
     try:
         if bench_args.profile:
-            requests.post(base_url + "/start_profile").raise_for_status()
+            requests.post(base_url + "/start_profile", json={"activities": ["CUDA_PROFILER"]}).raise_for_status()
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
