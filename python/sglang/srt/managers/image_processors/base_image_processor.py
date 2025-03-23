@@ -4,14 +4,14 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Union
 
 import PIL
 import transformers
 from decord import VideoReader, cpu
+from openai import BadRequestError
 from PIL import Image
 
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import load_image
 from sglang.utils import logger
 
@@ -31,14 +31,25 @@ class BaseImageProcessorOutput:
     # input_text, with each frame of video/image represented as an image_token
     input_text: str
 
+    def normalize(self):
+        for field_name in ["data_hashes", "image_sizes", "all_frames"]:
+            field = getattr(self, field_name, None)
+            if field is not None and isinstance(field, list) and len(field) == 0:
+                setattr(self, field_name, None)
+
 
 class BaseImageProcessor(ABC):
+    models = []
+
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
         self.server_args = server_args
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
+
+        # Initialize global processor first
+        init_global_processor(self, server_args)
 
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
@@ -113,7 +124,7 @@ class BaseImageProcessor(ABC):
         self,
         input_ids: list[int],
         image_data,
-        image_token: str,
+        image_token: Union[int, str],
         max_req_input_len: int,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
@@ -122,9 +133,16 @@ class BaseImageProcessor(ABC):
         Each frame of video/image will be replaced by a single image token
 
         Args:
+            image_token: The token ID representing the image placeholder.
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
+        if isinstance(image_token, int):
+            image_token_str = self._processor.tokenizer.convert_ids_to_tokens(
+                image_token
+            )
+        else:
+            image_token_str = image_token
 
         if isinstance(input_ids, list) and return_text:
             assert len(input_ids) and isinstance(input_ids[0], int)
@@ -190,13 +208,11 @@ class BaseImageProcessor(ABC):
                     new_text += text_part
 
             except Exception as e:
-                import openai
 
                 logger.error(f"An exception occurred while loading images: {e}")
                 raise BadRequestError(
                     f"An exception occurred while loading images: {e}"
                 )
-                continue
 
         return BaseImageProcessorOutput(
             image_hashes=hashes,
@@ -204,6 +220,8 @@ class BaseImageProcessor(ABC):
             all_frames=images,
             input_text=new_text,
         )
+        out.normalize()
+        return out
 
 
 class DummyImageProcessor(BaseImageProcessor):
@@ -214,9 +232,7 @@ class DummyImageProcessor(BaseImageProcessor):
         return None
 
 
-def init_global_processor(
-    sglang_image_processor: BaseImageProcessor, server_args: ServerArgs
-):
+def init_global_processor(sglang_image_processor: BaseImageProcessor, server_args):
     """Init the global processor for multi-modal models."""
     global global_processor
     transformers.logging.set_verbosity_error()
