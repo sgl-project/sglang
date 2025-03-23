@@ -24,10 +24,15 @@ class SchedulerInputBlocker:
         self._noop = noop
 
     def handle(self, recv_reqs: Optional[List[Any]]):
-        output_reqs = []
-        for recv_req in recv_reqs:
-            output_reqs += self._handle_recv_req(recv_req)
-        return output_reqs
+        assert (recv_reqs is None) == self._noop
+
+        if not self._noop:
+            output_reqs = []
+            for recv_req in recv_reqs:
+                output_reqs += self._handle_recv_req(recv_req)
+
+        if not self._noop:
+            return output_reqs
 
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
