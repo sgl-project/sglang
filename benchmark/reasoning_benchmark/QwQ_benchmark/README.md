@@ -13,14 +13,12 @@ Kindly remind that, even with `n_samples` set the same as QwQ officially recomme
 
 ## Download repo
 ```
-git submodule init
-git submodule update
+git clone https://github.com/QwenLM/QwQ.git
 
 ```
 
 ## Run benchmark
 ```
-pip install -r requirements.txt
 python -m sglang_router.launch_server --model-path Qwen/QwQ-32B --dp-size 4 --host=0.0.0.0 --port=30000
 ```
 
