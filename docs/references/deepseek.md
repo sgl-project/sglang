@@ -18,6 +18,7 @@ SGLang is recognized as one of the top engines for [DeepSeek model inference](ht
 | **Quantized weights (AWQ)** | 8 x H100/800/20 |
 | | 8 x A100/A800 |
 | **Quantized weights (int8)** | 16 x A100/800 |
+| | 32 x L40S |
 
 <style>
 .md-typeset__table {
@@ -56,6 +57,7 @@ Detailed commands for reference:
 - [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
 - [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
 - [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
+- [32 x L40S (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 
 ### Download Weights
 
@@ -114,7 +116,9 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
   <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison">
 </p>
 
-**Usage**: This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). Data Parallelism Attention optimization can be enabled by `--enable-dp-attention` for DeepSeek Series Models.
+**Usage**:
+- This optimization is aimed at improving throughput and should be used for scenarios with high QPS (Queries Per Second). It can be enabled by `--enable-dp-attention` for DeepSeek models.
+- Since v0.4.4, DP and TP attention can be flexibly combined. For example, to deploy DeepSeek-V3/R1 on 2 node with 8*H100, you can specify `--tp 16` and `--dp 2`, which means for attention part there are 2 DP groups, and in each DP group there are 8 TP groups.
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
@@ -141,11 +145,14 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 Add arguments `--speculative-algorithm`, `--speculative-draft-model-path`,
 `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 ```
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote --tp 8
+python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --speculative-algorithm EAGLE --speculative-draft-model-path lmsys/DeepSeek-V3-NextN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
 ```
 - The draft model are available at huggingface: [lmsys/DeepSeek-V3-NextN](https://huggingface.co/lmsys/DeepSeek-V3-NextN), [lmsys/DeepSeek-R1-NextN](https://huggingface.co/lmsys/DeepSeek-R1-NextN). It can also be exported from original DeepSeek-V3/R1 model with [export_deepseek_nextn.py](https://github.com/sgl-project/sglang/blob/main/scripts/export_deepseek_nextn.py) script.
 - The best configuratin for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
 - Currently when using flashinfer mla wrapper (`--enable-flashinfer-mla`) and speculative decoding together, the `--speculative-eagle-topk` parameter should be set to `1`.
+- To enable DeepSeek MTP for large batch sizes (>32), there are some parameters should be changed (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
+  - Adjust `--max-running-requests` to a larger number. The default value is `32` for MTP. For larger batch sizes, you should increase this value beyond the default value.
+  - Set `--cuda-graph-bs`. It's a list of batch sizes for cuda graph capture. The default captured batch sizes for speculative decoding is set [here](https://github.com/sgl-project/sglang/blob/49420741746c8f3e80e0eb17e7d012bfaf25793a/python/sglang/srt/model_executor/cuda_graph_runner.py#L126). You can include more batch sizes into it.
 
 
 ### Reasoning Content for DeepSeek R1

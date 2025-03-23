@@ -21,11 +21,12 @@ concurrency:
 
 jobs:
   accuracy-test-1-gpu-amd:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && github.event.pull_request.draft == false
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup docker
         run: |
@@ -60,11 +61,12 @@ jobs:
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 models/test_qwen_models.py
 
   mla-test-1-gpu-amd:
-    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup docker
         run: |
@@ -97,10 +99,20 @@ jobs:
           docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_mla.py
 
   finish:
+    if: always()
     needs: [
       accuracy-test-1-gpu-amd, mla-test-1-gpu-amd
     ]
     runs-on: ubuntu-latest
     steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
