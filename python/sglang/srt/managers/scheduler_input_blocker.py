@@ -25,6 +25,7 @@ class SchedulerInputBlocker:
         output_reqs = []
         for recv_req in recv_reqs:
             output_reqs += self._handle_recv_req(recv_req)
+        return output_reqs
 
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
