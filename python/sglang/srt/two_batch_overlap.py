@@ -3,7 +3,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -72,8 +71,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-                forward_batch.tbo_children
-            )
+            forward_batch.tbo_children
+        )
         ]
     )
 
@@ -103,6 +102,9 @@ def model_forward_merge_outputs(output_a, output_b):
 
 
 _ENABLE_PROFILE = bool(int(os.environ.get("SGLANG_TBO_ENABLE_PROFILE", "0")))
+
+if _ENABLE_PROFILE:
+    import nvtx
 
 
 def model_forward_execute_two_batch(
@@ -150,9 +152,9 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        debug_name = f"Stage-{self._debug_name}-{self._index}-{stage.__name__}"
+        debug_name = f"{self._debug_name}-{self._index}-{stage.__name__}"
         if _ENABLE_PROFILE:
-            ctx = torch.profiler.record_function(debug_name)
+            ctx = nvtx.annotate(debug_name)
         else:
             ctx = nullcontext()
 
@@ -185,7 +187,7 @@ class _StateDict:
         self._data = {}
 
     def __setattr__(self, key, value):
-        if key == '_data':
+        if key == "_data":
             super().__setattr__(key, value)
             return
         assert (
