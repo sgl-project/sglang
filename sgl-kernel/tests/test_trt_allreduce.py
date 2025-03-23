@@ -3,6 +3,7 @@ import logging
 import random
 import socket
 import time
+import pytest
 from typing import Any, List, Optional
 
 import ray
