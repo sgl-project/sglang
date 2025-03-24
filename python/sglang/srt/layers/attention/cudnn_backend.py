@@ -228,7 +228,10 @@ class CuDNNAttnBackend(AttentionBackend):
         stream = torch.cuda.current_stream().cuda_stream
         cudnn.set_stream(handle=self.cudnn_handle, stream=stream)
         self.cudnn_dtype = convert_to_cudnn_type(model_runner.model_config.dtype)
-        self.cudnn_version = cudnn.backend_version_string()
+        self.sm_version = (
+            torch.cuda.get_device_capability()[0] * 10
+            + torch.cuda.get_device_capability()[1]
+        )
 
         # Create CuDNN graphs for extend and decode operations
         self.extend_graph = self._create_cudnn_graph(
@@ -241,7 +244,7 @@ class CuDNNAttnBackend(AttentionBackend):
             self.head_dim,
             self.page_size,
             self.cudnn_handle,
-            self.cudnn_version,
+            self.sm_version,
             True,  # TODO: This is a design flaw, the is_causal attribute should be managed by the layer itself. This is a simplified approach that needs to be fixed.
         )
         self.extend_workspace = torch.empty(
@@ -251,8 +254,8 @@ class CuDNNAttnBackend(AttentionBackend):
         )
 
         self.decode_graph = self._create_cudnn_graph(
-            self.batch_size,
-            2,  # Should be 1, but causes an unidentified bug. Setting to 2 works correctly
+            1,
+            1,
             self.max_num_pages,
             self.max_page_per_req,
             self.num_qo_heads,
@@ -260,7 +263,7 @@ class CuDNNAttnBackend(AttentionBackend):
             self.head_dim,
             self.page_size,
             self.cudnn_handle,
-            self.cudnn_version,
+            self.sm_version,
             True,
         )
         self.decode_workspace = torch.empty(
@@ -322,7 +325,7 @@ class CuDNNAttnBackend(AttentionBackend):
         head_dim: int,
         page_size: int,
         handle: cudnn.handle,
-        cudnn_version: str,
+        sm_version: str,
         is_causal: bool,
     ):
         """Create a CuDNN graph for the SDPA operation.
@@ -337,7 +340,7 @@ class CuDNNAttnBackend(AttentionBackend):
             head_dim: Head Dimension
             page_size: Page Size
             handle: CuDNN Handle
-            cudnn_version: CuDNN Version
+            sm_version: SM Version
             is_causal: Whether to use causal attention
 
         Returns:
@@ -349,7 +352,7 @@ class CuDNNAttnBackend(AttentionBackend):
             intermediate_data_type=cudnn.data_type.FLOAT,
             compute_data_type=cudnn.data_type.FLOAT,
             handle=handle,
-            version=cudnn_version,
+            sm_version=sm_version,
         )
 
         Hqo, Hkv = qo_heads, kv_heads
@@ -515,8 +518,6 @@ class CuDNNAttnBackend(AttentionBackend):
         }
 
         graph.execute(variant_pack, workspace, handle=self.cudnn_handle)
-        torch.cuda.synchronize()
-        # TODO: We should avoid synchronization to improve performance.
 
         output = output.squeeze(0)
         output = output.movedim(output.dim() - 2, 0)
@@ -530,6 +531,7 @@ class CuDNNAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool,
+        is_decode,
         graph,
         workspace,
     ):
@@ -570,7 +572,7 @@ class CuDNNAttnBackend(AttentionBackend):
             o_start_idx,
             o_end_idx,
         ) in chunk_attention_data(
-            batch_size=self.batch_size,
+            batch_size=self.batch_size if is_decode is False else 1,
             query=q_,
             page_table_k=page_table_k_gpu,
             page_table_v=page_table_v_gpu,
@@ -612,6 +614,7 @@ class CuDNNAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             save_kv_cache,
+            False,
             graph=self.extend_graph,
             workspace=self.extend_workspace,
         )
@@ -633,6 +636,7 @@ class CuDNNAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             save_kv_cache,
+            True,
             graph=self.decode_graph,
             workspace=self.decode_workspace,
         )
