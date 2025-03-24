@@ -61,12 +61,14 @@ class ExpertDistributionRecorder:
         # the length of the dictionary is the number of layers
         # the length of the list is the number of tokens
         # the length of the tuple is topk's k value
-        self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(list)
+        self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(
+            list
+        )
         self._record = False
         self._current_layer_id = "UNKNOWN"
 
     def set_current_layer(self, layer_idx):
-         self._current_layer_id = layer_idx
+        self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
         if not self._record:
@@ -108,7 +110,10 @@ class ExpertDistributionRecorder:
             for token_record in layer_record:
                 for expert_idx in token_record:
                     results[layer_idx][expert_idx] += 1
-        with open(f"expert_distribution_rank{torch.distributed.get_rank()}_timestamp{time.time()}.csv", "w") as fd:
+        with open(
+            f"expert_distribution_rank{torch.distributed.get_rank()}_timestamp{time.time()}.csv",
+            "w",
+        ) as fd:
             fd.write("layer_id,expert_id,count\n")
             for layer_idx, layer_results in results.items():
                 for expert_idx, count in layer_results.items():
