@@ -64,5 +64,3 @@ def get_mm_processor(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
         f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
     )
-
-    self.image_proce

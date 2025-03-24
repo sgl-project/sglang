@@ -512,13 +512,18 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     import soundfile as sf
     from scipy.signal import resample
 
-    # print(f"loading {audio_file}")
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
         audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:

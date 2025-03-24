@@ -7,6 +7,7 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
     get_global_processor,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.models.llava import LlavaMistralForCausalLM, LlavaQwenForCausalLM
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
@@ -72,10 +73,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
     ):
-        if self.executor is not None:
+        if self.cpu_executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
-                self.executor,
+                self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
                 aspect_ratio,
@@ -83,7 +84,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             )
         else:
             return self._process_single_image_task(
-                image_data, aspect_ratio, grid_pinpoints
+                image_data,
+                aspect_ratio,
+                grid_pinpoints,
+                self._processor.image_processor,
             )
 
     async def process_mm_data_async(
@@ -134,14 +138,21 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 pixel_values, image_hash, image_size = await self._process_single_image(
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
-                data_hashes = [image_hash]
                 image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
-
+        modality = (
+            request_obj.modalities[0]
+            if isinstance(request_obj.modalities, list)
+            and len(request_obj.modalities) != 0
+            else "image"
+        )
         return {
-            "pixel_values": pixel_values,
-            "data_hashes": data_hashes,
-            "image_sizes": image_sizes,
-            "modalities": request_obj.modalities or ["image"],
+            "items": [
+                MultimodalDataItem(
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    modality=modality,
+                )
+            ],
         }

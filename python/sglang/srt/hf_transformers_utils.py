@@ -232,6 +232,11 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
+    if config.model_type in {"llava"}:
+        ...
+    else:
+        kwargs["use_fast"] = True
+
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,
