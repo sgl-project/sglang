@@ -145,6 +145,7 @@ class ModelRunner:
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
+                "enable_deepep_moe": server_args.enable_deepep_moe,
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
@@ -188,9 +189,6 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
-            self.torch_tp_applied = True
-        else:
-            self.torch_tp_applied = False
 
         # Init lora
         if server_args.lora_paths is not None:
@@ -275,10 +273,16 @@ class ModelRunner:
             if self.model_config.hf_config.architectures == ["DeepseekVL2ForCausalLM"]:
                 # TODO: deepseek-vl2 does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for deekseek-vl2."
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for deepseek-vl2."
                 )
                 server_args.chunked_prefill_size = -1
                 server_args.disable_radix_cache = True
+
+        if server_args.enable_deepep_moe:
+            logger.info("DeepEP is turned on.")
+            assert (
+                server_args.enable_dp_attention == True
+            ), "Currently DeepEP is bind to Attention DP. Set '--enable-dp-attention --enable-deepep-moe'"
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -624,6 +628,8 @@ class ModelRunner:
             load_config=self.load_config,
             dtype=self.dtype,
             lora_backend=self.server_args.lora_backend,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         logger.info("LoRA manager ready.")
 
@@ -862,6 +868,19 @@ class ModelRunner:
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             self.attn_backend = FlashMLABackend(self)
+        elif self.server_args.attention_backend == "fa3":
+            assert torch.cuda.get_device_capability()[0] >= 9, (
+                "FlashAttention v3 Backend requires SM>=90. "
+                "Please use `--attention-backend flashinfer`."
+            )
+            logger.warning(
+                "FlashAttention v3 Backend is in Beta. Multimodal, Page > 1, FP8, MLA and Speculative Decoding are not supported."
+            )
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            self.attn_backend = FlashAttentionBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"

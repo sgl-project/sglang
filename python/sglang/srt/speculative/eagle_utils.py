@@ -23,6 +23,8 @@ if is_cuda_available():
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
+elif is_hip():
+    from sgl_kernel import verify_tree_greedy
 
 if is_hip():
     from sgl_kernel import verify_tree_greedy

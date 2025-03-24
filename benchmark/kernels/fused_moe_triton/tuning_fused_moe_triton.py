@@ -267,6 +267,7 @@ class BenchmarkWorker:
                 topk,
                 dtype_str,
                 False,
+                block_shape,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
