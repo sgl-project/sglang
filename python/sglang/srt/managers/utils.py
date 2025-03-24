@@ -58,10 +58,15 @@ class ExpertDistributionRecorder:
         return cls.instance
 
     def __init__(self):
+        # the length of the dictionary is the number of layers
         # the length of the list is the number of tokens
         # the length of the tuple is topk's k value
-        self._expert_distribution_record: List[Tuple[int]] = []
+        self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(list)
         self._record = False
+        self._current_layer_id = "UNKNOWN"
+
+    def set_current_layer(self, layer_idx):
+         self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
         if not self._record:
@@ -69,13 +74,14 @@ class ExpertDistributionRecorder:
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
         for i in topk_ids_list:
-            self._expert_distribution_record.append(tuple(i))
+            self._expert_distribution_record[self._current_layer_id].append(tuple(i))
 
     def reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
         self._record = False
         self._expert_distribution_record.clear()
+        self._current_layer_id = "UNKNOWN"
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
@@ -96,12 +102,15 @@ class ExpertDistributionRecorder:
 
     def dump_record(self):
         """Dump the expert distribution record to a file. Reset the recorder after dumping."""
-        results = defaultdict(int)
-        for token_record in self._expert_distribution_record:
-            for expert_idx in token_record:
-                results[expert_idx] += 1
-        with open(f"expert_distribution_{time.time()}.csv", "w") as fd:
-            fd.write("expert_id,count\n")
-            for expert_idx, count in results.items():
-                fd.write(f"{expert_idx},{count}\n")
+        results = {}
+        for layer_idx, layer_record in self._expert_distribution_record.items():
+            results[layer_idx] = defaultdict(int)
+            for token_record in layer_record:
+                for expert_idx in token_record:
+                    results[layer_idx][expert_idx] += 1
+        with open(f"expert_distribution_rank{torch.distributed.get_rank()}_timestamp{time.time()}.csv", "w") as fd:
+            fd.write("layer_id,expert_id,count\n")
+            for layer_idx, layer_results in results.items():
+                for expert_idx, count in layer_results.items():
+                    fd.write(f"{layer_idx},{expert_idx},{count}\n")
         self.reset()
