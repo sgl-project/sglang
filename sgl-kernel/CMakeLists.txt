@@ -76,16 +76,15 @@ set(CUDA_NVCC_FLAGS
     "-DCUTLASS_TEST_LEVEL=0"
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
-    "--ptxas-options=-v"
     "--expt-relaxed-constexpr"
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 )
 
 option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
-option(SGL_KERNEL_ENABLE_SM90A "Enable SM90A" OFF)
-option(SGL_KERNEL_ENABLE_BF16  "Enable BF16"   ON)
-option(SGL_KERNEL_ENABLE_FP8   "Enable FP8"    ON)
+option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A" OFF)
+option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
+option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND CUDA_NVCC_FLAGS
@@ -154,13 +153,8 @@ Python_add_library(common_ops MODULE ${SOURCES} WITH_SOABI)
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
 
-target_include_directories(common_ops
-    PRIVATE
-        ${TORCH_INCLUDE_DIRS}
-)
+target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
-target_link_libraries(common_ops
-                      PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
-install(TARGETS common_ops
-        LIBRARY DESTINATION "sgl_kernel")
+install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
