@@ -238,11 +238,11 @@ class TestOpenAIServerFunctionCalling(unittest.TestCase):
         self.assertIn("a", args_obj, "Missing parameter 'a'")
         self.assertIn("b", args_obj, "Missing parameter 'b'")
         self.assertEqual(
-            args_obj["a"],
+            int(args_obj["a"]),
             5,
             "Parameter a should be 5",
         )
-        self.assertEqual(args_obj["b"], 7, "Parameter b should be 7")
+        self.assertEqual(int(args_obj["b"]), 7, "Parameter b should be 7")
 
 
 if __name__ == "__main__":
