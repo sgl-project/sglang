@@ -2,7 +2,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -31,6 +31,11 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_mab import MABConfig, MABGroupManager
+from sglang.srt.speculative.eagle_mab import (
+    MABConfig,
+    MABGroupManager,
+    SpeculativeResources,
+)
 from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -54,13 +59,6 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with disable_dp_size(), patch_tensor_parallel_group(tp_group):
         yield
-
-
-class SpeculativeResources(NamedTuple):
-    draft_attn_backend: object
-    draft_cuda_graph_runner: object
-    target_attn_backend: object
-    target_cuda_graph_runner: object
 
 
 class EAGLEWorker(TpModelWorker):
@@ -936,7 +934,7 @@ class EAGLEWorker(TpModelWorker):
         self.mab_window_size = self.server_args.speculative_mab_window_size
 
         # Define batch size groups for MAB
-        # TODO: batch_size should be determined by the server_args
+        # TODO: batch_size should be determined dynamically
         self.mab_groups = (
             list(range(1, 32)) + list(range(32, 128, 8)) + list(range(128, 257, 32))
         )
@@ -958,7 +956,7 @@ class EAGLEWorker(TpModelWorker):
         for mab_strategy in self.mab_strategies:
             if mab_strategy == self.default_mab_strategy:
                 continue
-            
+
             logging.info(f"Initializing MAB strategy {mab_strategy} resources")
             self.update_speculative_args(mab_strategy)
             self.max_topk = max(self.max_topk, self.topk)
