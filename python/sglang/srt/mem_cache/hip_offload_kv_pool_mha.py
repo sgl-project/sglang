@@ -86,6 +86,15 @@ class MHATokenToHiPOffloadKVPool(KVCache):
             layer.layer_id, table, cache_k, cache_v, async_copy, push_to_gpu_cache
         )
 
+    def get_flat_data(self, indices):
+        raise NotImplementedError()
+
+    def transfer(self, indices, flat_data):
+        raise NotImplementedError()
+
+    def transfer_per_layer(self, indices, flat_data, layer_id):
+        raise NotImplementedError()
+
     def on_model_start(self, forward_batch: ForwardBatch):
         assert forward_batch.token_to_kv_pool == self
 
