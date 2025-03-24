@@ -283,7 +283,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Precompute maximum sequence length
         metadata.max_seq_len_k = seqlens_in_batch.max().item()
         # Only zero out the part out of max_len_k
-        metadata.page_table[:, metadata.max_seq_len_k:].fill_(0)
+        metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
         # Then do the copy
         metadata.page_table[:, : metadata.max_seq_len_k].copy_(
             self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
