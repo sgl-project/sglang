@@ -98,7 +98,7 @@ class TestEmbeddingModels(unittest.TestCase):
         if is_in_ci():
             models_to_test = [random.choice(MODELS)]
 
-        for model, tp_size, prefill_tolerance in MODELS:
+        for model, tp_size, prefill_tolerance in models_to_test:
             for torch_dtype in TORCH_DTYPES:
                 self.assert_close_prefill_logits(
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
