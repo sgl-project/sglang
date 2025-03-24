@@ -8,4 +8,4 @@ providers:
     updateIntervalSeconds: 10
     allowUiUpdates: false
     options:
-      path: /var/lib/grafana/dashboards 
+      path: /var/lib/grafana/dashboards

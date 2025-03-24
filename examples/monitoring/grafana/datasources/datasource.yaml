@@ -5,4 +5,4 @@ datasources:
     access: proxy
     url: http://localhost:9090
     isDefault: true
-    editable: false 
+    editable: false

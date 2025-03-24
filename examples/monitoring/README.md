@@ -73,4 +73,4 @@ If Grafana cannot connect to Prometheus:
 
 ## Customization
 
-You can customize the monitoring setup by modifying the configuration files as needed. 
+You can customize the monitoring setup by modifying the configuration files as needed.
