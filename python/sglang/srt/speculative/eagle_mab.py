@@ -4,7 +4,7 @@ import math
 import re
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -91,6 +91,13 @@ class MABStrategyMetrics:
         """Add metrics for a single step in the sliding window."""
         self.rewards.append(reward)
         self.accept_lengths.append(accept_length)
+
+
+class SpeculativeResources(NamedTuple):
+    draft_attn_backend: object
+    draft_cuda_graph_runner: object
+    target_attn_backend: object
+    target_cuda_graph_runner: object
 
 
 class BaseMAB:
