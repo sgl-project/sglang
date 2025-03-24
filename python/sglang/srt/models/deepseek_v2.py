@@ -239,6 +239,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
+                async_finish=True,  # TODO
             )
 
     def forward(
@@ -250,8 +251,6 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -264,13 +263,11 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -319,7 +316,7 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
