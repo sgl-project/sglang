@@ -21,7 +21,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
+if "--plat-name" not in sys.argv:
     sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
 
 
