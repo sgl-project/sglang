@@ -261,7 +261,7 @@ class WorkloadGenerator:
 
         self.response_queue = queue.Queue()
         self.pbar = tqdm(total=args.num_clients * args.num_rounds)
-        self.performance_metrics = {"ttft": [], "latency": []}
+        self.performance_metrics = {"ttft": [], "latency": [], "itl": []}
 
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
@@ -322,6 +322,7 @@ class WorkloadGenerator:
                 self.client_records[client_id]["history"] += response.generated_text
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                self.performance_metricsp["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.completed_requests += 1
 
@@ -366,6 +367,14 @@ class WorkloadGenerator:
                 "median_ttft": sorted(self.performance_metrics["ttft"])[
                     len(self.performance_metrics["ttft"]) // 2
                 ],
+                "average_itl": sum(self.performance_metrics["itl"])
+                / len(self.performance_metrics["itl"]),
+                "p90_itl": sorted(self.performance_metrics["itl"])[
+                    int(0.9 * len(self.performance_metrics["itl"]))
+                ],
+                "median_itl": sorted(self.performance_metrics["itl"])[
+                    len(self.performance_metrics["itl"]) // 2
+                ],
                 "average_latency": sum(self.performance_metrics["latency"])
                 / len(self.performance_metrics["latency"]),
                 "p90_latency": sorted(self.performance_metrics["latency"])[
@@ -385,6 +394,9 @@ class WorkloadGenerator:
         print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
         print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
+        print(f"  Average ITL: {performance_data['summary']['average_itl']:.2f}")
+        print(f"  Median ITL: {performance_data['summary']['median_itl']:.2f}")
+        print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.2f}")
         print(
             f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
         )

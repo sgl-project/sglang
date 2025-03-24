@@ -41,11 +41,15 @@ class HiRadixCache(RadixCache):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio
+                self.kv_cache,
+                hicache_ratio,
+                pin_memory=False if hicache_oracle else True,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio
+                self.kv_cache,
+                hicache_ratio,
+                pin_memory=False if hicache_oracle else True,
             )
         else:
             raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")

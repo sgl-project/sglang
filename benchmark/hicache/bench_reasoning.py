@@ -56,7 +56,7 @@ class ReasoningWorkloadGenerator(WorkloadGenerator):
 
         self.response_queue = queue.Queue()
         self.pbar = tqdm(total=args.num_clients * args.num_rounds)
-        self.performance_metrics = {"ttft": [], "latency": []}
+        self.performance_metrics = {"ttft": [], "latency": [], "itl": []}
 
         self.max_parallel = args.max_parallel
         self.logfile = args.log_file
@@ -72,6 +72,7 @@ class ReasoningWorkloadGenerator(WorkloadGenerator):
                 self.client_records[client_id]["history"] += response.generated_text
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.completed_requests += 1
 
