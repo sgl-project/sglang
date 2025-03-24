@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.vptq import VPTQMoEMethod
 from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
 
 _is_cuda = is_cuda()
@@ -164,18 +165,28 @@ class EPMoE(torch.nn.Module):
             self.block_shape = None
             self.activation_scheme = None
         else:
-            self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
-                quant_config
-            )
-            self.use_fp8_w8a8 = True
-            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
-            self.block_shape = (
-                self.quant_method.quant_config.weight_block_size
-                if self.use_block_quant
-                else None
-            )
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.activation_scheme = quant_config.activation_scheme
+            if quant_config.get_name() == "vptq":
+                self.quant_method: Optional[QuantizeMethodBase] = VPTQMoEMethod(
+                    quant_config
+                )
+                self.use_fp8_w8a8 = quant_config.use_fp8_w8a8
+                self.use_block_quant = quant_config.use_block_quant
+                self.activation_scheme = quant_config.activation_scheme
+                self.w13_input_scale = None
+                self.w2_input_scale = None
+            else:
+                self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
+                    quant_config
+                )
+                self.use_fp8_w8a8 = True
+                self.use_block_quant = getattr(self.quant_method, "block_quant", False)
+                self.block_shape = (
+                    self.quant_method.quant_config.weight_block_size
+                    if self.use_block_quant
+                    else None
+                )
+                self.fp8_dtype = torch.float8_e4m3fn
+                self.activation_scheme = quant_config.activation_scheme
 
         self.quant_method.create_weights(
             layer=self,
@@ -251,6 +262,8 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=torch.int64,
         )
+        
+        # FIXIT
         # GroupGemm-0
         gateup_output = torch.empty(
             gateup_input.shape[0],

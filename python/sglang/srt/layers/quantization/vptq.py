@@ -1,14 +1,12 @@
 # Supports VPTQ compression, see https://arxiv.org/abs/2409.17066
 
 import math
-from pyexpat import features
-from typing import Any, Dict, List, Optional, Union
-from xml.sax.handler import all_features
+from typing import Any, Callable, Dict, List, Optional, Union
 
-from sympy import centroid
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from torch.nn import Module
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -46,6 +44,9 @@ class VPTQConfig(QuantizationConfig):
     ) -> None:
         self.config_for_layers = config_for_layers
         self.shared_layer_config = shared_layer_config
+        self.use_block_quant = False
+        self.use_fp8_w8a8 = False
+        self.activation_scheme = "static"
 
     def __repr__(self) -> str:
         return (
@@ -96,7 +97,10 @@ class VPTQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["VPTQLinearMethod"]:
+        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+        print(f'get_quant_method: {prefix}, type: {type(layer)}')
         if isinstance(layer, LinearBase):
+            print(f'match linear base layer: {prefix}, type: {type(layer)}')
             linear_name = prefix.split(".")[-1]
             base_name = prefix[: prefix.rfind(".")]
             if linear_name == "qkv_proj":
@@ -113,135 +117,13 @@ class VPTQConfig(QuantizationConfig):
             else:
                 quant_config = self.get_config_for_key(base_name, linear_name)
             return VPTQLinearMethod(quant_config)
+        elif isinstance(layer, EPMoE):
+            print(f'match ep moe layer: {prefix}')
+            return VPTQMoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-'''    
-# dequantize the weight from the quantization codes
-def dequantize_weight(
-    indices: torch.IntTensor,  #  [num_out_groups, num_in_groups, num_codebooks]
-    codebooks: torch.Tensor,  #  [num_codebooks, codebook_size, out_group_size, in_group_size]
-    res_codebooks: torch.Tensor,  #  [num_codebooks, codebook_size, out_group_size, in_group_size]
-    weight_scale: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    weight_bias: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    perm: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    metadata: MetaData,
-) -> torch.Tensor:
-    """
-    Decode float weights from quantization codes. Differentiable.
-    :param codes: tensor of integer quantization codes, shape
-        [*dims, num_out_groups, num_in_groups, num_codebooks]
-    :param codebooks: tensor of vectors for each quantization code,
-        [num_codebooks, codebook_size, out_group_size, in_group_size]
-    :param scales: weight will be multiplied by this factor, must be
-        broadcastble with
-        [*dims, out_groups, num_in_groups, out_group_size, in_group_size]
-    :return: reconstructed weight tensor of shape
-        [*dims, num_in_groups*group_size]
-    """
-    output_size = metadata.output_size
-    num_codebooks = indices.shape[0]
-    num_centroids = metadata.num_centroids
-    num_res_centroids = metadata.num_res_centroids
-    vector_len = metadata.vector_len
-    group_size = metadata.group_size
-
-    codebooks = codebooks.view(num_codebooks, num_centroids, vector_len)
-    res_codebooks = (
-        res_codebooks.view(num_codebooks, num_res_centroids, vector_len)
-        if num_res_centroids > 0
-        else None
-    )
-    index_bits = math.ceil(math.log2(num_centroids))
-    enable_residual = num_res_centroids > 0
-    index_res_bits = math.ceil(math.log2(num_res_centroids)) if enable_residual else 0
-
-    # print(f"indices shape: {indices.shape}")
-    indices, res_indices = unpack_index_tensor(
-        pack_tensor=indices,
-        index_bits=index_bits,
-        num_elements=group_size,
-        res_bits=index_res_bits,
-        num_res_elements=group_size,
-        index_dtype=torch.uint16,
-    )
-
-    indices = indices.unsqueeze(-1).expand(-1, -1, -1, vector_len)
-    indices = indices.reshape(num_codebooks, -1, vector_len)
-    selected_centroids = torch.gather(codebooks, 1, indices)
-    selected_centroids = selected_centroids.view(
-        num_codebooks, -1, group_size, vector_len
-    )
-    selected_centroids = selected_centroids.permute(0, 1, 3, 2)
-
-    qweight = selected_centroids.reshape(num_codebooks, -1, group_size)
-    qweight = qweight.permute(1, 0, 2)
-    qweight = qweight.reshape(-1, num_codebooks * group_size)
-
-    if enable_residual:
-        res_codebooks = res_codebooks.view(num_codebooks, num_res_centroids, vector_len)
-        res_indices = res_indices.unsqueeze(-1).expand(-1, -1, -1, vector_len)
-        res_indices = res_indices.reshape(num_codebooks, -1, vector_len)
-        selected_res_centroids = torch.gather(res_codebooks, 1, res_indices)
-        selected_res_centroids = selected_res_centroids.reshape(
-            num_codebooks, -1, group_size, vector_len
-        )
-        selected_res_centroids = selected_res_centroids.permute(0, 1, 3, 2)
-        qweight = qweight + (
-            selected_res_centroids.reshape(num_codebooks, -1, group_size)
-            .permute(1, 0, 2)
-            .reshape(-1, num_codebooks * group_size)
-        )
-
-    padding = -output_size % vector_len
-    if padding > 0:
-        qweight = qweight[:-padding, :]
-
-    enable_perm = perm is not None
-    if enable_perm:
-        invert_perm = torch.argsort(perm.view(torch.uint16).to(torch.int64))
-        qweight = qweight[:, invert_perm]
-
-    enable_norm = weight_scale is not None
-    if enable_norm:
-        qweight = qweight * weight_scale
-        qweight = qweight + weight_bias
-
-    return qweight
-
-
-# do the quantized matmul in a generic way, it's quite slow
-def generic_dequantize_gemm(
-    input: torch.Tensor,  #  [..., in_features]
-    indices: torch.IntTensor,  #  [num_out_groups, num_in_groups, num_codebooks]
-    codebooks: torch.Tensor,  #  [num_codebooks, codebook_size, out_group_size, in_group_size]
-    res_codebooks: torch.Tensor,  #  [num_codebooks, codebook_size, out_group_size, in_group_size]
-    weight_scale: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    weight_bias: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    perm: torch.Tensor,  #  [num_out_groups, 1, 1, 1]
-    bias: Optional[torch.Tensor],
-    metadata: MetaData,
-) -> torch.Tensor:
-    dequantized_weight = dequantize_weight(
-        indices,
-        codebooks,
-        res_codebooks,
-        weight_scale,
-        weight_bias,
-        perm,
-        metadata,
-    )
-    return F.linear(input, dequantized_weight, bias)
-
-
-
-
-
-
-'''
-
 
 class VPTQLinearMethod(LinearMethodBase):
     """Linear method for VPTQ.
@@ -518,7 +400,7 @@ def merged_dequantize_gemm(
             input,
             indices.narrow(1, indice_offset, indice_size),
             codebooks.narrow(0, codebooks_offset, num_codebooks),
-            res_codebooks.narrow(0, codebooks_offset, num_codebooks),
+            res_codebooks.narrow(0, codebooks_offset, num_codebooks) if res_codebooks is not None else None,
             weight_scale.narrow(0, input_offset, input_size),
             weight_bias.narrow(0, input_offset, input_size),
             perm.narrow(0, input_offset, input_size) if perm is not None else None,
@@ -557,6 +439,7 @@ def optimized_dequantize_gemm(
     )
      
     enable_residual = False
+    res_codebooks_ = None
     if res_codebooks is not None:
         enable_residual = True
         shape = (metadata.num_codebooks, metadata.num_res_centroids, metadata.vector_len)
@@ -611,3 +494,170 @@ def optimized_dequantize_gemm(
             out_features) 
     
         return F.linear(input, weight, bias)
+
+
+class VPTQMoEMethod:
+    """MoE method for VPTQ.
+    Supports loading VPTQ checkpoints with static weight scale and
+    dynamic activation scale.
+
+    Limitations:
+    Only support VPTQ quantization
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
+
+    def __init__(self, quant_config):
+        self.quant_config = quant_config
+
+    def moe_weight_loader(self):
+        def _moe_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            # print(f'param: {param.shape}, loaded_weight: {loaded_weight.shape}, '
+            #       f'weight_name: {weight_name}, shard_id: {shard_id}, expert_id: {expert_id}')
+            pass
+        return _moe_weight_loader
+
+    def create_weights(
+        self,
+        layer: Module,
+        num_experts_per_partition: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        print(f'num_experts: {num_experts_per_partition}')
+
+        # indices
+        up_gate_proj_weight_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition * 2, 1, 256, 3584, dtype=torch.int32
+            ),
+            requires_grad=False,
+        )
+        down_proj_weight_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition, 1, 896, 1024, dtype=torch.int32
+            ),
+            requires_grad=False,
+        )
+        # centroids
+        up_gate_proj_centroids = torch.nn.Embedding(
+            num_experts_per_partition * 2, 524288, dtype=params_dtype
+        )
+        up_gate_proj_centroids.weight.requires_grad = False
+        down_proj_centroids = torch.nn.Embedding(
+            num_experts_per_partition, 524288, dtype=params_dtype
+        )
+        down_proj_centroids.weight.requires_grad = False
+        
+        # weight scale
+        up_gate_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition * 2, 7168, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        down_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition, 2048, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        # weight bias
+        up_gate_proj_weight_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition * 2, 7168, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        down_proj_weight_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts_per_partition, 2048, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+         
+        extra_weight_attrs["weight_loader"] = self.moe_weight_loader()
+        # indices
+        layer.register_parameter("w13_indices", up_gate_proj_weight_indices)
+        layer.register_parameter("w2_indices", down_proj_weight_indices)
+        set_weight_attrs(up_gate_proj_weight_indices, extra_weight_attrs)
+        set_weight_attrs(down_proj_weight_indices, extra_weight_attrs)
+        
+        # centroids
+        layer.w13_centroids = up_gate_proj_centroids
+        layer.w2_centroids = down_proj_centroids
+        set_weight_attrs(up_gate_proj_centroids.weight, extra_weight_attrs)
+        set_weight_attrs(down_proj_centroids.weight, extra_weight_attrs)
+        
+        # weight scale
+        layer.register_parameter("w13_weight_scale", up_gate_proj_weight_scale)
+        layer.register_parameter("w2_weight_scale", down_proj_weight_scale)
+        set_weight_attrs(up_gate_proj_weight_scale, extra_weight_attrs)
+        set_weight_attrs(down_proj_weight_scale, extra_weight_attrs)
+        
+        # weight bias
+        layer.register_parameter("w13_weight_bias", up_gate_proj_weight_bias)
+        layer.register_parameter("w2_weight_bias", down_proj_weight_bias)
+        set_weight_attrs(up_gate_proj_weight_bias, extra_weight_attrs)
+        set_weight_attrs(down_proj_weight_bias, extra_weight_attrs)
+         
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        inplace: bool = True,
+        no_combine: bool = False,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
+        # Expert selection
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+        )
+        pass
+
