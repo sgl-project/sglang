@@ -10,7 +10,6 @@ from sglang.srt.cpu_utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
     get_actual_shard_size,
-    prepack_weight_if_needed,
     reset_param_data_if_needed,
 )
 from sglang.srt.custom_op import CustomOp

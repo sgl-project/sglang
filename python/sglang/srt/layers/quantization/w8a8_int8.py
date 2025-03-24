@@ -10,6 +10,7 @@ if is_cuda:
 
 from torch.nn.parameter import Parameter
 
+from sglang.srt.cpu_utils import _process_weight_after_loading, cpu_has_amx_support
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
@@ -18,6 +19,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+
+if cpu_has_amx_support():
+    import sgl_kernel.cpu
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -74,6 +78,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.weight.device == torch.device("cpu"):
+            assert (
+                cpu_has_amx_support()
+            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
+            _process_weight_after_loading(layer, ["weight"])
+            return
+
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
@@ -114,6 +125,12 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
+        if layer.use_intel_amx_backend:
+            x_q, x_scale = sgl_kernel.cpu.per_token_quant_int8(x)
+            return sgl_kernel.cpu.int8_scaled_mm(
+                x_q, layer.weight, x_scale, layer.weight_scale, bias, x.dtype
+            )
+
         x_q, x_scale = per_token_quant_int8(x)
 
         return int8_scaled_mm(
@@ -208,6 +225,13 @@ class W8A8Int8MoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
+            assert (
+                cpu_has_amx_support()
+            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
+            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            return
+
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -248,6 +272,21 @@ class W8A8Int8MoEMethod:
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
         )
+
+        if layer.use_intel_amx_backend:
+            return sgl_kernel.cpu.fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                inplace=True,
+                use_int8_w8a8=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
 
         return fused_experts(
             x,
