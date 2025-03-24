@@ -24,8 +24,6 @@ try:
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
     from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 
-    from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
