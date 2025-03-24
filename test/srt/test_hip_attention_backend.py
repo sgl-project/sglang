@@ -82,7 +82,7 @@ class TestHiPAttnBackend(unittest.TestCase):
         query_string += filler * (target_length // 35)
         query_string += "What was the passkey? The passkey is"
 
-        model = DEFAULT_MODEL_NAME_FOR_TEST
+        model = os.getenv("SRT_TEST_MODEL_NAME", DEFAULT_MODEL_NAME_FOR_TEST)
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
             model,

@@ -40,6 +40,7 @@ _is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.server_args import ServerArgs
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -151,6 +152,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
+def get_capture_configs(server_args: ServerArgs):
+    if server_args.enable_hip_attention:
+        from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+
+        return cuda_graph_capture_configs(server_args.hip_attention_config)
+    else:
+        return [()]
+
+
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -179,8 +189,6 @@ class CudaGraphRunner:
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_hip_attention = model_runner.server_args.enable_hip_attention
-        if self.enable_hip_attention:
-            self.hip_config = model_runner.server_args.hip_attention_config
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
 
@@ -197,6 +205,7 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        self.capture_configs = get_capture_configs(model_runner.server_args)
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -343,7 +352,7 @@ class CudaGraphRunner:
                         f"Capturing batches ({avail_mem=:.2f} GB)"
                     )
 
-                for capture_config in self.capture_configs():
+                for capture_config in self.capture_configs:
                     with patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
@@ -360,14 +369,6 @@ class CudaGraphRunner:
 
                     # Save gemlite cache after each capture
                     save_gemlite_cache()
-
-    def capture_configs(self):
-        if self.enable_hip_attention:
-            from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
-
-            return cuda_graph_capture_configs(self.hip_config)
-        else:
-            return [()]
 
     def capture_one_batch_size(self, bs: int, forward: Callable, capture_config: tuple):
         graph = torch.cuda.CUDAGraph()
