@@ -489,8 +489,8 @@ class GroupCoordinator:
             raise ValueError("split_size_or_sections must be int or list of ints")
 
         
-        output = torch.empty_like(input_list[self.rank % self.world_size])
-        torch.distributed.reduce_scatter(output, input_list, op=torch.distributed.ReduceOp.SUM)
+        output = input_list[self.rank_in_group]
+        torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
 
         return output
 

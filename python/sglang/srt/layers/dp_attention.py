@@ -251,5 +251,7 @@ def dp_scatter(
         )
 
 def tp_reduce_scatter(input_: torch.Tensor):
-    
     return get_attention_tp_group().reduce_scatter(input_)
+
+def tp_all_gather_into_tensor(input_: torch.Tensor):
+    return get_attention_tp_group().all_gather_into_tensor(input_, dim=0)

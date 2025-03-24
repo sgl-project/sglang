@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
     tp_reduce_scatter,
+    tp_all_gather_into_tensor,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -967,6 +968,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
     ) -> None:
+        
+        def is_sparse_layer(l: int):
+            return (
+                config.n_routed_experts is not None
+                and l >= config.first_k_dense_replace
+                and l % config.moe_layer_freq == 0
+            )
+
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -1017,16 +1026,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        if is_nextn or (
-            config.n_routed_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
-        ):
+        if is_nextn or is_sparse_layer(layer_id):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+            self.is_sparse = True
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -1035,6 +1041,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+            self.is_sparse = False
+
+        self.input_is_sharded = is_sparse_layer(layer_id - 1)
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1047,6 +1057,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
+            return self.forward_deepep(positions, hidden_states, forward_batch, residual)
+        else:
+            return self.forward_normal(positions, hidden_states, forward_batch, residual)
+
+    def forward_normal(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1062,17 +1085,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        if global_server_args_dict["enable_deepep_moe"] and isinstance(self.mlp, DeepseekV2MoE):
-            return self.forward_ffn_deepep(hidden_states, forward_batch, residual)
-        else:
-            return self.forward_ffn_normal(hidden_states, forward_batch, residual)
-
-    def forward_ffn_normal(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        
+        if get_attention_tp_size() != 1 and self.input_is_sharded:
+            hidden_states = tp_all_gather_into_tensor(hidden_states)
+            residual = tp_all_gather_into_tensor(residual)
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
@@ -1114,20 +1130,52 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
     
     
-    def forward_ffn_deepep(
+    def forward_deepep(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        
+        if hidden_states.shape[0] == 0:
+            residual = hidden_states
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if get_attention_tp_size() != 1 and self.input_is_sharded:
+            hidden_states = tp_all_gather_into_tensor(hidden_states)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
         if get_attention_tp_size() != 1:
             # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
             # can we reuse the buffer from dp attn?
-            hidden_states = tp_reduce_scatter(hidden_states)
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+            if self.input_is_sharded:
+                hidden_states = tp_reduce_scatter(hidden_states)
+                if hidden_states.shape[0] != 0:
+                    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            else:
+                if get_attention_tp_rank() == 0:
+                    hidden_states += residual
+                hidden_states = tp_reduce_scatter(hidden_states)
+                residual = hidden_states
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
         hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
         return hidden_states, residual
 
