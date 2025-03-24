@@ -293,7 +293,10 @@ class ExaoneModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+
+        forward_batch.on_model_start()
         for i in range(len(self.h)):
+            forward_batch.on_layer_start(i)
             layer = self.h[i]
             hidden_states, residual = layer(
                 positions,
@@ -301,11 +304,16 @@ class ExaoneModel(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         hidden_states, _ = self.ln_f(hidden_states, residual)
         return hidden_states
 
 
 class ExaoneForCausalLM(nn.Module):
+    hip_attention_supported = True
+
     def __init__(
         self,
         config,
