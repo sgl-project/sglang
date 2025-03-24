@@ -73,15 +73,25 @@ class ExpertDistributionRecorder:
 
     def reset(self):
         """Reset the expert distribution recorder."""
+        logger.info("Resetting expert distribution record...")
+        self._record = False
         self._expert_distribution_record.clear()
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
+        if self._record == True:
+            logger.warning(
+                "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
+            )
         self.reset()
         self._record = True
 
     def stop_record(self):
         """Stop recording the expert distribution. Set the recording flag to False."""
+        if self._record == False:
+            logger.warning(
+                "SGLang server has not been recording expert ids. Did you forget to start recording by sending request to the `/start_expert_distribution_record` endpoint?"
+            )
         self._record = False
 
     def dump_record(self):
