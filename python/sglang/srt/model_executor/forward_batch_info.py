@@ -332,7 +332,7 @@ class ForwardBatch:
 
         return ret
 
-    def get_merged_image_inputs(self) -> Optional[ImageInputs]:
+    def merge_image_inputs(self) -> Optional[ImageInputs]:
         """
         Merge all image inputs in the batch into a single ImageInputs object.
 
@@ -357,6 +357,16 @@ class ForwardBatch:
             merged.pixel_values = torch.from_numpy(merged.pixel_values)
 
         return merged
+
+    def contains_image_inputs(self) -> bool:
+        """ """
+        if self.image_inputs is None:
+            return True
+        return any(
+            image_input.pixel_values is not None and image_input.pixel_values is not []
+            for image_input in self.image_inputs
+            if image_input is not None
+        )
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -402,9 +412,16 @@ class ForwardBatch:
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
                             image_grid_thw=image_inputs.image_grid_thws,
+                            video_grid_thw=image_inputs.video_grid_thws,
+                            image_token_id=image_inputs.im_token_id,
+                            video_token_id=image_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
+                            vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
+                            seq_len=len(self.input_ids),
+                            second_per_grid_ts=image_inputs.second_per_grid_ts,
+                            tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta

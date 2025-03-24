@@ -26,13 +26,6 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-try:
-    from outlines.fsm.json_schema import convert_json_schema_to_str
-except ImportError:
-    # Before outlines 0.0.47, convert_json_schema_to_str is under
-    # outlines.integrations.utils
-    from outlines.integrations.utils import convert_json_schema_to_str
-
 from sglang.srt.code_completion_parser import (
     generate_completion_prompt_from_request,
     is_completion_template_defined,
@@ -79,7 +72,7 @@ from sglang.srt.openai_api.protocol import (
     UsageInfo,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.utils import get_exception_traceback
+from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +307,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
             )
 
         try:
+            created = int(time.time())
             ret = await tokenizer_manager.generate_request(adapted_request).__anext__()
             if not isinstance(ret, list):
                 ret = [ret]
@@ -321,13 +315,19 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                 responses = v1_chat_generate_response(
                     request,
                     ret,
+                    created,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
                     tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
                 )
             else:
                 responses = v1_generate_response(
-                    request, ret, tokenizer_manager, to_file=True
+                    request,
+                    ret,
+                    tokenizer_manager,
+                    created,
+                    to_file=True,
+                    cache_report=tokenizer_manager.server_args.enable_cache_report,
                 )
 
         except Exception as e:
@@ -577,7 +577,9 @@ def v1_generate_request(
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
+def v1_generate_response(
+    request, ret, tokenizer_manager, created, to_file=False, cache_report=False
+):
     choices = []
     echo = False
 
@@ -675,7 +677,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
                     # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "text_completion",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": request[i].model,
                     "choices": choice,
                     "usage": {
@@ -694,14 +696,19 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             ret[i]["meta_info"]["prompt_tokens"] for i in range(0, len(ret), request.n)
         )
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
+        cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
+            created=created,
             choices=choices,
             usage=UsageInfo(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                prompt_tokens_details=(
+                    {"cached_tokens": cached_tokens} if cache_report else None
+                ),
             ),
         )
     return response
@@ -710,6 +717,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [CompletionRequest(**request_json)]
+    created = int(time.time())
     adapted_request, request = v1_generate_request(all_requests)
 
     if adapted_request.stream:
@@ -719,6 +727,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             n_prev_tokens = {}
             prompt_tokens = {}
             completion_tokens = {}
+            cached_tokens = {}
+
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -731,6 +741,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     text = content["text"]
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                    cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
 
                     if not stream_buffer:  # The first chunk
                         if request.echo:
@@ -803,6 +814,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
+                        created=created,
                         object="text_completion",
                         choices=[choice_data],
                         model=request.model,
@@ -821,14 +833,24 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     total_completion_tokens = sum(
                         tokens for tokens in completion_tokens.values()
                     )
+                    cache_report = tokenizer_manager.server_args.enable_cache_report
+                    if cache_report:
+                        cached_tokens_sum = sum(
+                            tokens for tokens in cached_tokens.values()
+                        )
+                        prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
+                    else:
+                        prompt_tokens_details = None
                     usage = UsageInfo(
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=total_completion_tokens,
                         total_tokens=total_prompt_tokens + total_completion_tokens,
+                        prompt_tokens_details=prompt_tokens_details,
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
+                        created=created,
                         choices=[],
                         model=request.model,
                         usage=usage,
@@ -859,7 +881,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
-    response = v1_generate_response(request, ret, tokenizer_manager)
+    response = v1_generate_response(
+        request,
+        ret,
+        tokenizer_manager,
+        created,
+        cache_report=tokenizer_manager.server_args.enable_cache_report,
+    )
     return response
 
 
@@ -1045,6 +1073,7 @@ def v1_chat_generate_request(
 def v1_chat_generate_response(
     request,
     ret,
+    created,
     to_file=False,
     cache_report=False,
     tool_call_parser=None,
@@ -1196,7 +1225,7 @@ def v1_chat_generate_response(
                     # remain the same but if needed we can change that
                     "id": ret[i]["meta_info"]["id"],
                     "object": "chat.completion",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": request[i].model,
                     "choices": choice,
                     "usage": {
@@ -1218,6 +1247,7 @@ def v1_chat_generate_response(
         cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
         response = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
+            created=created,
             model=request.model,
             choices=choices,
             usage=UsageInfo(
@@ -1232,9 +1262,12 @@ def v1_chat_generate_response(
         return response
 
 
-async def v1_chat_completions(tokenizer_manager, raw_request: Request):
+async def v1_chat_completions(
+    tokenizer_manager, raw_request: Request, cache_report=False
+):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
+    created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
     if adapted_request.stream:
@@ -1247,6 +1280,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
             n_prev_tokens = {}
             prompt_tokens = {}
             completion_tokens = {}
+            cached_tokens = {}
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -1260,6 +1294,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                    cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                     if request.logprobs:
                         logprobs = to_openai_style_logprobs(
                             output_token_logprobs=content["meta_info"][
@@ -1327,6 +1362,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
+                            created=created,
                             choices=[choice_data],
                             model=request.model,
                         )
@@ -1361,6 +1397,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
+                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1392,6 +1429,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
+                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1443,6 +1481,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
+                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1475,6 +1514,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
+                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1498,16 +1538,26 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     total_completion_tokens = sum(
                         tokens for tokens in completion_tokens.values()
                     )
+                    cache_report = tokenizer_manager.server_args.enable_cache_report
+                    if cache_report:
+                        cached_tokens_sum = sum(
+                            tokens for tokens in cached_tokens.values()
+                        )
+                        prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
+                    else:
+                        prompt_tokens_details = None
                     usage = UsageInfo(
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=total_completion_tokens,
                         total_tokens=total_prompt_tokens + total_completion_tokens,
+                        prompt_tokens_details=prompt_tokens_details,
                     )
 
                 else:
                     usage = None
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
+                    created=created,
                     choices=[
                         ChatCompletionResponseStreamChoice(
                             index=index,
@@ -1543,6 +1593,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     response = v1_chat_generate_response(
         request,
         ret,
+        created,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
