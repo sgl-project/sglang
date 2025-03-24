@@ -33,14 +33,15 @@ except ImportError:
     class DummyConfig:
         pass
 
-    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = (
-        CompressedTensorsConfig
-    ) = DummyConfig
+    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+        DummyConfig
+    )
     DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
         GPTQMarlin24Config
     ) = DummyConfig
     MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
+from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -48,7 +49,6 @@ from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.quantization.awq import AWQConfig
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
