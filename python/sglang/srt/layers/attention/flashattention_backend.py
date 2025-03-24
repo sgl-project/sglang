@@ -46,9 +46,6 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         super().__init__()
 
-        # Parse constants
-        self.is_multimodal = model_runner.model_config.is_multimodal
-
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -280,15 +277,14 @@ class FlashAttentionBackend(AttentionBackend):
         seqlens_in_batch = seq_lens[:bs]
         metadata = self.decode_cuda_graph_metadata[bs]
         metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-        device = seqlens_in_batch.device
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
         # Precompute maximum sequence length
         metadata.max_seq_len_k = seqlens_in_batch.max().item()
-        metadata.page_table.fill_(
-            0
-        )  # QQ NOTE: since we do inplace so need a clear to avoid pollution by previous round?
+        # Only zero out the part out of max_len_k
+        metadata.page_table[:, metadata.max_seq_len_k:].fill_(0)
+        # Then do the copy
         metadata.page_table[:, : metadata.max_seq_len_k].copy_(
             self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
         )
