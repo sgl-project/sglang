@@ -807,15 +807,8 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    EM = sorted_token_ids.shape[0]
-    if A.shape[0] < config["BLOCK_SIZE_M"]:
-        # optimize for small batch_size.
-        # We assume that top_ids of each token is unique, so
-        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
-        # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
     grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
@@ -844,7 +837,7 @@ def invoke_fused_moe_kernel(
             num_tokens_post_padded,
             B.shape[1],
             A.shape[1],
-            EM,
+            sorted_token_ids.shape[0],
             topk_ids.numel(),
             A.stride(0),
             A.stride(1),
