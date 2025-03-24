@@ -221,6 +221,15 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     return capture_bs, compile_bs
 
 
+def get_capture_configs(server_args: ServerArgs):
+    if server_args.enable_hip_attention:
+        from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
+
+        return cuda_graph_capture_configs(server_args.hip_attention_config)
+    else:
+        return [()]
+
+
 # Reuse this memory pool across all device graph runners.
 global_graph_memory_pool = None
 
