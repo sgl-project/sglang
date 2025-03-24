@@ -386,7 +386,8 @@ class Fp8LinearOp:
             use_per_token_if_dynamic = self.use_per_token_if_dynamic
 
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
-        if self.cutlass_fp8_supported:
+        # for sgl-kernel fp8_scaled_mm, it support per channel W now
+        if self.cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             if _is_cuda:
                 qinput, x_scale = sgl_scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
             else:
@@ -397,12 +398,28 @@ class Fp8LinearOp:
                 use_per_token_if_dynamic=use_per_token_if_dynamic)
 
             # Fused GEMM_DQ
-            output = ops.cutlass_scaled_mm(qinput,
-                                           weight,
-                                           out_dtype=input.dtype,
-                                           scale_a=x_scale,
-                                           scale_b=weight_scale,
-                                           bias=bias)
+            if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+                # Fall back to vllm cutlass w8a8 fp8 kernel
+                output = ops.cutlass_scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+            else:
+                assert (
+                    weight_scale.numel() == weight.shape[1]
+                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
             return output.view(*output_shape)
 
         # torch.scaled_mm supports per tensor weights + activations only
@@ -410,7 +427,11 @@ class Fp8LinearOp:
         else:
             # Maybe apply padding to output, see comment in __init__
             if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(input_2d, input_scale, num_token_padding=self.output_padding, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                qinput, x_scale = sgl_scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                if self.output_padding:
+                    pad_size = max(self.output_padding - qinput.shape[0], 0)
+                    if pad_size > 0:
+                        qinput = torch.nn.functional.pad(qinput, (0, 0, 0, pad_size))
             else:
                 qinput, x_scale = ops.scaled_fp8_quant(
                     input_2d,

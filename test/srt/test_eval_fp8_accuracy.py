@@ -72,23 +72,23 @@ class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    # def test_mmlu_offline_only(self):
-    #     """Test with offline quantization only."""
-    #     self._run_test(
-    #         model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
-    #         other_args=[],
-    #         expected_score=0.64,
-    #     )
+    def test_mmlu_offline_only(self):
+        """Test with offline quantization only."""
+        self._run_test(
+            model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
+            other_args=[],
+            expected_score=0.64,
+        )
 
-    # def test_mmlu_offline_and_online_override(self):
-    #     """Test with both offline and online quantization."""
-    #     self._run_test(
-    #         model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
-    #         other_args=["--quantization", "w8a8_fp8"],
-    #         # inference will use sgl kernel w/ online quant override
-    #         # we observed that the accuracy is higher then offline only
-    #         expected_score=0.64,
-    #     )
+    def test_mmlu_offline_and_online_override(self):
+        """Test with both offline and online quantization."""
+        self._run_test(
+            model=DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
+            other_args=["--quantization", "w8a8_fp8"],
+            # inference will use sgl kernel w/ online quant override
+            # we observed that the accuracy is higher then offline only
+            expected_score=0.64,
+        )
 
     def test_mmlu_online_only(self):
         """Test with online quantization only."""

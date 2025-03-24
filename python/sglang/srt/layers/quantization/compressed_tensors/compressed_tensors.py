@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import suppress
-from typing import Any, Dict, List, Literal, Optional, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Tuple, NamedTuple, cast
 import logging
 
 import torch
@@ -33,6 +33,22 @@ __all__ = ["CompressedTensorsLinearMethod"]
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
+
+class DeviceCapability(NamedTuple):
+    major: int
+    minor: int
+
+    def as_version_str(self) -> str:
+        return f"{self.major}.{self.minor}"
+
+    def to_int(self) -> int:
+        """
+        Express device capability as an integer ``<major><minor>``.
+
+        It is assumed that the minor version is always a single digit.
+        """
+        assert 0 <= self.minor < 10
+        return self.major * 10 + self.minor
 
 class CompressedTensorsConfig(QuantizationConfig):
 
@@ -68,6 +84,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_name(self) -> str:
         return "compressed_tensors"
+    
+    def get_scaled_act_names(self) -> List[str]:
+        return []
 
     def get_quant_method(
         self,
@@ -184,7 +203,7 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _check_scheme_supported(self,
                                 min_capability: int,
                                 error: bool = True) -> bool:
-        capability_tuple = torch.cuda.get_device_capability()
+        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
             capability = capability_tuple.to_int()
