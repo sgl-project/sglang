@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -15,6 +14,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.utils import check_marlin_supports_layer
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
