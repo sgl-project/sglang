@@ -68,6 +68,8 @@ class TestJSONModeOutlines(unittest.TestCase):
         )
         text = response.choices[0].message.content
 
+        print(f"Response: {text}")
+
         # Verify the response is valid JSON
         try:
             js_obj = json.loads(text)
