@@ -1,6 +1,12 @@
 """
-python3 -m unittest test_json_mode.TestJSONObjectResponse.test_json_mode_response
-python3 -m unittest test_json_mode.TestJSONObjectResponse.test_json_mode_with_streaming
+python3 -m unittest test_json_mode.TestJSONModeOutlines.test_json_mode_response
+python3 -m unittest test_json_mode.TestJSONModeOutlines.test_json_mode_with_streaming
+
+python3 -m unittest test_json_mode.TestJSONModeXGrammar.test_json_mode_response
+python3 -m unittest test_json_mode.TestJSONModeXGrammar.test_json_mode_with_streaming
+
+python3 -m unittest test_json_mode.TestJSONModeLLGuidance.test_json_mode_response
+python3 -m unittest test_json_mode.TestJSONModeLLGuidance.test_json_mode_with_streaming
 """
 
 import json
@@ -16,27 +22,30 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+def setup_class(cls, backend):
+    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    cls.base_url = DEFAULT_URL_FOR_TEST
 
-class TestJSONObjectResponse(unittest.TestCase):
+    other_args = [
+        "--max-running-requests",
+        "10",
+        "--grammar-backend",
+        backend,
+    ]
+
+    cls.process = popen_launch_server(
+        cls.model,
+        cls.base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+    )
+    cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
+
+
+class TestJSONModeOutlines(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        other_args = [
-            "--max-running-requests",
-            "10",
-            "--grammar-backend",
-            "llguidance",
-        ]
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-        cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
+        setup_class(cls, "outlines")
 
     @classmethod
     def tearDownClass(cls):
@@ -98,6 +107,16 @@ class TestJSONObjectResponse(unittest.TestCase):
 
         self.assertIsInstance(js_obj, dict)
 
+
+class TestJSONModeXGrammar(TestJSONModeOutlines):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="xgrammar")
+
+class TestJSONModeLLGuidance(TestJSONModeOutlines):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="llguidance")
 
 if __name__ == "__main__":
     unittest.main()
