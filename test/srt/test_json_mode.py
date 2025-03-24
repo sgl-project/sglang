@@ -110,6 +110,9 @@ class TestJSONModeOutlines(unittest.TestCase):
         self.assertIsInstance(js_obj, dict)
 
 
+@unittest.skip(
+    "xgrammar has an open issue to fix this behavior: https://github.com/mlc-ai/xgrammar/issues/256"
+)
 class TestJSONModeXGrammar(TestJSONModeOutlines):
     @classmethod
     def setUpClass(cls):
