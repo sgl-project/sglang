@@ -470,9 +470,31 @@ class GroupCoordinator:
         # torch.dist:
         #   reduce_scatter: uneven scatter
         #   reduce_scatter_tensor: even scatter
+        total_size = input_.size(0)
+        if split_size_or_sections is None:
+            if total_size % self.world_size != 0:
+                split_size_or_sections = [total_size // self.world_size + (1 if i < total_size % self.world_size else 0) for i in range(self.world_size)]
+            else:
+                split_size_or_sections = [total_size // self.world_size] * self.world_size
+            assert sum(split_size_or_sections) == total_size
+        
+        if isinstance(split_size_or_sections, list):
+            input_list = list(torch.split(input_, split_size_or_sections, dim=0))
+            if len(input_list) != self.world_size:
+                raise ValueError("Number of splits must match world size")
+        elif isinstance(split_size_or_sections, int):
+            # todo
+            pass
+        else:
+            raise ValueError("split_size_or_sections must be int or list of ints")
 
-        # TODO(ch-wan)
-        pass 
+        
+        output = torch.empty_like(input_list[self.rank % self.world_size])
+        torch.distributed.reduce_scatter(output, input_list, op=torch.distributed.ReduceOp.SUM)
+
+        return output
+
+
         
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm

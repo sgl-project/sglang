@@ -1120,11 +1120,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.dp_size != get_attention_tp_size():
+        if get_attention_tp_size() != 1:
             # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
             # can we reuse the buffer from dp attn?
-            raise NotImplementedError
-            # tp_reduce_scatter(hidden_states)
+            hidden_states = tp_reduce_scatter(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual

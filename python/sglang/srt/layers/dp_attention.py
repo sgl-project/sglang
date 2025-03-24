@@ -251,6 +251,5 @@ def dp_scatter(
         )
 
 def tp_reduce_scatter(input_: torch.Tensor):
-    # TODO(ch-wan)
-    pass
-    # return get_attention_tp_group().reduce_scatter(input_)
+    
+    return get_attention_tp_group().reduce_scatter(input_)
