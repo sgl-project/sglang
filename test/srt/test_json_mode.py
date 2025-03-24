@@ -22,6 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 def setup_class(cls, backend):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
@@ -57,10 +58,7 @@ class TestJSONModeOutlines(unittest.TestCase):
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
-                {
-                    "role": "user",
-                    "content": "What is the capital of Bulgaria?"
-                },
+                {"role": "user", "content": "What is the capital of Bulgaria?"},
             ],
             temperature=0,
             max_tokens=128,
@@ -105,7 +103,9 @@ class TestJSONModeOutlines(unittest.TestCase):
         try:
             js_obj = json.loads(full_response)
         except json.JSONDecodeError as e:
-            self.fail(f"Streamed response is not valid JSON. Error: {e}. Response: {full_response}")
+            self.fail(
+                f"Streamed response is not valid JSON. Error: {e}. Response: {full_response}"
+            )
 
         self.assertIsInstance(js_obj, dict)
 
@@ -115,10 +115,12 @@ class TestJSONModeXGrammar(TestJSONModeOutlines):
     def setUpClass(cls):
         setup_class(cls, backend="xgrammar")
 
+
 class TestJSONModeLLGuidance(TestJSONModeOutlines):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="llguidance")
+
 
 if __name__ == "__main__":
     unittest.main()
