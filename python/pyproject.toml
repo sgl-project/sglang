@@ -7,7 +7,6 @@ root = ".."
 version_scheme = "guess-next-dev"
 local_scheme = "node-and-date"
 fallback_version = "0.4.4.post1"
-# write_to = "_version.py"  # 将生成的版本号写入指定的文件
 
 [project]
 name = "sglang"
