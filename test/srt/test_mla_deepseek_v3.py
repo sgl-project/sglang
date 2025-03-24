@@ -54,7 +54,7 @@ class TestDeepseekV3MTP(unittest.TestCase):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
-        if torch.cuda.is_available() and torch.version.cuda:
+        if torch.cuda.is_available() and (torch.version.cuda or torch.version.hip):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",

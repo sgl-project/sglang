@@ -74,6 +74,11 @@ def convert_to_channelwise(
         (sum(logical_widths), 1), dtype=torch.float32, device=weight_scale.device
     )
 
+    # Handle scalar tensor case: broadcast same scale to all channels
+    if weight_scale.dim() == 0:
+        weight_scale_channel.fill_(weight_scale.item())
+        return weight_scale_channel
+
     # Expand each scale to match the size of each logical matrix.
     start = 0
     for idx, logical_width in enumerate(logical_widths):
