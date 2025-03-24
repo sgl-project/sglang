@@ -98,6 +98,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       " float eps, float fp8_min, float fp8_max) -> ()");
   m.impl("sgl_per_token_group_quant_fp8", torch::kCUDA, &sgl_per_token_group_quant_fp8);
 
+  m.def(
+      "sgl_per_token_group_quant_int8(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float int8_min, float int8_max) -> ()");
+  m.impl("sgl_per_token_group_quant_int8", torch::kCUDA, &sgl_per_token_group_quant_int8);
+
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
 
@@ -117,6 +122,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
+  m.def(
+      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
+      "token_expert_indices, Tensor gating_output) -> ()");
+  m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+
   /*
    * From csrc/speculative
    */
@@ -124,21 +134,24 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
       "Tensor uniform_samples, Tensor target_probs, Tensor draft_probs, "
+      "float threshold_single, float threshold_acc, "
       "bool deterministic, int cuda_stream) -> ()");
   m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
 
   m.def(
-      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! "
-      "retrive_next_sibling, "
-      "int topk, int depth, int draft_token_num) -> ()");
-  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor target_predict, int cuda_stream) -> ()");
+  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
 
   m.def(
-      "build_tree_kernel(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, "
-      "int topk, int depth, int draft_token_num) -> ()");
-  m.impl("build_tree_kernel", torch::kCUDA, &build_tree_kernel);
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
+
+  m.def("segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int cuda_stream) -> ()");
+  m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
 
   /*
    * From FlashInfer

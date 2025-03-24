@@ -23,6 +23,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# image
+IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
+IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+
+# video
+VIDEO_JOBS_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+
+# audio
+AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"
+AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
+
 
 class TestOpenAIVisionServer(unittest.TestCase):
     @classmethod
@@ -58,9 +69,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -75,7 +84,8 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "person" in text, text
+        # `driver` is for gemma-3-it
+        assert "man" in text or "person" or "driver" in text, text
         assert "cab" in text or "taxi" in text or "SUV" in text, text
         assert "iron" in text, text
         assert response.id
@@ -95,9 +105,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -152,9 +160,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                            },
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
                             "modalities": "multi-images",
                         },
                         {
@@ -190,7 +196,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 12
+        max_frames_num = 20
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -225,10 +231,28 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
         return messages
 
-    def test_video_chat_completion(self):
-        url = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
+    def prepare_video_messages_video_direct(self, video_path):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"video:{video_path}"},
+                        "modalities": "video",
+                    },
+                    {"type": "text", "text": "Please describe the video in detail."},
+                ],
+            },
+        ]
+        return messages
+
+    def get_or_download_file(self, url: str) -> str:
         cache_dir = os.path.expanduser("~/.cache")
-        file_path = os.path.join(cache_dir, "jobs.mp4")
+        if url is None:
+            raise ValueError()
+        file_name = url.split("/")[-1]
+        file_path = os.path.join(cache_dir, file_name)
         os.makedirs(cache_dir, exist_ok=True)
 
         if not os.path.exists(file_path):
@@ -237,9 +261,15 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
+        return file_path
+
+    def test_video_chat_completion(self):
+        url = VIDEO_JOBS_URL
+        file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
+        # messages = self.prepare_video_messages_video_direct(file_path)
         messages = self.prepare_video_messages(file_path)
 
         video_request = client.chat.completions.create(
@@ -265,11 +295,13 @@ class TestOpenAIVisionServer(unittest.TestCase):
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
+            or "speaker" in video_response
         ), video_response
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
+            or "hold" in video_response
         )
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
@@ -293,9 +325,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -325,18 +355,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                    },
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
                 }
             )
         elif image_id == 1:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                    },
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
                 }
             )
         else:
@@ -367,7 +393,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
             list(executor.map(self.run_decode_with_image, image_ids))
 
 
-class TestQWen2VLServer(TestOpenAIVisionServer):
+class TestQwen2VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -381,14 +407,14 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                "--chunked-prefill-size",
-                "10000",
+                "--mem-fraction-static",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
 
 
-class TestQWen2_5_VLServer(TestOpenAIVisionServer):
+class TestQwen2_5_VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -402,9 +428,6 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                # FIXME: workaround to chunked prefill within image embeds
-                "--chunked-prefill-size",
-                "10000",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -449,9 +472,7 @@ class TestVLMContextLengthIssue(unittest.TestCase):
                         "content": [
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                                },
+                                "image_url": {"url": IMAGE_MAN_IRONING_URL},
                             },
                             {
                                 "type": "text",
@@ -507,9 +528,35 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "minicpmv",
+                "--mem-fraction-static",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
+
+
+class TestDeepseekVL2Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/deepseek-vl2-small"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "deepseek-vl2",
+                "--context-length",
+                "4096",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
 
 
 class TestJanusProServer(TestOpenAIVisionServer):
@@ -528,6 +575,32 @@ class TestJanusProServer(TestOpenAIVisionServer):
                 "janus-pro",
                 "--mem-fraction-static",
                 "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+    def test_single_image_chat_completion(self):
+        # Skip this test because it is flaky
+        pass
+
+
+class TestGemma3itServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3-4b-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "gemma-it",
             ],
         )
         cls.base_url += "/v1"

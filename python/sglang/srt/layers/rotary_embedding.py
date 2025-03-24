@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from vllm import _custom_ops as ops
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
@@ -14,6 +13,8 @@ from sglang.srt.utils import is_cuda_available
 _is_cuda_available = is_cuda_available()
 if _is_cuda_available:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+else:
+    from vllm import _custom_ops as ops
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -69,7 +70,6 @@ class RotaryEmbedding(CustomOp):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        device: str,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -78,7 +78,6 @@ class RotaryEmbedding(CustomOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self.device = device
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
@@ -149,7 +148,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda_available:
+        if _is_cuda_available and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -168,76 +167,6 @@ class RotaryEmbedding(CustomOp):
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
-        return query, key
-
-    def forward_xpu(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from vllm._ipex_ops import ipex_ops as ops
-
-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device, dtype=query.dtype)
-        ops.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
-        )
-        return query, key
-
-    def forward_hpu(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from habana_frameworks.torch.hpex.kernels import (
-            RotaryPosEmbeddingMode,
-            apply_rotary_pos_emb,
-        )
-
-        positions = positions.flatten()
-        if offsets is not None:
-            positions = positions + offsets
-        num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions).view(num_tokens, 1, -1)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
-        # to query hidden dimension, so the original tensors need to be
-        # expanded
-        # GPT-NeoX kernel requires position_ids = None, offset, mode = BLOCKWISE
-        # and expansion of cos/sin tensors via concatenation
-        # GPT-J kernel requires position_ids = None, offset = 0, mode = PAIRWISE
-        # and expansion of cos/sin tensors via repeat_interleave
-        rope_mode: RotaryPosEmbeddingMode
-        if self.is_neox_style:
-            rope_mode = RotaryPosEmbeddingMode.BLOCKWISE
-            cos = torch.cat((cos, cos), dim=-1)
-            sin = torch.cat((sin, sin), dim=-1)
-        else:
-            rope_mode = RotaryPosEmbeddingMode.PAIRWISE
-            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
-            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = apply_rotary_pos_emb(query_rot, cos, sin, None, 0, rope_mode)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = apply_rotary_pos_emb(key_rot, cos, sin, None, 0, rope_mode)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
     def extra_repr(self) -> str:
@@ -285,19 +214,12 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factors: Union[List[float], float],
         dtype: torch.dtype,
-        device: str,
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
         self.scaling_factors: List[float] = scaling_factors  # noqa
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         # Lazy initialized.
         self._scaling_factor_to_offset: Dict[float, int]
@@ -356,17 +278,10 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factor: float,
         dtype: torch.dtype,
-        device: str,
     ) -> None:
         self.scaling_factor = scaling_factor
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -450,7 +365,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factor: float,
         dtype: torch.dtype,
-        device: str,
         *,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
@@ -465,13 +379,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -533,16 +441,12 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
     ):
         super().__init__()
 
-        if rotary_dim != head_size:
-            raise ValueError(
-                f"`Phi3LongRoPEScaledRotaryEmbedding` does not support \
-                    rotary_dim != head_size ({rotary_dim}!={head_size})."
-            )
         if is_neox_style is False:
             raise ValueError(
                 "`Phi3LongRoPEScaledRotaryEmbedding` only supports neox_style."
             )
 
+        self.rotary_dim = rotary_dim
         self.head_size = head_size
         self.max_position_embeddings = max_position_embeddings
         self.original_max_position_embeddings = original_max_position_embeddings
@@ -591,8 +495,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
             * (
                 self.base
                 ** (
-                    torch.arange(0, self.head_size, 2, dtype=torch.float)
-                    / self.head_size
+                    torch.arange(0, self.rotary_dim, 2, dtype=torch.float)
+                    / self.rotary_dim
                 )
             )
         )
@@ -641,8 +545,15 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         cos = cos.repeat(1, 2).unsqueeze(-2)
         sin = sin.repeat(1, 2).unsqueeze(-2)
 
-        query = query * cos + _rotate_neox(query) * sin
-        key = key * cos + _rotate_neox(key) * sin
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = query_rot * cos + _rotate_neox(query_rot) * sin
+        query = torch.cat((query_rot, query_pass), dim=-1)
+
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = key_rot * cos + _rotate_neox(key_rot) * sin
+        key = torch.cat((key_rot, key_pass), dim=-1)
 
         return query.flatten(-2), key.flatten(-2)
 
@@ -668,7 +579,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factor: float,
         dtype: torch.dtype,
-        device: str,
         *,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
@@ -676,6 +586,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
+        device: Optional[str] = "cuda",
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -688,14 +599,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
             * attn_factor
         )
+        self.device = device
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -790,7 +696,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        device: str,
         scaling_factor: float,
         low_freq_factor: float,
         high_freq_factor: float,
@@ -801,13 +706,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         self.high_freq_factor = high_freq_factor
         self.orig_max_position = orig_max_position
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            str,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
@@ -845,17 +744,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        device: str,
         mrope_section: Optional[List[int]] = None,
     ) -> None:
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            device,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
         self.mrope_section = mrope_section
@@ -921,8 +813,17 @@ class MRotaryEmbedding(RotaryEmbedding):
         spatial_merge_size: int,
         context_len: int = 0,
         seq_len: Optional[int] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        tokens_per_second: Optional[int] = None,
     ) -> Tuple[List[List[int]], int]:
-        """Get mrope input positions and delta value."""
+        """
+        Get mrope input positions and delta value.
+
+        :arg
+            second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+                The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+
+        """
 
         if isinstance(image_grid_thw, torch.Tensor):
             image_grid_thw = image_grid_thw.tolist()
@@ -959,6 +860,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 )
                 image_index += 1
                 remain_images -= 1
+                second_per_grid_t = 0
                 ed = ed_image
             else:
                 t, h, w = (
@@ -966,6 +868,10 @@ class MRotaryEmbedding(RotaryEmbedding):
                     video_grid_thw[video_index][1],
                     video_grid_thw[video_index][2],
                 )
+                if second_per_grid_ts is not None:
+                    second_per_grid_t = second_per_grid_ts[video_index]
+                else:
+                    second_per_grid_t = 1.0
                 video_index += 1
                 remain_videos -= 1
                 ed = ed_video
@@ -982,11 +888,11 @@ class MRotaryEmbedding(RotaryEmbedding):
             )
 
             t_index = (
-                torch.arange(llm_grid_t)
-                .view(-1, 1)
-                .expand(-1, llm_grid_h * llm_grid_w)
-                .flatten()
-            )
+                torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w)
+                * second_per_grid_t
+                * tokens_per_second
+            ).flatten()
+
             h_index = (
                 torch.arange(llm_grid_h)
                 .view(1, -1, 1)
@@ -1045,14 +951,9 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
-    device: str = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if device is None:
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        device = global_server_args_dict["device"]
     if rope_scaling is not None:
         # Transforms every value that is a list into a tuple for caching calls
         rope_scaling_tuple = {
@@ -1077,7 +978,7 @@ def get_rope(
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype, device
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
         if "rope_type" in rope_scaling:
@@ -1099,7 +1000,6 @@ def get_rope(
                 base,
                 is_neox_style,
                 dtype,
-                device,
                 scaling_factor,
                 low_freq_factor,
                 high_freq_factor,
@@ -1114,7 +1014,6 @@ def get_rope(
                     base,
                     is_neox_style,
                     dtype,
-                    device,
                     mrope_section=rope_scaling["mrope_section"],
                 )
             else:
@@ -1125,7 +1024,6 @@ def get_rope(
                     base,
                     is_neox_style,
                     dtype,
-                    device,
                 )
         elif scaling_type == "linear":
             scaling_factor = rope_scaling["factor"]
@@ -1137,7 +1035,6 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
-                device,
             )
         elif scaling_type == "dynamic":
             scaling_factor = rope_scaling["factor"]
@@ -1149,7 +1046,6 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
-                device,
             )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
@@ -1168,7 +1064,6 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
-                device,
                 **extra_kwargs,
             )
         elif scaling_type == "deepseek_yarn":
@@ -1196,7 +1091,6 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
-                device,
                 **extra_kwargs,
             )
         elif scaling_type == "longrope":
@@ -1224,6 +1118,37 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+# Copied from transformers
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+
+    # embedding is performed in float
+    cos = cos.unsqueeze(unsqueeze_dim).float()
+    sin = sin.unsqueeze(unsqueeze_dim).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+
+    return q_embed, k_embed
 
 
 def get_rope_cpu(
@@ -1307,8 +1232,21 @@ def get_rope_wrapper(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
+    device: Optional[str] = None,
 ):
-    return get_rope(
+    if device != "cpu":
+        return get_rope(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+            partial_rotary_factor,
+        )
+
+    return get_rope_cpu(
         head_size,
         rotary_dim,
         max_position,
@@ -1317,4 +1255,5 @@ def get_rope_wrapper(
         rope_scaling,
         dtype,
         partial_rotary_factor,
+        device,
     )

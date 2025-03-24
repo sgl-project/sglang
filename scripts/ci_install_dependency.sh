@@ -20,10 +20,12 @@ pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --force-rei
 
 pip install torch_memory_saver --force-reinstall
 
-pip install transformers==4.45.2 sentence_transformers accelerate peft pandas datasets
+pip install transformers==4.50.0 sentence_transformers accelerate==1.4.0 peft pandas datasets
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
 
-# reinstall sgl-kernel
-pip install sgl-kernel==0.0.4.post3 --force-reinstall --no-deps
+# For DeepSeek-VL2
+pip install timm
+
+pip install sgl-kernel==0.0.5.post3 --force-reinstall

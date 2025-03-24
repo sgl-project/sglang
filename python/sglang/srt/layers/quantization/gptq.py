@@ -1,15 +1,22 @@
 import logging
-import sys
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from vllm.scalar_type import scalar_types
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -92,20 +99,7 @@ class GPTQConfig(QuantizationConfig):
     @classmethod
     # Need to figure it out
     def get_min_capability(cls) -> int:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return 60
-
-        # Vendors can update
-        return sys.maxsize
-
-    @classmethod
-    def get_availability(cls) -> bool:
-        major, minor = get_device_capability()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 60
-
-        # Vendors can update
-        return False
+        return 60
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -125,6 +119,9 @@ class GPTQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["GPTQLinearMethod"]:
+        if not VLLM_AVAILABLE:
+            raise ImportError("vllm is not installed")
+
         from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 
         from sglang.srt.layers.quantization import get_linear_quant_method
@@ -135,11 +132,16 @@ class GPTQConfig(QuantizationConfig):
 class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
-    # (num_bits, is_sym) -> quant_type
-    TYPE_MAP = {
-        (4, True): scalar_types.uint4b8,
-        (8, True): scalar_types.uint8b128,
-    }
+    if VLLM_AVAILABLE:
+        from vllm.scalar_type import scalar_types
+
+        # (num_bits, is_sym) -> quant_type
+        TYPE_MAP = {
+            (4, True): scalar_types.uint4b8,
+            (8, True): scalar_types.uint8b128,
+        }
+    else:
+        raise ImportError("vllm is not installed")
 
     def __init__(
         self,
@@ -224,20 +226,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return 80
-
-        # Vendors can update
-        return sys.maxsize
-
-    @classmethod
-    def get_availability(cls) -> bool:
-        major, minor = get_device_capability()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 80
-
-        # Vendors can update
-        return False
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -291,6 +280,9 @@ class GPTQMarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        if not VLLM_AVAILABLE:
+            raise ImportError("vllm is not installed")
+
         from vllm.model_executor.layers.quantization.gptq_marlin import (
             GPTQMarlinLinearMethod,
             GPTQMarlinMoEMethod,
@@ -313,6 +305,9 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def is_gptq_marlin_compatible(cls, quant_config: Dict[str, Any]):
+        if not VLLM_AVAILABLE:
+            return False
+
         quant_method = quant_config.get("quant_method", "").lower()
         num_bits = quant_config.get("bits")
         group_size = quant_config.get("group_size")
@@ -322,9 +317,8 @@ class GPTQMarlinConfig(QuantizationConfig):
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (
             check_marlin_supported,
         )
-        from vllm.platforms import current_platform
 
-        if not current_platform.is_cuda():
+        if not _is_cuda:
             return False
 
         if quant_method != "gptq":
@@ -399,20 +393,7 @@ class MarlinConfig(QuantizationConfig):
     @classmethod
     # Need to figure it out
     def get_min_capability(cls) -> int:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return 80
-
-        # Vendors can update
-        return sys.maxsize
-
-    @classmethod
-    def get_availability(cls) -> bool:
-        major, minor = get_device_capability()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 80
-
-        # Vendors can update
-        return False
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -448,6 +429,9 @@ class MarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["MarlinLinearMethod"]:
+        if not VLLM_AVAILABLE:
+            raise ImportError("vllm is not installed")
+
         from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
 
         if isinstance(layer, LinearBase) or (

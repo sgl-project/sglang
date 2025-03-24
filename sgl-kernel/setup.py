@@ -153,12 +153,14 @@ sources = [
     "csrc/gemm/fp8_gemm_kernel.cu",
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu",
     "csrc/gemm/int8_gemm_kernel.cu",
-    "csrc/gemm/per_token_group_quant_fp8.cu",
+    "csrc/gemm/per_token_group_quant_8bit.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/gemm/per_tensor_quant_fp8.cu",
     "csrc/moe/moe_align_kernel.cu",
+    "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
     "csrc/speculative/speculative_sampling.cu",
+    "csrc/speculative/packbit.cu",
     "csrc/torch_extension.cc",
     "3rdparty/flashinfer/csrc/norm.cu",
     "3rdparty/flashinfer/csrc/renorm.cu",
@@ -178,6 +180,8 @@ if torch.cuda.is_available():
     if cuda_version >= (12, 8) and sm_version >= 100:
         nvcc_flags.append("-gencode=arch=compute_100,code=sm_100")
         nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+    else:
+        nvcc_flags.append("-use_fast_math")
     if sm_version >= 90:
         nvcc_flags.extend(nvcc_flags_fp8)
     if sm_version >= 80:
@@ -188,6 +192,8 @@ else:
         nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
     if enable_sm100a:
         nvcc_flags.append("-gencode=arch=compute_100a,code=sm_100a")
+    else:
+        nvcc_flags.append("-use_fast_math")
     if enable_fp8:
         nvcc_flags.extend(nvcc_flags_fp8)
     if enable_bf16:

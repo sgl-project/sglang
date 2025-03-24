@@ -33,12 +33,13 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend, next_power_of_2
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -263,15 +264,24 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
         )
 
+        # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
-            max_len = max(ret.global_num_tokens_cpu)
+            ret.global_num_tokens_gpu = torch.tensor(
+                batch.global_num_tokens, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
+                batch.global_num_tokens_for_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
+
+            sum_len = sum(batch.global_num_tokens)
             ret.gathered_buffer = torch.zeros(
-                (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+                (sum_len, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
                 device=device,
             )
-
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             return ret
@@ -322,6 +332,42 @@ class ForwardBatch:
 
         return ret
 
+    def merge_image_inputs(self) -> Optional[ImageInputs]:
+        """
+        Merge all image inputs in the batch into a single ImageInputs object.
+
+        Returns:
+            if none, current batch contains no image input
+
+        """
+        if not self.image_inputs or all(x is None for x in self.image_inputs):
+            return None
+
+        # Filter out None values
+        valid_inputs = [x for x in self.image_inputs if x is not None]
+
+        # Start with the first valid image input
+        merged = valid_inputs[0]
+
+        # Merge remaining inputs
+        for img_input in valid_inputs[1:]:
+            merged.merge(img_input)
+
+        if isinstance(merged.pixel_values, np.ndarray):
+            merged.pixel_values = torch.from_numpy(merged.pixel_values)
+
+        return merged
+
+    def contains_image_inputs(self) -> bool:
+        """ """
+        if self.image_inputs is None:
+            return True
+        return any(
+            image_input.pixel_values is not None and image_input.pixel_values is not []
+            for image_input in self.image_inputs
+            if image_input is not None
+        )
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -366,15 +412,22 @@ class ForwardBatch:
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
                             image_grid_thw=image_inputs.image_grid_thws,
+                            video_grid_thw=image_inputs.video_grid_thws,
+                            image_token_id=image_inputs.im_token_id,
+                            video_token_id=image_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
+                            vision_end_token_id=hf_config.vision_end_token_id,
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
+                            seq_len=len(self.input_ids),
+                            second_per_grid_ts=image_inputs.second_per_grid_ts,
+                            tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
                     batch.image_inputs[i].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
 
-        self.mrope_positions = torch.concat(
+        self.mrope_positions = torch.cat(
             [torch.tensor(pos, device=device) for pos in mrope_positions_list],
             axis=1,
         )
@@ -440,7 +493,7 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
-    positions = torch.concat(
+    positions = torch.cat(
         [
             torch.arange(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device

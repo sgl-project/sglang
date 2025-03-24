@@ -272,12 +272,12 @@ class PagedTokenToKVPoolAllocator:
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.concat(self.free_group))
+            self.free(torch.cat(self.free_group))
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []

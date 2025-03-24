@@ -1,9 +1,9 @@
 # Supported Models
 
 ## Generative Models
-- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2
+- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3
 - Mistral / Mixtral / Mistral NeMo / Mistral Small 3
-- Gemma / Gemma 2
+- Gemma / Gemma 2 / Gemma3
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
 - OLMoE
@@ -32,6 +32,8 @@
 - Phi-3-Small
 - IBM Granite 3
 - Janus-Pro-1B / Janus-Pro-7B
+- Deepseek-VL2 / Deepseek-VL2-small
+- Gemma 3 (it)
 
 ## Embedding Models
 

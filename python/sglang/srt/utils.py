@@ -36,12 +36,13 @@ import tempfile
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
-from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
 
 import numpy as np
@@ -60,6 +61,7 @@ from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils._contextlib import _DecoratorContextManager
 from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
@@ -74,6 +76,11 @@ show_time_cost = False
 time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -126,12 +133,61 @@ def is_cuda_available():
     return is_cuda()
 
 
-def is_triton_available():
-    if is_cuda() or is_xpu() or is_hip():
-        return get_bool_env_var("TRITON_AVAILABLE", default="true")
-    else:
-        # update once CPU/HPU supports triton
-        return False
+_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
+    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
+)
+
+
+class DynamicGradMode(_DecoratorContextManager):
+    """
+    A combination of torch.no_grad and torch.inference_mode,
+    with their behavior controlled by an environment variable. Just refer to them.
+    """
+
+    @staticmethod
+    def set_inference_mode(mode: bool):
+        if isinstance(mode, bool):
+            global _ENABLE_TORCH_INFERENCE_MODE
+
+            _ENABLE_TORCH_INFERENCE_MODE = mode
+        else:
+            logger.warning("mode is not a boolean object")
+
+    def __init__(self, mode=True):
+        if not torch._jit_internal.is_scripting():
+            super().__init__()
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self.mode = mode
+        else:
+            self.prev = False
+
+    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
+        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
+            return super().__new__(cls)
+        return cls()(mode_or_orig_func)
+
+    def __enter__(self) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context = torch._C._InferenceMode(self.mode)
+            self._inference_mode_context.__enter__()
+        else:
+            self.prev = torch.is_grad_enabled()
+            torch.set_grad_enabled(False)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
+        else:
+            torch.set_grad_enabled(self.prev)
+
+    def clone(self) -> "DynamicGradMode":
+        r"""
+        Create a copy of this class
+        """
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            return self.__class__(self.mode)
+        else:
+            return self.__class__()
 
 
 def enable_show_time_cost():
@@ -206,7 +262,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        num_gpus = cuda_device_count_stateless()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -460,8 +516,9 @@ def load_image(image_file: Union[str, bytes]):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        image = Image.open(BytesIO(response.content))
+        response = requests.get(image_file, stream=True, timeout=timeout).raw
+        image = Image.open(response)
+        response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -479,7 +536,10 @@ def load_image(image_file: Union[str, bytes]):
 
 
 def suppress_other_loggers():
-    from vllm.logger import logger as vllm_default_logger
+    try:
+        from vllm.logger import logger as vllm_default_logger
+    except ImportError:
+        return
 
     vllm_default_logger.setLevel(logging.WARN)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
@@ -488,6 +548,7 @@ def suppress_other_loggers():
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
+    logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -535,6 +596,10 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
     if include_parent:
         try:
+            if parent_pid == os.getpid():
+                itself.kill()
+                sys.exit(0)
+
             itself.kill()
 
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
@@ -563,11 +628,14 @@ def monkey_patch_p2p_access_check():
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.quantization.gguf import (
-        GGUFConfig,
-        GGUFEmbeddingMethod,
-        GGUFLinearMethod,
-    )
+    try:
+        from vllm.model_executor.layers.quantization.gguf import (
+            GGUFConfig,
+            GGUFEmbeddingMethod,
+            GGUFLinearMethod,
+        )
+    except ImportError:
+        return
 
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -659,6 +727,16 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
     format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
@@ -782,12 +860,22 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
-    if socket_type == zmq.PUSH:
+
+    def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-    elif socket_type == zmq.PULL:
+
+    def set_recv_opt():
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
@@ -916,6 +1004,13 @@ def get_amdgpu_memory_capacity():
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )
+
+
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
 
 
 def get_nvgpu_memory_capacity():
@@ -1144,7 +1239,6 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
-        assert 0 <= minor < 10
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
@@ -1253,11 +1347,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 @lru_cache(maxsize=2)
@@ -1570,6 +1659,16 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
+@contextmanager
+def empty_context(*args, **kwargs):
+    try:
+        # Setup code goes here
+        yield
+    finally:
+        # Cleanup code goes here
+        pass
+
+
 def add_prefix(name: str, prefix: str) -> str:
     """Add a weight path prefix to a module name.
 
@@ -1581,3 +1680,29 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def is_remote_url(url: Union[str, Path]) -> bool:
+    """
+    Check if the URL is a remote URL of the format:
+    <connector_type>://<host>:<port>/<model_name>
+    """
+    if isinstance(url, Path):
+        return False
+
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    return m is not None
+
+
+def parse_connector_type(url: str) -> str:
+    """
+    Parse the connector type from the URL of the format:
+    <connector_type>://<path>
+    """
+    pattern = r"(.+)://(.*)"
+    m = re.match(pattern, url)
+    if m is None:
+        return ""
+
+    return m.group(1)

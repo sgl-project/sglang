@@ -1,26 +1,38 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-import sys
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
-    prepare_fp8_layer_for_marlin,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     convert_to_channelwise,
+    is_layer_skipped,
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        apply_fp8_marlin_linear,
+        prepare_fp8_layer_for_marlin,
+    )
+
+    MARLIN_FP8_AVAILABLE = True
+except ImportError:
+    MARLIN_FP8_AVAILABLE = False
+
+    def apply_fp8_marlin_linear(*args, **kwargs):
+        raise ImportError("vllm is not installed")
+
+    def prepare_fp8_layer_for_marlin(*args, **kwargs):
+        raise ImportError("vllm is not installed")
+
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -37,11 +49,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    native_per_token_group_quant_fp8,
-    native_w8a8_block_fp8_matmul,
-    per_token_group_quant_fp8,
-)
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_w8a8_block_fp8_linear,
@@ -51,7 +59,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_device_capability,
     is_cuda,
     is_hip,
     permute_weight,
@@ -62,11 +69,17 @@ from sglang.srt.utils import (
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 _is_hip = is_hip()
-_is_cuda = is_cuda()
 
 if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+else:
+    from vllm import _custom_ops as vllm_ops
 
 logger = logging.getLogger(__name__)
 
@@ -116,24 +129,7 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return 80
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return 0
-
-        # Vendors can update
-        return sys.maxsize
-
-    @classmethod
-    def get_availability(cls) -> bool:
-        major, minor = get_device_capability()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            return major * 10 + minor > 80
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            return True
-
-        # Vendors can update
-        return False
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -156,8 +152,6 @@ class Fp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.attention.layer import Attention  # Avoid circular import
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -166,8 +160,6 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
-        elif isinstance(layer, Attention):
-            return Fp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -198,7 +190,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+        self.use_marlin = (
+            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
+        )
         # Disable marlin for ROCm
         if _is_hip:
             self.use_marlin = False
@@ -396,9 +390,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
         if self.use_marlin:
-            prepare_fp8_layer_for_marlin(layer)
-            # Activations not quantized for marlin.
-            del layer.input_scale
+            try:
+                prepare_fp8_layer_for_marlin(layer)
+                # Activations not quantized for marlin.
+                del layer.input_scale
+            except ImportError:
+                self.use_marlin = False
 
     def apply(
         self,
@@ -408,15 +405,18 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.use_marlin:
-            return apply_fp8_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
+            try:
+                return apply_fp8_marlin_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    workspace=layer.workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias,
+                )
+            except ImportError:
+                self.use_marlin = False
 
         if self.block_quant:
             return apply_w8a8_block_fp8_linear(
@@ -705,12 +705,20 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             for expert in range(layer.num_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                if _is_cuda:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
+                else:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -787,9 +795,18 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
+                    if _is_cuda:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                    else:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = vllm_ops.scaled_fp8_quant(
+                            dq_weight, max_w13_scales[expert_id]
+                        )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -875,52 +892,6 @@ class Fp8MoEMethod:
             )
             torch.cuda.empty_cache()
 
-    def torch_w8a8_block_fp8_moe(
-        self, a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_shape
-    ):
-        from sglang.srt.layers.activation import SiluAndMul
-
-        """This function performs fused moe with block-wise quantization using native torch."""
-
-        B, D = a.shape
-        topk = topk_ids.shape[-1]
-        a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
-        out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
-        topk_weight = topk_weight.view(-1)
-        topk_ids = topk_ids.view(-1)
-
-        _, block_k = block_shape[0], block_shape[1]
-        a_q, a_s = native_per_token_group_quant_fp8(a, block_k)
-        # NOTE(HandH1998): Since "index_cuda" not implemented for 'Float8_e4m3fn', we need to cast `float8`` to `float32``.
-        a_q = a_q.to(torch.float32)
-        for i in range(w1.shape[0]):
-            mask = topk_ids == i
-            if mask.sum():
-                inter_out = native_w8a8_block_fp8_matmul(
-                    a_q[mask],
-                    w1[i],
-                    a_s[mask],
-                    w1_s[i],
-                    block_shape,
-                    output_dtype=a.dtype,
-                )
-                act_out = SiluAndMul().forward_native(inter_out)
-                act_out_q, act_out_s = native_per_token_group_quant_fp8(
-                    act_out, block_k
-                )
-                act_out = act_out.to(torch.float32)
-                out[mask] = native_w8a8_block_fp8_matmul(
-                    act_out_q,
-                    w2[i],
-                    act_out_s,
-                    w2_s[i],
-                    block_shape,
-                    output_dtype=a.dtype,
-                )
-        return (
-            out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
-        ).sum(dim=1)
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -994,7 +965,7 @@ class Fp8MoEMethod:
                     layer.w13_weight_scale1,
                     layer.w2_weight_scale1,
                 )
-        elif _is_cuda:
+        else:
             # Expert fusion with FP8 quantization
             return fused_experts(
                 x,
@@ -1020,24 +991,6 @@ class Fp8MoEMethod:
                 block_shape=self.quant_config.weight_block_size,
                 no_combine=no_combine,
             )
-
-        # for CPU and other accelerators, fallback to native path
-        return self.torch_w8a8_block_fp8_moe(
-            a=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            w1_s=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_s=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
-            topk_weight=topk_weights,
-            topk_ids=topk_ids,
-            block_shape=self.quant_config.weight_block_size,
-        )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
