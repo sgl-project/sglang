@@ -1,6 +1,6 @@
 """
-python3 -m unittest test_json_object.TestJSONObjectResponse.test_json_object_response
-python3 -m unittest test_json_object.TestJSONObjectResponse.test_json_object_with_streaming
+python3 -m unittest test_json_mode.TestJSONObjectResponse.test_json_mode_response
+python3 -m unittest test_json_mode.TestJSONObjectResponse.test_json_mode_with_streaming
 """
 
 import json
@@ -42,8 +42,8 @@ class TestJSONObjectResponse(unittest.TestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_json_object_response(self):
-        """Test that response_format json_object produces valid JSON."""
+    def test_json_mode_response(self):
+        """Test that response_format json_object (also known as "json mode") produces valid JSON."""
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -68,8 +68,8 @@ class TestJSONObjectResponse(unittest.TestCase):
         # Verify it's actually an object (dict)
         self.assertIsInstance(js_obj, dict, f"Response is not a JSON object: {text}")
 
-    def test_json_object_with_streaming(self):
-        """Test that streaming with json_object response format works correctly."""
+    def test_json_mode_with_streaming(self):
+        """Test that streaming with json_object response (also known as "json mode") format works correctly."""
         stream = self.client.chat.completions.create(
             model=self.model,
             messages=[
