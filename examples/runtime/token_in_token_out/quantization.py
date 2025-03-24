@@ -17,12 +17,13 @@ else:
     from sglang.utils import launch_server_cmd
 
 
-MODEL_PATH = "Qwen/Qwen2.5-32B-Instruct"
+MODEL_PATH = "VPTQ-community/Qwen2.5-32B-Instruct-v8-k256-256-woft"
+
 
 def main():
     # Launch the server
     server_process, port = launch_server_cmd(
-        f"python -m sglang.launch_server --model-path {MODEL_PATH} --skip-tokenizer-init --host 0.0.0.0"
+        f"python -m sglang.launch_server --model-path {MODEL_PATH} --skip-tokenizer-init --host 0.0.0.0 --quantization vptq"
     )
     wait_for_server(f"http://localhost:{port}")
 

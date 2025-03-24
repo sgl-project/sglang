@@ -443,6 +443,7 @@ class ServerArgs:
                 "awq",
                 "fp8",
                 "gptq",
+                "vptq",
                 "marlin",
                 "gptq_marlin",
                 "awq_marlin",
