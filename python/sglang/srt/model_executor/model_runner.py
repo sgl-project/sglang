@@ -868,13 +868,13 @@ class ModelRunner:
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             self.attn_backend = FlashMLABackend(self)
-        elif self.server_args.attention_backend == "flashattention":
+        elif self.server_args.attention_backend == "fa3":
             assert torch.cuda.get_device_capability()[0] >= 9, (
-                "FlashAttention Backend requires SM>=90. "
+                "FlashAttention v3 Backend requires SM>=90. "
                 "Please use `--attention-backend flashinfer`."
             )
             logger.warning(
-                "FlashAttention Backend is in Beta. Multimodal, Page > 1, FP8, MLA and Speculative Decoding are not supported."
+                "FlashAttention v3 Backend is in Beta. Multimodal, Page > 1, FP8, MLA and Speculative Decoding are not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
