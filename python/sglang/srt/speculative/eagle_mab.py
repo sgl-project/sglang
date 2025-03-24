@@ -212,11 +212,17 @@ class MABGroupManager:
 
     def __init__(
         self,
-        groups: List[int],
         strategies: List[str],
         algorithm: str = "EG",
         window_size: int = 1000,
     ):
+        # Define batch size groups for MAB
+        # TODO: batch_size should be determined more refinely
+        groups = (
+            list(range(1, 32))  # Fine-grained for small batches
+            + list(range(32, 128, 8))  # Medium step size for medium batches
+            + list(range(128, 257, 32))  # Large step size for large batches
+        )
         self.groups = sorted(groups)
         self.strategies = strategies
 
