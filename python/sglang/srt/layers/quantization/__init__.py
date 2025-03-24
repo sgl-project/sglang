@@ -9,7 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -34,7 +33,7 @@ except ImportError:
     class DummyConfig:
         pass
 
-    AQLMConfig = AWQConfig = AWQMarlinConfig = BitsAndBytesConfig = (
+    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = (
         CompressedTensorsConfig
     ) = DummyConfig
     DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
@@ -49,6 +48,7 @@ from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.layers.quantization.awq import AWQConfig
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
