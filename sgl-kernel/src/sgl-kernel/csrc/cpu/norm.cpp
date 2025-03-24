@@ -9,16 +9,16 @@ void rmsnorm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ weight,
-    int batch_size,
-    int hidden_size,
+    int64_t batch_size,
+    int64_t hidden_size,
     float eps = 1e-5) {
 
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int begin, int end) {
-    for (int i = begin; i < end; ++i) {
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
       const scalar_t* __restrict__ input_ptr = input + i * hidden_size;
@@ -26,7 +26,7 @@ void rmsnorm_kernel_impl(
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
 
-      int d;
+      int64_t d;
       #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
@@ -78,19 +78,19 @@ void fused_add_rmsnorm_kernel_impl(
     scalar_t* __restrict__ residual,
     const scalar_t* __restrict__ weight,
     float* __restrict__ buffer,
-    int batch_size,
-    int hidden_size,
+    int64_t batch_size,
+    int64_t hidden_size,
     float eps = 1e-5) {
 
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int begin, int end) {
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
     int tid = at::get_thread_num();
     float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
 
-    for (int i = begin; i < end; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       scalar_t* __restrict__ input_ptr = input + i * hidden_size;
       scalar_t* __restrict__ residual_ptr = residual + i * hidden_size;
@@ -98,7 +98,7 @@ void fused_add_rmsnorm_kernel_impl(
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
 
-      int d;
+      int64_t d;
       #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
@@ -173,8 +173,8 @@ void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, doub
   CHECK_DIM(2, input);
   CHECK_DIM(1, weight);
   CHECK_EQ(input.size(1), weight.size(0));
-  int batch_size = input.size(0);
-  int hidden_size = input.size(1);
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = input.size(1);
   CHECK_EQ(output.size(0), batch_size);
   CHECK_EQ(output.size(1), hidden_size);
 
@@ -204,13 +204,13 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
   CHECK_EQ(input.size(0), residual.size(0));
   CHECK_EQ(input.size(1), residual.size(1));
   CHECK_EQ(input.size(1), weight.size(0));
-  int batch_size = input.size(0);
-  int hidden_size = input.size(1);
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = input.size(1);
 
   // allocate temp buffer to store x in float32 per thread
   // TODO: implement a singleton for context
-  int num_threads = at::get_num_threads();
-  at::Tensor buffer = at::zeros({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+  int64_t num_threads = at::get_num_threads();
+  at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_rmsnorm_kernel", [&] {
     fused_add_rmsnorm_kernel_impl<scalar_t>(
