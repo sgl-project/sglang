@@ -51,65 +51,74 @@ else:
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
+
 @triton.jit
-def write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token,
-                          token_mask, BLOCK_SIZE_M, BLOCK_SIZE_N,
-                          compute_type):
+def write_zeros_to_output(
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    pid_n,
+    N,
+    offs_token,
+    token_mask,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    compute_type,
+):
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
-                                                                   None, :]
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
 def fused_moe_kernel_gptq_awq(
-        # Pointers to matrices
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        b_scale_ptr,
-        b_zp_ptr,
-        topk_weights_ptr,
-        sorted_token_ids_ptr,
-        expert_ids_ptr,
-        num_tokens_post_padded_ptr,
-        # Matrix dimensions
-        N: tl.constexpr,
-        K: tl.constexpr,
-        EM,
-        num_valid_tokens,
-        # The stride variables represent how much to increase the ptr by when
-        # moving by 1 element in a particular dimension. E.g. `stride_am` is
-        # how much to increase `a_ptr` by to get the element one row down
-        # (A has M rows).
-        stride_am,
-        stride_ak,
-        stride_be,
-        stride_bk,
-        stride_bn,
-        stride_cm,
-        stride_cn,
-        stride_bse,
-        stride_bsk,
-        stride_bsn,
-        stride_bze,
-        stride_bzk,
-        stride_bzn,
-        group_size: tl.constexpr,
-        # Meta-parameters
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr,
-        MUL_ROUTED_WEIGHT: tl.constexpr,
-        top_k: tl.constexpr,
-        compute_type: tl.constexpr,
-        has_zp: tl.constexpr,
-        use_int4_w4a16: tl.constexpr,
-        use_int8_w8a16: tl.constexpr,
-        even_Ks: tl.constexpr,
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    group_size: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_int4_w4a16: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+    even_Ks: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -158,8 +167,7 @@ def fused_moe_kernel_gptq_awq(
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
-        tl.int64)
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
@@ -168,25 +176,41 @@ def fused_moe_kernel_gptq_awq(
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
-        write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N,
-                              offs_token, token_mask, BLOCK_SIZE_M,
-                              BLOCK_SIZE_N, compute_type)
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
-                      offs_k[None, :] * stride_ak)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
 
     if use_int4_w4a16:
-        b_ptrs = b_ptr + off_experts * stride_be + \
-                 (offs_k[:, None] // 2) * stride_bk + offs_bn[None, :] * \
-                 stride_bn
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] // 2) * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
         b_shifter = (offs_k[:, None] % 2) * 4
     elif use_int8_w8a16:
-        b_ptrs = b_ptr + off_experts * stride_be + \
-                 offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
 
     if not has_zp and use_int4_w4a16:
         b_zp_num = 8
@@ -212,34 +236,43 @@ def fused_moe_kernel_gptq_awq(
             k_mask = None
             k_other = None
 
-        a = tl.load(a_ptrs,
-                    mask=token_mask[:, None] &
-                         (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                    other=0.0)
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
         b = tl.load(b_ptrs)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
-        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + \
-                       offs_bn[None, :] * stride_bsn + \
-                       ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * \
-                       stride_bsk
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
         b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = b_zp_ptr + off_experts * stride_bze + \
-                        (offs_bn[None, :] // 2) * stride_bzn + \
-                        offs_k_true * stride_bzk
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 2) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = ((b_zp >> b_zp_shifter) & 0xF)
+            b_zp = (b_zp >> b_zp_shifter) & 0xF
             b_zp = b_zp.to(tl.float32)
         elif has_zp and use_int8_w8a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
-            b_zp_ptrs = b_zp_ptr + off_experts * stride_bze + \
-                        offs_bn[None, :] * stride_bzn + \
-                        offs_k_true * stride_bzk
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + offs_bn[None, :] * stride_bzn
+                + offs_k_true * stride_bzk
+            )
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
             b_zp = b_zp.to(tl.float32)
 
@@ -258,19 +291,17 @@ def fused_moe_kernel_gptq_awq(
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token,
-                             mask=token_mask,
-                             other=0)
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
-                                                                   None, :]
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
 
 @triton.jit
 def fused_moe_kernel(
@@ -782,10 +813,11 @@ def invoke_fused_moe_kernel(
         # We assume that top_ids of each token is unique, so
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.shape[0],
-                 A.shape[0] * top_k * config['BLOCK_SIZE_M'])
-    grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.shape[1], META['BLOCK_SIZE_N']), )
+        EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+    )
 
     K = B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:
@@ -793,8 +825,11 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
-    if (use_int8_w8a16 or use_int4_w4a16) and \
-            block_shape is not None and block_shape[1] > 0:
+    if (
+        (use_int8_w8a16 or use_int4_w4a16)
+        and block_shape is not None
+        and block_shape[1] > 0
+    ):
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         fused_moe_kernel_gptq_awq[grid](
@@ -1283,10 +1318,11 @@ def fused_experts_impl(
 
     # Check constraints.
     if use_int4_w4a16:
-        assert hidden_states.shape[1] // 2 == w1.shape[
-            2], "Hidden size mismatch"
+        assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
+        assert (
+            hidden_states.shape[1] == w1.shape[2] - padded_size
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
