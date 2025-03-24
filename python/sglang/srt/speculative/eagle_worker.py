@@ -933,14 +933,7 @@ class EAGLEWorker(TpModelWorker):
         # Set window size for MAB metrics
         self.mab_window_size = self.server_args.speculative_mab_window_size
 
-        # Define batch size groups for MAB
-        # TODO: batch_size should be determined dynamically
-        self.mab_groups = (
-            list(range(1, 32)) + list(range(32, 128, 8)) + list(range(128, 257, 32))
-        )
-
         self.mab_manager = MABGroupManager(
-            groups=self.mab_groups,
             strategies=self.mab_strategies,
             algorithm=self.mab_algorithm,
             window_size=self.mab_window_size,
