@@ -263,12 +263,11 @@ class ModelRunner:
             ] or self.model_config.hf_config.architectures == [
                 "Qwen2_5_VLForConditionalGeneration"
             ]:
-                # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
+                # Chunked prefill is not supported for qwen-vl series
                 logger.info(
-                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen-vl series."
+                    "Automatically turn off --chunked-prefill-size for qwen-vl series."
                 )
                 server_args.chunked_prefill_size = -1
-                server_args.disable_radix_cache = True
 
             if self.model_config.hf_config.architectures == ["DeepseekVL2ForCausalLM"]:
                 # TODO: deepseek-vl2 does not support radix cache now, set disable_radix_cache=True automatically
