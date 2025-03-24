@@ -10,6 +10,8 @@ from sglang.srt.utils import load_image
 
 
 class MllamaImageProcessor(BaseImageProcessor):
+    models = [MllamaForConditionalGeneration]
+
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
@@ -55,6 +57,3 @@ class MllamaImageProcessor(BaseImageProcessor):
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
         return image_inputs
-
-
-ImageProcessorMapping = {MllamaForConditionalGeneration: MllamaImageProcessor}

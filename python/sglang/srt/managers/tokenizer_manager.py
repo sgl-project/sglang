@@ -179,7 +179,7 @@ class TokenizerManager:
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it
-            # We creat image_processor for any skip_tokenizer_init to make sure we still encode
+            # We create image_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.image_processor = get_image_processor(
                 self.model_config.hf_config, server_args, _processor

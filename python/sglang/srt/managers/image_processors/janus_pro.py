@@ -11,6 +11,8 @@ from sglang.srt.models.deepseek_janus_pro import MultiModalityCausalLM
 
 
 class JanusProProcessor(SGLangBaseImageProcessor):
+    models = [MultiModalityCausalLM]
+
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
@@ -77,6 +79,3 @@ class JanusProProcessor(SGLangBaseImageProcessor):
             "im_end_id": res["im_end_id"],
             "im_token_id": res["im_token_id"],
         }
-
-
-ImageProcessorMapping = {MultiModalityCausalLM: JanusProProcessor}

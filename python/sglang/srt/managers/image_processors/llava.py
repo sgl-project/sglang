@@ -15,6 +15,8 @@ from sglang.utils import get_exception_traceback
 
 
 class LlavaImageProcessor(BaseImageProcessor):
+    models = [LlavaVidForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
 
@@ -143,10 +145,3 @@ class LlavaImageProcessor(BaseImageProcessor):
             "image_sizes": image_sizes,
             "modalities": request_obj.modalities or ["image"],
         }
-
-
-ImageProcessorMapping = {
-    LlavaVidForCausalLM: LlavaImageProcessor,
-    LlavaQwenForCausalLM: LlavaImageProcessor,
-    LlavaMistralForCausalLM: LlavaImageProcessor,
-}
