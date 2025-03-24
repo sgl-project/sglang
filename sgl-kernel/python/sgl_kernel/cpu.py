@@ -119,3 +119,29 @@ def grouped_topk(
         num_expert_group,
         topk_group,
     )
+
+def fused_add_rmsnorm(
+    input,
+    residual,
+    weight,
+    eps,
+):
+    sgl_kernel.common_ops.fused_add_rmsnorm_cpu(
+        input,
+        residual,
+        weight,
+        eps,
+    )
+
+def rmsnorm(
+    output,
+    input,
+    weight,
+    eps,
+):
+    return sgl_kernel.common_ops.rmsnorm_cpu(
+        output,
+        input,
+        weight,
+        eps,
+    )

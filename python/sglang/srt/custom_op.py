@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.cpu_utils import cpu_has_amx_support
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -36,10 +37,13 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif global_server_args_dict["device"] == "cpu":
+            return self.forward_cpu
         else:
             return self.forward_native
 
