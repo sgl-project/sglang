@@ -1179,9 +1179,7 @@ def get_distributed_backend() -> str:
     device = get_device().lower()
 
     backend_map = {"cuda": "nccl", "xpu": "ccl", "hpu": "hccl", "cpu": "gloo"}
-
-    backend = backend_map.get(device, "nccl")
-    return backend
+    return backend_map[device]
 
 
 @lru_cache(maxsize=8)
