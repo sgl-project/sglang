@@ -415,6 +415,7 @@ class LlamaForCausalLM(nn.Module):
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
     }
+    hip_attention_supported = True
 
     def __init__(
         self,

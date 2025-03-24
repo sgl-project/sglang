@@ -566,6 +566,23 @@ class ModelRunner:
                     "This may lead to less accurate results!"
                 )
 
+        if self.server_args.enable_hip_attention:
+            model_supports_hip_attention = hasattr(
+                self.model, "hip_attention_supported"
+            )
+            if self.server_args.hip_attention_config.using_extend:
+                if not model_supports_hip_attention:
+                    raise RuntimeError(
+                        "Model does not support HiP attention context length extension. "
+                        "Try disabling context extension in --hip-attention-config."
+                    )
+            if self.server_args.enable_hip_kv_cache_offload:
+                if not model_supports_hip_attention:
+                    raise RuntimeError(
+                        "Model does not support HiP attention KV cache offloading. "
+                        "Try disabling --enable-hip-kv-cache-offload."
+                    )
+
         # Parse other args
         self.sliding_window_size = (
             self.model.get_attention_sliding_window_size()
