@@ -49,6 +49,8 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.conn import KVBootstrapServer
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.image_processor import (
     get_dummy_image_processor,
@@ -177,7 +179,7 @@ class TokenizerManager:
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it
-            # We creat image_processor for any skip_tokenizer_init to make sure we still encode
+            # We create image_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.image_processor = get_image_processor(
                 self.model_config.hf_config, server_args, _processor
@@ -312,6 +314,16 @@ class TokenizerManager:
                 (HealthCheckOutput, lambda x: None),
             ]
         )
+
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        # for disaggregtion, start kv boostrap server on prefill
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # only start bootstrap server on prefill tm
+            self.bootstrap_server = KVBootstrapServer(
+                self.server_args.disaggregation_bootstrap_port
+            )
 
     async def generate_request(
         self,
