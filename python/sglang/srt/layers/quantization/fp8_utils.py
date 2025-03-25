@@ -42,7 +42,10 @@ if _is_cuda:
 TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 
 _TORCH_VERSION = torch.__version__.split("+")[0]
-_TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+try:
+    _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+except ValueError:
+    _TORCH_VERSION_TUPLE = (0, 0, 0)
 
 # The condition to determine if it is on a platform that supports
 # torch._scaled_mm rowwise feature.
