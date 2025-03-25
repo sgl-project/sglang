@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -87,7 +88,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput, ExpertDistributionReqOutput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,

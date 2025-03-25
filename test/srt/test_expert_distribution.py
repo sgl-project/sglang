@@ -4,6 +4,7 @@ import os
 import unittest
 
 import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -71,7 +72,9 @@ class TestExpertDistribution(unittest.TestCase):
             # Verify the dumped file exists and has correct format
             csv_files = glob.glob("expert_distribution_*.csv")
             self.assertEqual(
-                len(csv_files), 1, f"Expected exactly one expert distribution CSV file {csv_files=}"
+                len(csv_files),
+                1,
+                f"Expected exactly one expert distribution CSV file {csv_files=}",
             )
 
             # Check CSV file format
@@ -100,11 +103,17 @@ class TestExpertDistribution(unittest.TestCase):
 
                     # Verify data types
                     layer_id, expert_id, count = row
-                    self.assertTrue(layer_id.isdigit(), f"layer_id should be an integer {row=} {rows=}")
                     self.assertTrue(
-                        expert_id.isdigit(), f"expert_id should be an integer {row=} {rows=}"
+                        layer_id.isdigit(),
+                        f"layer_id should be an integer {row=} {rows=}",
                     )
-                    self.assertTrue(count.isdigit(), f"count should be an integer {row=} {rows=}")
+                    self.assertTrue(
+                        expert_id.isdigit(),
+                        f"expert_id should be an integer {row=} {rows=}",
+                    )
+                    self.assertTrue(
+                        count.isdigit(), f"count should be an integer {row=} {rows=}"
+                    )
 
         finally:
             kill_process_tree(process.pid)

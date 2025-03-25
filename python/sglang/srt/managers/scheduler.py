@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -85,7 +86,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput, ExpertDistributionReqOutput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
