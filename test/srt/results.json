@@ -1,0 +1,210 @@
+[
+  {
+    "timestamp": "2025-03-25T06:46:43.164095",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "metrics": {
+      "en": 0.856,
+      "en:std": 0.35108973211986705,
+      "group_latin": 0.856,
+      "group_latin:std": 0.35108973211986705,
+      "score:std": 0.35108973211986705,
+      "score": 0.856
+    },
+    "score": 0.856
+  },
+  {
+    "timestamp": "2025-03-25T06:47:24.805797",
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "metrics": {
+      "en": 0.596,
+      "en:std": 0.4906974628016738,
+      "group_latin": 0.596,
+      "group_latin:std": 0.4906974628016738,
+      "score:std": 0.4906974628016738,
+      "score": 0.596
+    },
+    "score": 0.596
+  },
+  {
+    "timestamp": "2025-03-25T06:48:35.661809",
+    "model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "metrics": {
+      "en": 0.884,
+      "en:std": 0.32022492095400695,
+      "group_latin": 0.884,
+      "group_latin:std": 0.32022492095400695,
+      "score:std": 0.32022492095400695,
+      "score": 0.884
+    },
+    "score": 0.884
+  },
+  {
+    "timestamp": "2025-03-25T06:50:11.257282",
+    "model": "google/gemma-2-27b-it",
+    "metrics": {
+      "en": 0.256,
+      "en:std": 0.4364218143035474,
+      "group_latin": 0.256,
+      "group_latin:std": 0.4364218143035474,
+      "score:std": 0.4364218143035474,
+      "score": 0.256
+    },
+    "score": 0.256
+  },
+  {
+    "timestamp": "2025-03-25T06:53:25.613977",
+    "model": "meta-llama/Llama-3.1-70B-Instruct",
+    "metrics": {
+      "en": 0.968,
+      "en:std": 0.176,
+      "group_latin": 0.968,
+      "group_latin:std": 0.176,
+      "score:std": 0.176,
+      "score": 0.968
+    },
+    "score": 0.968
+  },
+  {
+    "timestamp": "2025-03-25T06:57:55.624174",
+    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "metrics": {
+      "en": 0.68,
+      "en:std": 0.46647615158762407,
+      "group_latin": 0.68,
+      "group_latin:std": 0.46647615158762407,
+      "score:std": 0.46647615158762407,
+      "score": 0.68
+    },
+    "score": 0.68
+  },
+  {
+    "timestamp": "2025-03-25T07:00:31.513479",
+    "model": "Qwen/Qwen2-57B-A14B-Instruct",
+    "metrics": {
+      "en": 0.888,
+      "en:std": 0.31536645351083237,
+      "group_latin": 0.888,
+      "group_latin:std": 0.31536645351083237,
+      "score:std": 0.31536645351083237,
+      "score": 0.888
+    },
+    "score": 0.888
+  },
+  {
+    "timestamp": "2025-03-25T07:01:19.624933",
+    "model": "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",
+    "metrics": {
+      "en": 0.864,
+      "en:std": 0.34278856457005674,
+      "group_latin": 0.864,
+      "group_latin:std": 0.34278856457005674,
+      "score:std": 0.34278856457005674,
+      "score": 0.864
+    },
+    "score": 0.864
+  },
+  {
+    "timestamp": "2025-03-25T07:02:01.884726",
+    "model": "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
+    "metrics": {
+      "en": 0.564,
+      "en:std": 0.4958870839213298,
+      "group_latin": 0.564,
+      "group_latin:std": 0.4958870839213298,
+      "score:std": 0.4958870839213298,
+      "score": 0.564
+    },
+    "score": 0.564
+  },
+  {
+    "timestamp": "2025-03-25T07:03:19.192046",
+    "model": "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+    "metrics": {
+      "en": 0.856,
+      "en:std": 0.35108973211986705,
+      "group_latin": 0.856,
+      "group_latin:std": 0.35108973211986705,
+      "score:std": 0.35108973211986705,
+      "score": 0.856
+    },
+    "score": 0.856
+  },
+  {
+    "timestamp": "2025-03-25T07:04:02.904439",
+    "model": "neuralmagic/gemma-2-2b-it-FP8",
+    "metrics": {
+      "en": 0.508,
+      "en:std": 0.49993599590347565,
+      "group_latin": 0.508,
+      "group_latin:std": 0.49993599590347565,
+      "score:std": 0.49993599590347565,
+      "score": 0.508
+    },
+    "score": 0.508
+  },
+  {
+    "timestamp": "2025-03-25T07:05:55.616059",
+    "model": "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8",
+    "metrics": {
+      "en": 0.956,
+      "en:std": 0.20509509989270833,
+      "group_latin": 0.956,
+      "group_latin:std": 0.20509509989270833,
+      "score:std": 0.20509509989270833,
+      "score": 0.956
+    },
+    "score": 0.956
+  },
+  {
+    "timestamp": "2025-03-25T07:07:27.806099",
+    "model": "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+    "metrics": {
+      "en": 0.724,
+      "en:std": 0.4470167782086037,
+      "group_latin": 0.724,
+      "group_latin:std": 0.4470167782086037,
+      "score:std": 0.4470167782086037,
+      "score": 0.724
+    },
+    "score": 0.724
+  },
+  {
+    "timestamp": "2025-03-25T07:08:50.339152",
+    "model": "neuralmagic/Qwen2-72B-Instruct-FP8",
+    "metrics": {
+      "en": 0.952,
+      "en:std": 0.2137662274541982,
+      "group_latin": 0.952,
+      "group_latin:std": 0.2137662274541982,
+      "score:std": 0.2137662274541982,
+      "score": 0.952
+    },
+    "score": 0.952
+  },
+  {
+    "timestamp": "2025-03-25T07:10:14.894103",
+    "model": "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
+    "metrics": {
+      "en": 0.844,
+      "en:std": 0.3628553430776512,
+      "group_latin": 0.844,
+      "group_latin:std": 0.3628553430776512,
+      "score:std": 0.3628553430776512,
+      "score": 0.844
+    },
+    "score": 0.844
+  },
+  {
+    "timestamp": "2025-03-25T07:11:53.998764",
+    "model": "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+    "metrics": {
+      "en": 0.864,
+      "en:std": 0.3427885645700568,
+      "group_latin": 0.864,
+      "group_latin:std": 0.3427885645700568,
+      "score:std": 0.3427885645700568,
+      "score": 0.864
+    },
+    "score": 0.864
+  }
+]
