@@ -7,7 +7,7 @@ try:
 except ImportError:
     use_deepep = False
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
@@ -178,6 +178,7 @@ class DeepEPDispatcher:
         self.src2dst = src2dst
         return reorder_topk_ids, seg_indptr, gateup_input
 
+    # TODO wait for low_latency code, so currently this file is just hacky refactor
     def dispatch(self, *args, **kwargs):
         self.dispatch_a(*args, **kwargs)
         return self.dispatch_b()
@@ -196,6 +197,7 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
         topk_idx = topk_idx.to(torch.int64)
+
         (
             hidden_states,
             topk_idx,
@@ -338,4 +340,3 @@ class DeepEPDispatcher:
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
         )
         return combined_x, event
-
