@@ -195,7 +195,6 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
-        self.hidden_shape = hidden_states.shape
         topk_idx = topk_idx.to(torch.int64)
         # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
@@ -351,7 +350,7 @@ class DeepEPDispatcher:
             event.current_stream_wait()
 
         self.handle = None
-        return hidden_states.view(self.hidden_shape)
+        return hidden_states
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple):
         previous_event = Buffer.capture() if self.async_finish else None
