@@ -8,11 +8,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
@@ -108,7 +104,7 @@ def check_model_scores(results):
     print(summary)
 
     if is_in_ci():
-        write_github_step_summary(f"### TestNightlyGsm8KEval\n{summary}")
+        write_github_step_summary(f"### TestNightlyGsm8KEval for vLLM awq, gptq, gguf\n{summary}")
 
     if failed_models:
         raise AssertionError("\n".join(failed_models))

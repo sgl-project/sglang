@@ -203,11 +203,11 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_with_triton_attention_backend
 
-      # - name: Benchmark offline throughput (w/ FP8)
-      #   timeout-minutes: 10
-      #   run: |
-      #     cd test/srt
-      #     python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+      - name: Benchmark offline throughput (w/ FP8)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
