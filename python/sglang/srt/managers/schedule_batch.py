@@ -144,11 +144,11 @@ class FINISH_ABORT(BaseFinishReason):
 
 
 @dataclasses.dataclass
-class ImageInputs:
+class MultimodalInputs:
     """The image related inputs."""
 
     pixel_values: Union[torch.Tensor, np.array]
-    image_hashes: Optional[list] = None
+    data_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     image_pad_len: Optional[list] = None
@@ -182,20 +182,27 @@ class ImageInputs:
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
     slice_end_id: Optional[int] = None
+    # [num_images, 2 (w, h)]
     tgt_sizes: Optional[list] = None
+
+    # audio
+    audio_start_id: Optional[torch.Tensor] = None
+    audio_end_id: Optional[torch.Tensor] = None
+    audio_features: Optional[List[torch.Tensor]] = None
+    audio_feature_lens: Optional[List[torch.Tensor]] = None
 
     @staticmethod
     def from_dict(obj: dict):
-        ret = ImageInputs(
+        ret = MultimodalInputs(
             pixel_values=obj["pixel_values"],
-            image_hashes=obj["image_hashes"],
+            data_hashes=obj["data_hashes"],
         )
 
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        ret.pad_values = [x % (1 << 30) for x in ret.image_hashes]
+        ret.pad_values = [x % (1 << 30) for x in ret.data_hashes]
 
         optional_args = [
             "image_sizes",
@@ -211,6 +218,10 @@ class ImageInputs:
             "slice_start_id",
             "slice_end_id",
             "tgt_sizes",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_features",
+            "audio_feature_lens",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -223,9 +234,19 @@ class ImageInputs:
             or isinstance(ret.pixel_values, list)
         )
 
+        assert ret.audio_features is None or isinstance(ret.audio_features, list)
+
         return ret
 
-    def merge(self, other: ImageInputs):
+    def contains_image_inputs(self) -> bool:
+        """ """
+        return self.pixel_values is not None and self.pixel_values != []
+
+    def contains_audio_inputs(self) -> bool:
+        """ """
+        return self.audio_features is not None and self.audio_features != []
+
+    def merge(self, other: MultimodalInputs):
         """
         merge image inputs when requests are being merged
         """
@@ -268,10 +289,12 @@ class ImageInputs:
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
-        self.image_hashes += other.image_hashes
-        self.pad_values = [x % (1 << 30) for x in self.image_hashes]
+        self.data_hashes += other.data_hashes
+        self.pad_values = [x % (1 << 30) for x in self.data_hashes]
+
         # args needed to be merged
         optional_args = [
+            "audio_features",
             "image_sizes",
             "image_offsets",
             "image_pad_len",
@@ -362,7 +385,7 @@ class Req:
         self.decoded_text = ""
 
         # For multimodal inputs
-        self.image_inputs: Optional[ImageInputs] = None
+        self.multimodal_inputs: Optional[MultimodalInputs] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -458,10 +481,10 @@ class Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     def extend_image_inputs(self, image_inputs):
-        if self.image_inputs is None:
-            self.image_inputs = image_inputs
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
         else:
-            self.image_inputs.merge(image_inputs)
+            self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -802,7 +825,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = []
 
         for req in self.reqs:
-            im = req.image_inputs
+            im = req.multimodal_inputs
             if im is None or im.num_image_tokens is None:
                 # No image input
                 self.encoder_lens_cpu.append(0)
@@ -1391,7 +1414,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            image_inputs=[r.image_inputs for r in self.reqs],
+            multimodal_inputs=[r.multimodal_inputs for r in self.reqs],
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
@@ -1474,7 +1497,7 @@ class ModelWorkerBatch:
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 
     # For multimodal
-    image_inputs: Optional[List[ImageInputs]]
+    multimodal_inputs: Optional[List[MultimodalInputs]]
 
     # For encoder-decoder
     encoder_cached: Optional[List[bool]]
