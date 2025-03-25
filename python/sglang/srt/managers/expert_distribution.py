@@ -4,6 +4,8 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 
