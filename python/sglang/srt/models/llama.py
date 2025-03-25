@@ -478,6 +478,10 @@ class LlamaForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
+        # print some info
+        print(f"Parameters: {params_dict}")
+        print(f"Weights: {weights}")
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
