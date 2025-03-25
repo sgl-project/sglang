@@ -86,7 +86,7 @@ if __name__ == "__main__":
     args.max_parallel = 64
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in [16, 12, 8, 4, 2, 1]:
+    for request_rate in [24, 16, 12, 8, 4, 2, 1]:
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)
