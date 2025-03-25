@@ -11,8 +11,10 @@ from sglang.test.test_programs import (
     test_stream,
 )
 
+from sglang.test.test_utils import CustomTestCase
 
-class TestVertexAIBackend(unittest.TestCase):
+
+class TestVertexAIBackend(CustomTestCase):
     backend = None
 
     @classmethod

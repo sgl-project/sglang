@@ -8,6 +8,8 @@ from sglang.lang.choices import (
     unconditional_likelihood_normalized,
 )
 
+from sglang.test.test_utils import CustomTestCase
+
 MOCK_CHOICES_INPUT_DATA = {
     "choices": [
         "organ",  # ["organ"]
@@ -51,7 +53,7 @@ MOCK_CHOICES_INPUT_DATA = {
 }
 
 
-class TestChoices(unittest.TestCase):
+class TestChoices(CustomTestCase):
 
     def test_token_length_normalized(self):
         """Confirm 'antidisestablishmentarianism' is selected due to high confidences for
