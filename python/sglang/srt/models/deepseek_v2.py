@@ -1429,7 +1429,7 @@ class DeepseekV2Model(nn.Module):
                 ),
                 operations=operations,
                 delta_stages={
-                    ForwardMode.EXTEND: 1,
+                    ForwardMode.EXTEND: 0,
                     ForwardMode.DECODE: 2,
                 }[forward_batch.forward_mode],
             )
