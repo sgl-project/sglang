@@ -1868,7 +1868,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return ProfileReqOutput(success=True, message="Succeeded")
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
