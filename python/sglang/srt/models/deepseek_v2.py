@@ -293,12 +293,10 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        dispatch_state = self._forward_deepep_dispatch_a(
+        self._forward_deepep_dispatch_a(
             self.deepep_dispatcher, forward_mode, hidden_states, router_logits
         )
-        recv_hidden_states, reorder_topk_ids, seg_indptr = (
-            self.deepep_dispatcher.dispatch_b(dispatch_state)
-        )
+        recv_hidden_states, reorder_topk_ids, seg_indptr = self.deepep_dispatcher.dispatch_b()
 
         final_hidden_states = self._forward_deepep_expert(
             forward_mode, recv_hidden_states, reorder_topk_ids, seg_indptr
@@ -343,7 +341,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        return chosen_deepep_dispatcher.dispatch_a(
+        chosen_deepep_dispatcher.dispatch_a(
             hidden_states,
             topk_idx,
             topk_weights,
@@ -379,7 +377,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_dispatch_a(self, state):
-        state.state_dispatch = self._forward_deepep_dispatch_a(
+        self._forward_deepep_dispatch_a(
             self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
             state.forward_batch.forward_mode,
             state.hidden_states_for_moe_input,
@@ -392,10 +390,10 @@ class DeepseekV2MoE(nn.Module):
             state.recv_hidden_states_from_dispatch,
             state.reorder_topk_ids_from_dispatch,
             state.seg_indptr_from_dispatch,
-        ) = dispatcher.dispatch_b(state.state_dispatch)
+        ) = dispatcher.dispatch_b()
 
     def _forward_tbo_op_combine_a(self, state):
-        state.state_combine = self.tbo_deepep_dispatchers[
+        self.tbo_deepep_dispatchers[
             state.tbo_subbatch_index
         ].combine_a(
             state.expert_output_hidden_states, state.forward_batch.forward_mode
@@ -403,9 +401,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        state.hidden_states_from_combine = dispatcher.combine_b(
-            state.state_combine
-        )
+        state.hidden_states_from_combine = dispatcher.combine_b()
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
