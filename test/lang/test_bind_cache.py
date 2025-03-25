@@ -1,9 +1,7 @@
 import unittest
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
-
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 class TestBind(CustomTestCase):

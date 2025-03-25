@@ -3,7 +3,6 @@ import unittest
 
 from sglang import Anthropic, set_default_backend
 from sglang.test.test_programs import test_mt_bench, test_stream
-
 from sglang.test.test_utils import CustomTestCase
 
 

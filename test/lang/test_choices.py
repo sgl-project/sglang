@@ -7,7 +7,6 @@ from sglang.lang.choices import (
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
-
 from sglang.test.test_utils import CustomTestCase
 
 MOCK_CHOICES_INPUT_DATA = {

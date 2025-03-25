@@ -3,7 +3,6 @@ import unittest
 import sglang as sgl
 from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.chat_template import get_chat_template
-
 from sglang.test.test_utils import CustomTestCase
 
 
