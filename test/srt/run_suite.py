@@ -30,6 +30,7 @@ suites = {
         TestFile("test_ebnf_constrained.py"),
         TestFile("test_fp8_kernel.py", 2),
         TestFile("test_embedding_openai_server.py", 36),
+        TestFile("test_expert_distribution.py", 31),
         TestFile("test_gguf.py", 78),
         TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_hidden_states.py", 55),
