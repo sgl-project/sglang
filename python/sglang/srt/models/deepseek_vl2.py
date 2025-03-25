@@ -11,7 +11,7 @@ from sglang.srt.configs.deepseekvl2 import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -222,7 +222,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         ):
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             extend_seq_lens_cpu = forward_batch.extend_seq_lens.cpu().numpy()
-            for idx, image in enumerate(forward_batch.image_inputs):
+            for idx, image in enumerate(forward_batch.mm_inputs):
                 if image is None:
                     continue
                 start_idx = extend_start_loc_cpu[idx]
@@ -262,10 +262,10 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         return input_ids
 
-    def get_image_feature(self, image_input: ImageInputs):
+    def get_image_feature(self, image_input: MultimodalInputs):
         pixel_values = image_input.pixel_values.type(
             next(self.vision.parameters()).dtype
         ).to(device=next(self.vision.parameters()).device)

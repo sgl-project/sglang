@@ -57,7 +57,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -513,7 +513,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -523,7 +523,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
-    def get_image_feature(self, image_input: ImageInputs) -> torch.Tensor:
+    def get_image_feature(self, image_input: MultimodalInputs) -> torch.Tensor:
         pixel_values = image_input.pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_input.image_grid_thws)
         return image_embeds
@@ -572,10 +572,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         inputs_embeds = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
             embed_tokens=self.get_input_embeddings(),
-            image_embedding_func=self.get_image_feature,
+            mm_data_embedding_func=self.get_image_feature,
         )
 
         hidden_states = self.model(
