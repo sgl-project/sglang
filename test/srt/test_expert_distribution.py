@@ -90,11 +90,14 @@ class TestExpertDistribution(unittest.TestCase):
                 for row in rows:
                     # Verify each row has 2 columns
                     self.assertEqual(
-                        len(row), 2, "Each row should have expert_id and count"
+                        len(row), 3, "Each row should have layer_id, expert_id and count"
                     )
 
                     # Verify data types
-                    expert_id, count = row
+                    layer_id, expert_id, count = row
+                    self.assertTrue(
+                        layer_id.isdigit(), "layer_id should be an integer"
+                    )
                     self.assertTrue(
                         expert_id.isdigit(), "expert_id should be an integer"
                     )
