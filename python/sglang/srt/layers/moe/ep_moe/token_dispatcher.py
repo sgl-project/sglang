@@ -178,26 +178,7 @@ class DeepEPDispatcher:
         self.src2dst = src2dst
         return reorder_topk_ids, seg_indptr, gateup_input
 
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_experts: int,
-        forward_mode: ForwardMode,
-        num_max_dispatch_tokens_per_rank: int = 128,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        state = self.dispatch_stage_start(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            num_experts,
-            forward_mode,
-            num_max_dispatch_tokens_per_rank,
-        )
-        return self.dispatch_stage_wait(state)
-
-    def dispatch_stage_start(
+    def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -238,7 +219,7 @@ class DeepEPDispatcher:
 
         return event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
 
-    def dispatch_stage_wait(self, state):
+    def dispatch_b(self, state):
         event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = state
 
         if self.async_finish:
@@ -319,73 +300,7 @@ class DeepEPDispatcher:
             event,
         )
 
-    def dispatch_low_latency(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-    ):
-        """
-        # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'
-        # Please please make sure to change DeepEP code in internode_ll.cu dispatch / combine first and then reinstall!
-        # More details refer: https://github.com/deepseek-ai/DeepEP/issues/15#issuecomment-2709715782
-        +
-        diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
-        index f60e933..cddaabf 100644
-        --- a/csrc/kernels/internode_ll.cu
-        +++ b/csrc/kernels/internode_ll.cu
-        @@ -307,14 +307,14 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
-                    int num_topk, int num_experts, int rank, int num_ranks,
-                    void* workspace, cudaStream_t stream, int phases) {
-            constexpr int kNumMaxTopK = 9;
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
-        +
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-            const auto num_sms = cell_div(num_experts, kNumWarpGroups);
-            EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
-        -    EP_HOST_ASSERT(cell_div(static_cast<int>(hidden * 2 / sizeof(int4)), 32 * (num_warps - 1)) <= 2);
-        +    // EP_HOST_ASSERT(cell_div(static_cast<int>(hidden * 2 / sizeof(int4)), 32 * (num_warps - 1)) <= 2);
-        +
-            // Workspace checks
-            auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
-        @@ -505,8 +505,8 @@ void combine(void* combined_x,
-                    int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-                    int num_topk, int num_experts, int rank, int num_ranks,
-                    void* workspace, cudaStream_t stream, int phases) {
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            constexpr int kNumMaxTopk = 9;
-        +
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-        """
-
-        recv_hidden_states, recv_expert_count, handle, event, hook = (
-            self.buffer_low_latency.low_latency_dispatch(
-                hidden_states,
-                topk_idx,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                async_finish=self.async_finish,
-                return_recv_hook=False,  # True for double-batch overlapping, need call hook()
-            )
-        )
-        # hook()
-        return recv_hidden_states, recv_expert_count, handle, event, hook
-
-    def combine(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        state = self.combine_stage_start(hidden_states, forward_mode)
-        return self.combine_stage_wait(state)
-
-    def combine_stage_start(
+    def combine_a(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ):
         # Todo: enable low latency combine
@@ -421,7 +336,7 @@ class DeepEPDispatcher:
 
         return event, hidden_states
 
-    def combine_stage_wait(self, state):
+    def combine_b(self, state):
         event, hidden_states = state
 
         if self.async_finish:
@@ -442,22 +357,3 @@ class DeepEPDispatcher:
         )
         return combined_x, event
 
-    def combine_low_latency(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        handle: Tuple,
-    ):
-        combined_hidden_states, event_overlap, hook = (
-            self.buffer_low_latency.low_latency_combine(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                handle,
-                async_finish=self.async_finish,
-                return_recv_hook=False,  # True for double-batch overlapping, need call hook()
-            )
-        )
-        # hook()
-        return combined_hidden_states, event_overlap, hook
