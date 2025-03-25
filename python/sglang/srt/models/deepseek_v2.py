@@ -1311,7 +1311,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             and isinstance(self.mlp, DeepseekV2MoE)
         )
         state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(state.self_attn_state)
-        TODO
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
         state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = \
