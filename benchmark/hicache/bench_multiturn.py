@@ -100,6 +100,12 @@ def parse_args():
         default="performance_metrics.jsonl",
         help="File to log performance metrics",
     )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Tag of a certain run",
+    )
     return parser.parse_args()
 
 
@@ -183,9 +189,9 @@ def gen_payload(prompt, output_len):
     return payload
 
 
-def log_to_jsonl_file(data, file_path="performance_metrics.jsonl"):
+def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
     """Append the data with a timestamp to the specified JSONL file."""
-    timestamped_data = {"timestamp": datetime.now().isoformat(), **data}
+    timestamped_data = {"timestamp": datetime.now().isoformat(), "tag": tag, **data}
     try:
         with open(file_path, "a") as file:
             file.write(
@@ -266,7 +272,6 @@ class WorkloadGenerator:
         self.num_rounds = args.num_rounds
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
-        self.logfile = args.log_file
 
     async def handle_request(self, item):
         try:
@@ -409,7 +414,7 @@ class WorkloadGenerator:
         metrics = get_metrics(self.baseurl + "metrics")
         print("Metrics:", metrics)
         performance_data["metrics"] = metrics
-        log_to_jsonl_file(performance_data, self.logfile)
+        return performance_data
 
 
 def get_metrics(metrics_url):
@@ -443,4 +448,5 @@ if __name__ == "__main__":
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)
-        WorkloadGenerator(args).run()
+        performance_data = WorkloadGenerator(args).run()
+        log_to_jsonl_file(performance_data, args.logfile)

@@ -1,20 +1,18 @@
 import json
 import queue
 import time
+
 import requests
-from tqdm.asyncio import tqdm
-
-from sglang.bench_serving import (
-    get_tokenizer,
-)
-
-
 from bench_multiturn import (
-    parse_args,
-    gen_payload,
     ReadyQueue,
     WorkloadGenerator,
+    gen_payload,
+    log_to_jsonl_file,
+    parse_args,
 )
+from tqdm.asyncio import tqdm
+
+from sglang.bench_serving import get_tokenizer
 
 
 class ReasoningWorkloadGenerator(WorkloadGenerator):
@@ -59,7 +57,6 @@ class ReasoningWorkloadGenerator(WorkloadGenerator):
         self.performance_metrics = {"ttft": [], "latency": [], "itl": []}
 
         self.max_parallel = args.max_parallel
-        self.logfile = args.log_file
 
     def response_handler(self):
         while True:
@@ -111,4 +108,5 @@ if __name__ == "__main__":
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)
-        ReasoningWorkloadGenerator(args).run()
+        performance_data = ReasoningWorkloadGenerator(args).run()
+        log_to_jsonl_file(performance_data, "reasoning_benchmark.jsonl")
