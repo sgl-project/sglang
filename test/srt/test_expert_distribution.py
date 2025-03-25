@@ -97,9 +97,7 @@ class TestExpertDistribution(unittest.TestCase):
 
                     # Verify data types
                     layer_id, expert_id, count = row
-                    self.assertTrue(
-                        layer_id.isdigit(), "layer_id should be an integer"
-                    )
+                    self.assertTrue(layer_id.isdigit(), "layer_id should be an integer")
                     self.assertTrue(
                         expert_id.isdigit(), "expert_id should be an integer"
                     )
