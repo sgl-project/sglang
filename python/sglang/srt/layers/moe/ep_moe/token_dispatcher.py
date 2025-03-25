@@ -178,7 +178,7 @@ class DeepEPDispatcher:
 
     def dispatch(
         self,
-        hidden_states: torch.Tensor,
+        x: Tuple[torch.Tensor, torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
@@ -189,26 +189,24 @@ class DeepEPDispatcher:
         # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
             (
-                hidden_states,
+                x,
                 topk_idx,
                 topk_weights,
                 num_recv_tokens_per_expert_list,
                 handle,
                 event,
-            ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+            ) = self.dispatch_normal(x, topk_idx, topk_weights, num_experts)
             self.tokens_per_expert = torch.tensor(
                 num_recv_tokens_per_expert_list,
-                device=hidden_states.device,
+                device=topk_idx.device,
                 dtype=torch.int64,
             )
         else:
-            hidden_states, recv_expert_count, handle, event, hook = (
-                self.dispatch_low_latency(
-                    hidden_states,
-                    topk_idx,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                )
+            x, recv_expert_count, handle, event, hook = self.dispatch_low_latency(
+                x,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
             )
             self.recv_expert_count = recv_expert_count
 
@@ -218,6 +216,8 @@ class DeepEPDispatcher:
         self.handle = handle
         self.topk_idx = topk_idx
         self.topk_weights = topk_weights
+
+        hidden_states, hidden_scales = x if isinstance(x, tuple) else (x, None)
         if hidden_states.shape[0] > 0:
             reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
                 hidden_states, fp8_dtype=hidden_states.dtype
@@ -229,11 +229,11 @@ class DeepEPDispatcher:
             seg_indptr = torch.zeros(
                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
             )
-        return hidden_states, reorder_topk_ids, seg_indptr
+        return (hidden_states, hidden_scales), reorder_topk_ids, seg_indptr
 
     def dispatch_normal(
         self,
-        x: torch.Tensor,
+        x: Tuple[torch.Tensor, torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,

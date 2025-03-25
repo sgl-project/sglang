@@ -83,6 +83,7 @@ class GroupedGemmRunner(torch.nn.Module):
         scale_a: torch.Tensor = None,
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
+        is_w13: bool = False,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -110,6 +111,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 scale_a,
                 scale_b,
                 block_shape=block_shape,
+                is_w13=is_w13,
             )
         return c
 
@@ -788,6 +790,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 class DeepEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+    Only support Deepseek V3 series
     """
 
     _has_printed = False
@@ -830,7 +833,7 @@ class DeepEPMoE(EPMoE):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Tuple[torch.Tensor, torch.Tensor],
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
         forward_mode: ForwardMode,
@@ -845,24 +848,18 @@ class DeepEPMoE(EPMoE):
 
     def forward_normal(
         self,
-        hidden_states: torch.Tensor,
+        x: Tuple[torch.Tensor, torch.Tensor],
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
+        hidden_states, input_scales = x
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
 
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            max_value = (
-                torch.max(hidden_states)
-                .repeat(self.num_experts_per_partition)
-                .to(torch.float32)
-            )
-            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -875,7 +872,7 @@ class DeepEPMoE(EPMoE):
             hidden_states.shape[0],
             self.w13_weight.shape[1],
             device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            dtype=torch.bfloat16,
         )
 
         if hidden_states.shape[0] > 0:
@@ -888,13 +885,14 @@ class DeepEPMoE(EPMoE):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices_cur_rank,
                 use_fp8_w8a8=self.use_fp8_w8a8,
-                scale_a=self.w13_input_scale,
+                scale_a=input_scales,
                 scale_b=(
                     self.w13_weight_scale_inv
                     if self.use_block_quant
                     else self.w13_weight_scale
                 ),
                 block_shape=self.block_shape,
+                is_w13=True,
             )
 
         # Act
@@ -902,11 +900,7 @@ class DeepEPMoE(EPMoE):
             gateup_output.shape[0],
             gateup_output.shape[1] // 2,
             device=gateup_output.device,
-            dtype=(
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
-            ),
+            dtype=torch.bfloat16,
         )
         if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
@@ -934,7 +928,7 @@ class DeepEPMoE(EPMoE):
             down_input.shape[0],
             self.w2_weight.shape[1],
             device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            dtype=torch.bfloat16,
         )
         if down_input.shape[0] > 0:
             down_output = self.grouped_gemm_runner(
