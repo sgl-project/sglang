@@ -51,24 +51,25 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
 
     torch.cuda.synchronize()
     start_time = time.time()
-    with nvtx.annotate(debug_name):
-        try:
-            yield
-        finally:
-            torch.cuda.synchronize()
-            latency = time.time() - start_time
-            debug_info = dict(
-                forward_mode=forward_batch.forward_mode.name,
-                throughput=num_tokens / latency,
-                latency=latency,
-                batch_size=forward_batch.batch_size,
-                num_tokens=num_tokens,
-                global_num_tokens=global_num_tokens,
-                can_run_tbo=forward_batch.can_run_tbo,
-                start_time=start_time,
-                tp_rank=tp_rank,
-            )
-            _write_output(debug_info, tp_rank)
+    with torch.autograd.profiler.record_function(debug_name):
+        with nvtx.annotate(debug_name):
+            try:
+                yield
+            finally:
+                torch.cuda.synchronize()
+                latency = time.time() - start_time
+                debug_info = dict(
+                    forward_mode=forward_batch.forward_mode.name,
+                    throughput=num_tokens / latency,
+                    latency=latency,
+                    batch_size=forward_batch.batch_size,
+                    num_tokens=num_tokens,
+                    global_num_tokens=global_num_tokens,
+                    can_run_tbo=forward_batch.can_run_tbo,
+                    start_time=start_time,
+                    tp_rank=tp_rank,
+                )
+                _write_output(debug_info, tp_rank)
 
 
 def _write_output(data, tp_rank):
