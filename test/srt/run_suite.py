@@ -41,6 +41,7 @@ suites = {
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 92),
         TestFile("test_mla_deepseek_v3.py", 221),
+        TestFile("test_mla_int8_deepseek_v3.py", 421),
         TestFile("test_mla_flashinfer.py", 395),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_no_chunked_prefill.py", 126),
