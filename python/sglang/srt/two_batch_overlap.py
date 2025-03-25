@@ -160,24 +160,28 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        stage_name_brief = (
-            stage.__name__.replace("_forward_tbo_stage_", "")
-            .replace("prefill", "P")
-            .replace("decode", "D")
-        )
-        debug_name = f"{self._debug_name}{self._index}-{stage_name_brief}"
-        if _ENABLE_PROFILE:
-            ctx = nvtx.annotate(debug_name)
-        else:
-            ctx = nullcontext()
+        for op in stage:
+            self._stage_output = op(
+                state=self._stage_state, **(self._stage_output or {})
+            )
 
-        with ctx:
-            try:
-                self._stage_output = stage(
-                    state=self._stage_state, **(self._stage_output or {})
-                )
-            except Exception as e:
-                raise Exception(f"Error when handling stage {debug_name} {e=}")
+        # TODO
+        # stage_name_brief = (
+        #     stage.__name__.replace("_forward_tbo_stage_", "")
+        #     .replace("prefill", "P")
+        #     .replace("decode", "D")
+        # )
+        # debug_name = f"{self._debug_name}{self._index}-{stage_name_brief}"
+        # if _ENABLE_PROFILE:
+        #     ctx = nvtx.annotate(debug_name)
+        # else:
+        #     ctx = nullcontext()
+        #
+        # with ctx:
+        #     try:
+        #         TODO
+        #     except Exception as e:
+        #         raise Exception(f"Error when handling stage {debug_name} {e=}")
 
         self._index += 1
 
