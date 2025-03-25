@@ -79,8 +79,8 @@ class TestExpertDistribution(unittest.TestCase):
                 header = next(csv_reader)
                 self.assertEqual(
                     header,
-                    ["expert_id", "count"],
-                    "CSV header should be 'expert_id,count'",
+                    ["layer_id", "expert_id", "count"],
+                    "CSV header should be 'layer_id,expert_id,count'",
                 )
 
                 # Check data rows
