@@ -217,3 +217,7 @@ class YieldOperation:
 
 def convert_operations_to_stages(operations) -> List[Callable]:
     return TODO
+
+
+def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> Sequence[List[Any]]:
+    TODO
