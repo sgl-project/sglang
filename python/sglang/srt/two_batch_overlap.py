@@ -117,21 +117,21 @@ Stage = List[Callable]
 
 def model_forward_execute_two_batch(
     inputs,
-    stages_a: List[Stage],
-    stages_b: List[Stage],
+    operations: List[Operation],
     delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
     output_a, output_b = _execute_two_batch_raw(
-        inputs_a, inputs_b, stages_a, stages_b, delta_stages=delta_stages
+        inputs_a, inputs_b, operations, delta_stages=delta_stages
     )
     return model_forward_merge_outputs(output_a, output_b)
 
 
-def _execute_two_batch_raw(inputs_a, inputs_b, stages_a, stages_b, delta_stages: int):
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
+def _execute_two_batch_raw(inputs_a, inputs_b, operations, delta_stages: int):
+    stages = _convert_operations_to_stages(operations)
+    executor_a = _StageExecutor("a", stages, inputs=inputs_a)
+    executor_b = _StageExecutor("b", stages, inputs=inputs_b)
 
     for _ in range(delta_stages):
         executor_a.next()
@@ -219,7 +219,7 @@ class _StateDict:
         self._data.clear()
 
 
-def convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
+def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
     operation_chunks = list(_chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation)))
     assert all(len(chunk) > 0 for chunk in operation_chunks)
     return operation_chunks
