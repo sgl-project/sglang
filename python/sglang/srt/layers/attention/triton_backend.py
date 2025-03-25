@@ -81,6 +81,7 @@ class ForwardMetadata:
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
     max_extend_len: int
+    max_prefix_extend_len: int
     num_kv_splits: torch.Tensor
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
@@ -541,19 +542,12 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        (
-            _,
-            max_extend_len,
-            max_prefix_extend_len,
-            num_kv_splits,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-        ) = self.forward_metadata
-
         if _is_hip and get_bool_env_var("CK_MOE"):
+            max_extend_len = self.forward_metadata.max_extend_len
+            max_prefix_extend_len = self.forward_metadata.max_prefix_extend_len
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            qo_indptr = self.forward_metadata.qo_indptr
             K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]

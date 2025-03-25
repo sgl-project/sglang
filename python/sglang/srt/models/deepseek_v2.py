@@ -265,8 +265,6 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         if _is_hip and get_bool_env_var("CK_MOE"):
@@ -277,7 +275,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
-            return final_hidden_states.view(num_tokens, hidden_dim)
+            return final_hidden_states.view(final_hidden_states.shape)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         final_hidden_states = (
