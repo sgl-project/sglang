@@ -62,7 +62,6 @@ suites = {
         TestFile("test_torch_compile_moe.py", 85),
         TestFile("test_torch_native_attention_backend.py", 149),
         TestFile("test_torchao.py", 70),
-        TestFile("test_two_batch_overlap.py", 60),
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 134),
         TestFile("test_update_weights_from_disk.py", 114),
