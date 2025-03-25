@@ -22,7 +22,6 @@
 
 #include <flashinfer/activation.cuh>
 
-#include "pytorch_extension_utils.h"
 #include "utils.h"
 
 #else

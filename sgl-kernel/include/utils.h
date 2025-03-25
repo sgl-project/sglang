@@ -18,8 +18,8 @@ limitations under the License.
 #include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+
 #ifndef USE_ROCM
-#include <pytorch_extension_utils.h>
 #else
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
@@ -35,10 +35,7 @@ limitations under the License.
     return __VA_ARGS__();                \
   }
 
-#endif
-#include <torch/extension.h>
-
-#include <sstream>
+#endif  // USE_ROCM
 
 #ifndef USE_ROCM
 // Adapt from FlashInfer
@@ -50,7 +47,7 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_F16(c_type, ...)
-#endif
+#endif  // FLASHINFER_ENABLE_F16
 
 #ifdef FLASHINFER_ENABLE_BF16
 #define _DISPATCH_CASE_BF16(c_type, ...) \
@@ -60,7 +57,7 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_BF16(c_type, ...)
-#endif
+#endif  // FLASHINFER_ENABLE_BF16
 
 #ifdef FLASHINFER_ENABLE_FP8_E4M3
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
@@ -70,7 +67,7 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...)
-#endif
+#endif  // FLASHINFER_ENABLE_FP8_E4M3
 
 #ifdef FLASHINFER_ENABLE_FP8_E5M2
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
@@ -80,7 +77,7 @@ limitations under the License.
   }
 #else
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
-#endif
+#endif  // FLASHINFER_ENABLE_FP8_E5M2
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
   [&]() -> bool {                                                                        \
@@ -216,7 +213,7 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 inline bool is_float8_tensor(const at::Tensor& tensor) {
   return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn || tensor.scalar_type() == at::ScalarType::Float8_e5m2;
 }
-#endif
+#endif  // USE_ROCM
 
 struct cuda_error : public std::runtime_error {
   /**
