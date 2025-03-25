@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    ExpertDistributionReq,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -636,6 +637,18 @@ class TokenizerManager:
 
     def stop_profile(self):
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        self.send_to_scheduler.send_pyobj(req)
+
+    def start_expert_distribution_record(self):
+        req = ExpertDistributionReq.START_RECORD
+        self.send_to_scheduler.send_pyobj(req)
+
+    def stop_expert_distribution_record(self):
+        req = ExpertDistributionReq.STOP_RECORD
+        self.send_to_scheduler.send_pyobj(req)
+
+    def dump_expert_distribution_record(self):
+        req = ExpertDistributionReq.DUMP_RECORD
         self.send_to_scheduler.send_pyobj(req)
 
     async def update_weights_from_disk(
