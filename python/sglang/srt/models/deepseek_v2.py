@@ -1277,7 +1277,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_tbo_op_attn_0(
+    def _forward_tbo_op_input_layernorm(
         self,
         state,
         positions: torch.Tensor,
@@ -1287,11 +1287,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         tbo_subbatch_index: int,
     ):
         hidden_states, residual = self._forward_input_layernorm(hidden_states, residual)
-        self_attn_state = self.self_attn.forward_absorb_stage_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
         state.update(
             dict(
                 self_attn_state=self_attn_state,
@@ -1302,7 +1297,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-    def _forward_tbo_op_attn_1(self, state):
+    def _forward_tbo_op_decode_attn_0(self, state):
+        self_attn_state = self.self_attn.forward_absorb_stage_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        TODO
+
+    def _forward_tbo_op_decode_attn_1(self, state):
         assert (
             (get_tensor_model_parallel_world_size() > 1)
             and global_server_args_dict["enable_dp_attention"]
@@ -1310,9 +1313,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             and isinstance(self.mlp, DeepseekV2MoE)
         )
         hidden_states = self.self_attn.forward_absorb_stage_core(state.self_attn_state)
+        TODO
+
+    def _forward_tbo_op_post_attn_layernorm(self, state):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, state.residual_after_input_ln
         )
+        TODO
+
+    def _forward_tbo_op_mlp_gate(self, state):
         router_logits = self.mlp.gate(hidden_states)
         state.update(
             dict(
