@@ -665,6 +665,10 @@ class ExpertDistributionReq(Enum):
 
 
 @dataclass
+class ExpertDistributionReqOutput:
+    pass
+
+@dataclass
 class ProfileReq:
     type: ProfileReqType
     output_dir: Optional[str] = None

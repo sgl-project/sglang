@@ -264,6 +264,9 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -639,17 +642,17 @@ class TokenizerManager:
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
 
-    def start_expert_distribution_record(self):
-        req = ExpertDistributionReq.START_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def start_expert_distribution_record(self):
+        await self._execute_expert_distribution_record(ExpertDistributionReq.START_RECORD)
 
-    def stop_expert_distribution_record(self):
-        req = ExpertDistributionReq.STOP_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def stop_expert_distribution_record(self):
+        await self._execute_expert_distribution_record(ExpertDistributionReq.STOP_RECORD)
 
-    def dump_expert_distribution_record(self):
-        req = ExpertDistributionReq.DUMP_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def dump_expert_distribution_record(self):
+        await self._execute_expert_distribution_record(ExpertDistributionReq.DUMP_RECORD)
+
+    async def _execute_expert_distribution_record(self, req: ExpertDistributionReq):
+        await self.expert_distribution_communicator(req)
 
     async def update_weights_from_disk(
         self,

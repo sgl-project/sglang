@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, ExpertDistributionReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1905,6 +1905,7 @@ class Scheduler(
             expert_distribution_recorder.dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
