@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -23,6 +24,9 @@ class CustomOp(nn.Module):
     def forward_cuda(self, *args, **kwargs):
         raise NotImplementedError
 
+    def forward_triton(self, *args, **kwargs):
+        raise NotImplementedError
+
     def forward_hip(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)
 
@@ -35,7 +39,13 @@ class CustomOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_triton(self, *args, **kwargs):
+        return self.forward_triton(*args, **kwargs)
+
     def dispatch_forward(self):
+        if os.environ.get("SGL_USE_TRITON_NON_ATTN", "").lower() in ("true", "1"):
+            return self.forward_triton
+
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
