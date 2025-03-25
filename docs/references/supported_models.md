@@ -54,6 +54,8 @@
   - `python -m sglang.launch_server --model-path internlm/internlm2-7b-reward --is-embedding --trust-remote-code`
 - Qwen2ForRewardModel
   - `python -m sglang.launch_server --model-path Qwen/Qwen2.5-Math-RM-72B --is-embedding --trust-remote-code --tp-size=4`
+- Qwen2ForSequenceClassification
+  - `python -m sglang.launch_server --model-path jason9693/Qwen2.5-1.5B-apeach --is-embedding --trust-remote-code`
 ## How to Support a New Language Model
 
 To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
