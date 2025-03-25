@@ -200,7 +200,7 @@ class DeepEPDispatcher:
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.enable_async else None
-        self.dispatch_intermediate_state = hidden_states, topk_idx, topk_weights, num_experts
+        self.dispatch_intermediate_state = hidden_states, topk_idx, topk_weights, num_experts, previous_event
 
     def dispatch_b(self):
         hidden_states, topk_idx, topk_weights, num_experts, previous_event = self.dispatch_intermediate_state
@@ -316,12 +316,15 @@ class DeepEPDispatcher:
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
-        hidden_states, event = self.combine_normal(output, self.handle)
 
-        self.combine_intermediate_state = event, hidden_states
+        previous_event = Buffer.capture() if self.enable_async else None
+
+        self.combine_intermediate_state = output, hidden_states, previous_event
 
     def combine_b(self):
-        event, hidden_states = self.combine_intermediate_state
+        output, hidden_states, previous_event = self.combine_intermediate_state
+
+        hidden_states, event = self.combine_normal(output, self.handle, previous_event)
 
         if self.enable_async:
             event.current_stream_wait()
@@ -329,9 +332,7 @@ class DeepEPDispatcher:
         self.handle = None
         return hidden_states
 
-    def combine_normal(self, x: torch.Tensor, handle: Tuple):
-        previous_event = Buffer.capture() if self.enable_async else None
-
+    def combine_normal(self, x: torch.Tensor, handle: Tuple, previous_event):
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
