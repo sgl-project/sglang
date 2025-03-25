@@ -51,7 +51,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -1959,7 +1959,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         )
         self.logits_processor = LogitsProcessor(config)
 
-    def get_image_feature(self, image_input: ImageInputs) -> torch.Tensor:
+    def get_image_feature(self, image_input: MultimodalInputs) -> torch.Tensor:
         pixel_values = image_input.pixel_values
         bs, n = pixel_values.shape[0:2]
         pixel_values = pixel_values.to(
@@ -1988,10 +1988,9 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         inputs_embeds = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
             embed_tokens=self.get_input_embeddings(),
-            image_embedding_func=self.get_image_feature,
+            mm_data_embedding_func=self.get_image_feature,
         )
 
         return self.language_model(
@@ -2005,7 +2004,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]

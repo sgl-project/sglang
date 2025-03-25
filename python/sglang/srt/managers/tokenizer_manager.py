@@ -16,7 +16,6 @@
 import asyncio
 import copy
 import dataclasses
-import json
 import logging
 import os
 import pickle
@@ -52,10 +51,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.managers.image_processor import (
-    get_dummy_image_processor,
-    get_image_processor,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -65,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -92,6 +89,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+)
+from sglang.srt.managers.multimodal_processor import (
+    get_dummy_processor,
+    get_mm_processor,
+    import_processors,
 )
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -171,6 +173,7 @@ class TokenizerManager:
         self.image_token_id = self.model_config.image_token_id
 
         if self.model_config.is_multimodal:
+            import_processors()
             _processor = get_processor(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
@@ -179,9 +182,9 @@ class TokenizerManager:
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it
-            # We create image_processor for any skip_tokenizer_init to make sure we still encode
+            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
-            self.image_processor = get_image_processor(
+            self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor
             )
 
@@ -192,7 +195,7 @@ class TokenizerManager:
                 self.tokenizer = self.processor.tokenizer
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
-            self.image_processor = get_dummy_image_processor()
+            self.mm_processor = get_dummy_processor()
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -262,6 +265,9 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -310,6 +316,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    ExpertDistributionReqOutput,
+                    self.expert_distribution_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -389,7 +399,7 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Dict = await self.image_processor.process_images_async(
+        image_inputs: Dict = await self.mm_processor.process_mm_data_async(
             obj.image_data, input_text or input_ids, obj, self.max_req_input_len
         )
         if image_inputs and "input_ids" in image_inputs:
@@ -636,6 +646,15 @@ class TokenizerManager:
     def stop_profile(self):
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
+
+    async def start_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+
+    async def stop_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+
+    async def dump_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
         self,
