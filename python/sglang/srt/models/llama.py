@@ -51,8 +51,91 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
-
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 logger = logging.getLogger(__name__)
+
+### WA: Temporary workaround code
+#################################
+#################################
+
+TP_OVERLAP = True
+# for debug
+# ASYNC_OP=False
+ASYNC_OP = TP_OVERLAP
+
+
+tp_b0_handle = None
+tp_b1_handle = None
+# TODO: explicitly call the torch communication backend. 
+# and create TP group
+from torch.distributed import ReduceOp
+
+# default using `customer_allreduce` does not create a TP group.
+ranks = list(range(2))
+group_ = torch.distributed.new_group(ranks=ranks)
+from copy import copy, deepcopy
+
+
+def token_balanced_batch_split(fwd_batch):
+    sub_fwd_batch0 = copy(fwd_batch)
+    sub_fwd_batch1 = copy(fwd_batch)
+    bs_joint_batch_boundary = 0
+    batch_boundary = 0
+    if fwd_batch.forward_mode.is_extend():
+        all_tokens = sum(fwd_batch.extend_seq_lens)
+        batch_boundary = 0
+        for batch_tokens in fwd_batch.extend_seq_lens[:-1]:
+            bs_joint_batch_boundary += batch_tokens
+            batch_boundary += 1
+            if bs_joint_batch_boundary >= all_tokens // 2:
+                break
+
+    elif fwd_batch.forward_mode.is_decode():
+        bs_joint_batch_boundary = fwd_batch.batch_size // 2
+    else:
+        assert False
+    for key in [
+        "req_pool_indices",
+        "seq_lens",
+        "decode_seq_lens_cpu",
+        "extend_seq_lens",
+        "extend_prefix_lens",
+        "extend_start_loc",
+        "extend_prefix_lens_cpu",
+        "extend_seq_lens_cpu",
+        "extend_logprob_start_lens_cpu",
+        "positions",
+    ]:
+        if getattr(fwd_batch, key) is not None:
+            # skip for decode mode
+            setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:batch_boundary])
+            setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[batch_boundary:])
+
+    if (
+        not fwd_batch.forward_mode.is_decode()
+        and getattr(fwd_batch, "extend_num_tokens") is not None
+    ):
+        setattr(sub_fwd_batch0, "extend_num_tokens", bs_joint_batch_boundary)
+        setattr(
+            sub_fwd_batch1,
+            "extend_num_tokens",
+            getattr(fwd_batch, "extend_num_tokens") - bs_joint_batch_boundary,
+        )
+
+    for key in [
+        "input_ids",
+        "positions",
+        "out_cache_loc",
+    ]:
+        setattr(sub_fwd_batch0, key, getattr(fwd_batch, key)[:bs_joint_batch_boundary])
+        setattr(sub_fwd_batch1, key, getattr(fwd_batch, key)[bs_joint_batch_boundary:])
+
+    return bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1
+
+### WA: Temporary workaround code
+#################################
+#################################
+
 
 
 class LlamaMLP(nn.Module):
@@ -76,6 +159,7 @@ class LlamaMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
+            reduce_results=not TP_OVERLAP,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
@@ -148,6 +232,7 @@ class LlamaAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=bias,
+            reduce_results=not TP_OVERLAP,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -180,6 +265,7 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+
         return output
 
 
@@ -240,23 +326,115 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        hidden_states1: Optional[torch.Tensor] = None,
+        positions1: Optional[torch.Tensor] = None,
+        residual1: Optional[torch.Tensor] = None,
+        fwd_batch1: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if not TP_OVERLAP or hidden_states1 is None:
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+            if TP_OVERLAP:
+                hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+                # torch.distributed.all_reduce(
+                #     hidden_states, op=ReduceOp.SUM, group=group_
+                # )
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
+            if TP_OVERLAP:
+                hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+                # torch.distributed.all_reduce(
+                #     hidden_states, op=ReduceOp.SUM, group=group_
+                # )
+
+            return hidden_states, residual
+        else:
+            global tp_b0_handle, tp_b1_handle
+            ### u-batch0 norm~attn
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                if ASYNC_OP:
+                    tp_b0_handle.wait()
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            tp_b0_handle = torch.distributed.all_reduce(
+                hidden_states, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+            )
+
+            ### u-batch1 norm~attn
+
+            if residual1 is None:
+                residual1 = hidden_states1
+                hidden_states1 = self.input_layernorm(hidden_states1)
+            else:
+                if ASYNC_OP:
+                    tp_b1_handle.wait()
+                hidden_states1, residual1 = self.input_layernorm(
+                    hidden_states1, residual1
+                )
+
+
+            hidden_states1 = self.self_attn(
+                positions=positions1,
+                hidden_states=hidden_states1,
+                forward_batch=fwd_batch1,
+            )
+
+            tp_b1_handle = torch.distributed.all_reduce(
+                hidden_states1, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+            )
+
+            ### u-batch0 mlp
+            if ASYNC_OP:
+                tp_b0_handle.wait()
+
+            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
+
+            tp_b0_handle = torch.distributed.all_reduce(
+                hidden_states, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+            )
+            # hidden_states=tensor_model_parallel_all_reduce(hidden_states)
+
+            ### u-batch1 mlp
+            if ASYNC_OP:
+                tp_b1_handle.wait()
+            # hidden_states =tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states1, residual1 = self.post_attention_layernorm(
+                hidden_states1, residual1
+            )
+            hidden_states1 = self.mlp(hidden_states1)
+
+            tp_b1_handle = torch.distributed.all_reduce(
+                hidden_states1, op=ReduceOp.SUM, group=group_, async_op=ASYNC_OP
+            )
+
+            return hidden_states, residual, hidden_states1, residual1
 
 
 class LlamaModel(nn.Module):
@@ -298,14 +476,49 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
+
+        if forward_batch.batch_size > 1 and TP_OVERLAP:
+
+            bs_joint_batch_boundary, sub_fwd_batch0, sub_fwd_batch1 = (
+                token_balanced_batch_split(forward_batch)
             )
+
+            hidden_states0 = hidden_states[0:bs_joint_batch_boundary]
+            hidden_states1 = hidden_states[bs_joint_batch_boundary:]
+            positions0 = positions[0:bs_joint_batch_boundary]
+            positions1 = positions[bs_joint_batch_boundary:]
+
+            residual1 = None
+            for i in range(len(self.layers)):
+
+                layer = self.layers[i]
+                hidden_states0, residual, hidden_states1, residual1 = layer(
+                    positions0,
+                    hidden_states0,
+                    sub_fwd_batch0,
+                    residual,
+                    hidden_states1,
+                    positions1,
+                    residual1,
+                    sub_fwd_batch1,
+                )
+            global tp_b0_handle, tp_b1_handle
+            if ASYNC_OP:
+                tp_b0_handle.wait()
+                tp_b1_handle.wait()
+            hidden_states = torch.cat([hidden_states0, hidden_states1], dim=0)
+            residual = torch.cat([residual, residual1], dim=0)
+
+        else:
+            for i in range(len(self.layers)):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
