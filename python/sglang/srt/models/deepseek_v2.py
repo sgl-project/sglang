@@ -1260,15 +1260,19 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def get_forward_tbo_operations(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
-            return TODO
-            # return [
-            #     self._forward_tbo_stage_prefill_attn,
-            #     self.mlp._forward_tbo_stage_prefill_dispatch_start,
-            #     self.mlp._forward_tbo_stage_prefill_dispatch_wait,
-            #     self.mlp._forward_tbo_stage_prefill_mlp,
-            #     self.mlp._forward_tbo_stage_prefill_combine_start,
-            #     self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
-            # ]
+            return [
+                self._forward_tbo_op_attn_0,
+                self._forward_tbo_op_attn_1,
+                two_batch_overlap.YieldOperation(),
+
+                # TODO below
+                # self._forward_tbo_stage_prefill_attn,
+                self.mlp._forward_tbo_stage_prefill_dispatch_start,
+                self.mlp._forward_tbo_stage_prefill_dispatch_wait,
+                self.mlp._forward_tbo_stage_prefill_mlp,
+                self.mlp._forward_tbo_stage_prefill_combine_start,
+                self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
+            ]
         elif forward_mode == ForwardMode.DECODE:
             return [
                 self._forward_tbo_op_attn_0,
@@ -1292,11 +1296,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             ]
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
-
-    # TODO
-    # def _forward_tbo_stage_prefill_attn(self, state, **kwargs):
-    #     self._forward_tbo_stage_decode_attn_0(state, **kwargs)
-    #     self._forward_tbo_stage_decode_attn_1(state)
 
     def _forward_tbo_op_attn_0(
         self,
