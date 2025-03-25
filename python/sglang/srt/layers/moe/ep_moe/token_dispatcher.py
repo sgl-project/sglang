@@ -196,38 +196,25 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
         topk_idx = topk_idx.to(torch.int64)
-        # Todo: enable low latency dispatch
-        if True:  # not forward_mode.is_decode():
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                num_recv_tokens_per_expert_list,
-                handle,
-                event,
-            ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
-            # TODO move to below
-            # self.tokens_per_expert = torch.tensor(
-            #     num_recv_tokens_per_expert_list,
-            #     device=hidden_states.device,
-            #     dtype=torch.int64,
-            # )
-        else:
-            hidden_states, recv_expert_count, handle, event, hook = (
-                self.dispatch_low_latency(
-                    hidden_states,
-                    topk_idx,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                )
-            )
-            # TODO move to below
-            self.recv_expert_count = recv_expert_count
+        (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            num_recv_tokens_per_expert_list,
+            handle,
+            event,
+        ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+        # TODO move to below
+        # self.tokens_per_expert = torch.tensor(
+        #     num_recv_tokens_per_expert_list,
+        #     device=hidden_states.device,
+        #     dtype=torch.int64,
+        # )
 
-        return event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
+        self.dispatch_intermediate_state = event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
 
     def dispatch_b(self, state):
-        event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = state
+        event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = self.dispatch_intermediate_state
 
         if self.async_finish:
             event.current_stream_wait()
@@ -310,41 +297,35 @@ class DeepEPDispatcher:
     def combine_a(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ):
-        # Todo: enable low latency combine
-        if True:  # not forward_mode.is_decode():
-            if hidden_states.shape[0] > 0:
-                num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.empty(
-                    (num_tokens, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-                deepep_post_reorder_triton_kernel[(num_tokens,)](
-                    hidden_states,
-                    output,
-                    self.src2dst,
-                    self.topk_idx,
-                    self.topk_weights,
-                    self.router_topk,
-                    hidden_states.shape[1],
-                    BLOCK_SIZE=512,
-                )
-            else:
-                output = torch.zeros(
-                    (0, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-            hidden_states, event = self.combine_normal(output, self.handle)
-        else:
-            hidden_states, event, hook = self.combine_low_latency(
-                hidden_states, self.topk_idx, self.topk_weights, self.handle
+        if hidden_states.shape[0] > 0:
+            num_tokens = self.src2dst.shape[0] // self.router_topk
+            output = torch.empty(
+                (num_tokens, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
+            deepep_post_reorder_triton_kernel[(num_tokens,)](
+                hidden_states,
+                output,
+                self.src2dst,
+                self.topk_idx,
+                self.topk_weights,
+                self.router_topk,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
+        else:
+            output = torch.zeros(
+                (0, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        hidden_states, event = self.combine_normal(output, self.handle)
 
-        return event, hidden_states
+        self.combine_intermediate_state = event, hidden_states
 
     def combine_b(self, state):
-        event, hidden_states = state
+        event, hidden_states = self.combine_intermediate_state
 
         if self.async_finish:
             event.current_stream_wait()
