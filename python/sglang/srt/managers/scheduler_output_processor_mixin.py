@@ -26,7 +26,6 @@ class SchedulerOutputProcessorMixin:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
-        print(f"!!! 111 process_batch_result_prefill")
         if self.is_generation:
             (
                 logits_output,
@@ -42,11 +41,8 @@ class SchedulerOutputProcessorMixin:
                 result.bid,
             )
 
-            print(f"!!! 222 process_batch_result_prefill inner")
             if self.enable_overlap:
-                print(f"!!! 333 process_batch_result_prefill inner")
                 logits_output, next_token_ids = self.tp_worker.resolve_batch_result(bid)
-                print(f"!!! 444 process_batch_result_prefill inner")
             else:
                 # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
@@ -60,7 +56,6 @@ class SchedulerOutputProcessorMixin:
                             logits_output.input_token_logprobs.tolist()
                         )
 
-            print(f"!!! 555 process_batch_result_prefill inner")
             hidden_state_offset = 0
 
             # Check finish conditions
@@ -68,7 +63,6 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.is_retracted:
                     continue
-                print(f"!!! 333 process_batch_result_prefill, next_token_id {next_token_id}")
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
                     j = len(batch.out_cache_loc) - len(batch.reqs) + i
@@ -119,7 +113,6 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        print(f"!!!  req.grammar {req.grammar}, req.grammar.finished {req.grammar.finished}")
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
                 else:
@@ -176,7 +169,6 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-        print(f"!!! 2 process_batch_result_prefill")
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
@@ -201,14 +193,12 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
 
         self.token_to_kv_pool_allocator.free_group_begin()
-        print(f"!!! 111 process_batch_result_decode")
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
-            print(f"!!! 333 process_batch_result_decode, next_token_id {next_token_id}")
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
                 if self.page_size == 1:
@@ -256,7 +246,6 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
-                print(f"!!!  req.grammar {req.grammar}, req.grammar.finished {req.grammar.finished}")
                 req.grammar.accept_token(next_token_id)
                 req.grammar.finished = req.finished()
 
@@ -264,7 +253,6 @@ class SchedulerOutputProcessorMixin:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
-        print(f"!!! 222 process_batch_result_decode")
 
         self.stream_output(batch.reqs, batch.return_logprob)
 

@@ -76,7 +76,7 @@ class BaseGrammarObject(ABC):
 
     @staticmethod
     @abstractmethod
-    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         raise NotImplementedError
 
 
