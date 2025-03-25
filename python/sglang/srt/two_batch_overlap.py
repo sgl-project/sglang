@@ -216,7 +216,8 @@ class YieldOperation:
 
 
 def convert_operations_to_stages(operations) -> List[Callable]:
-    operation_chunks = _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
+    operation_chunks = list(_chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation)))
+    assert all(len(chunk) > 0 for chunk in operation_chunks)
     return TODO
 
 
