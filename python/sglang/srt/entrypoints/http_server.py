@@ -343,6 +343,36 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+async def start_expert_distribution_record_async():
+    """Start recording the expert distribution. Clear the previous record if any."""
+    _global_state.tokenizer_manager.start_expert_distribution_record()
+    return Response(
+        content="Start recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+async def stop_expert_distribution_record_async():
+    """Stop recording the expert distribution."""
+    _global_state.tokenizer_manager.stop_expert_distribution_record()
+    return Response(
+        content="Stop recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+async def dump_expert_distribution_record_async():
+    """Dump expert distribution record."""
+    _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return Response(
+        content="Dump expert distribution record.\n",
+        status_code=200,
+    )
+
+
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
@@ -730,9 +760,9 @@ def _wait_and_warmup(
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [10, 11, 12]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
     else:
-        json_data["text"] = "The capital city of France is"
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -743,14 +773,13 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        for i in range(server_args.dp_size):
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
+        res = requests.post(
+            url + request_name,
+            json=json_data,
+            headers=headers,
+            timeout=600,
+        )
+        assert res.status_code == 200, f"{res}"
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
