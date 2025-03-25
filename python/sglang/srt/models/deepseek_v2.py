@@ -1272,19 +1272,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         elif forward_mode == ForwardMode.DECODE:
             return [
                 self._forward_tbo_op_attn_0,
-                yieldop,
+                two_batch_overlap.YieldOperation(),
                 self._forward_tbo_op_attn_1,
-                yieldop,
+                two_batch_overlap.YieldOperation(),
                 self._forward_tbo_op_dispatch_start,
                 self._forward_tbo_op_shared,
-                yieldop,
+                two_batch_overlap.YieldOperation(),
                 self._forward_tbo_op_dispatch_wait,
                 self._forward_tbo_op_mlp,
                 self._forward_tbo_op_combine_start,
-                yieldop,
+                two_batch_overlap.YieldOperation(),
                 self._forward_tbo_op_combine_wait,
                 self._forward_tbo_op_compute_layer_output,
-                yieldop,
+                two_batch_overlap.YieldOperation(),
             ]
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")

@@ -211,5 +211,9 @@ class _StateDict:
         self._data.clear()
 
 
+class YieldOperation:
+    pass
+
+
 def convert_operations_to_stages(operations) -> List[Callable]:
     return TODO
