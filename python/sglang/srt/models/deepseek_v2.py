@@ -1255,10 +1255,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
-                self._forward_tbo_op_attn_0,
+                self._forward_tbo_op_input_layernorm,
+                self._forward_tbo_op_decode_attn_0,
                 two_batch_overlap.YieldOperation(),
 
-                self._forward_tbo_op_attn_1,
+                self._forward_tbo_op_decode_attn_1,
+                self._forward_tbo_op_post_attn_layernorm,
+                self._forward_tbo_op_mlp_gate,
                 two_batch_overlap.YieldOperation(),
 
                 self.mlp._forward_tbo_op_dispatch_a,
