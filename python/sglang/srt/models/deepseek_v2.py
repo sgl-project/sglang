@@ -368,6 +368,9 @@ class DeepseekV2MoE(nn.Module):
 
     # ----------------------------------------- TBO-related --------------------------------------------
 
+    def _forward_tbo_op_gate(self, state):
+        state.router_logits = self.gate(state.hidden_states_after_post_attn_ln)
+
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self._forward_deepep_expert(
             state.forward_batch.forward_mode,
@@ -1242,7 +1245,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_input_layernorm,
                 self._forward_tbo_op_prefill_attn,
                 self._forward_tbo_op_post_attn_layernorm,
-                self._forward_tbo_op_mlp_gate,
+                self.mlp._forward_tbo_op_gate,
                 self.mlp._forward_tbo_op_dispatch_a,
                 two_batch_overlap.YieldOperation(),
 
@@ -1263,7 +1266,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
                 self._forward_tbo_op_decode_attn_1,
                 self._forward_tbo_op_post_attn_layernorm,
-                self._forward_tbo_op_mlp_gate,
+                self.mlp._forward_tbo_op_gate,
                 two_batch_overlap.YieldOperation(),
 
                 self.mlp._forward_tbo_op_dispatch_a,
@@ -1327,9 +1330,6 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _forward_tbo_op_post_attn_layernorm(self, state):
         state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = \
             self.post_attention_layernorm(state.hidden_states_after_attn, state.residual_after_input_ln)
-
-    def _forward_tbo_op_mlp_gate(self, state):
-        state.router_logits = self.mlp.gate(state.hidden_states_after_post_attn_ln)
 
 
 class DeepseekV2Model(nn.Module):
