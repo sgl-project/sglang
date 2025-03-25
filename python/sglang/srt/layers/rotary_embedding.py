@@ -8,10 +8,11 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, cpu_has_amx_support
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -695,6 +696,21 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query.to(dtype), key.to(dtype)
+
+
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        if positions.device == torch.device("cpu") and _is_cpu_amx:
+            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+                positions, query, key, self.head_size, self.cos_sin_cache, False)
+        else:
+            return self.forward_native(positions, query, key, offsets)
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
