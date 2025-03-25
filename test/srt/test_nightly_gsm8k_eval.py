@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+from sglang.test.test_utils import CustomTestCase
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,

@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
     write_github_step_summary,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestBenchOneBatch(CustomTestCase):

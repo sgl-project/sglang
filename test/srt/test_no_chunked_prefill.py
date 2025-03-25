@@ -5,6 +5,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
     run_mmlu_test,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestNoChunkedPrefill(CustomTestCase):

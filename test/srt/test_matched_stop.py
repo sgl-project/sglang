@@ -9,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
+from sglang.test.test_utils import CustomTestCase
 
 MANY_NEW_TOKENS_PROMPT = """
 Please write an extremely detailed and vivid fantasy story, set in a world full of intricate magic systems, political intrigue, and complex characters.

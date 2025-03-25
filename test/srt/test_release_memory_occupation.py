@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM
 
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import CustomTestCase
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = True

@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestNightlyHumanEval(CustomTestCase):

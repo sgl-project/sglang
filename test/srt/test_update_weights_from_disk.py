@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 ###############################################################################

@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.test.test_utils import CustomTestCase
 
 
 # For test

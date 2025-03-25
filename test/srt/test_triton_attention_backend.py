@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_bench_one_batch,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestTritonAttnBackend(CustomTestCase):

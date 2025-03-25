@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     STDOUT_FILENAME,
     popen_launch_server,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestLargeMaxNewTokens(CustomTestCase):

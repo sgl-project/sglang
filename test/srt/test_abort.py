@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from sglang.test.test_utils import run_and_check_memory_leak
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestAbort(CustomTestCase):

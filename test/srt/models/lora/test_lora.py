@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 LORA_SETS = [
     # {

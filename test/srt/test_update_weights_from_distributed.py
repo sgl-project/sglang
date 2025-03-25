@@ -37,6 +37,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 from sglang.utils import terminate_process
+from sglang.test.test_utils import CustomTestCase
 
 mp.set_start_method("spawn", force=True)
 

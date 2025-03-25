@@ -6,6 +6,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8KVCacheMethod,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestModelOptFp8KVCacheMethod(CustomTestCase):

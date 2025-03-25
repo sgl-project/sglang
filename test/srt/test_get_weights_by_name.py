@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 from sglang.utils import terminate_process
+from sglang.test.test_utils import CustomTestCase
 
 
 def _process_return(ret):

@@ -22,6 +22,7 @@ from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import calculate_rouge_l, is_in_ci
+from sglang.test.test_utils import CustomTestCase
 
 CI_LORA_MODELS = [
     LoRAModelCase(

@@ -7,6 +7,7 @@ from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestFusedMOE(CustomTestCase):

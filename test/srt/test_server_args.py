@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.srt.server_args import prepare_server_args
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestPrepareServerArgs(CustomTestCase):

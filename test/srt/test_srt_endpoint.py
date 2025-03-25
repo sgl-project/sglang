@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_logprob_check,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestSRTEndpoint(CustomTestCase):

@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     kill_process_tree,
     popen_launch_server,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def gen_radix_tree(num_nodes=400, chunk_len=256):

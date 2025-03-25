@@ -24,6 +24,7 @@ import multiprocessing as mp
 import os
 import unittest
 from typing import List
+from sglang.test.test_utils import CustomTestCase
 
 import torch
 

@@ -5,6 +5,8 @@ python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_p
 import unittest
 
 from sglang.test.test_utils import run_mmlu_test, run_mulit_request_test
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestChunkedPrefill(CustomTestCase):

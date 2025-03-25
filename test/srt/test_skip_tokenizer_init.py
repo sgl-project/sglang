@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestSkipTokenizerInit(CustomTestCase):
