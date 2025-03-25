@@ -16,6 +16,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import random
 import time
 from typing import Tuple
 
@@ -42,6 +43,7 @@ class BenchArgs:
     profile_with_stack: bool = False
     profile_record_shapes: bool = False
     profile_skip_cases: int = 0
+    seed: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -77,6 +79,7 @@ class BenchArgs:
         parser.add_argument(
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
+        parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -193,6 +196,9 @@ def run_one_case(
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
     else:
