@@ -217,7 +217,6 @@ class DeepEPDispatcher:
         if self.enable_async:
             event.current_stream_wait()
 
-        # TODO move from above
         self.tokens_per_expert = torch.tensor(
             num_recv_tokens_per_expert_list,
             device=hidden_states.device,
