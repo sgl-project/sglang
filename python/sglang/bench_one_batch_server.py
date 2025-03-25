@@ -162,7 +162,7 @@ def run_one_case(
         fine_grained_output = fine_grained_benchmark.read_output()
         df = pd.DataFrame(fine_grained_output)
         df["throughput"] = df["num_tokens"] / df["latency"]
-        with pd.option_context('display.max_rows', 10000, 'display.max_columns', 10000):
+        with pd.option_context('display.max_rows', 10000, 'display.max_columns', 10000, 'display.width', 10000):
             print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
 
     if result_filename:
