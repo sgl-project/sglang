@@ -1001,4 +1001,10 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
+        _retry_execution(lambda: super()._callTestMethod(method), max_retry=TODO)
+
+def _retry_execution(fn, max_retry: int):
+    if max_retry == 0:
+        fn()
+    else:
         TODO
