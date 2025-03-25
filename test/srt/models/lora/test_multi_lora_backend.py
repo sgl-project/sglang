@@ -19,8 +19,7 @@ from typing import List
 import torch
 from utils import BACKENDS, TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
-from sglang.test.test_utils import is_in_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 MULTI_LORA_MODELS = [
     LoRAModelCase(

@@ -6,8 +6,7 @@ python3 test_overlap_schedule.py
 
 import unittest
 
-from sglang.test.test_utils import run_mmlu_test
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 
 
 class TestOverlapSchedule(CustomTestCase):

@@ -15,12 +15,11 @@
 
 import multiprocessing as mp
 import unittest
-from sglang.test.test_utils import CustomTestCase
 
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import get_similarities
+from sglang.test.test_utils import CustomTestCase, get_similarities
 
 TEXTS = "two Subway Series sandwiches with meats, cheese, lettuce, tomatoes, and onions on a black background, accompanied by the Subway Series logo, highlighting a new sandwich series."
 IMAGES = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild/resolve/main/images/023.jpg"

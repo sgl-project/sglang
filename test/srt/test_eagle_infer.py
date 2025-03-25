@@ -24,10 +24,10 @@ from sglang.test.test_utils import (
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
     run_logprob_check,
 )
-from sglang.test.test_utils import CustomTestCase
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2

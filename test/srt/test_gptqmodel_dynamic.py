@@ -8,9 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):

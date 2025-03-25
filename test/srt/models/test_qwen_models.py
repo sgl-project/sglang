@@ -6,9 +6,9 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestQwen2(CustomTestCase):

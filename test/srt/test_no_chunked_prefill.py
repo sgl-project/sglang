@@ -2,10 +2,10 @@ import unittest
 
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
     run_bench_serving,
     run_mmlu_test,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestNoChunkedPrefill(CustomTestCase):

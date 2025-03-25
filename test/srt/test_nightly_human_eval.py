@@ -14,9 +14,9 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestNightlyHumanEval(CustomTestCase):

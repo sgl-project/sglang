@@ -8,9 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestCacheReport(CustomTestCase):

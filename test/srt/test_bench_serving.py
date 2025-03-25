@@ -6,11 +6,11 @@ from sglang.test.test_utils import (
     DEFAULT_FP8_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     run_bench_serving,
     write_github_step_summary,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestBenchServing(CustomTestCase):

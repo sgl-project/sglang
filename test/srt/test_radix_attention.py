@@ -8,10 +8,10 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     kill_process_tree,
     popen_launch_server,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 def gen_radix_tree(num_nodes=400, chunk_len=256):

@@ -21,8 +21,7 @@ import torch
 from utils import BACKENDS, TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l, is_in_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
 
 CI_LORA_MODELS = [
     LoRAModelCase(

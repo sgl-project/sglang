@@ -1000,12 +1000,17 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             else:
                                 raise
 
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        _retry_execution(lambda: super()._callTestMethod(method), max_retry=_get_max_retry())
+        _retry_execution(
+            lambda: super()._callTestMethod(method), max_retry=_get_max_retry()
+        )
+
 
 def _get_max_retry():
     return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
+
 
 def _retry_execution(fn, max_retry: int):
     if max_retry == 0:
@@ -1015,6 +1020,8 @@ def _retry_execution(fn, max_retry: int):
     try:
         fn()
     except Exception as e:
-        print(f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}")
+        print(
+            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
+        )
         traceback.print_exc()
-        _retry_execution(fn, max_retry=max_retry-1)
+        _retry_execution(fn, max_retry=max_retry - 1)

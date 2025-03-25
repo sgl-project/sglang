@@ -3,12 +3,12 @@ import unittest
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
     get_bool_env_var,
     is_in_ci,
     run_bench_one_batch,
     write_github_step_summary,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestBenchOneBatch(CustomTestCase):

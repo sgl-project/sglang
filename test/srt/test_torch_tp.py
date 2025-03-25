@@ -1,7 +1,6 @@
 import unittest
 
-from sglang.test.test_utils import is_in_ci, run_bench_one_batch
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
 
 class TestTorchTP(CustomTestCase):

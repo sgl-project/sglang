@@ -24,7 +24,6 @@ import multiprocessing as mp
 import os
 import unittest
 from typing import List
-from sglang.test.test_utils import CustomTestCase
 
 import torch
 
@@ -34,7 +33,7 @@ from sglang.test.runners import (
     SRTRunner,
     check_close_model_outputs,
 )
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
 @dataclasses.dataclass
