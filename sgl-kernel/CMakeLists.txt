@@ -41,9 +41,6 @@ find_package(Python REQUIRED COMPONENTS
 find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
-# Find pybind11.
-find_package(pybind11 CONFIG REQUIRED)
-
 # Print build information.
 message(STATUS "Build configuration:")
 message(STATUS "  CMake version: ${CMAKE_VERSION}")
@@ -68,11 +65,33 @@ include_directories(
     ${FLASHINFER_DIR}/include
     ${FLASHINFER_DIR}/include/gemm
     ${FLASHINFER_DIR}/csrc
-    ${DEEPGEMM_DIR}/include
+    ${DEEPGEMM_DIR}/deep_gemm/include
     ${TORCH_INCLUDE_DIRS}
     ${Python_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+configure_file(
+    ${DEEPGEMM_DIR}/deep_gemm/__init__.py
+    ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/__init__.py
+    COPYONLY
+)
+
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${CUTLASS_DIR}/include/cute
+        ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${CUTLASS_DIR}/include/cutlass
+        ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass
+    COMMENT "Creating symbolic links for third-party headers"
+)
+
+include_directories(
+    ${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include
 )
 
 # Determine CUDA capabilities.
@@ -117,16 +136,16 @@ foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})
 endforeach()
 
 # Check for SM90A support.
-if((CUDA_VERSION_MAJOR GREATER_EQUAL 12 AND CUDA_VERSION_MINOR GREATER_EQUAL 0) OR DEFINED ENV{ENABLE_SM90A})
-    if("$ENV{ENABLE_SM90A}" STREQUAL "ON" OR "$ENV{ENABLE_SM90A}" STREQUAL "1")
+if(CUDA_VERSION_MAJOR GREATER_EQUAL 12 AND CUDA_VERSION_MINOR GREATER_EQUAL 0)
+    if((DEFINED ENV{SGL_KERNEL_ENABLE_SM90A}) AND ("$ENV{SGL_KERNEL_ENABLE_SM90A}" STREQUAL "1"))
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90a,code=sm_90a")
         add_compile_definitions(ENABLE_SM90A)
     endif()
 endif()
 
 # Check for SM100A support.
-if((CUDA_VERSION_MAJOR GREATER_EQUAL 12 AND CUDA_VERSION_MINOR GREATER_EQUAL 8) OR DEFINED ENV{ENABLE_SM100A})
-    if("$ENV{ENABLE_SM100A}" STREQUAL "ON" OR "$ENV{ENABLE_SM100A}" STREQUAL "1")
+if(CUDA_VERSION_MAJOR GREATER_EQUAL 12 AND CUDA_VERSION_MINOR GREATER_EQUAL 8)
+    if((DEFINED ENV{SGL_KERNEL_ENABLE_SM100A}) AND ("$ENV{SGL_KERNEL_ENABLE_SM100A}" STREQUAL "1"))
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_100,code=sm_100")
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_100a,code=sm_100a")
     else()
@@ -134,24 +153,23 @@ if((CUDA_VERSION_MAJOR GREATER_EQUAL 12 AND CUDA_VERSION_MINOR GREATER_EQUAL 8) 
     endif()
 endif()
 
-# Check for FP8 support.
-if(DEFINED ENV{ENABLE_FP8})
-    if("$ENV{ENABLE_FP8}" STREQUAL "ON" OR "$ENV{ENABLE_FP8}" STREQUAL "1")
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} \
-            -DFLASHINFER_ENABLE_FP8 \
-            -DFLASHINFER_ENABLE_FP8_E4M3 \
-            -DFLASHINFER_ENABLE_FP8_E5M2"
-        )
+# Auto-enable FP8 based on compute capability.
+if(CUDA_VERSION_MAJOR GREATER_EQUAL 11 AND CUDA_VERSION_MINOR GREATER_EQUAL 8)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -c "import torch; print(torch.cuda.get_device_capability()[0]*10+torch.cuda.get_device_capability()[1] if torch.cuda.is_available() else 0)"
+        OUTPUT_VARIABLE SM_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(SM_VERSION GREATER_EQUAL 90)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DFLASHINFER_ENABLE_FP8 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2")
         add_compile_definitions(ENABLE_FP8)
     endif()
 endif()
 
 # Check for BF16 support.
-if(DEFINED ENV{ENABLE_BF16})
-    if("$ENV{ENABLE_BF16}" STREQUAL "ON" OR "$ENV{ENABLE_BF16}" STREQUAL "1")
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DFLASHINFER_ENABLE_BF16")
-        add_compile_definitions(ENABLE_BF16)
-    endif()
+if((DEFINED ENV{SGL_KERNEL_ENABLE_BF16}) AND ("$ENV{SGL_KERNEL_ENABLE_BF16}" STREQUAL "1"))
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DFLASHINFER_ENABLE_BF16")
+    add_compile_definitions(ENABLE_BF16)
 endif()
 
 # Remove problematic CUDA flags.
@@ -160,89 +178,7 @@ string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUD
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
-# Create a more complete pytorch_extension_utils.h file
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pytorch_extension_utils.h" "#pragma once
-#include <torch/extension.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <sstream>
-#include <vector>
-
-// Common check macros
-#define CHECK_CPU(x) AT_ASSERTM(!x.is_cuda(), #x \" must be a CPU tensor\")
-#define CHECK_CUDA(x) AT_ASSERTM(x.is_cuda(), #x \" must be a CUDA tensor\")
-#define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x \" must be contiguous\")
-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
-#define CHECK_SHAPE(x, ...) AT_ASSERTM(check_shape(x, {__VA_ARGS__}), #x \" must have shape \" #__VA_ARGS__)
-#define CHECK_SHAPES(x, y) AT_ASSERTM(check_same_shape(x, y), #x \" and \" #y \" must have the same shape\")
-#define CHECK_DIM(dim, x) AT_ASSERTM(x.dim() == dim, #x \" must have dimension \" #dim)
-#define CHECK_EQ(x, y) AT_ASSERTM(x == y, #x \" must be equal to \" #y)
-
-// Dispatch macros
-#define _DISPATCH_CASE_F16(TYPE, TYPE_NAME, ...) \
-    case at::ScalarType::Half: { using TYPE_NAME = at::Half; __VA_ARGS__; break; }
-
-#define _DISPATCH_CASE_BF16(TYPE, TYPE_NAME, ...) \
-    case at::ScalarType::BFloat16: { using TYPE_NAME = at::BFloat16; __VA_ARGS__; break; }
-
-#define _DISPATCH_CASE_FP32(TYPE, TYPE_NAME, ...) \
-    case at::ScalarType::Float: { using TYPE_NAME = float; __VA_ARGS__; break; }
-
-#define _DISPATCH_CASE_FP64(TYPE, TYPE_NAME, ...) \
-    case at::ScalarType::Double: { using TYPE_NAME = double; __VA_ARGS__; break; }
-
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(DTYPE, TYPE_NAME, ...) \
-    [&] { \
-        switch (DTYPE) { \
-            _DISPATCH_CASE_F16(DTYPE, TYPE_NAME, return __VA_ARGS__) \
-            _DISPATCH_CASE_FP32(DTYPE, TYPE_NAME, return __VA_ARGS__) \
-            default: { \
-                AT_ERROR(\"Unsupported dtype for FP16 dispatch: \", DTYPE); \
-            } \
-        } \
-        return torch::Tensor(); \
-    }()
-
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(DTYPE, TYPE_NAME, ...) \
-    [&] { \
-        switch (DTYPE) { \
-            case at::ScalarType::Char: { using TYPE_NAME = int8_t; return __VA_ARGS__; } \
-            case at::ScalarType::Byte: { using TYPE_NAME = uint8_t; return __VA_ARGS__; } \
-            default: { \
-                AT_ERROR(\"Unsupported dtype for FP8 dispatch: \", DTYPE); \
-            } \
-        } \
-        return torch::Tensor(); \
-    }()
-
-inline bool check_shape(const torch::Tensor& x, std::vector<int64_t> shape) {
-    if (x.dim() != shape.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < shape.size(); i++) {
-        if (shape[i] != -1 && shape[i] != x.size(i)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-inline bool check_same_shape(const torch::Tensor& x, const torch::Tensor& y) {
-    if (x.dim() != y.dim()) {
-        return false;
-    }
-    for (int i = 0; i < x.dim(); i++) {
-        if (x.size(i) != y.size(i)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Get the current CUDA stream
-inline cudaStream_t torch_current_stream() {
-    return at::cuda::getCurrentCUDAStream();
-}
-")
+add_compile_definitions(TORCH_EXTENSION_NAME=\"sgl_kernel.common_ops\")
 
 # Collect source files.
 set(SOURCES
@@ -272,19 +208,48 @@ set(SOURCES
     3rdparty/flashinfer/csrc/sampling.cu
 )
 
-# Create Python extension module.
-pybind11_add_module(sgl_kernel_core ${SOURCES})
-target_link_libraries(sgl_kernel_core PRIVATE
+# Rename library to match setup.py extension name.
+add_library(common_ops MODULE ${SOURCES})
+
+target_link_libraries(common_ops PRIVATE
     ${TORCH_LIBRARIES}
     CUDA::cudart
     CUDA::cuda_driver
     CUDA::cublas
 )
 
-# Set rpath for the extension module.
-set_target_properties(sgl_kernel_core PROPERTIES
+set_target_properties(common_ops PROPERTIES
     INSTALL_RPATH "$ORIGIN/../../torch/lib"
+    INTERPROCEDURAL_OPTIMIZATION TRUE
+    POSITION_INDEPENDENT_CODE ON
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/sgl_kernel"
+    OUTPUT_NAME "common_ops"
+    PREFIX ""
+    SUFFIX ".so"
 )
 
-# Install target.
-install(TARGETS sgl_kernel_core DESTINATION .)
+if(${Python_VERSION} VERSION_GREATER_EQUAL "3.9")
+    set_property(TARGET common_ops PROPERTY 
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+        COMPILE_DEFINITIONS "Py_LIMITED_API=0x03090000"
+    )
+endif()
+
+install(TARGETS common_ops 
+    LIBRARY DESTINATION sgl_kernel
+)
+
+install(
+    DIRECTORY ${DEEPGEMM_DIR}/deep_gemm/
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/deep_gemm
+)
+
+install(
+    DIRECTORY ${CUTLASS_DIR}/include/cute
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/deep_gemm/include
+)
+
+install(
+    DIRECTORY ${CUTLASS_DIR}/include/cutlass
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/deep_gemm/include
+)
