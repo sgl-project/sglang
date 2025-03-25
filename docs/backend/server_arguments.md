@@ -90,6 +90,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `enable_ep_moe`: Enables expert parallelism that distributes the experts onto multiple GPUs for MoE models.
 * `ep_size`: The size of EP. Please shard the model weights with `tp_size=ep_size`, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203). If not set, `ep_size` will be automatically set to `tp_size`.
 * `enable_deepep_moe`: Enables expert parallelism that distributes the experts onto multiple GPUs for DeepSeek-V3 model based on deepseek-ai/DeepEP. Currently DeepEP is bind to DP Attention. Please set `--enable-dp-attention --enable-deepep-moe`, perfer `tp_size=dp_size=ep_size`.
+* `deepep_low_latency`: Specify the mode for when enable DeepEP MoE, could be `normal` for prefill or `low latency` for decode, default is `normal`, set `--deepep-low-latency` to enable `low latency` mode.
 
 ## Memory and scheduling
 

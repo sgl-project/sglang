@@ -158,6 +158,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    deepep_low_latency: Optional[bool] = False
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -292,8 +293,9 @@ class ServerArgs:
             # DeepEP MoE
             if self.enable_deepep_moe:
                 self.ep_size = self.dp_size
+                deepep_mode = "lowlatency" if self.deepep_low_latency else "normal"
                 logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
+                    f"DeepEP MoE is enabled, mode selected: {deepep_mode}. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
                 )
 
         # Speculative Decoding
@@ -1048,6 +1050,11 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--deepep-low-latency",
+            action="store_true",
+            help="Specify the mode for when enable DeepEP MoE, could be `normal` for prefill or `lowlatency` for decode, default is `normal`.",
         )
 
         # Server warmups

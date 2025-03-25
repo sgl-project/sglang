@@ -809,6 +809,7 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        deepep_low_latency: bool = False,
     ):
         super().__init__(
             num_experts,
@@ -827,6 +828,7 @@ class DeepEPMoE(EPMoE):
             custom_routing_function,
             activation,
         )
+        self.deepep_low_latency = deepep_low_latency
 
     def forward(
         self,
@@ -836,7 +838,7 @@ class DeepEPMoE(EPMoE):
         forward_mode: ForwardMode,
     ):
         # Todo: use m_grouped_gemm_fp8_fp8_bf16_nt_masked after low_latency dispatch (decode)
-        if True:  # not forward_mode.is_decode():
+        if not self.deepep_low_latency:
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         else:
             return self.forward_deepgemm_masked(
@@ -965,82 +967,84 @@ class DeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
-            max_value = (
-                torch.max(hidden_states)
-                .repeat(self.num_experts_per_partition)
-                .to(torch.float32)
-            )
-            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+        # if self.activation_scheme == "dynamic" and not self.use_block_quant:
+        #     max_value = (
+        #         torch.max(hidden_states)
+        #         .repeat(self.num_experts_per_partition)
+        #         .to(torch.float32)
+        #     )
+        #     self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
-        # GroupGemm-0
-        gateup_output = torch.empty(
-            hidden_states.shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        if hidden_states.shape[0] > 0:
-            # Transpose earlier so that the testing will not trigger transposing kernels
-            hidden_states = (
-                hidden_states[0],
-                get_col_major_tma_aligned_tensor(hidden_states[1]),
-            )
-            """
-            gateup_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                hidden_states, self.w13_weight, out, masked_m, expected_m
-            )
-            """
+        # # GroupGemm-0
+        # gateup_output = torch.empty(
+        #     hidden_states.shape[0],
+        #     self.w13_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # if hidden_states.shape[0] > 0:
+        #     # Transpose earlier so that the testing will not trigger transposing kernels
+        #     hidden_states = (
+        #         hidden_states[0],
+        #         get_col_major_tma_aligned_tensor(hidden_states[1]),
+        #     )
+        #     """
+        #     gateup_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        #         hidden_states, self.w13_weight, out, masked_m, expected_m
+        #     )
+        #     """
 
-        # Act
-        down_input = torch.empty(
-            gateup_output.shape[0],
-            gateup_output.shape[1] // 2,
-            device=gateup_output.device,
-            dtype=(
-                self.fp8_dtype
-                if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states.dtype
-            ),
-        )
-        if self.w2_input_scale is None and not self.use_block_quant:
-            self.w2_input_scale = torch.ones(
-                self.num_experts_per_partition,
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
+        # # Act
+        # down_input = torch.empty(
+        #     gateup_output.shape[0],
+        #     gateup_output.shape[1] // 2,
+        #     device=gateup_output.device,
+        #     dtype=(
+        #         self.fp8_dtype
+        #         if (self.use_fp8_w8a8 and not self.use_block_quant)
+        #         else hidden_states.dtype
+        #     ),
+        # )
+        # if self.w2_input_scale is None and not self.use_block_quant:
+        #     self.w2_input_scale = torch.ones(
+        #         self.num_experts_per_partition,
+        #         dtype=torch.float32,
+        #         device=hidden_states.device,
+        #     )
 
-        if self.activation == "silu":
-            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-                gateup_output,
-                down_input,
-                gateup_output.shape[1],
-                reorder_topk_ids,
-                self.w2_input_scale,
-                0,
-                self.num_experts_per_partition - 1,
-                BLOCK_SIZE=512,
-            )
-        else:
-            raise ValueError(f"Unsupported activation: {self.activation=}")
+        # if self.activation == "silu":
+        #     silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+        #         gateup_output,
+        #         down_input,
+        #         gateup_output.shape[1],
+        #         reorder_topk_ids,
+        #         self.w2_input_scale,
+        #         0,
+        #         self.num_experts_per_partition - 1,
+        #         BLOCK_SIZE=512,
+        #     )
+        # else:
+        #     raise ValueError(f"Unsupported activation: {self.activation=}")
 
-        # GroupGemm-1
-        down_output = torch.empty(
-            down_input.shape[0],
-            self.w2_weight.shape[1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        if down_input.shape[0] > 0:
-            # Transpose earlier so that the testing will not trigger transposing kernels
-            down_input = (
-                down_input[0],
-                get_col_major_tma_aligned_tensor(down_input[1]),
-            )
-            """
-            down_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                down_input, self.w2_weight, out, masked_m, expected_m
-            )
-            """
+        # # GroupGemm-1
+        # down_output = torch.empty(
+        #     down_input.shape[0],
+        #     self.w2_weight.shape[1],
+        #     device=hidden_states.device,
+        #     dtype=hidden_states.dtype,
+        # )
+        # if down_input.shape[0] > 0:
+        #     # Transpose earlier so that the testing will not trigger transposing kernels
+        #     down_input = (
+        #         down_input[0],
+        #         get_col_major_tma_aligned_tensor(down_input[1]),
+        #     )
+        #     """
+        #     down_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        #         down_input, self.w2_weight, out, masked_m, expected_m
+        #     )
+        #     """
 
-        return down_output
+        # return down_output
+        simulated_gemm_x = hidden_states.clone()
+        return simulated_gemm_x
