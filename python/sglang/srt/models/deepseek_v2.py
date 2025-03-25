@@ -396,7 +396,7 @@ class DeepseekV2MoE(nn.Module):
             state.seg_indptr_from_dispatch,
         )
 
-    def _forward_tbo_op_dispatch_start(self, state):
+    def _forward_tbo_op_dispatch_a(self, state):
         state.state_dispatch = self._forward_deepep_dispatch_stage_start(
             self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
             state.forward_batch.forward_mode,
@@ -404,7 +404,7 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits,
         )
 
-    def _forward_tbo_op_dispatch_wait(self, state):
+    def _forward_tbo_op_dispatch_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         (
             state.recv_hidden_states_from_dispatch,
@@ -412,14 +412,14 @@ class DeepseekV2MoE(nn.Module):
             state.seg_indptr_from_dispatch,
         ) = dispatcher.dispatch_stage_wait(state.state_dispatch)
 
-    def _forward_tbo_op_combine_start(self, state):
+    def _forward_tbo_op_combine_a(self, state):
         state.state_combine = self.tbo_deepep_dispatchers[
             state.tbo_subbatch_index
         ].combine_stage_start(
             state.expert_output_hidden_states, state.forward_batch.forward_mode
         )
 
-    def _forward_tbo_op_combine_wait(self, state):
+    def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         state.hidden_states_from_combine = dispatcher.combine_stage_wait(
             state.state_combine
@@ -1281,16 +1281,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_attn_1,
                 two_batch_overlap.YieldOperation(),
 
-                self.mlp._forward_tbo_op_dispatch_start,
+                self.mlp._forward_tbo_op_dispatch_a,
                 self.mlp._forward_tbo_op_shared,
                 two_batch_overlap.YieldOperation(),
 
-                self.mlp._forward_tbo_op_dispatch_wait,
+                self.mlp._forward_tbo_op_dispatch_b,
                 self.mlp._forward_tbo_op_mlp,
-                self.mlp._forward_tbo_op_combine_start,
+                self.mlp._forward_tbo_op_combine_a,
                 two_batch_overlap.YieldOperation(),
 
-                self.mlp._forward_tbo_op_combine_wait,
+                self.mlp._forward_tbo_op_combine_b,
                 self.mlp._forward_tbo_op_compute_layer_output,
                 two_batch_overlap.YieldOperation(),
             ]
