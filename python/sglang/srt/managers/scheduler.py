@@ -581,7 +581,7 @@ class Scheduler(
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
             )
             # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_infight_queue: List[Req] = []
+            self.disagg_prefill_inflight_queue: List[Req] = []
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -661,10 +661,10 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
-            if len(self.disagg_prefill_infight_queue) > 0:
-                self.process_disagg_prefill_infight_queue()
+            if len(self.disagg_prefill_inflight_queue) > 0:
+                self.process_disagg_prefill_inflight_queue()
 
-            if batch is None and len(self.disagg_prefill_infight_queue) == 0:
+            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
