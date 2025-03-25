@@ -1263,15 +1263,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             return [
                 self._forward_tbo_op_attn_0,
                 self._forward_tbo_op_attn_1,
+                self.mlp._forward_tbo_op_dispatch_a,
                 two_batch_overlap.YieldOperation(),
 
-                # TODO below
-                # self._forward_tbo_stage_prefill_attn,
-                self.mlp._forward_tbo_stage_prefill_dispatch_start,
-                self.mlp._forward_tbo_stage_prefill_dispatch_wait,
-                self.mlp._forward_tbo_stage_prefill_mlp,
-                self.mlp._forward_tbo_stage_prefill_combine_start,
-                self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
+                self.mlp._forward_tbo_op_dispatch_b,
+                self.mlp._forward_tbo_op_mlp,
+                self.mlp._forward_tbo_op_combine_a,
+                two_batch_overlap.YieldOperation(),
+
+                self.mlp._forward_tbo_op_shared,
+                self.mlp._forward_tbo_op_combine_b,
+                self.mlp._forward_tbo_op_compute_layer_output,
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
