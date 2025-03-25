@@ -41,13 +41,13 @@ include_dirs = [
 ]
 
 sources = [
-    "csrc/torch_extension_rocm.cc",
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/elementwise/activation.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
-    "csrc/elementwise/activation.cu",
+    "csrc/torch_extension_rocm.cc",
 ]
 
 cxx_flags = ["-O3"]
