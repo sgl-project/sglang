@@ -1899,11 +1899,6 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
-
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def open_session(self, recv_req: OpenSessionReqInput):
