@@ -188,6 +188,7 @@ class DeepEPDispatcher:
         self.combine_a(*args, **kwargs)
         return self.combine_b()
 
+    # TODO actual name should be prepare-execute and issue-receive instead of a-b, can rename
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
