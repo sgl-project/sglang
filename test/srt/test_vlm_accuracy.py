@@ -24,7 +24,7 @@ from transformers import (
 
 import sglang as sgl
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.conversation import generate_chat_conv
+from sglang.srt.conversation import chat_templates, generate_chat_conv
 from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -250,9 +250,6 @@ class TestQWEN2VLLogits(VisionLLMLogitsBase):
         cls.model.to(cls.device)
         cls.max_new_tokens = 5
         cls.temperature = 0.4
-        cls.hf_top_k = 0
-        cls.sgl_top_k = -1
-        cls.top_p = 1.0
         cls.debug_tensor_dump_output_folder = "logits"
 
     def compare_outputs(
@@ -310,8 +307,6 @@ class TestQWEN2VLLogits(VisionLLMLogitsBase):
         sampling_params = {
             "temperature": self.temperature,
             "max_new_tokens": self.max_new_tokens,
-            "top_k": self.sgl_top_k,
-            "top_p": self.top_p,
         }
 
         # Generate output from SGLang used to save the logits
@@ -328,12 +323,10 @@ class TestQWEN2VLLogits(VisionLLMLogitsBase):
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 return_dict_in_generate=True,
-                output_scores=True,
+                output_logits=True,
                 temperature=self.temperature,
-                top_k=self.hf_top_k,
-                top_p=self.top_p,
             )
-            hf_logits_output = hf_outputs.scores
+            hf_logits_output = hf_outputs.logits
 
         # Load SGLang logits
         data = np.load(
