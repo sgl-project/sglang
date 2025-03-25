@@ -204,12 +204,6 @@ class DeepEPDispatcher:
             handle,
             event,
         ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
-        # TODO move to below
-        # self.tokens_per_expert = torch.tensor(
-        #     num_recv_tokens_per_expert_list,
-        #     device=hidden_states.device,
-        #     dtype=torch.int64,
-        # )
 
         self.dispatch_intermediate_state = event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
 
