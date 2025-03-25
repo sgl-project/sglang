@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnu
 from sglang.srt.layers.quantization.utils import is_cuda, is_fp8_fnuz, all_close_1d, per_tensor_dequantize, replace_parameter
 
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.moe.topk import select_experts
 
 _is_cuda = is_cuda()
 
@@ -234,12 +235,12 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -248,8 +249,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias)
+            correction_bias=correction_bias)
 
         return fused_experts(x,
                              layer.w13_weight,
@@ -259,8 +259,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                              inplace=True,
                              activation=activation,
                              use_fp8_w8a8=True,
-                             global_num_experts=global_num_experts,
-                             expert_map=expert_map,
                              w1_scale=layer.w13_weight_scale,
                              w2_scale=layer.w2_weight_scale,
                              a1_scale=layer.w13_input_scale,
@@ -567,7 +565,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
         assert activation == "silu", "Only SiLU activation is supported."
@@ -578,7 +576,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 "Expert Parallelism is not supported for "
                 "fused Marlin MoE method.")
 
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -588,7 +586,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias)
+            correction_bias=correction_bias)
 
         return torch.ops.vllm.fused_marlin_moe(
             x,
