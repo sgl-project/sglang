@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 LORA_SETS = [
     # {
@@ -70,7 +71,7 @@ What do you know about llamas?
 #     PROMPTS.append(sample[0]["content"][:2000])
 
 
-class TestLoRA(unittest.TestCase):
+class TestLoRA(CustomTestCase):
 
     def inference(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing inference =======================")

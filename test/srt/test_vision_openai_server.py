@@ -20,6 +20,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -35,7 +36,7 @@ AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test
 AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
 
 
-class TestOpenAIVisionServer(unittest.TestCase):
+class TestOpenAIVisionServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
@@ -507,7 +508,7 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestVLMContextLengthIssue(unittest.TestCase):
+class TestVLMContextLengthIssue(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
