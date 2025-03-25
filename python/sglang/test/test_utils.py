@@ -1010,4 +1010,8 @@ def _retry_execution(fn, max_retry: int):
     if max_retry == 0:
         fn()
     else:
-        TODO
+        try:
+            fn()
+        except Exception as e:
+            TODO
+            _retry_execution(fn, max_retry=max_retry-1)
