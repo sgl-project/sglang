@@ -1,5 +1,5 @@
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Generator, Union
 
 import torch
@@ -161,27 +161,10 @@ class _StageExecutor:
         stage = self._stages[self._index]
 
         for op in stage:
-            self._stage_output = op(
-                state=self._stage_state, **(self._stage_output or {})
-            )
-
-        # TODO
-        # stage_name_brief = (
-        #     stage.__name__.replace("_forward_tbo_stage_", "")
-        #     .replace("prefill", "P")
-        #     .replace("decode", "D")
-        # )
-        # debug_name = f"{self._debug_name}{self._index}-{stage_name_brief}"
-        # if _ENABLE_PROFILE:
-        #     ctx = nvtx.annotate(debug_name)
-        # else:
-        #     ctx = nullcontext()
-        #
-        # with ctx:
-        #     try:
-        #         TODO
-        #     except Exception as e:
-        #         raise Exception(f"Error when handling stage {debug_name} {e=}")
+            with _annotate_region(debug_name=self._compute_debug_name()):
+                self._stage_output = op(
+                    state=self._stage_state, **(self._stage_output or {})
+                )
 
         self._index += 1
 
@@ -197,6 +180,25 @@ class _StageExecutor:
     @property
     def num_stages(self):
         return len(self._stages)
+
+    @staticmethod
+    def _compute_debug_name():
+        stage_name_brief = (
+            stage.__name__.replace("_forward_tbo_stage_", "")
+            .replace("prefill", "P")
+            .replace("decode", "D")
+        )
+        return f"{self._debug_name}{self._index}-{stage_name_brief}"
+
+
+@contextmanager
+def _annotate_region(debug_name):
+    if _ENABLE_PROFILE:
+        with torch.autograd.profiler.record_function(debug_name):
+            with nvtx.annotate(debug_name):
+                yield
+    else:
+        yield
 
 
 class _StateDict:
