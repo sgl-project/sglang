@@ -37,7 +37,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
     tp_reduce_scatter,
-    tp_all_gather_into_tensor,
+    tp_all_gather,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -967,7 +967,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
-        gathered_list_shape: list = None,
     ) -> None:
         
         def is_sparse_layer(l: int):
@@ -985,6 +984,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
         self.dp_size = get_attention_dp_size()
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
 
         if not global_server_args_dict["disable_mla"]:
             self.self_attn = DeepseekV2AttentionMLA(
@@ -1045,6 +1046,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.is_sparse = False
 
         self.input_is_scattered = is_sparse_layer(layer_id - 1)
+        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1087,15 +1089,23 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         
-        if get_attention_tp_size() != 1 and self.input_is_scattered:
-            hidden_states = tp_all_gather_into_tensor(hidden_states)
-            residual = tp_all_gather_into_tensor(residual)
+        if self.attn_tp_size != 1 and self.input_is_scattered:
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states)
+            residual, local_residual = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                residual,
+            )
+            tp_all_gather(list(residual.tensor_split(self.attn_tp_size)), local_residual)
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
             # all gather and all reduce
             if self.dp_size != 1:
-                if get_attention_tp_rank() == 0:
+                if self.attn_tp_rank == 0:
                     hidden_states += residual
                 hidden_states, local_hidden_states = (
                     forward_batch.gathered_buffer,
@@ -1148,8 +1158,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if get_attention_tp_size() != 1 and self.input_is_scattered:
-            hidden_states = tp_all_gather_into_tensor(hidden_states, self.gathered_list_shape)
+        if self.attn_tp_size != 1 and self.input_is_scattered:
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1158,17 +1172,22 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        if get_attention_tp_size() != 1:
+        if self.attn_tp_size != 1:
             # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
             # can we reuse the buffer from dp attn?
             if self.input_is_scattered:
-                hidden_states, self.gathered_list_shape = tp_reduce_scatter(hidden_states)
+                # TODO(ch-wan): use gathered_buffer
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                tp_reduce_scatter(hidden_states, tensor_list)
                 if hidden_states.shape[0] != 0:
                     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             else:
-                if get_attention_tp_rank() == 0:
+                if self.attn_tp_rank == 0:
                     hidden_states += residual
-                hidden_states, self.gathered_list_shape = tp_reduce_scatter(hidden_states)
+                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
+                hidden_states = tensor_list[self.attn_tp_rank]
+                tp_reduce_scatter(hidden_states, tensor_list)
                 residual = hidden_states
                 if hidden_states.shape[0] != 0:
                     hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1178,6 +1197,19 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states, residual
                 )
         hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+
+        if self.is_last_layer and self.attn_tp_size != 1:
+            hidden_states, local_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            tp_all_gather(list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states)
+            residual, local_residual = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                residual,
+            )
+            tp_all_gather(list(residual.tensor_split(self.attn_tp_size)), local_residual)
+
         return hidden_states, residual
 
 

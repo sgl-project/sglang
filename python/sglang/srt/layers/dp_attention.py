@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, List
 
 import torch
 import triton
@@ -250,8 +250,11 @@ def dp_scatter(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
 
-def tp_reduce_scatter(input_: torch.Tensor):
-    return get_attention_tp_group().reduce_scatter(input_)
+def tp_reduce_scatter(
+    output: torch.Tensor, 
+    input_list: List[torch.Tensor],
+):
+    return get_attention_tp_group().reduce_scatter(output, input_list)
 
-def tp_all_gather_into_tensor(input_: torch.Tensor, shapes: list):
-    return get_attention_tp_group().all_gather_into_tensor(input_, shapes)
+def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
+    return get_attention_tp_group().all_gather_(output_list, input_)
