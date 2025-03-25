@@ -453,6 +453,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
@@ -461,18 +462,19 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
-    "LlavaLlamaForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaMistralForCausalLM",
-    "LlavaVidForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    "LlavaLlamaForCausalLM",
+    "LlavaMistralForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaVidForCausalLM",
+    "MiniCPMO",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "MiniCPMV",
-    "MultiModalityCausalLM",
 ]
 
 
