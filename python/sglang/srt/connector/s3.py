@@ -107,14 +107,14 @@ class S3Connector(BaseFileConnector):
             self.client.download_file(bucket_name, file, destination_file)
 
     def weight_iterator(
-        self, rank: int = 0
+        self, allow_pattern: list[str]=["*.safetensors"]
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         from sglang.srt.model_loader.weight_utils import (
             runai_safetensors_weights_iterator,
         )
 
         # only support safetensor files now
-        hf_weights_files = self.glob(allow_pattern=["*.safetensors"])
+        hf_weights_files = self.glob(allow_pattern=allow_pattern)
         return runai_safetensors_weights_iterator(hf_weights_files)
 
     def close(self):
