@@ -230,7 +230,7 @@ def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -
 def _chunk_by_separator_raw(items: List[Any], is_separator: Callable[[Any], bool]) -> Generator[List[Any], None, None]:
     pending_items = []
     for item in items:
-        if is_separator:
+        if is_separator(item):
             yield pending_items
             pending_items = []
         else:
