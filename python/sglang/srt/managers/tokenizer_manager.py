@@ -643,16 +643,13 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
-        await self._execute_expert_distribution_record(ExpertDistributionReq.START_RECORD)
+        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
     async def stop_expert_distribution_record(self):
-        await self._execute_expert_distribution_record(ExpertDistributionReq.STOP_RECORD)
+        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        await self._execute_expert_distribution_record(ExpertDistributionReq.DUMP_RECORD)
-
-    async def _execute_expert_distribution_record(self, req: ExpertDistributionReq):
-        await self.expert_distribution_communicator(req)
+        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
         self,
