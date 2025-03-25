@@ -81,12 +81,12 @@ class ContextWorkloadGenerator(WorkloadGenerator):
 
 if __name__ == "__main__":
     args = parse_args()
-    args.num_clients = 1318 # hack for 100 loogle contexts
+    args.num_clients = 1318  # hack for 100 loogle contexts
     args.num_rounds = 1
     args.max_parallel = 64
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in [8, 4, 2, 1]:
+    for request_rate in [16, 12, 8, 4, 2, 1]:
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)

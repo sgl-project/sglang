@@ -1093,7 +1093,7 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 break
 
             req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
+                self.tree_cache,
                 self.enable_hierarchical_cache,
             )
 
