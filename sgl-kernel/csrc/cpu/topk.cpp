@@ -159,12 +159,19 @@ inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input)
   }
 }
 
-template <int SIZE>
-inline void apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const float* __restrict__ bias) {
-  using Vec = at::vec::Vectorized<float>;
-  for (int d = 0; d < SIZE; d += Vec::size()) {
-    Vec x_vec = Vec::loadu(scores + d) + Vec::loadu(bias + d);
-    x_vec.store(scores2 + d);
+template <typename scalar_t, int SIZE>
+inline void apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const scalar_t* __restrict__ bias) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  for (int d = 0; d < SIZE; d += bVec::size()) {
+    bVec bias_vec = bVec::loadu(bias + d);
+    fVec bias0, bias1;
+    std::tie(bias0, bias1) = at::vec::convert_to_float(bias_vec);
+
+    fVec x0 = fVec::loadu(scores + d) + bias0;
+    fVec x1 = fVec::loadu(scores + d + fVec::size()) + bias1;
+    x0.store(scores2 + d);
+    x1.store(scores2 + d + fVec::size());
   }
 }
 
@@ -173,7 +180,7 @@ void biased_grouped_topk_kernel_impl(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_ids,
     const scalar_t* __restrict__ gating_output,
-    const float* __restrict__ bias,
+    const scalar_t* __restrict__ bias,
     int64_t num_tokens,
     int64_t num_groups,
     int64_t topk_group,
@@ -195,7 +202,7 @@ void biased_grouped_topk_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       // do sigmoid to get scores
       sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
-      apply_bias<NUM_EXPERTS>(scores2, scores, bias);
+      apply_bias<scalar_t, NUM_EXPERTS>(scores2, scores, bias);
 
       for (int64_t g = 0; g < num_groups; ++g) {
         // find the max
@@ -293,7 +300,7 @@ void biased_grouped_topk_kernel_impl(
         topk_weights.data_ptr<float>(),                     \
         topk_ids.data_ptr<int32_t>(),                       \
         gating_output.data_ptr<scalar_t>(),                 \
-        correction_bias.data_ptr<float>(),                  \
+        correction_bias.data_ptr<scalar_t>(),               \
         num_tokens,                                         \
         num_expert_group,                                   \
         topk_group,                                         \
@@ -361,6 +368,7 @@ void biased_grouped_topk_cpu(
 
   const auto st = hidden_states.scalar_type();
   CHECK_EQ(gating_output.scalar_type(), st);
+  CHECK_EQ(correction_bias.scalar_type(), st);
   CHECK_EQ(topk_ids.scalar_type(), at::kInt);
   CHECK_EQ(topk_weights.scalar_type(), at::kFloat);
 
