@@ -129,23 +129,23 @@ class Engine:
         )
 
     def generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
-        return_hidden_states: bool = False,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Union[List[Dict], Dict]] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            # The image input. It can be a file name, a url, or base64 encoded string.
+            # See also python/sglang/srt/utils.py:load_image.
+            image_data: Optional[Union[List[str], str]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            custom_logit_processor: Optional[Union[List[str], str]] = None,
+            return_hidden_states: bool = False,
+            stream: bool = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -189,22 +189,22 @@ class Engine:
             return ret
 
     async def async_generate(
-        self,
-        # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[List[Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
-        stream: bool = False,
+            self,
+            # The input prompt. It can be a single prompt or a batch of prompts.
+            prompt: Optional[Union[List[str], str]] = None,
+            sampling_params: Optional[Union[List[Dict], Dict]] = None,
+            # The token ids for text; one can either specify text or input_ids.
+            input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+            # The image input. It can be a file name, a url, or base64 encoded string.
+            # See also python/sglang/srt/utils.py:load_image.
+            image_data: Optional[Union[List[str], str]] = None,
+            return_logprob: Optional[Union[List[bool], bool]] = False,
+            logprob_start_len: Optional[Union[List[int], int]] = None,
+            top_logprobs_num: Optional[Union[List[int], int]] = None,
+            token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+            lora_path: Optional[List[Optional[str]]] = None,
+            custom_logit_processor: Optional[Union[List[str], str]] = None,
+            stream: bool = False,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -231,9 +231,9 @@ class Engine:
             return await generator.__anext__()
 
     def encode(
-        self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[Union[List[str], str]] = None,
+            self,
+            prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+            image_data: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -278,13 +278,13 @@ class Engine:
         }
 
     def init_weights_update_group(
-        self,
-        master_address: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        group_name: str,
-        backend: str = "nccl",
+            self,
+            master_address: str,
+            master_port: int,
+            rank_offset: int,
+            world_size: int,
+            group_name: str,
+            backend: str = "nccl",
     ):
         """Initialize parameter update group."""
         obj = InitWeightsUpdateGroupReqInput(
@@ -313,10 +313,10 @@ class Engine:
         )
 
     def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
-        load_format: Optional[str] = None,
-        flush_cache: bool = True,
+            self,
+            named_tensors: List[Tuple[str, torch.Tensor]],
+            load_format: Optional[str] = None,
+            flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be true
         to avoid duplicated operations such as clearing cache."""
@@ -334,9 +334,9 @@ class Engine:
         )
 
     def update_weights_from_disk(
-        self,
-        model_path: str,
-        load_format: Optional[str] = None,
+            self,
+            model_path: str,
+            load_format: Optional[str] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -454,7 +454,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 def _launch_subprocesses(
-    server_args: ServerArgs, port_args: Optional[PortArgs] = None
+        server_args: ServerArgs, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
@@ -490,8 +490,8 @@ def _launch_subprocesses(
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    server_args.base_gpu_id
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
             )
             proc = mp.Process(
                 target=run_scheduler_process,
