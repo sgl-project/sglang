@@ -1,6 +1,6 @@
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Generator
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Generator, Union
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -107,10 +107,18 @@ if _ENABLE_PROFILE:
     import nvtx
 
 
+class YieldOperation:
+    pass
+
+
+Operation = Union[YieldOperation, Callable]
+Stage = List[Callable]
+
+
 def model_forward_execute_two_batch(
     inputs,
-    stages_a: List[Callable],
-    stages_b: List[Callable],
+    stages_a: List[Stage],
+    stages_b: List[Stage],
     delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
@@ -140,7 +148,7 @@ def _execute_two_batch_raw(inputs_a, inputs_b, stages_a, stages_b, delta_stages:
 
 
 class _StageExecutor:
-    def __init__(self, debug_name: str, stages: List[Callable], inputs):
+    def __init__(self, debug_name: str, stages: List[Stage], inputs):
         self._debug_name = debug_name
         self._stages = stages
         self._index = 0
@@ -211,14 +219,10 @@ class _StateDict:
         self._data.clear()
 
 
-class YieldOperation:
-    pass
-
-
-def convert_operations_to_stages(operations) -> List[Callable]:
+def convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
     operation_chunks = list(_chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation)))
     assert all(len(chunk) > 0 for chunk in operation_chunks)
-    return [_convert_operation_chunk_to_stage(chunk) for chunk in operation_chunks]
+    return operation_chunks
 
 
 def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> Generator[List[Any], None, None]:
@@ -231,11 +235,3 @@ def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -
             pending_items.append(item)
     if len(pending_items) > 0:
         yield pending_items
-
-
-def _convert_operation_chunk_to_stage(operation_chunk: List[Callable]) -> Callable:
-    def stage_fn(*args, **kwargs):
-        for op in operation_chunk:
-            op(*args, **kwargs)
-           
-    return TODO
