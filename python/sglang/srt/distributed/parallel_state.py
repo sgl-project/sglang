@@ -490,9 +490,10 @@ class GroupCoordinator:
 
         
         output = input_list[self.rank_in_group]
+        shapes = [chunk.shape for chunk in input_list]
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
 
-        return output
+        return output, shapes
 
 
         
@@ -505,13 +506,17 @@ class GroupCoordinator:
                 output, input, group=self.device_group
             )
 
-    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if not supports_custom_op():
-            self._all_gather_into_tensor(output, input)
-        else:
-            torch.ops.sglang.reg_all_gather_into_tensor(
-                output, input, group_name=self.unique_name
-            )
+    def all_gather_into_tensor(self, input_: torch.Tensor, shapes: list):
+        output_list = [torch.zeros(shape, dtype=input_.dtype, device=input_.device) for shape in shapes]
+        torch.distributed.all_gather(output_list, input_, group = self.device_group)
+        output = torch.cat(output_list, dim=0)
+        return output
+        #if not supports_custom_op():
+        #    self._all_gather_into_tensor(output, input)
+        #else:
+        #    torch.ops.sglang.reg_all_gather_into_tensor(
+        #        output, input, group_name=self.unique_name
+        #    )
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

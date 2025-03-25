@@ -967,6 +967,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
+        gathered_list_shape: list = None,
     ) -> None:
         
         def is_sparse_layer(l: int):
@@ -1043,7 +1044,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             self.is_sparse = False
 
-        self.input_is_sharded = is_sparse_layer(layer_id - 1)
+        self.input_is_scattered = is_sparse_layer(layer_id - 1)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1086,7 +1087,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         
-        if get_attention_tp_size() != 1 and self.input_is_sharded:
+        if get_attention_tp_size() != 1 and self.input_is_scattered:
             hidden_states = tp_all_gather_into_tensor(hidden_states)
             residual = tp_all_gather_into_tensor(residual)
 
@@ -1147,8 +1148,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if get_attention_tp_size() != 1 and self.input_is_sharded:
-            hidden_states = tp_all_gather_into_tensor(hidden_states)
+        if get_attention_tp_size() != 1 and self.input_is_scattered:
+            hidden_states = tp_all_gather_into_tensor(hidden_states, self.gathered_list_shape)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1160,14 +1161,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         if get_attention_tp_size() != 1:
             # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
             # can we reuse the buffer from dp attn?
-            if self.input_is_sharded:
-                hidden_states = tp_reduce_scatter(hidden_states)
+            if self.input_is_scattered:
+                hidden_states, self.gathered_list_shape = tp_reduce_scatter(hidden_states)
                 if hidden_states.shape[0] != 0:
                     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             else:
                 if get_attention_tp_rank() == 0:
                     hidden_states += residual
-                hidden_states = tp_reduce_scatter(hidden_states)
+                hidden_states, self.gathered_list_shape = tp_reduce_scatter(hidden_states)
                 residual = hidden_states
                 if hidden_states.shape[0] != 0:
                     hidden_states = self.post_attention_layernorm(hidden_states)
