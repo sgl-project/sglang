@@ -1284,8 +1284,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             # ]
         elif forward_mode == ForwardMode.DECODE:
             return [
-                self._forward_tbo_stage_decode_attn_0,
-                self._forward_tbo_stage_decode_attn_1,
+                self._forward_tbo_op_attn_0,
+                self._forward_tbo_op_attn_1,
                 self.mlp._forward_tbo_stage_decode_shared,
                 self.mlp._forward_tbo_stage_decode_mlp,
                 self.mlp._forward_tbo_stage_decode_extra,
@@ -1293,11 +1293,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
 
-    def _forward_tbo_stage_prefill_attn(self, state, **kwargs):
-        self._forward_tbo_stage_decode_attn_0(state, **kwargs)
-        self._forward_tbo_stage_decode_attn_1(state)
+    # TODO
+    # def _forward_tbo_stage_prefill_attn(self, state, **kwargs):
+    #     self._forward_tbo_stage_decode_attn_0(state, **kwargs)
+    #     self._forward_tbo_stage_decode_attn_1(state)
 
-    def _forward_tbo_stage_decode_attn_0(
+    def _forward_tbo_op_attn_0(
         self,
         state,
         positions: torch.Tensor,
@@ -1322,7 +1323,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-    def _forward_tbo_stage_decode_attn_1(self, state):
+    def _forward_tbo_op_attn_1(self, state):
         assert (
             (get_tensor_model_parallel_world_size() > 1)
             and global_server_args_dict["enable_dp_attention"]
