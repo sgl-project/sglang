@@ -213,7 +213,7 @@ class DeepEPDispatcher:
 
         self.dispatch_intermediate_state = event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
 
-    def dispatch_b(self, state):
+    def dispatch_b(self):
         event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = self.dispatch_intermediate_state
 
         if self.async_finish:
@@ -324,7 +324,7 @@ class DeepEPDispatcher:
 
         self.combine_intermediate_state = event, hidden_states
 
-    def combine_b(self, state):
+    def combine_b(self):
         event, hidden_states = self.combine_intermediate_state
 
         if self.async_finish:
