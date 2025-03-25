@@ -88,7 +88,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ImageInputs,
+    MultimodalInputs,
     Req,
     ScheduleBatch,
     global_server_args_dict,
@@ -841,8 +841,8 @@ class Scheduler(
                 return
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -856,7 +856,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -960,7 +960,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -974,7 +974,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
