@@ -388,19 +388,6 @@ class DeepseekV2MoE(nn.Module):
     #     self._forward_tbo_substage_combine_wait(state)
     #     return self._forward_tbo_substage_compute_layer_output(state)
 
-    def _forward_tbo_stage_decode_shared(self, state):
-        self._forward_tbo_op_dispatch_start(state)
-        self._forward_tbo_op_shared(state)
-
-    def _forward_tbo_stage_decode_mlp(self, state):
-        self._forward_tbo_op_dispatch_wait(state)
-        self._forward_tbo_op_mlp(state)
-        self._forward_tbo_op_combine_start(state)
-
-    def _forward_tbo_stage_decode_extra(self, state):
-        self._forward_tbo_op_combine_wait(state)
-        return self._forward_tbo_op_compute_layer_output(state)
-
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self._forward_deepep_expert(
             state.forward_batch.forward_mode,
@@ -1285,10 +1272,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         elif forward_mode == ForwardMode.DECODE:
             return [
                 self._forward_tbo_op_attn_0,
+                yieldop,
                 self._forward_tbo_op_attn_1,
-                self.mlp._forward_tbo_stage_decode_shared,
-                self.mlp._forward_tbo_stage_decode_mlp,
-                self.mlp._forward_tbo_stage_decode_extra,
+                yieldop,
+                self._forward_tbo_op_dispatch_start,
+                self._forward_tbo_op_shared,
+                yieldop,
+                self._forward_tbo_op_dispatch_wait,
+                self._forward_tbo_op_mlp,
+                self._forward_tbo_op_combine_start,
+                yieldop,
+                self._forward_tbo_op_combine_wait,
+                self._forward_tbo_op_compute_layer_output,
+                yieldop,
             ]
         else:
             raise NotImplementedError(f"Unsupported {forward_mode=}")
