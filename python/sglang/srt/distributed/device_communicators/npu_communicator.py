@@ -7,6 +7,7 @@ from sglang.srt.utils import is_npu
 if is_npu():
     import torch_npu  # noqa: F401
 
+
 class NpuCommunicator:
 
     def __init__(self, group: ProcessGroup):
