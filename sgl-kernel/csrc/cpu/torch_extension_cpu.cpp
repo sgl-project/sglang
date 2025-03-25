@@ -64,6 +64,10 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
     at::Tensor& scales1, at::Tensor& scales2,
     std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
 
+// bmm
+void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni,
+    std::optional<at::Tensor>& scale);
+
 // fused moe
 at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
     at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace, bool use_int8_w8a8,
@@ -108,6 +112,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // igemm
   m.def("int8_scaled_mm_cpu", &int8_scaled_mm_cpu, "int8 weight packed linear for intel AMX");
+
+  // bmm
+  m.def("bmm_cpu", &bmm_cpu, "bmm kernel for intel AMX");
 
   // moe
   m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");

@@ -329,6 +329,22 @@ void weight_packed_linear_kernel_impl(
 
 } // anonymous namespace
 
+// tinygemm interface
+template <typename scalar_t>
+void tinygemm_kernel(const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
+    float* __restrict__ Ctmp, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, bool brg) {
+  tinygemm_kernel<scalar_t, false>(A, B, C, Ctmp, nullptr, M, N, K, lda, ldb, ldc, brg);
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)                                             \
+    template void tinygemm_kernel<TYPE>(                                                \
+        const TYPE* __restrict__ A, const TYPE* __restrict__ B, TYPE* __restrict__ C,   \
+        float* __restrict__ Ctmp, int64_t M, int64_t N, int64_t K, int64_t lda,         \
+        int64_t ldb, int64_t ldc, bool brg)
+
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
+
 at::Tensor convert_weight_packed(at::Tensor& weight) {
   // for 3d moe weights
   // weight : [E, OC, IC]

@@ -41,6 +41,7 @@ include_dirs = []
 
 sources = [
     "csrc/cpu/activation.cpp",
+    "csrc/cpu/bmm.cpp",
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
