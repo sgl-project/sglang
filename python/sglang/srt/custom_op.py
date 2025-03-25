@@ -1,6 +1,6 @@
 from torch import nn
 
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -64,6 +64,9 @@ class CustomOp(nn.Module):
     def forward_npu(self, *args, **kwargs):
         raise NotImplementedError
 
+    def forward_triton(self, *args, **kwargs):
+        raise NotImplementedError
+
     def forward_hip(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)
 
@@ -77,6 +80,9 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
+        if get_bool_env_var("SGL_USE_TRITON_NON_ATTN"):
+            return self.forward_triton
+
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
