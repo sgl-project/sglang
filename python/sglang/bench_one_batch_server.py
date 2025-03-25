@@ -21,6 +21,7 @@ from typing import Tuple
 
 import numpy as np
 import requests
+import torch.multiprocessing as mp
 
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
@@ -39,6 +40,8 @@ class BenchArgs:
     skip_warmup: bool = False
     profile: bool = False
     profile_activities: Tuple[str] = ("CUDA_PROFILER",)
+    profile_with_stack: bool = False
+    profile_record_shapes: bool = False
     profile_skip_cases: int = 0
 
     @staticmethod
@@ -69,6 +72,11 @@ class BenchArgs:
             type=str,
             nargs="+",
             default=BenchArgs.profile_activities,
+        )
+        parser.add_argument("--profile-with-stack", action="store_true")
+        parser.add_argument("--profile-record-shapes", action="store_true")
+        parser.add_argument(
+            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
         parser.add_argument(
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
@@ -162,7 +170,14 @@ def run_one_case(
         fine_grained_output = fine_grained_benchmark.read_output()
         df = pd.DataFrame(fine_grained_output)
         df["throughput"] = df["num_tokens"] / df["latency"]
-        with pd.option_context('display.max_rows', 10000, 'display.max_columns', 10000, 'display.width', 10000):
+        with pd.option_context(
+            "display.max_rows",
+            10000,
+            "display.max_columns",
+            10000,
+            "display.width",
+            10000,
+        ):
             print(df[df["tp_rank"] == 0].drop(["start_time", "tp_rank"], axis=1))
 
     if result_filename:
@@ -209,7 +224,11 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 print("Execute start_profile")
                 requests.post(
                     base_url + "/start_profile",
-                    json={"activities": bench_args.profile_activities},
+                    json={
+                        "activities": bench_args.profile_activities,
+                        "with_stack": bench_args.profile_with_stack,
+                        "record_shapes": bench_args.profile_record_shapes,
+                    },
                 ).raise_for_status()
             run_one_case(
                 base_url,
@@ -230,6 +249,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
