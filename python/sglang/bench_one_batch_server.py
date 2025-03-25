@@ -21,6 +21,7 @@ from typing import Tuple
 
 import numpy as np
 import requests
+import torch.multiprocessing as mp
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -38,6 +39,8 @@ class BenchArgs:
     skip_warmup: bool = False
     profile: bool = False
     profile_activities: Tuple[str] = ("CUDA_PROFILER",)
+    profile_with_stack: bool = False
+    profile_record_shapes: bool = False
     profile_skip_cases: int = 0
 
     @staticmethod
@@ -64,7 +67,15 @@ class BenchArgs:
                  "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
-            "--profile-activities", type=str, nargs="+", default=BenchArgs.profile_activities
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=BenchArgs.profile_activities,
+        )
+        parser.add_argument("--profile-with-stack", action="store_true")
+        parser.add_argument("--profile-record-shapes", action="store_true")
+        parser.add_argument(
+            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
         parser.add_argument("--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases)
 
@@ -81,6 +92,7 @@ def launch_server_internal(server_args):
     try:
         launch_server(server_args)
     except Exception as e:
+        print(f'hi launch_server_internal see error {e=}', flush=True)
         raise e
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
@@ -198,9 +210,15 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         )):
             if bench_args.profile and index == bench_args.profile_skip_cases:
-                print('Execute start_profile')
-                requests.post(base_url + "/start_profile",
-                              json={"activities": bench_args.profile_activities}).raise_for_status()
+                print("Execute start_profile")
+                requests.post(
+                    base_url + "/start_profile",
+                    json={
+                        "activities": bench_args.profile_activities,
+                        "with_stack": bench_args.profile_with_stack,
+                        "record_shapes": bench_args.profile_record_shapes,
+                    },
+                ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -220,6 +238,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
 
 if __name__ == "__main__":
+    print('HACK!! set_start_method')
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
