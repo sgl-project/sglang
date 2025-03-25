@@ -28,9 +28,13 @@ class TestExpertDistribution(unittest.TestCase):
     def test_expert_distribution_record(self):
         """Test expert distribution record endpoints"""
         process = popen_launch_server(
-            DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
+            # The feature is only implemented in deepseek_v2.py
+            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+            ],
         )
 
         try:
@@ -68,7 +72,9 @@ class TestExpertDistribution(unittest.TestCase):
             # Verify the dumped file exists and has correct format
             csv_files = glob.glob("expert_distribution_*.csv")
             self.assertEqual(
-                len(csv_files), 1, "Expected exactly one expert distribution CSV file"
+                len(csv_files),
+                1,
+                f"Expected exactly one expert distribution CSV file {csv_files=}",
             )
 
             # Check CSV file format
@@ -97,11 +103,17 @@ class TestExpertDistribution(unittest.TestCase):
 
                     # Verify data types
                     layer_id, expert_id, count = row
-                    self.assertTrue(layer_id.isdigit(), "layer_id should be an integer")
                     self.assertTrue(
-                        expert_id.isdigit(), "expert_id should be an integer"
+                        layer_id.isdigit(),
+                        f"layer_id should be an integer {row=} {rows=}",
                     )
-                    self.assertTrue(count.isdigit(), "count should be an integer")
+                    self.assertTrue(
+                        expert_id.isdigit(),
+                        f"expert_id should be an integer {row=} {rows=}",
+                    )
+                    self.assertTrue(
+                        count.isdigit(), f"count should be an integer {row=} {rows=}"
+                    )
 
         finally:
             kill_process_tree(process.pid)
