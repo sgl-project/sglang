@@ -46,6 +46,7 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
         f"-bs{forward_batch.batch_size}"
         f"-tok{num_tokens}"
         f"-gtok{global_num_tokens}"
+        f"{'-tbo' if forward_batch.can_run_tbo else ''}"
     )
 
     torch.cuda.synchronize()
@@ -63,7 +64,7 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
                 batch_size=forward_batch.batch_size,
                 num_tokens=num_tokens,
                 global_num_tokens=global_num_tokens,
-                # can_run_tbo=forward_batch.can_run_tbo, # TODO enable in tbo PR
+                can_run_tbo=forward_batch.can_run_tbo,
                 start_time=start_time,
                 tp_rank=tp_rank,
             )
