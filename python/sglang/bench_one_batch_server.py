@@ -92,7 +92,6 @@ def launch_server_internal(server_args):
     try:
         launch_server(server_args)
     except Exception as e:
-        print(f'hi launch_server_internal see error {e=}', flush=True)
         raise e
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
@@ -238,7 +237,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
 
 if __name__ == "__main__":
-    print('HACK!! set_start_method')
     mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
