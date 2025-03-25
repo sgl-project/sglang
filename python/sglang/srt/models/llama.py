@@ -285,6 +285,7 @@ class LlamaModel(nn.Module):
             ),
             prefix="model.layers",
         )
+        print(f"LlamaModel layers: {self.layers}")
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
@@ -482,6 +483,10 @@ class LlamaForCausalLM(nn.Module):
         print(f"Parameters: {params_dict}")
         print(f"Weights: {weights}")
 
+        for name, loaded_weight in weights:
+            print("Loading weight for", name, "with shape", loaded_weight.shape, flush=True)
+            continue
+        
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue

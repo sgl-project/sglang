@@ -1,0 +1,682 @@
+INFO 03-25 04:01:01 __init__.py:190] Automatically detected platform cuda.
+INFO 03-25 04:01:09 __init__.py:190] Automatically detected platform cuda.
+INFO 03-25 04:01:10 __init__.py:190] Automatically detected platform cuda.
+Model config: <sglang.srt.configs.model_config.ModelConfig object at 0x7fa889a27220>
+LlamaModel layers: ModuleList(
+  (0-15): 16 x LlamaDecoderLayer(
+    (self_attn): LlamaAttention(
+      (qkv_proj): QKVParallelLinear(in_features=2048, output_features=3072, bias=False, tp_size=1, gather_output=False)
+      (o_proj): RowParallelLinear(input_features=2048, output_features=2048, bias=False, tp_size=1, reduce_results=True)
+      (rotary_emb): Llama3RotaryEmbedding(head_size=64, rotary_dim=64, max_position_embeddings=131072, base=500000.0, is_neox_style=True)
+      (attn): RadixAttention()
+    )
+    (mlp): LlamaMLP(
+      (gate_up_proj): MergedColumnParallelLinear(in_features=2048, output_features=16384, bias=False, tp_size=1, gather_output=False)
+      (down_proj): RowParallelLinear(input_features=8192, output_features=2048, bias=False, tp_size=1, reduce_results=True)
+      (act_fn): SiluAndMul()
+    )
+    (input_layernorm): RMSNorm()
+    (post_attention_layernorm): RMSNorm()
+  )
+)
+Parameters: {'model.embed_tokens.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.0.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.1.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.1.self_attn.o_proj.weight': Parameter containing:
+tensor([[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  ...,  4.3809e-06,
+         -1.0027e+29,  2.9057e-06],
+        [ 1.8208e-13,  5.5078e-01, -4.6736e-23,  ...,  8.9407e-06,
+          4.3685e-24,  5.9307e-06],
+        [-7.9746e-35,  9.1797e-01, -1.7010e-30,  ...,  1.3471e-05,
+          1.2772e-21,  8.9407e-06],
+        ...,
+        [-3.3751e+06,  5.8203e-01,  3.3826e-27,  ...,  9.2773e-03,
+          1.5900e-30,  6.1646e-03],
+        [ 1.0522e+29,  9.3359e-01, -2.9463e+29,  ...,  9.2773e-03,
+          2.8033e-15,  6.1646e-03],
+        [-1.1176e-08,  9.7266e-01, -2.5861e-36,  ...,  9.2773e-03,
+          4.5625e+00,  6.1646e-03]], device='cuda:0'), 'model.layers.1.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.1.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.1.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.1.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.2.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  ...,  4.3809e-06,
+         -1.0027e+29,  2.9057e-06],
+        [ 0.0000e+00,  3.2000e+01, -4.5656e+20,  ...,  8.9407e-06,
+          4.3685e-24,  5.9307e-06],
+        [ 0.0000e+00,  6.4000e+01, -4.5656e+20,  ...,  1.3471e-05,
+          1.2772e-21,  8.9407e-06],
+        ...,
+        [-8.5899e+09,  9.7792e+04, -1.5399e-27,  ...,  1.3916e-02,
+         -9.7581e-25,  9.2163e-03],
+        [-3.6893e+19,  9.7792e+04, -9.8255e-15,  ...,  1.3916e-02,
+         -4.0549e-17,  9.2163e-03],
+        [-1.5846e+29,  9.7792e+04, -5.7861e-02,  ...,  1.3916e-02,
+         -1.6225e-09,  9.2163e-03]], device='cuda:0'), 'model.layers.2.self_attn.o_proj.weight': Parameter containing:
+tensor([[ 6.3949e-13,  6.9141e-01,  8.3267e-15,  ...,  9.2773e-03,
+          7.6702e+15,  6.1646e-03],
+        [-2.5229e-23,  1.7871e-01, -7.1705e-37,  ...,  9.2773e-03,
+          1.2835e+31,  6.1646e-03],
+        [ 2.8280e-12, -3.9258e-01, -1.9246e+27,  ...,  9.2773e-03,
+         -1.7950e-31,  6.1646e-03],
+        ...,
+        [ 1.3784e-07,  1.3867e-01, -2.0890e+27,  ...,  1.8555e-02,
+          1.2421e-15,  1.2329e-02],
+        [ 9.3184e+04, -4.2969e-01, -1.1259e+15,  ...,  1.8555e-02,
+          5.0059e-08,  1.2329e-02],
+        [ 1.3824e+10, -8.5547e-01,  1.0488e+36,  ...,  1.8555e-02,
+          1.9531e+00,  1.2329e-02]], device='cuda:0'), 'model.layers.2.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.2.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.2.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.2.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.3.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[ 0.0000e+00,  1.0000e+00,  0.0000e+00,  ...,  1.0000e+00,
+          0.0000e+00,  1.0000e+00],
+        [-1.6763e-29,  8.3203e-01,  4.7360e+04,  ...,  1.0000e+00,
+          0.0000e+00,  1.0000e+00],
+        [-8.8769e-19,  3.9062e-01,  3.8624e+30,  ...,  1.0000e+00,
+          0.0000e+00,  1.0000e+00],
+        ...,
+        [ 2.2070e-01, -2.4023e-01, -2.6944e-11,  ...,  9.9609e-01,
+         -1.4788e+37,  9.9609e-01],
+        [ 1.3028e+20, -7.3438e-01, -8.7617e+12,  ...,  9.9609e-01,
+         -1.4705e+37,  9.9609e-01],
+        [-3.4180e-02, -9.8438e-01,  8.9335e+11,  ...,  9.9609e-01,
+         -1.4705e+37,  9.9609e-01]], device='cuda:0'), 'model.layers.3.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.3.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.3.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.3.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.3.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.4.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.4.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.4.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.4.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.4.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.4.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.5.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.5.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.5.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.5.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.5.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.5.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.6.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.6.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.6.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.6.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.6.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.6.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.7.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.7.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.7.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.7.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.7.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.7.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.8.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.8.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.8.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.8.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.8.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.8.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.9.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.9.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.9.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.9.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.9.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.9.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.10.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.10.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.10.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.10.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.10.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.10.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.11.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.11.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.11.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.11.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.11.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.11.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.12.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.12.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.12.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.12.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.12.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.12.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.13.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.13.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.13.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.13.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.13.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.13.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.14.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.14.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.14.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.14.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.14.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.14.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.15.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.15.self_attn.o_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.15.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.15.mlp.down_proj.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.15.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.15.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.norm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True)}
+Weights: <generator object DefaultModelLoader._get_all_weights at 0x7faad0d7b5a0>
+Loading weight for model.embed_tokens.weight with shape torch.Size([128256, 2048])
+Loading weight for model.layers.0.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.0.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.0.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.0.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.0.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.0.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.0.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.0.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.0.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.1.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.1.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.1.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.1.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.1.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.1.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.1.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.1.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.1.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.10.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.10.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.10.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.10.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.10.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.10.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.10.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.10.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.10.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.11.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.11.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.11.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.11.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.11.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.11.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.11.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.11.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.11.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.12.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.12.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.12.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.12.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.12.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.12.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.12.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.12.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.12.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.13.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.13.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.13.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.13.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.13.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.13.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.13.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.13.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.13.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.14.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.14.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.14.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.14.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.14.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.14.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.14.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.14.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.14.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.15.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.15.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.15.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.15.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.15.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.15.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.15.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.15.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.15.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.2.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.2.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.2.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.2.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.2.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.2.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.2.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.2.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.2.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.3.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.3.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.3.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.3.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.3.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.3.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.3.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.3.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.3.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.4.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.4.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.4.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.4.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.4.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.4.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.4.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.4.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.4.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.5.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.5.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.5.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.5.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.5.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.5.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.5.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.5.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.5.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.6.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.6.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.6.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.6.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.6.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.6.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.6.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.6.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.6.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.7.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.7.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.7.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.7.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.7.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.7.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.7.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.7.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.7.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.8.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.8.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.8.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.8.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.8.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.8.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.8.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.8.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.8.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.9.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.9.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.9.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.9.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.9.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.9.self_attn.k_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.layers.9.self_attn.o_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.9.self_attn.q_proj.weight with shape torch.Size([2048, 2048])
+Loading weight for model.layers.9.self_attn.v_proj.weight with shape torch.Size([512, 2048])
+Loading weight for model.norm.weight with shape torch.Size([2048])
+[2025-03-25 04:02:04] INFO:     127.0.0.1:53188 - "GET /get_model_info HTTP/1.1" 200 OK
