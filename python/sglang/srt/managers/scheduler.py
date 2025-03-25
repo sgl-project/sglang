@@ -1878,7 +1878,7 @@ class Scheduler(
 
         if "MEM" in self.torch_profiler_activities:
             memory_profile_path = os.path.join(
-                self.torch_profiler_trace_dir,
+                self.torch_profiler_output_dir,
                 str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
