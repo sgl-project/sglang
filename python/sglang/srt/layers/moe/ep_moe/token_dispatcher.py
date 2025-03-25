@@ -119,7 +119,7 @@ class DeepEPDispatcher:
         self.token_probs = None
         # Handle used for combine operation
         self.handle = None
-        self.async_finish = async_finish
+        self.enable_async = async_finish
 
         # `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -212,7 +212,7 @@ class DeepEPDispatcher:
     def dispatch_b(self):
         event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = self.dispatch_intermediate_state
 
-        if self.async_finish:
+        if self.enable_async:
             event.current_stream_wait()
 
         # TODO move from above
@@ -245,7 +245,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         num_experts: int,
     ):
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = Buffer.capture() if self.enable_async else None
 
         (
             num_tokens_per_rank,
@@ -257,8 +257,8 @@ class DeepEPDispatcher:
             topk_idx,
             num_experts,
             previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            async_finish=self.enable_async,
+            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
         )
 
         (
@@ -277,8 +277,8 @@ class DeepEPDispatcher:
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            async_finish=self.enable_async,
+            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
         )
 
         return (
@@ -323,20 +323,20 @@ class DeepEPDispatcher:
     def combine_b(self):
         event, hidden_states = self.combine_intermediate_state
 
-        if self.async_finish:
+        if self.enable_async:
             event.current_stream_wait()
 
         self.handle = None
         return hidden_states
 
     def combine_normal(self, x: torch.Tensor, handle: Tuple):
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = Buffer.capture() if self.enable_async else None
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
             handle,
-            async_finish=self.async_finish,
+            async_finish=self.enable_async,
             previous_event=previous_event,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
         )
         return combined_x, event
