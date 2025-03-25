@@ -258,7 +258,7 @@ class DeepEPDispatcher:
             num_experts,
             previous_event=previous_event,
             async_finish=self.enable_async,
-            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
+            allocate_on_comm_stream=previous_event is not None,
         )
 
         (
@@ -278,7 +278,7 @@ class DeepEPDispatcher:
             num_tokens_per_expert=num_tokens_per_expert,
             previous_event=previous_event,
             async_finish=self.enable_async,
-            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
+            allocate_on_comm_stream=previous_event is not None,
         )
 
         return (
@@ -338,6 +338,6 @@ class DeepEPDispatcher:
             handle,
             async_finish=self.enable_async,
             previous_event=previous_event,
-            allocate_on_comm_stream=(previous_event is not None) and self.enable_async,
+            allocate_on_comm_stream=previous_event is not None,
         )
         return combined_x, event
