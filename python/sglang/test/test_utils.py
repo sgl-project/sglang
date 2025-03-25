@@ -1010,10 +1010,11 @@ def _get_max_retry():
 def _retry_execution(fn, max_retry: int):
     if max_retry == 0:
         fn()
-    else:
-        try:
-            fn()
-        except Exception as e:
-            print(f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}")
-            traceback.print_exc()
-            _retry_execution(fn, max_retry=max_retry-1)
+        return
+
+    try:
+        fn()
+    except Exception as e:
+        print(f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}")
+        traceback.print_exc()
+        _retry_execution(fn, max_retry=max_retry-1)
