@@ -90,7 +90,9 @@ class TestExpertDistribution(unittest.TestCase):
                 for row in rows:
                     # Verify each row has 3 columns
                     self.assertEqual(
-                        len(row), 3, "Each row should have layer_id, expert_id and count"
+                        len(row),
+                        3,
+                        "Each row should have layer_id, expert_id and count",
                     )
 
                     # Verify data types
