@@ -166,6 +166,7 @@ class SamplingBatchInfo:
             first_grammar.apply_vocab_mask
         )  # force to use static method
 
+        print(f"!!! 111 update_regex_vocab_mask")
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished:
@@ -194,6 +195,7 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
+        print(f"!!! 222 apply_logits_bias")
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 

@@ -937,6 +937,7 @@ class Scheduler(
                 key = ("structural_tag", req.sampling_params.structural_tag)
 
             req.grammar = self.grammar_backend.get_cached_value(key)
+
             if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
