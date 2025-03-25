@@ -188,12 +188,12 @@ class ReasonerGrammarObject(ABC):
     def result(self, timeout=0.05):
         print(f"!!! result")
         self.grammar = self.grammar.result(timeout)
-        return self.grammar
+        return self
     
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        self.grammar.allocate_vocab_mask(vocab_size, batch_size)
+        return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         print(f"!!! fill_vocab_mask")
@@ -207,7 +207,7 @@ class ReasonerGrammarObject(ABC):
         return self.grammar.apply_vocab_mask
     
     def accept_token(self, token: int):
-        print(f"!!! 111 accept_token")
+        print(f"!!! accept_token")
         if token == self.think_end_id:
             self.is_in_reasoing = False
             self.grammar.fill_vocab_mask(self.vocab_mask, self.idx)
