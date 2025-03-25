@@ -1004,7 +1004,7 @@ class CustomTestCase(unittest.TestCase):
         _retry_execution(lambda: super()._callTestMethod(method), max_retry=_get_max_retry())
 
 def _get_max_retry():
-    return TODO
+    return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
 
 def _retry_execution(fn, max_retry: int):
     if max_retry == 0:
