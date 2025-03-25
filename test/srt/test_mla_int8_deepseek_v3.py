@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 class TestMLADeepseekV3ChannelInt8(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
+        cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
