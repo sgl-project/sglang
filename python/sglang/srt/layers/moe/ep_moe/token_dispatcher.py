@@ -204,6 +204,7 @@ class DeepEPDispatcher:
 
     def dispatch_b(self):
         hidden_states, topk_idx, topk_weights, num_experts, previous_event = self.dispatch_intermediate_state
+        del self.dispatch_intermediate_state
 
         (
             hidden_states,
@@ -323,6 +324,7 @@ class DeepEPDispatcher:
 
     def combine_b(self):
         output, hidden_states, previous_event = self.combine_intermediate_state
+        del self.combine_intermediate_state
 
         hidden_states, event = self.combine_normal(output, self.handle, previous_event)
 
