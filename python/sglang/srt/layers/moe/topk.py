@@ -350,19 +350,31 @@ def select_experts(
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
         else:
-            topk_weights, topk_ids = biased_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                n_share_experts_fusion=n_share_experts_fusion,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
+            device = hidden_states.device
+            if device == torch.device("cpu") and _is_cpu_amx:
+                topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
+                    hidden_states,
+                    router_logits,
+                    correction_bias,
+                    top_k,
+                    renormalize,
+                    num_expert_group,
+                    topk_group,
+                )
+            else:
+                topk_weights, topk_ids = biased_grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    n_share_experts_fusion=n_share_experts_fusion,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                )
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None
