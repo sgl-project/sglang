@@ -998,3 +998,7 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
+class CustomTestCase(unittest.TestCase):
+    def _callTestMethod(self, method):
+        TODO
