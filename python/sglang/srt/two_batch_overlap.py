@@ -1,6 +1,6 @@
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Generator
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -219,5 +219,20 @@ def convert_operations_to_stages(operations) -> List[Callable]:
     return TODO
 
 
-def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> Sequence[List[Any]]:
-    TODO
+def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> List[List[Any]]:
+    return [
+        chunk
+        for chunk in _chunk_by_separator_raw(items, is_separator)
+        if len(chunk) > 0
+    ]
+
+
+def _chunk_by_separator_raw(items: List[Any], is_separator: Callable[[Any], bool]) -> Generator[List[Any], None, None]:
+    pending_items = []
+    for item in items:
+        if is_separator:
+            yield pending_items
+            pending_items = []
+        else:
+            pending_items.append(item)
+    yield pending_items
