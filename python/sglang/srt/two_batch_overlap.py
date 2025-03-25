@@ -218,7 +218,7 @@ class YieldOperation:
 def convert_operations_to_stages(operations) -> List[Callable]:
     operation_chunks = list(_chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation)))
     assert all(len(chunk) > 0 for chunk in operation_chunks)
-    return TODO
+    return [_convert_operation_chunk_to_stage(chunk) for chunk in operation_chunks]
 
 
 def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> Generator[List[Any], None, None]:
@@ -231,3 +231,7 @@ def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -
             pending_items.append(item)
     if len(pending_items) > 0:
         yield pending_items
+
+
+def _convert_operation_chunk_to_stage(chunk: List[Callable]) -> Callable:
+    return TODO
