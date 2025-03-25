@@ -158,7 +158,7 @@ class DecodePreallocQueue:
 
         preallocated_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens(count_retracted=True)
+        allocatable_tokens = self._allocatable_tokens()
 
         for i, decode_req in enumerate(self.queue):
             if not decode_req.waiting_for_input:
