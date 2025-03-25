@@ -30,7 +30,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_mab import MABConfig, MABGroupManager
 from sglang.srt.speculative.eagle_mab import (
     MABConfig,
     MABGroupManager,
