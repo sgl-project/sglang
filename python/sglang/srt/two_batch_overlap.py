@@ -3,7 +3,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -72,8 +71,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-                forward_batch.tbo_children
-            )
+            forward_batch.tbo_children
+        )
         ]
     )
 
@@ -210,3 +209,7 @@ class _StateDict:
 
     def clear(self):
         self._data.clear()
+
+
+def convert_operations_to_stages(operations) -> List[Callable]:
+    return TODO

@@ -1432,6 +1432,7 @@ class DeepseekV2Model(nn.Module):
                 forward_batch.forward_mode
             )
         ]
+        stages = two_batch_overlap.convert_operations_to_stages(operations)
 
         # TODO do not hardcode
         chosen_num_sms = (
