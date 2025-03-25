@@ -146,18 +146,18 @@ nvcc_flags_fp8 = [
 ]
 
 sources = [
-    "src/sgl-kernel/csrc/cpu/activation.cpp",
-    "src/sgl-kernel/csrc/cpu/decode.cpp",
-    "src/sgl-kernel/csrc/cpu/extend.cpp",
-    "src/sgl-kernel/csrc/cpu/gemm.cpp",
-    "src/sgl-kernel/csrc/cpu/gemm_int8.cpp",
-    "src/sgl-kernel/csrc/cpu/moe.cpp",
-    "src/sgl-kernel/csrc/cpu/moe_int8.cpp",
-    "src/sgl-kernel/csrc/cpu/norm.cpp",
-    "src/sgl-kernel/csrc/cpu/topk.cpp",
-    "src/sgl-kernel/csrc/cpu/interface.cpp",
-    "src/sgl-kernel/csrc/cpu/shm.cpp",
-    "src/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp",
+    "csrc/cpu/activation.cpp",
+    "csrc/cpu/decode.cpp",
+    "csrc/cpu/extend.cpp",
+    "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_int8.cpp",
+    "csrc/cpu/moe.cpp",
+    "csrc/cpu/moe_int8.cpp",
+    "csrc/cpu/norm.cpp",
+    "csrc/cpu/topk.cpp",
+    "csrc/cpu/interface.cpp",
+    "csrc/cpu/shm.cpp",
+    "csrc/cpu/torch_extension_cpu.cpp",
 ]
 cuda_sources = (
     [
