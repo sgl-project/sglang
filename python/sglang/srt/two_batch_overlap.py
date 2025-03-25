@@ -216,6 +216,7 @@ class YieldOperation:
 
 
 def convert_operations_to_stages(operations) -> List[Callable]:
+    operation_chunks = _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
     return TODO
 
 
