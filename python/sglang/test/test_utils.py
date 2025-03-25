@@ -1004,7 +1004,7 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         _retry_execution(
-            lambda: super()._callTestMethod(method), max_retry=_get_max_retry()
+            lambda: super(CustomTestCase, self)._callTestMethod(method), max_retry=_get_max_retry()
         )
 
 
