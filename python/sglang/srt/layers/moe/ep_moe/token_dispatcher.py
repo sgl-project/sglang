@@ -102,7 +102,7 @@ class DeepEPDispatcher:
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        async_finish: bool = False,
+        enable_async: bool = False,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -119,7 +119,7 @@ class DeepEPDispatcher:
         self.token_probs = None
         # Handle used for combine operation
         self.handle = None
-        self.enable_async = async_finish
+        self.enable_async = enable_async
 
         # `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
