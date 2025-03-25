@@ -56,6 +56,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -88,7 +90,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ImageInputs,
+    MultimodalInputs,
     Req,
     ScheduleBatch,
     global_server_args_dict,
@@ -104,7 +106,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import validate_input_length
+from sglang.srt.managers.utils import ExpertDistributionRecorder, validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -127,6 +129,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +407,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (ExpertDistributionReq, self.expert_distribution_handle),
             ]
         )
 
@@ -841,8 +846,8 @@ class Scheduler(
                 return
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -856,7 +861,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -960,7 +965,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -974,7 +979,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -1891,6 +1896,17 @@ class Scheduler(
             self.send_to_tokenizer.send_pyobj(
                 ProfileReqOutput(success=True, message="Succeeded.")
             )
+
+    def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        if recv_req == ExpertDistributionReq.START_RECORD:
+            expert_distribution_recorder.start_record()
+        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+            expert_distribution_recorder.stop_record()
+        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+            expert_distribution_recorder.dump_record()
+        else:
+            raise ValueError("Unrecognized ExpertDistributionReq value")
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
