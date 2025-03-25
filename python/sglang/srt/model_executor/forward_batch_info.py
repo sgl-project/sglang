@@ -38,7 +38,6 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -410,20 +409,20 @@ class ForwardBatch:
                 if image_inputs is None:
                     # text only
                     mrope_positions = [
-                        [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
-                        ]
-                    ] * 3
+                                          [
+                                              pos
+                                              for pos in range(
+                                              extend_prefix_len, extend_prefix_len + extend_seq_len
+                                          )
+                                          ]
+                                      ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ],
+                                         extend_start_loc: extend_start_loc + extend_seq_len
+                                         ],
                             image_grid_thw=image_inputs.image_grid_thws,
                             video_grid_thw=image_inputs.video_grid_thws,
                             image_token_id=image_inputs.im_token_id,
@@ -507,6 +506,7 @@ class ForwardBatch:
         for key in [
             "req_pool_indices",
             "seq_lens",
+            "decode_seq_lens_cpu",
             "extend_seq_lens",
             "extend_prefix_lens",
             "extend_start_loc",
