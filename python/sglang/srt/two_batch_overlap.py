@@ -233,5 +233,9 @@ def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -
         yield pending_items
 
 
-def _convert_operation_chunk_to_stage(chunk: List[Callable]) -> Callable:
+def _convert_operation_chunk_to_stage(operation_chunk: List[Callable]) -> Callable:
+    def stage_fn(*args, **kwargs):
+        for op in operation_chunk:
+            op(*args, **kwargs)
+           
     return TODO
