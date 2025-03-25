@@ -748,7 +748,13 @@ def w8a8_block_fp8_matmul(
     if configs:
         # If an optimal configuration map has been found, look up the
         # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        # TorchDynamo (used by torch.compile) does not support Python's min() with a 'key' argument.
+        # Replace it with an alternative to resolve the warning:
+        #   torch/_dynamo/variables/builtin.py:777] [2/1] incorrect arg count
+        #   <bound method BuiltinVariable._call_min_max of BuiltinVariable()> got an unexpected keyword
+        #   argument 'key' and no constant handler
+        # config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        config = configs[min([(abs(k - M), k) for k in configs])[1]]
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_K must be divisable by block_size[1]
