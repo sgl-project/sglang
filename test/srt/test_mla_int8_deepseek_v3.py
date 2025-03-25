@@ -162,7 +162,7 @@ class TestDeepseekV3MTPBlockInt8(unittest.TestCase):
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-draft",
-                    "lmsys/sglang-ci-dsv3-block-int8-test-NextN",
+                    "sgl-project/sglang-ci-dsv3-block-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
