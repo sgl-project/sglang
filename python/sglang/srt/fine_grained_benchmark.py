@@ -35,8 +35,11 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
     import nvtx
 
     num_tokens = forward_batch.input_ids.shape[0]
-    global_num_tokens = sum(
-        forward_batch.global_num_tokens_cpu) if forward_batch.global_num_tokens_cpu is not None else None
+    global_num_tokens = (
+        sum(forward_batch.global_num_tokens_cpu)
+        if forward_batch.global_num_tokens_cpu is not None
+        else None
+    )
     debug_name = (
         f"forward"
         f"-{forward_batch.forward_mode.name}"
