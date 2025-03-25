@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -433,6 +432,9 @@ class MarlinConfig(QuantizationConfig):
             raise ImportError("vllm is not installed")
 
         from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
+
+        # Delay import to avoid circular dependency
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized

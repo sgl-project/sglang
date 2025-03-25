@@ -26,11 +26,14 @@ from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
     cublas_grouped_gemm,
+    cutlass_scaled_fp4_mm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
+    scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_fp8,
+    sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.moe import moe_align_block_size, topk_softmax
