@@ -41,16 +41,16 @@ if _is_cuda:
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 
-_TORCH_VERSION = torch.__version__.split('+')[0]
-_TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split('.')[:3]))
+_TORCH_VERSION = torch.__version__.split("+")[0]
+_TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
 
 # The condition to determine if it is on a platform that supports
 # torch._scaled_mm rowwise feature.
 # The condition is determined once as the operations
 # are time consuming.
-USE_ROWWISE_TORCH_SCALED_MM = (_is_hip and 
-                              get_device_capability() >= (9, 4) and 
-                              _TORCH_VERSION_TUPLE >= (2, 7, 0))
+USE_ROWWISE_TORCH_SCALED_MM = (
+    _is_hip and get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
+)
 
 
 def cutlass_fp8_supported():
