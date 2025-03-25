@@ -199,6 +199,10 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
     ):
         topk_idx = topk_idx.to(torch.int64)
+        self.dispatch_intermediate_state = hidden_states, topk_idx, topk_weights, num_experts
+
+    def dispatch_b(self):
+        hidden_states, topk_idx, topk_weights, num_experts = self.dispatch_intermediate_state
 
         (
             hidden_states,
@@ -208,11 +212,6 @@ class DeepEPDispatcher:
             handle,
             event,
         ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
-
-        self.dispatch_intermediate_state = event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list
-
-    def dispatch_b(self):
-        event, handle, topk_idx, topk_weights, hidden_states, num_experts, num_recv_tokens_per_expert_list = self.dispatch_intermediate_state
 
         if self.enable_async:
             event.current_stream_wait()
