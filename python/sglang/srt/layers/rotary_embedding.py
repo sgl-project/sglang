@@ -189,7 +189,8 @@ class RotaryEmbedding(CustomOp):
             self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
         if offsets is not None:
             raise NotImplementedError(
-                    "Batched rotary embedding is currently not supported on NPU.")
+                "Batched rotary embedding is currently not supported on NPU."
+            )
         else:
             # TODO: Remove the contiguous in the future.
             query = query.contiguous()
