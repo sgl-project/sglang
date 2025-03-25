@@ -23,15 +23,18 @@ It supports page size = 1.
 import math
 import iree.turbine.kernel as tk
 from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils import (
-    get_default_run_config,
+from iree.turbine.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
+)
+from iree.turbine.kernel.wave.utils.run_utils import (
+    set_default_run_config,
 )
 from iree.turbine.kernel.wave.constraints import MMAType
 from iree.turbine.kernel.wave.templates.paged_decode_attention import (
     get_paged_decode_attention_kernels,
     paged_decode_attention_shape,
 )
+from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
 
 import logging
 
@@ -686,47 +689,48 @@ def decode_attention_wave(
     )
     hyperparams_0.update(get_default_scheduling_params())
     hyperparams_1.update(get_default_scheduling_params())
-    config = get_default_run_config()
 
     log2e = 1.44269504089
     dk_sqrt = math.sqrt(1.0 / head_size)
 
-    with tk.gen.TestLaunchContext(
-        hyperparams_0,
+    options = WaveCompileOptions(
+        subs=hyperparams_0,
         canonicalize=True,
-        run=True,
         run_bench=False,
-        run_config=config,
-    ):
-        # TODO: Add scaling of QK as part of kernel.
-        mb_qk = phase_0(
-            q * dk_sqrt * log2e,
-            k_buffer,
-            v_buffer,
-            b_req_idx,
-            b_seq_len,
-            req_to_token,
-            attn_logits,
-            attn_logits_max,
-        )
-        if dump_generated_mlir:
-            filename = f"wave_decode_attention_phase0_{'x'.join(map(str, shape))}.mlir"
-            with open(filename, "w") as f:
-                f.write(mb_qk.module_op.get_asm())
+    )
+    options = set_default_run_config(options)
+    phase_0 = wave_compile(options, phase_0)
+
+    # TODO: Add scaling of QK as part of kernel.
+    mb_qk = phase_0(
+        q * dk_sqrt * log2e,
+        k_buffer,
+        v_buffer,
+        b_req_idx,
+        b_seq_len,
+        req_to_token,
+        attn_logits,
+        attn_logits_max,
+    )
+    if dump_generated_mlir:
+        filename = f"wave_decode_attention_phase0_{'x'.join(map(str, shape))}.mlir"
+        with open(filename, "w") as f:
+            f.write(mb_qk.module_op.get_asm())
 
 
-    with tk.gen.TestLaunchContext(
-        hyperparams_1,
+    options = WaveCompileOptions(
+        subs=hyperparams_1,
         canonicalize=True,
-        run=True,
         run_bench=False,
-        run_config=config,
-    ):
-        mb_sv = phase_1(attn_logits, attn_logits_max, b_seq_len, o)
-        if dump_generated_mlir:
-            filename = f"wave_decode_attention_phase1_{'x'.join(map(str, shape))}.mlir"
-            with open(filename, "w") as f:
-                f.write(mb_sv.module_op.get_asm())
+    )
+    options = set_default_run_config(options)
+    phase_1 = wave_compile(options, phase_1)
+
+    mb_sv = phase_1(attn_logits, attn_logits_max, b_seq_len, o)
+    if dump_generated_mlir:
+        filename = f"wave_decode_attention_phase1_{'x'.join(map(str, shape))}.mlir"
+        with open(filename, "w") as f:
+            f.write(mb_sv.module_op.get_asm())
 
 
 
