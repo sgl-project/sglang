@@ -685,15 +685,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key_rot
         return query, key
 
-    def forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return super(RotaryEmbedding, self).forward_cuda(positions, query, key, offsets)
-
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
