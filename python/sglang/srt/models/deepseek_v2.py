@@ -370,22 +370,23 @@ class DeepseekV2MoE(nn.Module):
 
     # ----------------------------------------- TBO-related --------------------------------------------
 
-    def _forward_tbo_stage_prefill_dispatch_start(self, state):
-        self._forward_tbo_substage_dispatch_start(state)
-
-    def _forward_tbo_stage_prefill_dispatch_wait(self, state):
-        self._forward_tbo_substage_dispatch_wait(state)
-
-    def _forward_tbo_stage_prefill_mlp(self, state):
-        self._forward_tbo_substage_mlp(state)
-
-    def _forward_tbo_stage_prefill_combine_start(self, state):
-        self._forward_tbo_substage_combine_start(state)
-
-    def _forward_tbo_stage_prefill_shared_and_combine_wait(self, state):
-        self._forward_tbo_substage_shared(state)
-        self._forward_tbo_substage_combine_wait(state)
-        return self._forward_tbo_substage_compute_layer_output(state)
+    # TODO
+    # def _forward_tbo_stage_prefill_dispatch_start(self, state):
+    #     self._forward_tbo_substage_dispatch_start(state)
+    #
+    # def _forward_tbo_stage_prefill_dispatch_wait(self, state):
+    #     self._forward_tbo_substage_dispatch_wait(state)
+    #
+    # def _forward_tbo_stage_prefill_mlp(self, state):
+    #     self._forward_tbo_substage_mlp(state)
+    #
+    # def _forward_tbo_stage_prefill_combine_start(self, state):
+    #     self._forward_tbo_substage_combine_start(state)
+    #
+    # def _forward_tbo_stage_prefill_shared_and_combine_wait(self, state):
+    #     self._forward_tbo_substage_shared(state)
+    #     self._forward_tbo_substage_combine_wait(state)
+    #     return self._forward_tbo_substage_compute_layer_output(state)
 
     def _forward_tbo_stage_decode_shared(self, state):
         self._forward_tbo_substage_dispatch_start(state)
@@ -1272,14 +1273,15 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def get_forward_tbo_operations(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
-            return [
-                self._forward_tbo_stage_prefill_attn,
-                self.mlp._forward_tbo_stage_prefill_dispatch_start,
-                self.mlp._forward_tbo_stage_prefill_dispatch_wait,
-                self.mlp._forward_tbo_stage_prefill_mlp,
-                self.mlp._forward_tbo_stage_prefill_combine_start,
-                self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
-            ]
+            return TODO
+            # return [
+            #     self._forward_tbo_stage_prefill_attn,
+            #     self.mlp._forward_tbo_stage_prefill_dispatch_start,
+            #     self.mlp._forward_tbo_stage_prefill_dispatch_wait,
+            #     self.mlp._forward_tbo_stage_prefill_mlp,
+            #     self.mlp._forward_tbo_stage_prefill_combine_start,
+            #     self.mlp._forward_tbo_stage_prefill_shared_and_combine_wait,
+            # ]
         elif forward_mode == ForwardMode.DECODE:
             return [
                 self._forward_tbo_stage_decode_attn_0,
