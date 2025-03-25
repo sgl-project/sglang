@@ -45,8 +45,8 @@ TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 # torch._scaled_mm rowwise feature.
 # The condition is determined once as the operations
 # are time consuming.
-USE_ROWWISE_TORCH_SCALED_MM = (_is_hip
-                               and get_device_capability() >= (9, 4))
+USE_ROWWISE_TORCH_SCALED_MM = _is_hip and get_device_capability() >= (9, 4)
+
 
 def cutlass_fp8_supported():
     if not _is_cuda:
