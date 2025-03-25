@@ -87,7 +87,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, ExpertDistributionReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -315,6 +315,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    ExpertDistributionReqOutput,
+                    self.expert_distribution_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
