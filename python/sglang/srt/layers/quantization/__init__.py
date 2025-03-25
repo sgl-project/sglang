@@ -22,6 +22,7 @@ try:
     from vllm.model_executor.layers.quantization.marlin import MarlinConfig
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
+
     from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 
     VLLM_AVAILABLE = True
@@ -42,13 +43,13 @@ except ImportError:
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {

@@ -23,8 +23,8 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    _ColumnvLLMParameter,
 )
-from sglang.srt.layers.parameter import _ColumnvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,

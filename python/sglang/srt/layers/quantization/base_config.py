@@ -37,6 +37,7 @@ class QuantizeMethodBase(ABC):
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
+
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize

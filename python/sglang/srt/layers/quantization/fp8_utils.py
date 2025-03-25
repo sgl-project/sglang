@@ -32,11 +32,10 @@ if _is_hip and get_bool_env_var("CK_MOE"):
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm
+    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
-    from sgl_kernel import fp8_scaled_mm
+    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -336,6 +335,7 @@ def maybe_create_device_identity():
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 
+
 # TODO(luka): follow similar pattern for marlin and block-fp8-linear
 #  https://github.com/vllm-project/vllm/issues/14397
 class Fp8LinearOp:
@@ -346,10 +346,12 @@ class Fp8LinearOp:
     in the __init__ method, as reading config is not allowed inside forward.
     """
 
-    def __init__(self,
-                 cutlass_fp8_supported: bool = cutlass_fp8_supported(),
-                 use_per_token_if_dynamic: bool = False,
-                 pad_output: Optional[bool] = None):
+    def __init__(
+        self,
+        cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+        use_per_token_if_dynamic: bool = False,
+        pad_output: Optional[bool] = None,
+    ):
         self.cutlass_fp8_supported = cutlass_fp8_supported
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
 
@@ -370,7 +372,7 @@ class Fp8LinearOp:
         input_scale_ub: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         # TODO(luka) remove this parameter in favor of __init__
-        use_per_token_if_dynamic: Optional[bool] = None
+        use_per_token_if_dynamic: Optional[bool] = None,
     ) -> torch.Tensor:
         # ops.scaled_fp8_quant supports both dynamic and static quant.
         #   If dynamic, layer.input_scale is None and x_scale computed from x.
@@ -389,13 +391,18 @@ class Fp8LinearOp:
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if self.cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                qinput, x_scale = sgl_scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
             else:
                 qinput, x_scale = ops.scaled_fp8_quant(
-                input_2d,
-                input_scale,
-                scale_ub=input_scale_ub,
-                use_per_token_if_dynamic=use_per_token_if_dynamic)
+                    input_2d,
+                    input_scale,
+                    scale_ub=input_scale_ub,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
 
             # Fused GEMM_DQ
             if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
@@ -427,7 +434,11 @@ class Fp8LinearOp:
         else:
             # Maybe apply padding to output, see comment in __init__
             if _is_cuda:
-                qinput, x_scale = sgl_scaled_fp8_quant(input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic)
+                qinput, x_scale = sgl_scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
                 if self.output_padding:
                     pad_size = max(self.output_padding - qinput.shape[0], 0)
                     if pad_size > 0:
@@ -437,30 +448,35 @@ class Fp8LinearOp:
                     input_2d,
                     input_scale,
                     num_token_padding=self.output_padding,
-                    use_per_token_if_dynamic=use_per_token_if_dynamic)
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
 
-            per_tensor_weights = (weight_scale.numel() == 1)
-            per_tensor_activations = (x_scale.numel() == 1)
+            per_tensor_weights = weight_scale.numel() == 1
+            per_tensor_activations = x_scale.numel() == 1
 
             if per_tensor_weights and per_tensor_activations:
                 # Fused GEMM_DQ
-                output = torch._scaled_mm(qinput,
-                                          weight,
-                                          out_dtype=input.dtype,
-                                          scale_a=x_scale,
-                                          scale_b=weight_scale,
-                                          bias=bias)
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
                 # A fix for discrepancy in scaled_mm which returns tuple
                 # for torch < 2.5 and a single value in torch >= 2.5
                 if type(output) is tuple and len(output) == 2:
                     output = output[0]
 
-                return torch.narrow(output, 0, 0,
-                                    input_2d.shape[0]).view(*output_shape)
+                return torch.narrow(output, 0, 0, input_2d.shape[0]).view(*output_shape)
 
-            elif (use_per_token_if_dynamic and not per_tensor_weights
-                  and not per_tensor_activations
-                  and USE_ROWWISE_TORCH_SCALED_MM):
+            elif (
+                use_per_token_if_dynamic
+                and not per_tensor_weights
+                and not per_tensor_activations
+                and USE_ROWWISE_TORCH_SCALED_MM
+            ):
                 # For now validated on ROCm platform
                 # fp8 rowwise scaling in torch._scaled_mm is introduced in
                 # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
@@ -468,12 +484,14 @@ class Fp8LinearOp:
                 # For CUDA platform please validate if the
                 # torch._scaled_mm support rowwise scaled GEMM
                 # Fused GEMM_DQ Rowwise GEMM
-                output = torch._scaled_mm(qinput,
-                                          weight,
-                                          out_dtype=input.dtype,
-                                          scale_a=x_scale,
-                                          scale_b=weight_scale.t(),
-                                          bias=bias)
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale.t(),
+                    bias=bias,
+                )
 
                 output = torch.narrow(output, 0, 0, input_2d.shape[0])
                 output = output.view(*output_shape)
@@ -498,11 +516,13 @@ class Fp8LinearOp:
                 # GEMM
                 # This computes C = (X * W).
                 # Output in fp32 to allow subsequent ops to happen in-place
-                output = torch._scaled_mm(qinput,
-                                          weight,
-                                          scale_a=TORCH_DEVICE_IDENTITY,
-                                          scale_b=TORCH_DEVICE_IDENTITY,
-                                          out_dtype=torch.float32)
+                output = torch._scaled_mm(
+                    qinput,
+                    weight,
+                    scale_a=TORCH_DEVICE_IDENTITY,
+                    scale_b=TORCH_DEVICE_IDENTITY,
+                    out_dtype=torch.float32,
+                )
                 # A fix for discrepancy in scaled_mm which returns tuple
                 # for torch < 2.5 and a single value in torch >= 2.5
                 if type(output) is tuple and len(output) == 2:
