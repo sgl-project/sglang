@@ -42,7 +42,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestEBNFConstrained(unittest.TestCase):
+class TestEBNFConstrained(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "xgrammar", disable_overlap=False)

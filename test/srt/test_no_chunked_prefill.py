@@ -7,7 +7,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestNoChunkedPrefill(unittest.TestCase):
+class TestNoChunkedPrefill(CustomTestCase):
 
     def test_no_chunked_prefill(self):
         run_mmlu_test(

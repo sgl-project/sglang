@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestFimCompletion(unittest.TestCase):
+class TestFimCompletion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/deepseek-coder-1.3b-base"

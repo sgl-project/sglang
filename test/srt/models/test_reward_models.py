@@ -41,7 +41,7 @@ CONVS = [
 ]
 
 
-class TestRewardModels(unittest.TestCase):
+class TestRewardModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

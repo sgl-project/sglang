@@ -523,7 +523,7 @@ def test_update_weights_from_distributed(
     torch.cuda.empty_cache()
 
 
-class TestUpdateWeightsFromDistributed(unittest.TestCase):
+class TestUpdateWeightsFromDistributed(CustomTestCase):
 
     def test_update_weights_from_distributed(self):
 

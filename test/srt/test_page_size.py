@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestPageSize(unittest.TestCase):
+class TestPageSize(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_DEBUG_MEMORY_POOL"] = "1"

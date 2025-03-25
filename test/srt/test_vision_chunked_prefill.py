@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestVisionChunkedPrefill(unittest.TestCase):
+class TestVisionChunkedPrefill(CustomTestCase):
     def prepare_video_messages(self, video_path, max_frames_num=8):
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.

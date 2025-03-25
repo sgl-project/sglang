@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestAWQ(unittest.TestCase):
+class TestAWQ(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST

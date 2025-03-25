@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEnableMetrics(unittest.TestCase):
+class TestEnableMetrics(CustomTestCase):
     def test_metrics_enabled(self):
         """Test that metrics endpoint returns data when enabled"""
         process = popen_launch_server(

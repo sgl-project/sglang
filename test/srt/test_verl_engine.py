@@ -73,7 +73,7 @@ ALL_OTHER_MODELS = [
 ]
 
 
-class TestVerlEngine(unittest.TestCase):
+class TestVerlEngine(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")

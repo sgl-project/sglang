@@ -40,7 +40,7 @@ def test_update_weights_from_tensor(tp_size):
     ), f"Memory leak detected: {memory_after - memory_before} bytes"
 
 
-class TestUpdateWeightsFromTensor(unittest.TestCase):
+class TestUpdateWeightsFromTensor(CustomTestCase):
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:

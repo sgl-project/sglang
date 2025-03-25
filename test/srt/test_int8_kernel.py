@@ -71,7 +71,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     ).sum(dim=1)
 
 
-class TestW8A8Int8FusedMoE(unittest.TestCase):
+class TestW8A8Int8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33]
     N = [128, 1024]

@@ -11,7 +11,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 _DEBUG_EXTRA = True
 
 
-class TestReleaseMemoryOccupation(unittest.TestCase):
+class TestReleaseMemoryOccupation(CustomTestCase):
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}

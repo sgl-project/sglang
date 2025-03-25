@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestPenalty(unittest.TestCase):
+class TestPenalty(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

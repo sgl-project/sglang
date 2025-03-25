@@ -51,7 +51,7 @@ PROMPTS = [
 ]
 
 
-class TestMultiLoRABackend(unittest.TestCase):
+class TestMultiLoRABackend(CustomTestCase):
     def run_backend_batch(
         self,
         prompts: List[str],

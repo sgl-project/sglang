@@ -54,7 +54,7 @@ def multi_process_parallel(
     ray.shutdown()
 
 
-class TestCustomAllReduce(unittest.TestCase):
+class TestCustomAllReduce(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         random.seed(42)

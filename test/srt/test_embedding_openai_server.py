@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "intfloat/e5-mistral-7b-instruct"

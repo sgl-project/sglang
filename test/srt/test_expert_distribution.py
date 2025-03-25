@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestExpertDistribution(unittest.TestCase):
+class TestExpertDistribution(CustomTestCase):
     def setUp(self):
         # Clean up any existing expert distribution files before each test
         for f in glob.glob("expert_distribution_*.csv"):

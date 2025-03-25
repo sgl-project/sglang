@@ -8,7 +8,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 
 
-class TestFP8Base(unittest.TestCase):
+class TestFP8Base(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.M = 256

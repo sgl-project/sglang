@@ -8,7 +8,7 @@ import requests
 from sglang.test.test_utils import run_and_check_memory_leak
 
 
-class TestAbort(unittest.TestCase):
+class TestAbort(CustomTestCase):
     def workload_func(self, base_url, model):
         def process_func():
             def run_one(_):

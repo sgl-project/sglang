@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestFp8KvcacheBase(unittest.TestCase):
+class TestFp8KvcacheBase(CustomTestCase):
     model_config = None
 
     @classmethod

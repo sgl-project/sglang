@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestPyTorchSamplingBackend(unittest.TestCase):
+class TestPyTorchSamplingBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

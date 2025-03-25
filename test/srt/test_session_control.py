@@ -27,7 +27,7 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(unittest.TestCase):
+class TestSessionControl(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -560,7 +560,7 @@ class TestSessionControl(unittest.TestCase):
         )
 
 
-class TestSessionControlVision(unittest.TestCase):
+class TestSessionControlVision(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-7b-ov"

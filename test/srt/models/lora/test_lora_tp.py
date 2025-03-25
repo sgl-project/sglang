@@ -69,7 +69,7 @@ PROMPTS = [
 BACKEND = "triton"
 
 
-class TestLoRATP(unittest.TestCase):
+class TestLoRATP(CustomTestCase):
     def run_tp(
         self,
         prompt: str,

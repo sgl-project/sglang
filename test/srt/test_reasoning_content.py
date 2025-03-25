@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestReasoningContentAPI(unittest.TestCase):
+class TestReasoningContentAPI(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST
@@ -181,7 +181,7 @@ class TestReasoningContentAPI(unittest.TestCase):
         assert len(response.choices[0].message.content) > 0
 
 
-class TestReasoningContentWithoutParser(unittest.TestCase):
+class TestReasoningContentWithoutParser(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST

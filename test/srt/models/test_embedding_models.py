@@ -31,7 +31,7 @@ MODELS = [
 TORCH_DTYPES = [torch.float16]
 
 
-class TestEmbeddingModels(unittest.TestCase):
+class TestEmbeddingModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

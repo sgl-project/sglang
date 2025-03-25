@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestBenchServing(unittest.TestCase):
+class TestBenchServing(CustomTestCase):
 
     def test_offline_throughput_default(self):
         res = run_bench_serving(

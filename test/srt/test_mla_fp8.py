@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestMLA(unittest.TestCase):
+class TestMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST

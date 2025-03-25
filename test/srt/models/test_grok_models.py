@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestGrok(unittest.TestCase):
+class TestGrok(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmzheng/grok-1"

@@ -26,7 +26,7 @@ def _process_return(ret):
     return np.array(ret)
 
 
-class TestGetWeightsByName(unittest.TestCase):
+class TestGetWeightsByName(CustomTestCase):
 
     def init_hf_model(self, model_name, tie_word_embeddings):
         self.hf_model = AutoModelForCausalLM.from_pretrained(

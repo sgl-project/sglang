@@ -67,7 +67,7 @@ PROMPTS = [
 ]
 
 
-class TestLoRABackend(unittest.TestCase):
+class TestLoRABackend(CustomTestCase):
     def run_backend(
         self,
         prompt: str,

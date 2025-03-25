@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestW8A8(unittest.TestCase):
+class TestW8A8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"

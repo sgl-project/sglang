@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchNativeAttnBackend(unittest.TestCase):
+class TestTorchNativeAttnBackend(CustomTestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,

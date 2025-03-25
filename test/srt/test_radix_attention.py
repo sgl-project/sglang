@@ -59,7 +59,7 @@ def run_test(base_url, nodes):
     assert res.status_code == 200
 
 
-class TestRadixCacheFCFS(unittest.TestCase):
+class TestRadixCacheFCFS(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

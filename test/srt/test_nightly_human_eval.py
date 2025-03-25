@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestNightlyHumanEval(unittest.TestCase):
+class TestNightlyHumanEval(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if is_in_ci():

@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompileMoe(unittest.TestCase):
+class TestTorchCompileMoe(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST

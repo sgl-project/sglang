@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestMLADeepseekV3(unittest.TestCase):
+class TestMLADeepseekV3(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -48,7 +48,7 @@ class TestMLADeepseekV3(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestDeepseekV3MTP(unittest.TestCase):
+class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"

@@ -102,7 +102,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test GPTQ fallback kernel that is not Marlin
-class TestGPTQModelDynamic(unittest.TestCase):
+class TestGPTQModelDynamic(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
     )
@@ -157,7 +157,7 @@ class TestGPTQModelDynamic(unittest.TestCase):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test Marlin kernel
-class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
+class TestGPTQModelDynamicWithMarlin(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
     )

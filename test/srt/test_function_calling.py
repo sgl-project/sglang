@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestOpenAIServerFunctionCalling(unittest.TestCase):
+class TestOpenAIServerFunctionCalling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST

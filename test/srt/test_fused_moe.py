@@ -9,7 +9,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 
 
-class TestFusedMOE(unittest.TestCase):
+class TestFusedMOE(CustomTestCase):
     NUM_EXPERTS = [8, 64]
     TOP_KS = [2, 6]
 

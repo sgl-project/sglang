@@ -50,7 +50,7 @@ def setup_class(cls, backend: str):
     )
 
 
-class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
+class TestJSONConstrainedOutlinesBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, backend="outlines")

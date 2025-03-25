@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestRequestLengthValidation(unittest.TestCase):
+class TestRequestLengthValidation(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST

@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTritonAttnBackend(unittest.TestCase):
+class TestTritonAttnBackend(CustomTestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST,

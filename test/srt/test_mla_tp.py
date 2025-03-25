@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDeepseekTP2(unittest.TestCase):
+class TestDeepseekTP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"

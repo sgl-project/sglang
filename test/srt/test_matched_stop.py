@@ -18,7 +18,7 @@ The story should span multiple events, challenges, and character developments ov
 """
 
 
-class TestMatchedStop(unittest.TestCase):
+class TestMatchedStop(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

@@ -129,7 +129,7 @@ def check_model_scores(results):
         raise AssertionError("\n".join(failed_models))
 
 
-class TestNightlyGsm8KEval(unittest.TestCase):
+class TestNightlyGsm8KEval(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [

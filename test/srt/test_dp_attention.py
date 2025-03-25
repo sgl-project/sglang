@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDPAttentionDP2TP2(unittest.TestCase):
+class TestDPAttentionDP2TP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST

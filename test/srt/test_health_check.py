@@ -7,7 +7,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestHealthCheck(unittest.TestCase):
+class TestHealthCheck(CustomTestCase):
     def test_health_check(self):
         """Test that metrics endpoint returns data when enabled"""
         with self.assertRaises(TimeoutError):

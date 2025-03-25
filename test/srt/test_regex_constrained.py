@@ -41,7 +41,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestRegexConstrained(unittest.TestCase):
+class TestRegexConstrained(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         setup_class(cls, "xgrammar", disable_overlap=False)

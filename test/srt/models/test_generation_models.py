@@ -71,7 +71,7 @@ ALL_OTHER_MODELS = [
 TORCH_DTYPES = [torch.float16]
 
 
-class TestGenerationModels(unittest.TestCase):
+class TestGenerationModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

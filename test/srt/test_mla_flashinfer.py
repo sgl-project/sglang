@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestFlashinferMLA(unittest.TestCase):
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -55,7 +55,7 @@ class TestFlashinferMLA(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLANoRagged(unittest.TestCase):
+class TestFlashinferMLANoRagged(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -99,7 +99,7 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLAMTP(unittest.TestCase):
+class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
