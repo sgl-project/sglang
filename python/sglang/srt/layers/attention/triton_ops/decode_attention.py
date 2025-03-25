@@ -691,6 +691,7 @@ def decode_attention_fwd(
     kv_indices,
     attn_logits,
     attn_lse,
+    kv_last_page_len,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -726,7 +727,7 @@ def decode_attention_fwd(
             o,
             kv_indptr,
             kv_indices,
-            attn_logits,
+            kv_last_page_len,
             sm_scale,
             logit_cap,
         )
