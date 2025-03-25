@@ -30,6 +30,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 285),
         TestFile("test_eagle_infer.py", 584),
+        TestFile("test_eagle_mab.py", 300),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_embedding_openai_server.py", 141),
         TestFile("test_eval_fp8_accuracy.py", 303),

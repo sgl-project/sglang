@@ -271,7 +271,7 @@ class MABGroupManager:
         valid_strategies = [
             s for s in self.strategies if get_draft_tokens(s) * batch_size <= 2048
         ]
-        # If all strategies would cause OOM, return the safest one - the one with least tokens
+        # If all strategies would cause OOM, return the safest one - the one with the least tokens
         if not valid_strategies:
             return [min(self.strategies, key=lambda s: get_draft_tokens(s))]
 
@@ -282,7 +282,7 @@ class MABGroupManager:
         for group in reversed(self.groups):
             if group <= batch_size:
                 return group
-        return self.groups[0]  # Fallback to smallest group
+        return self.groups[0]  # Fallback to the smallest group
 
     def select_strategy(self, batch_size: int) -> str:
         """Select strategy for given batch size using appropriate MAB.
