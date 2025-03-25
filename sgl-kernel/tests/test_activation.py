@@ -36,6 +36,4 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

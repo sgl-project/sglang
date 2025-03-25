@@ -40,6 +40,4 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])
