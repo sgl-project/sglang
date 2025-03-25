@@ -74,7 +74,7 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seqlens_in_batch.max().item()
+        metadata.max_seq_len_k = seqlens_in_batch.max()
         # Precompute page table
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
@@ -93,7 +93,6 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
-            metadata.max_seq_len_q = seqlens_in_batch.max().item()
         self.forward_metadata = metadata
 
     def forward_extend(
@@ -281,7 +280,7 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seqlens_in_batch.max().item()
+        metadata.max_seq_len_k = seqlens_in_batch.max()
         # Only zero out the part out of max_len_k
         metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
         # Then do the copy
