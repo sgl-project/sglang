@@ -121,6 +121,12 @@ jobs:
           cd test/srt
           python3 test_moe_ep.py
 
+      - name: Test two batch overlap
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_two_batch_overlap.py
+
       - name: Test torch compile (TP=2)
         timeout-minutes: 10
         run: |
