@@ -179,6 +179,7 @@ class DeepEPDispatcher:
         return reorder_topk_ids, seg_indptr, gateup_input
 
     # TODO wait for low_latency code, so currently this file is just hacky refactor
+    # TODO low_latency_dispatch/low_latency_combine's async_finish should be false, return_recv_hook should be self.enable_async
     def dispatch(self, *args, **kwargs):
         self.dispatch_a(*args, **kwargs)
         return self.dispatch_b()
