@@ -55,7 +55,7 @@ class TestFlashAttention3(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.62)
 
     @classmethod
     def tearDownClass(cls):
@@ -103,6 +103,7 @@ class TestFlashAttention3DisableCudaGraph(unittest.TestCase):
         print(metrics)
 
         self.assertGreater(metrics["accuracy"], 0.62)
+
 
 if __name__ == "__main__":
     unittest.main()
