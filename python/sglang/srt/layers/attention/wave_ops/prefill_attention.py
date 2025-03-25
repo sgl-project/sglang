@@ -24,8 +24,10 @@ import math
 
 import iree.turbine.kernel as tk
 from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils import (
-    get_default_run_config,
+from iree.turbine.kernel.wave.utils.run_utils import (
+    set_default_run_config,
+)
+from iree.turbine.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
 )
 from iree.turbine.kernel.wave.constraints import MMAType
@@ -34,6 +36,7 @@ from iree.turbine.kernel.wave.templates.attention_common import AttentionShape
 from iree.turbine.kernel.wave.templates.prefill_attention import (
     get_prefill_attention_kernel,
 )
+from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
 
 import os
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
@@ -72,32 +75,31 @@ def prefill_attention_wave(
     )
 
     hyperparams.update(get_default_scheduling_params())
-    config = get_default_run_config()
 
     log2e = 1.44269504089
     dk_sqrt = math.sqrt(1.0 / shape.head_size)
 
-    with tk.gen.TestLaunchContext(
-        hyperparams,
+    options = WaveCompileOptions(
+        subs=hyperparams,
         canonicalize=True,
-        run=True,
         run_bench=False,
-        run_config=config,
-        schedule=False,
         use_scheduling_barriers=False,
-    ):
-        # TODO: Add scaling of QK as part of kernel.
-        # TODO: Add variant of non-transposed V attention kernel.
-        mb = prefill(
-            q * dk_sqrt * log2e,
-            k,
-            v,
-            b_start_loc,
-            b_seq_len,
-            o,
-        )
-        if dump_generated_mlir:
-            shape_list = [q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2]]
-            filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
-            with open(filename, "w") as f:
-                f.write(mb.module_op.get_asm())
+    )
+    options = set_default_run_config(options)
+    prefill = wave_compile(options, prefill)
+
+    # TODO: Add scaling of QK as part of kernel.
+    # TODO: Add variant of non-transposed V attention kernel.
+    mb = prefill(
+        q * dk_sqrt * log2e,
+        k,
+        v,
+        b_start_loc,
+        b_seq_len,
+        o,
+    )
+    if dump_generated_mlir:
+        shape_list = [q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2]]
+        filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
+        with open(filename, "w") as f:
+            f.write(mb.module_op.get_asm())

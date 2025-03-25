@@ -24,9 +24,11 @@ import math
 
 import iree.turbine.kernel as tk
 from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils import (
-    get_default_run_config,
+from iree.turbine.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
+)
+from iree.turbine.kernel.wave.utils.run_utils import (
+    set_default_run_config,
 )
 from iree.turbine.kernel.wave.constraints import MMAType
 from iree.turbine.kernel.wave.scheduling.schedule import SchedulingType
@@ -35,12 +37,12 @@ from iree.turbine.kernel.wave.templates.attention_common import AttentionShape
 from iree.turbine.kernel.wave.templates.extend_attention import (
     get_extend_attention_kernel,
 )
+from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
 
 import os
 import functools
 
 dump_generated_mlir = int(os.environ.get("WAVE_DUMP_MLIR", 0))
-kernel_hash = []
 
 
 @functools.lru_cache
@@ -87,30 +89,25 @@ def get_wave_kernel(
     )
 
     hyperparams.update(get_default_scheduling_params())
-    config = get_default_run_config()
-    compile_config = {"waves_per_eu": 2, "denorm_fp_math_f32": "preserve-sign"}
-    config["gpu-native-math-precision"] = True
-    config["wave_runtime"] = True
-    launch_context = tk.gen.TestLaunchContext(
-        hyperparams,
+    options = WaveCompileOptions(
+        subs=hyperparams,
         canonicalize=True,
-        run=True,
         run_bench=False,
-        run_config=config,
-        compile_config=compile_config,
         schedule=SchedulingType.NONE,
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
-        kernel_hash=kernel_hash,
         use_buffer_load_ops=True,
         use_buffer_store_ops=True,
+        waves_per_eu=2,
+        denorm_fp_math_f32="preserve-sign",
+        gpu_native_math_precision=True,
+        wave_runtime=True
     )
+    options = set_default_run_config(options)
+    extend_attention = wave_compile(options, extend_attention)
 
-    return (
-        launch_context,
-        extend_attention,
-    )
+    return extend_attention
 
 
 def extend_attention_wave(
@@ -130,7 +127,6 @@ def extend_attention_wave(
     layer_scaling=None,
     logit_cap=0,
 ):
-    global kernel_hash
     shape = AttentionShape(
         num_query_heads=q_extend.shape[1],
         num_kv_heads=k_extend.shape[1],
@@ -141,10 +137,7 @@ def extend_attention_wave(
     )
 
     # Run the wave kernel.
-    (
-        launch_context,
-        extend_attention,
-    ) = get_wave_kernel(
+    extend_attention = get_wave_kernel(
         shape,
         q_extend.shape,
         k_extend.shape,
@@ -161,29 +154,28 @@ def extend_attention_wave(
         logit_cap=logit_cap,
     )
 
-    with launch_context:
-        mb = extend_attention(
-            q_extend,
-            k_extend,
-            v_extend,
-            k_buffer,
-            v_buffer,
-            req_to_tokens,
-            b_req_idx,
-            b_seq_len,
-            b_seq_len_extend,
-            b_start_loc_extend,
-            output,
-        )
+    mb = extend_attention(
+        q_extend,
+        k_extend,
+        v_extend,
+        k_buffer,
+        v_buffer,
+        req_to_tokens,
+        b_req_idx,
+        b_seq_len,
+        b_seq_len_extend,
+        b_start_loc_extend,
+        output,
+    )
 
-        if dump_generated_mlir:
-            shape_list = [
-                q_extend.shape[0],
-                q_extend.shape[1],
-                k_extend.shape[1],
-                q_extend.shape[2],
-                k_extend.shape[2],
-            ]
-            filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
-            with open(filename, "w") as f:
-                f.write(mb.module_op.get_asm())
+    if dump_generated_mlir:
+        shape_list = [
+            q_extend.shape[0],
+            q_extend.shape[1],
+            k_extend.shape[1],
+            q_extend.shape[2],
+            k_extend.shape[2],
+        ]
+        filename = f"wave_prefill_attention_{'x'.join(map(str, shape_list))}.mlir"
+        with open(filename, "w") as f:
+            f.write(mb.module_op.get_asm())
