@@ -343,7 +343,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        return chosen_deepep_dispatcher.dispatch_stage_start(
+        return chosen_deepep_dispatcher.dispatch_a(
             hidden_states,
             topk_idx,
             topk_weights,
@@ -392,18 +392,18 @@ class DeepseekV2MoE(nn.Module):
             state.recv_hidden_states_from_dispatch,
             state.reorder_topk_ids_from_dispatch,
             state.seg_indptr_from_dispatch,
-        ) = dispatcher.dispatch_stage_wait(state.state_dispatch)
+        ) = dispatcher.dispatch_b(state.state_dispatch)
 
     def _forward_tbo_op_combine_a(self, state):
         state.state_combine = self.tbo_deepep_dispatchers[
             state.tbo_subbatch_index
-        ].combine_stage_start(
+        ].combine_a(
             state.expert_output_hidden_states, state.forward_batch.forward_mode
         )
 
     def _forward_tbo_op_combine_b(self, state):
         dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        state.hidden_states_from_combine = dispatcher.combine_stage_wait(
+        state.hidden_states_from_combine = dispatcher.combine_b(
             state.state_combine
         )
 
