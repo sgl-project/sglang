@@ -9,11 +9,12 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestMLADeepseekV3ChannelInt8(unittest.TestCase):
+class TestMLADeepseekV3ChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
@@ -48,7 +49,7 @@ class TestMLADeepseekV3ChannelInt8(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestDeepseekV3MTPChannelInt8(unittest.TestCase):
+class TestDeepseekV3MTPChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
@@ -109,7 +110,7 @@ class TestDeepseekV3MTPChannelInt8(unittest.TestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
-class TestMLADeepseekV3BlockInt8(unittest.TestCase):
+class TestMLADeepseekV3BlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
@@ -144,7 +145,7 @@ class TestMLADeepseekV3BlockInt8(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestDeepseekV3MTPBlockInt8(unittest.TestCase):
+class TestDeepseekV3MTPBlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
