@@ -380,7 +380,7 @@ class DeepseekV2MoE(nn.Module):
         self._forward_deepep_dispatch_a(
             self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
             state.forward_batch.forward_mode,
-            state.hidden_states_for_moe_input,
+            state.hidden_states_after_post_attn_ln,
             state.router_logits,
         )
 
@@ -405,7 +405,7 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_shared(self, state):
         state.shared_output = self._forward_deepep_shared_output(
-            state.forward_batch.forward_mode, state.hidden_states_for_moe_input
+            state.forward_batch.forward_mode, state.hidden_states_after_post_attn_ln
         )
 
     def _forward_tbo_op_compute_layer_output(self, state):
@@ -1297,12 +1297,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _forward_tbo_op_decode_attn_0(self, state):
-        self_attn_state = self.self_attn.forward_absorb_stage_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        state.self_attn_state = self.self_attn.forward_absorb_stage_prepare(
+            positions=state.positions,
+            hidden_states=state.hidden_states_after_input_ln,
+            forward_batch=state.forward_batch,
         )
-        TODO
 
     def _forward_tbo_op_decode_attn_1(self, state):
         assert (
@@ -1311,24 +1310,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             and global_server_args_dict["enable_deepep_moe"]
             and isinstance(self.mlp, DeepseekV2MoE)
         )
-        hidden_states = self.self_attn.forward_absorb_stage_core(state.self_attn_state)
+        state.hidden_states_after_attn = self.self_attn.forward_absorb_stage_core(state.self_attn_state)
         TODO
 
     def _forward_tbo_op_post_attn_layernorm(self, state):
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, state.residual_after_input_ln
-        )
-        TODO
+        state.hidden_states_after_post_attn_ln, state.residual_after_post_attn_ln = \
+            self.post_attention_layernorm(state.hidden_states_after_attn, state.residual_after_input_ln)
 
     def _forward_tbo_op_mlp_gate(self, state):
-        router_logits = self.mlp.gate(hidden_states)
-        state.update(
-            dict(
-                hidden_states_for_moe_input=hidden_states,
-                residual_after_post_attn_ln=residual,
-                router_logits=router_logits,
-            )
-        )
+        state.router_logits = self.mlp.gate(state.hidden_states_after_post_attn_ln)
 
 
 class DeepseekV2Model(nn.Module):
