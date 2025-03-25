@@ -8,6 +8,7 @@ import random
 import subprocess
 import threading
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -1013,5 +1014,6 @@ def _retry_execution(fn, max_retry: int):
         try:
             fn()
         except Exception as e:
-            TODO
+            print(f"retry_execution failed once, error: {e}")
+            traceback.print_exc()
             _retry_execution(fn, max_retry=max_retry-1)
