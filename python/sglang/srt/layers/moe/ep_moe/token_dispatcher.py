@@ -178,6 +178,14 @@ class DeepEPDispatcher:
         self.src2dst = src2dst
         return reorder_topk_ids, seg_indptr, gateup_input
 
+    def dispatch(self, *args, **kwargs):
+        self.dispatch_a(*args, **kwargs)
+        return self.dispatch_b()
+
+    def combine(self, *args, **kwargs):
+        self.combine_a(*args, **kwargs)
+        return self.combine_b()
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,

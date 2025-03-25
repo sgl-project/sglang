@@ -293,11 +293,11 @@ class DeepseekV2MoE(nn.Module):
         else:
             router_logits = None
 
-        dispatch_state = self._forward_deepep_dispatch_stage_start(
+        dispatch_state = self._forward_deepep_dispatch_a(
             self.deepep_dispatcher, forward_mode, hidden_states, router_logits
         )
         recv_hidden_states, reorder_topk_ids, seg_indptr = (
-            self.deepep_dispatcher.dispatch_stage_wait(dispatch_state)
+            self.deepep_dispatcher.dispatch_b(dispatch_state)
         )
 
         final_hidden_states = self._forward_deepep_expert(
@@ -323,7 +323,7 @@ class DeepseekV2MoE(nn.Module):
             return self.shared_experts(hidden_states)
         return None
 
-    def _forward_deepep_dispatch_stage_start(
+    def _forward_deepep_dispatch_a(
         self, chosen_deepep_dispatcher, forward_mode, hidden_states, router_logits
     ):
         topk_idx = torch.full(
@@ -379,7 +379,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_dispatch_a(self, state):
-        state.state_dispatch = self._forward_deepep_dispatch_stage_start(
+        state.state_dispatch = self._forward_deepep_dispatch_a(
             self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
             state.forward_batch.forward_mode,
             state.hidden_states_for_moe_input,
