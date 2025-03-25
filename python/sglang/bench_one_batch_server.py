@@ -22,7 +22,6 @@ from typing import Tuple
 import numpy as np
 import requests
 import torch.multiprocessing as mp
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -65,7 +64,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -75,9 +74,6 @@ class BenchArgs:
         )
         parser.add_argument("--profile-with-stack", action="store_true")
         parser.add_argument("--profile-record-shapes", action="store_true")
-        parser.add_argument(
-            "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
-        )
         parser.add_argument(
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
