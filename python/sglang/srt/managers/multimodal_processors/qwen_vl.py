@@ -1,12 +1,16 @@
 import asyncio
 import math
+import time
 from typing import List, Union
 
 import torch
 from PIL import Image
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.multimodal_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.managers.multimodal_processors.base_processor import (
+    MultimodalSpecialTokens,
     get_global_processor,
 )
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -14,7 +18,7 @@ from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
 
 # Compatible with Qwen2VL and Qwen2_5VL
-class Qwen2_5VLImageProcessor(BaseImageProcessor):
+class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -59,7 +63,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         else:
             return self._process_images_task(images, input_text, self.hf_config)
 
-    async def process_images_async(
+    async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_ids,
@@ -68,16 +72,17 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
         *args,
         **kwargs,
     ):
+        start = time.time()
         if not image_data:
             return None
         if isinstance(image_data, str):
             image_data = [image_data]
 
         image_token = self.IMAGE_TOKEN
-        base_output = self.load_images(
+        base_output = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
-            image_token=image_token,
+            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
         )
 
@@ -139,7 +144,7 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
             """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
             return math.floor(number / factor) * factor
 
-        images = [resize_image(image) for image in base_output.all_frames]
+        images = [resize_image(image) for image in base_output.images]
 
         ret = await self._process_single_image(
             images=images, input_text=base_output.input_text
@@ -147,11 +152,10 @@ class Qwen2_5VLImageProcessor(BaseImageProcessor):
 
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         video_grid_thws = None
-
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
-            "image_hashes": base_output.image_hashes,
+            "data_hashes": base_output.mm_data_hashes,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
             "video_grid_thws": video_grid_thws,
