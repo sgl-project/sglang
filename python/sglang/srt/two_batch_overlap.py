@@ -160,11 +160,12 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
-        for op in stage:
-            with _annotate_region(debug_name=self._compute_debug_name(self._index, op)):
-                self._stage_output = op(
-                    state=self._stage_state, **(self._stage_output or {})
-                )
+        with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
+            for op in stage:
+                with _annotate_region(debug_name=op.__name__.replace("_forward_tbo_op_", "")):
+                    self._stage_output = op(
+                        state=self._stage_state, **(self._stage_output or {})
+                    )
 
         self._index += 1
 
@@ -180,10 +181,6 @@ class _StageExecutor:
     @property
     def num_stages(self):
         return len(self._stages)
-
-    def _compute_debug_name(self, stage_index, op):
-        stage_name_brief = op.__name__.replace("_forward_tbo_op_", "")
-        return f"{self._debug_name}{stage_index}-{stage_name_brief}"
 
 
 @contextmanager
