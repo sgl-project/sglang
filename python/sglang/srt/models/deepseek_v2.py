@@ -1425,10 +1425,10 @@ class DeepseekV2Model(nn.Module):
         if start_layer == end_layer:
             return hidden_states, residual
 
-        stages = [
-            stage
+        operations = [
+            op
             for i in range(start_layer, end_layer)
-            for stage in self.layers[i].get_forward_tbo_stages(
+            for op in self.layers[i].get_forward_tbo_operations(
                 forward_batch.forward_mode
             )
         ]
