@@ -10,6 +10,7 @@ python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --
 python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 """
 
+import torch
 import argparse
 import dataclasses
 import itertools
@@ -223,15 +224,17 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             )
         ):
             if bench_args.profile and index == bench_args.profile_skip_cases:
-                print("Execute start_profile")
-                requests.post(
-                    base_url + "/start_profile",
-                    json={
-                        "activities": bench_args.profile_activities,
-                        "with_stack": bench_args.profile_with_stack,
-                        "record_shapes": bench_args.profile_record_shapes,
-                    },
-                ).raise_for_status()
+                print('bench script call cudaProfilerStart')
+                torch.cuda.cudart().cudaProfilerStart()
+                # print("Execute start_profile")
+                # requests.post(
+                #     base_url + "/start_profile",
+                #     json={
+                #         "activities": bench_args.profile_activities,
+                #         "with_stack": bench_args.profile_with_stack,
+                #         "record_shapes": bench_args.profile_record_shapes,
+                #     },
+                # ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -241,8 +244,10 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.result_filename,
             )
         if bench_args.profile:
-            print("Execute stop_profile")
-            requests.post(base_url + "/stop_profile").raise_for_status()
+            print('bench script call cudaProfilerStop')
+            torch.cuda.cudart().cudaProfilerStop()
+            # print("Execute stop_profile")
+            # requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
