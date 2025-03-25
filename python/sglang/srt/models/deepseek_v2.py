@@ -1281,17 +1281,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_attn_1,
                 two_batch_overlap.YieldOperation(),
 
-                self._forward_tbo_op_dispatch_start,
-                self._forward_tbo_op_shared,
+                self.mlp._forward_tbo_op_dispatch_start,
+                self.mlp._forward_tbo_op_shared,
                 two_batch_overlap.YieldOperation(),
 
-                self._forward_tbo_op_dispatch_wait,
-                self._forward_tbo_op_mlp,
-                self._forward_tbo_op_combine_start,
+                self.mlp._forward_tbo_op_dispatch_wait,
+                self.mlp._forward_tbo_op_mlp,
+                self.mlp._forward_tbo_op_combine_start,
                 two_batch_overlap.YieldOperation(),
 
-                self._forward_tbo_op_combine_wait,
-                self._forward_tbo_op_compute_layer_output,
+                self.mlp._forward_tbo_op_combine_wait,
+                self.mlp._forward_tbo_op_compute_layer_output,
                 two_batch_overlap.YieldOperation(),
             ]
         else:
