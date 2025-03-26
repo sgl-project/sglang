@@ -128,7 +128,7 @@ async def async_request_trt_llm(
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
-                            ttft = time.perf_counter() - st
+                            ttft = timestamp - st
                             output.ttft = ttft
 
                         # Decoding phase
@@ -220,7 +220,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = data.get("usage", {}).get(
+                                output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
@@ -501,6 +501,7 @@ def get_dataset(args, tokenizer):
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
             tokenizer=tokenizer,
+            args=args,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -788,6 +789,7 @@ def sample_generated_shared_prefix_requests(
     question_len: int,
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
+    args: argparse.Namespace,
 ) -> List[Tuple[str, int, int]]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
@@ -1006,7 +1008,7 @@ async def benchmark(
 
     # Flush cache
     if "sglang" in backend:
-        requests.post(base_url + "/flush_cache")
+        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
 

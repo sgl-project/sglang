@@ -1,11 +1,16 @@
 # Minimal Makefile for Sphinx documentation
 SPHINXOPTS    ?=
 SPHINXBUILD   ?= sphinx-build
+SPHINXAUTOBUILD ?= sphinx-autobuild
 SOURCEDIR     = .
 BUILDDIR      = _build
+PORT          ?= 8003
 
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@echo ""
+	@echo "Additional targets:"
+	@echo "  serve       to build and serve documentation with auto-build and live reload"
 
 # Compile Notebook files and record execution time
 compile:
@@ -18,7 +23,8 @@ compile:
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		NB_NAME=$$(basename {}); \
 		START_TIME=$$(date +%s); \
-		jupyter nbconvert --to notebook --execute --inplace "{}" \
+		retry --delay=0 --times=3 -- \
+			jupyter nbconvert --to notebook --execute --inplace "{}" \
 			--ExecutePreprocessor.timeout=600 \
 			--ExecutePreprocessor.kernel_name=python3; \
 		RET_CODE=$$?; \
@@ -32,8 +38,15 @@ compile:
 	echo "Total execution time: $${TOTAL_ELAPSED}s" >> logs/timing.log; \
 	echo "All Notebook execution timings:" && cat logs/timing.log
 
+# Serve documentation with auto-build and live reload
+serve:
+	@echo "Starting auto-build server at http://localhost:$(PORT)"
+	@$(SPHINXAUTOBUILD) "$(SOURCEDIR)" "$(BUILDDIR)/html" \
+		--port $(PORT) \
+		--watch $(SOURCEDIR) \
+		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"
 
-.PHONY: help Makefile compile clean
+.PHONY: help Makefile compile clean serve
 
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)

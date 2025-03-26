@@ -7,11 +7,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestEnableMetrics(unittest.TestCase):
+class TestEnableMetrics(CustomTestCase):
     def test_metrics_enabled(self):
         """Test that metrics endpoint returns data when enabled"""
         process = popen_launch_server(
@@ -59,6 +60,7 @@ class TestEnableMetrics(unittest.TestCase):
                 "sglang:spec_accept_length",
                 "sglang:prompt_tokens_total",
                 "sglang:generation_tokens_total",
+                "sglang:cached_tokens_total",
                 "sglang:num_requests_total",
                 "sglang:time_to_first_token_seconds",
                 "sglang:time_per_output_token_seconds",

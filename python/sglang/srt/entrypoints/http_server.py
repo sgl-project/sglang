@@ -14,11 +14,12 @@
 """
 The entry point of inference server. (SRT = SGLang Runtime)
 
-This file implements HTTP APIs for the inferenc engine via fastapi.
+This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
 import dataclasses
+import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -259,6 +260,29 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
+@app.api_route("/generate_from_file", methods=["POST"])
+async def generate_from_file_request(file: UploadFile, request: Request):
+    """Handle a generate request, this is purely to work with input_embeds."""
+    content = await file.read()
+    input_embeds = json.loads(content.decode("utf-8"))
+
+    obj = GenerateReqInput(
+        input_embeds=input_embeds,
+        sampling_params={
+            "repetition_penalty": 1.2,
+            "temperature": 0.2,
+            "max_new_tokens": 512,
+        },
+    )
+
+    try:
+        ret = await _global_state.generate_request(obj, request).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"Error: {e}")
+        return _create_error_response(e)
+
+
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
@@ -283,7 +307,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.post("/flush_cache")
+@app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
     _global_state.tokenizer_manager.flush_cache()
@@ -315,6 +339,36 @@ async def stop_profile_async():
     _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+async def start_expert_distribution_record_async():
+    """Start recording the expert distribution. Clear the previous record if any."""
+    await _global_state.tokenizer_manager.start_expert_distribution_record()
+    return Response(
+        content="Start recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+async def stop_expert_distribution_record_async():
+    """Stop recording the expert distribution."""
+    await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    return Response(
+        content="Stop recording the expert distribution.\n",
+        status_code=200,
+    )
+
+
+@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+async def dump_expert_distribution_record_async():
+    """Dump expert distribution record."""
+    await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return Response(
+        content="Dump expert distribution record.\n",
         status_code=200,
     )
 
@@ -614,7 +668,7 @@ def launch_server(
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(
@@ -706,9 +760,15 @@ def _wait_and_warmup(
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [10, 11, 12]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
     else:
-        json_data["text"] = "The capital city of France is"
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -719,14 +779,13 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        for i in range(server_args.dp_size):
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
+        res = requests.post(
+            url + request_name,
+            json=json_data,
+            headers=headers,
+            timeout=600,
+        )
+        assert res.status_code == 200, f"{res}"
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:

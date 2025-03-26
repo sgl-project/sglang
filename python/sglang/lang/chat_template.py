@@ -15,6 +15,7 @@ class ChatTemplate:
     role_prefix_and_suffix: Dict[str, Tuple[str, str]]
     stop_str: List[str] = ()
     image_token: str = "<image>"
+    audio_token: str = "<audio>"
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
 
     def get_prefix_and_suffix(
@@ -230,6 +231,45 @@ register_chat_template(
     )
 )
 
+register_chat_template(
+    ChatTemplate(
+        name="janus-pro",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "",
+                "",
+            ),
+            "User": (
+                "<｜User｜>",
+                "",
+            ),
+            "assistant": (
+                "<｜Assistant｜>",
+                "<｜end▁of▁sentence｜>",
+            ),
+        },
+        stop_str=("<｜end▁of▁sentence｜>",),
+        image_token="<image_placeholder>\n",
+    )
+)
+
+# https://huggingface.co/openbmb/MiniCPM-o-2_6
+register_chat_template(
+    ChatTemplate(
+        name="minicpmo",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", " "),
+            "user": ("user:", " "),
+            "assistant": ("assistant:", "</s>"),
+        },
+        stop_str=("<|im_end|>", "<|endoftext|>"),
+        image_token="(<image>./</image>)",
+        audio_token="(<audio>./</audio>)",
+    )
+)
+
 # The difference between "llama-3-instruct-llava" and "llama-3-instruct" is that llava uses a different image_token.
 register_chat_template(
     ChatTemplate(
@@ -385,6 +425,12 @@ def match_deepseek(model_path: str):
 
 
 @register_chat_template_matching_function
+def match_deepseek_janus_pro(model_path: str):
+    if "janus" in model_path.lower():
+        return get_chat_template("janus-pro")
+
+
+@register_chat_template_matching_function
 def match_dbrx(model_path: str):
     if "dbrx" in model_path.lower() and "instruct" in model_path.lower():
         return get_chat_template("dbrx-instruct")
@@ -446,12 +492,6 @@ def match_chat_ml(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_chat_minicpm(model_path: str):
-    if "minicpm" in model_path:
-        return get_chat_template("minicpmv")
-
-
-@register_chat_template_matching_function
 def match_chat_yi(model_path: str):
     model_path = model_path.lower()
     if "yi-vl" in model_path and "llava" not in model_path:
@@ -470,8 +510,10 @@ def match_gemma_it(model_path: str):
 @register_chat_template_matching_function
 def match_openbmb_minicpm(model_path: str):
     model_path = model_path.lower()
-    if "minicpm" in model_path:
+    if "minicpm-v" in model_path:
         return get_chat_template("minicpmv")
+    elif "minicpm-o" in model_path:
+        return get_chat_template("minicpmo")
 
 
 @register_chat_template_matching_function
@@ -489,6 +531,14 @@ def match_granite_instruct(model_path: str):
     # template works across the board.
     if "granite" in model_path and "instruct" in model_path:
         return get_chat_template("granite-3-instruct")
+
+
+@register_chat_template_matching_function
+def match_gemma3_instruct(model_path: str):
+    model_path = model_path.lower()
+    if "gemma-3" in model_path and "1b" not in model_path:
+        # gemma-3-1b-it is completion model
+        return get_chat_template("gemma-it")
 
 
 if __name__ == "__main__":

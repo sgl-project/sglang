@@ -8,6 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -102,7 +103,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test GPTQ fallback kernel that is not Marlin
-class TestGPTQModelDynamic(unittest.TestCase):
+class TestGPTQModelDynamic(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
     )
@@ -129,6 +130,7 @@ class TestGPTQModelDynamic(unittest.TestCase):
                 "text": "The capital of France is",
                 "sampling_params": {
                     "max_new_tokens": max_new_tokens,
+                    "temperature": 0.001,
                 },
             },
         )
@@ -143,11 +145,11 @@ class TestGPTQModelDynamic(unittest.TestCase):
 
         print(f"result = `{result}`")
 
-        assert "paris" in result["text"].lower()
+        self.assertIn("paris", result["text"].lower())
 
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 140
+        self.assertGreaterEqual(throughput, 140)
 
     def test_gptq_module(self):
         check_quant_method(self.MODEL_PATH, use_marlin_kernel=False)
@@ -156,7 +158,7 @@ class TestGPTQModelDynamic(unittest.TestCase):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test Marlin kernel
-class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
+class TestGPTQModelDynamicWithMarlin(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
     )
@@ -183,6 +185,7 @@ class TestGPTQModelDynamicWithMarlin(unittest.TestCase):
                 "text": "The capital of France is",
                 "sampling_params": {
                     "max_new_tokens": max_new_tokens,
+                    "temperature": 0.001,
                 },
             },
         )

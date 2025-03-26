@@ -189,6 +189,9 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_message_queue_broadcaster: (
+        bool  # a hint of whether to use message queue broadcaster
+    )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
@@ -241,6 +244,7 @@ class GroupCoordinator:
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
+        self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -269,7 +273,7 @@ class GroupCoordinator:
             HpuCommunicator,
         )
 
-        self.hpu_communicator: Optional[HpuCommunicator]
+        self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
@@ -277,7 +281,7 @@ class GroupCoordinator:
             XpuCommunicator,
         )
 
-        self.xpu_communicator: Optional[XpuCommunicator]
+        self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
@@ -1228,7 +1232,16 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
         ray.shutdown()
     gc.collect()
     if not current_platform.is_cpu():
-        torch.cuda.empty_cache()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+            else:
+                logger.warning(
+                    "torch._C._host_emptyCache() only available in Pytorch >=2.5"
+                )
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:

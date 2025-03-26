@@ -45,6 +45,8 @@ class GenerateReqInput:
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
+    # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -103,6 +105,8 @@ class GenerateReqInput:
                 self.batch_size = len(self.text)
             self.input_embeds = None
         elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
@@ -163,6 +167,13 @@ class GenerateReqInput:
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
+                pass
+
+            if self.audio_data is None:
+                self.audio_data = [None] * num
+            elif not isinstance(self.audio_data, list):
+                self.audio_data = [self.audio_data] * num
+            elif isinstance(self.audio_data, list):
                 pass
 
             if self.sampling_params is None:
@@ -229,6 +240,7 @@ class GenerateReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i],
+            audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
@@ -257,8 +269,8 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image inputs
-    image_inputs: dict
+    # The multimodal inputs
+    mm_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -293,6 +305,8 @@ class TokenizedGenerateReqInput:
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
+    # The image input. It can be a file name, a url, or base64 encoded string.
+    image_data: Optional[Union[List[str], str]] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
@@ -303,28 +317,40 @@ class EmbeddingReqInput:
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
+    # The modalities of the image data [image, multi-images, video]
+    modalities: Optional[List[str]] = None
 
     def normalize_batch_and_arguments(self):
-        if (self.text is None and self.input_ids is None) or (
-            self.text is not None and self.input_ids is not None
-        ):
-            raise ValueError("Either text or input_ids should be provided.")
+        # at least one of text, input_ids, or image should be provided
+        if self.text is None and self.input_ids is None and self.image_data is None:
+            raise ValueError(
+                "At least one of text, input_ids, or image should be provided"
+            )
+
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
 
         # Derive the batch size
+        self.batch_size = 0
+        self.is_single = True
+
+        # check the batch size of text
         if self.text is not None:
-            if isinstance(self.text, str):
-                self.is_single = True
-                self.batch_size = 1
+            if isinstance(self.text, list):
+                self.batch_size += len(self.text)
             else:
-                self.is_single = False
-                self.batch_size = len(self.text)
-        else:
-            if isinstance(self.input_ids[0], int):
-                self.is_single = True
-                self.batch_size = 1
+                self.batch_size += 1
+
+        # check the batch size of input_ids
+        if self.input_ids is not None:
+            if isinstance(self.input_ids[0], list):
+                self.batch_size += len(self.input_ids)
             else:
-                self.is_single = False
-                self.batch_size = len(self.input_ids)
+                self.batch_size += 1
+
+        if self.batch_size > 1:
+            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
@@ -352,6 +378,7 @@ class EmbeddingReqInput:
         return EmbeddingReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            image_data=self.image_data[i] if self.image_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
         )
@@ -365,6 +392,8 @@ class TokenizedEmbeddingReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
+    # The image inputs
+    image_inputs: dict
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
 
@@ -482,6 +511,7 @@ class BatchEmbeddingOut:
     embeddings: List[List[float]]
     # Token counts
     prompt_tokens: List[int]
+    cached_tokens: List[int]
 
 
 @dataclass
@@ -520,7 +550,8 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    # List containing one serialized Dict[str, torch.Tensor] per TP worker
+    serialized_named_tensors: List[bytes]
     load_format: Optional[str]
     flush_cache: bool
 
@@ -627,6 +658,17 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
+    pass
+
+
 @dataclass
 class ProfileReq:
     type: ProfileReqType
@@ -705,3 +747,15 @@ class SeparateReasoningReqInput:
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None
+
+
+@dataclass
+class RpcReqInput:
+    method: str
+    parameters: Optional[Dict] = None
+
+
+@dataclass
+class RpcReqOutput:
+    success: bool
+    message: str

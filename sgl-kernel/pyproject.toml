@@ -1,10 +1,15 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "torch"]
+requires = [
+  "setuptools>=75.0",
+  "scikit-build-core>=0.10",
+  "torch==2.5.1",
+  "wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.3.post6"
+version = "0.0.5.post3"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,10 +24,6 @@ dependencies = []
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
-
-[tool.setuptools]
-package-dir = {"sgl_kernel" = "src/sgl-kernel"}
-packages = ["sgl_kernel", "sgl_kernel.ops", "sgl_kernel.csrc"]
 
 [tool.wheel]
 exclude = [
