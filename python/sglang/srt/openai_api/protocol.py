@@ -181,6 +181,9 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    lz_penalty: float = 0.0
+    lz_buffer_size: int = 32
+    lz_lookback_size: int = 512
 
 
 class CompletionResponseChoice(BaseModel):
@@ -345,16 +348,9 @@ class ChatCompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-    min_reasoning_penalty: Optional[float] = None
-    max_reasoning_penalty: Optional[float] = None
-    num_reasoning_penalty_steps: Optional[int] = None
-    stop_reasoning: Optional[Union[str, List[str]]] = None
-    stop_reasoning_token_ids: Optional[List[int]] = None
-    ngram_penalty: float = 0.0
-    ngram_n: int = 32
-    ngram_lookback_window: int = 512
-    separate_reasoning: bool = True
-    stream_reasoning: bool = True
+    lz_penalty: float = 0.0
+    lz_buffer_size: int = 32
+    lz_lookback_size: int = 512
 
 class FunctionResponse(BaseModel):
     """Function response."""
