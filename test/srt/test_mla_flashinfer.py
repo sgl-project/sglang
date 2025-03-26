@@ -9,11 +9,12 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestFlashinferMLA(unittest.TestCase):
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -55,7 +56,7 @@ class TestFlashinferMLA(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLANoRagged(unittest.TestCase):
+class TestFlashinferMLANoRagged(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -99,7 +100,7 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLAMTP(unittest.TestCase):
+class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"

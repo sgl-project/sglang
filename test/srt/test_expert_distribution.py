@@ -10,11 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestExpertDistribution(unittest.TestCase):
+class TestExpertDistribution(CustomTestCase):
     def setUp(self):
         # Clean up any existing expert distribution files before each test
         for f in glob.glob("expert_distribution_*.csv"):

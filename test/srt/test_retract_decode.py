@@ -8,11 +8,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestRetractDecode(unittest.TestCase):
+class TestRetractDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_TEST_RETRACT"] = "1"
@@ -40,7 +41,7 @@ class TestRetractDecode(unittest.TestCase):
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 
-class TestRetractDecodeChunkCache(unittest.TestCase):
+class TestRetractDecodeChunkCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_TEST_RETRACT"] = "1"

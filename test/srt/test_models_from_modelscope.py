@@ -5,9 +5,10 @@ import unittest
 from unittest import mock
 
 from sglang.srt.utils import prepare_model_and_tokenizer
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestDownloadFromModelScope(unittest.TestCase):
+class TestDownloadFromModelScope(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

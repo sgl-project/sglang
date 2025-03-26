@@ -301,7 +301,7 @@ class Phi3SmallModel(nn.Module):
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Phi3SmallDecoderLayer(
+            lambda idx, prefix: Phi3SmallDecoderLayer(
                 config,
                 int(prefix.split(".")[-1]),
                 quant_config,
