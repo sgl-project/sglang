@@ -72,7 +72,7 @@ def tl_gemm(
         scales_b: T.Buffer(Scales_B_shape, "float32"),
         C: T.Buffer((M, N), out_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+        with T.Kernel(N // block_N, T.ceildiv(M, block_M), threads=128) as (
             bx,
             by,
         ):
@@ -105,7 +105,7 @@ def tl_gemm(
                 scale_b_boundary_idx = group_size - bx * block_N % group_size
                 # Promote to enable 2xAcc
                 for i, j in T.Parallel(block_M, block_N):
-                    Scale_B = (1 - j // scale_b_boundary_idx) * Scale_B_0 + (j // scale_b_boundary_idx) * Scale_B_1
+                    Scale_B = T.if_then_else(j < scale_b_boundary_idx, Scale_B_0, Scale_B_1)
                     C_local_accum[i, j] += C_local[i, j] * Scale_C_shared[i] * Scale_B
                 T.clear(C_local)
             # TMA store
@@ -228,12 +228,19 @@ def calculate_diff(m: int, n: int, k: int):
 
     print(f"Shape m={m}, n={n}, k={k}:")
     # print(f"DeepGEMM output: {out_deepgemm[0, 0:128]}")
-    print(f"SGLang output: {out_sglang[0:2, 0:64]}")
-    print(f"TileLang output: {out_tilelang[0:2, 0:64]}")
-    print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
-    print(f"Mean absolute difference (TileLang-DeepGEMM): {diff_tilelang_deepgemm}")
-    print(f"Mean absolute difference (TileLang-SGLang): {diff_tilelang_sglang}")
+    # print(f"SGLang output: {out_sglang[-2:, -32:]}")
+    # print(f"TileLang output: {out_tilelang[-2:, -32:]}")
+    # print(f"Mean absolute difference (SGLang-DeepGEMM): {diff_sglang_deepgemm}")
+    # print(f"Mean absolute difference (TileLang-DeepGEMM): {diff_tilelang_deepgemm}")
+    # print(f"Mean absolute difference (TileLang-SGLang): {diff_tilelang_sglang}")
 
+    diff = torch.abs(out_tilelang - out_sglang)
+
+    mask = diff > 1
+
+    # torch.set_printoptions(threshold=torch.inf, linewidth=1000)
+    indices = torch.nonzero(mask, as_tuple=False)
+    print(f"Indices of cells where diff > 1: {indices[:100, :]}")
     sglang_deepgemm_match = torch.allclose(
         out_deepgemm, out_sglang, atol=1e-2, rtol=1e-2
     )
@@ -324,7 +331,6 @@ def get_benchmark(tp_size):
         x_scale_col_major = get_col_major_tma_aligned_tensor(x_scale.clone())
 
         quantiles = [0.5, 0.2, 0.8]
-
         if provider == "deepgemm":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: fp8_gemm_deepgemm(
@@ -364,6 +370,20 @@ def get_benchmark(tp_size):
                 quantiles=quantiles,
             )
 
+            out_sglang = fp8_gemm_sglang(
+                x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone(), m, n, k
+            )
+
+            out_tilelang = tilelang_kernel(
+                x_fp8.clone(), x_scale.clone(), y_fp8.clone(), y_scale.clone()
+            )
+            tilelang_sglang_match = torch.allclose(
+                out_tilelang, out_sglang, atol=1e-2, rtol=1e-2
+            )
+            if tilelang_sglang_match:
+                print("✅ All implementations match")
+            else:
+                print("❌ Some implementations differ")
         # Calculate TFLOPS
         flops = 2 * m * n * k  # multiply-adds
         tflops = flops / (ms * 1e-3) / 1e12
@@ -410,9 +430,9 @@ if __name__ == "__main__":
     # Run correctness tests on a few examples
     if args.run_correctness:
         print("Running correctness tests...")
-        calculate_diff(64, 512, 7168)  # Small test
-        calculate_diff(64, 7168, 16384)  # Medium test
-        calculate_diff(64, 18432, 7168)  # Large test
+        # calculate_diff(64, 512, 7168)  # Small test
+        # calculate_diff(64, 7168, 16384)  # Medium test
+        # calculate_diff(64, 18432, 7168)  # Large test
 
     # Get the benchmark function with the specified tp_size
     benchmark = get_benchmark(args.tp_size)
