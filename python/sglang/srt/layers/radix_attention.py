@@ -54,6 +54,7 @@ class RadixAttention(nn.Module):
         is_cross_attention: bool = False,
         orig_context_len: Optional[int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        rope_range: Optional[tuple[int, int]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         attn_type=AttentionType.DECODER,
         prefix: str = "",
@@ -101,6 +102,8 @@ class RadixAttention(nn.Module):
                     rope.repeated_cos_sin_cache = (self.rope_cos, self.rope_sin)
         else:
             self.rope_cos = self.rope_sin = None
+
+        self.rope_range = rope_range
 
     def forward(
         self,
