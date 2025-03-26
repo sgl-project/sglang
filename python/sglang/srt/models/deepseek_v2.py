@@ -737,6 +737,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
+        self.quant_method = PackWeightMethod(
+            weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+        )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1006,7 +1010,33 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
         else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            if self.use_intel_amx_backend:
+                # [Note] Align shapes of bmm inputs.
+                # Shapes of inputs:
+                #   q_nope: [M, B, K]
+                #   original self.w_kc: [B, K, N]
+                #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
+
+                # Shapes of inputs to sgl_kernel.cpu.bmm:
+                #   out: [B, M, N]
+                #   mat1: [B, M, K]
+                #   mat2: [B, N, K]
+                B = self.w_kc.size(0)
+                N = self.w_kc.size(1)
+                M = q_nope.size(0)
+
+                # TODO: how to reuse q_input for q_nope_out on latest main
+                # q_nope_out = q_input[..., : self.kv_lora_rank].transpose_(0, 1)
+                q_nope_out = torch.empty([B, M, N], dtype=q_nope.dtype)
+                torch.ops.sgl_kernel.bmm_cpu(
+                    q_nope_out,
+                    q_nope.transpose(0, 1),
+                    self.w_kc,
+                    True,  # is_vnni
+                    None,  # scale
+                )
+            else:
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -1016,6 +1046,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
+        # TODO how to reuse q_input for q_nope_out on latest main
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
@@ -1062,8 +1093,24 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
         else:
-            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            if self.use_intel_amx_backend:
+                # See [Note] Align shapes of bmm inputs.
+                B = self.w_vc.size(0)
+                N = self.w_vc.size(1)
+                M = attn_output.size(0)
+                output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
+                attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
+                torch.ops.sgl_kernel.bmm_cpu(
+                    attn_bmm_output,
+                    attn_output.transpose(0, 1),
+                    self.w_vc,
+                    True,  # is_vnni
+                    None,  # scale
+                )
+                attn_output = output
+            else:
+                attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+                attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
 
         return output

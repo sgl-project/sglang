@@ -2268,18 +2268,27 @@ def prepack_weight_if_needed(weight):
     return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
 
-def _process_weight_after_loading(module, weight_names) -> None:
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
     assert len(devices) == 1, f"Expects all weights to be on the same device"
     device = devices.pop()
 
-    for weight_name in weight_names:
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
         setattr(
             module,
             weight_name,
             torch.nn.Parameter(
-                prepack_weight_if_needed(getattr(module, weight_name)),
+                prepack_weight_if_needed(weight_tensor),
                 requires_grad=False,
             ),
         )
@@ -2290,11 +2299,12 @@ def _process_weight_after_loading(module, weight_names) -> None:
 
 
 class PackWeightMethod:
-    def __init__(self, weight_names):
+    def __init__(self, weight_names, transpose_dims=None):
         self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
 
     def process_weights_after_loading(self, module) -> None:
-        _process_weight_after_loading(module, self.weight_names)
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
 
 
 class LazyValue:
