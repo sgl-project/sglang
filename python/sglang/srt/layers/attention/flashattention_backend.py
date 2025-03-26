@@ -74,7 +74,7 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seqlens_in_batch.max()
+        metadata.max_seq_len_k = seqlens_in_batch.max().item()
         # Precompute page table
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
