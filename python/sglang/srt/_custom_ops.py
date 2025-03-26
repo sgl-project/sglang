@@ -6,10 +6,12 @@ from typing import List, Tuple
 import torch
 import torch.library
 
-from sglang.srt.utils import is_hip, is_hpu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu
 
 logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
+use_vllm_custom_allreduce = get_bool_env_var(
+    "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
+)
 
 if not is_hpu():
     # ROCm does not use vllm custom allreduce
@@ -75,42 +77,42 @@ else:
             rank: int,
             full_nvlink: bool,
         ) -> int:
-            return sgl_kernel.ops.allreduce.init_custom_ar(
+            return sgl_kernel.allreduce.init_custom_ar(
                 meta, rank_data, handles, offsets, rank, full_nvlink
             )
 
         def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-            sgl_kernel.ops.allreduce.all_reduce_reg(fa, inp, out)
+            sgl_kernel.allreduce.all_reduce_reg(fa, inp, out)
 
         def all_reduce_unreg(
             fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
         ) -> None:
-            sgl_kernel.ops.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
+            sgl_kernel.allreduce.all_reduce_unreg(fa, inp, reg_buffer, out)
 
         def dispose(fa: int) -> None:
-            sgl_kernel.ops.allreduce.dispose(fa)
+            sgl_kernel.allreduce.dispose(fa)
 
         def meta_size() -> int:
-            return sgl_kernel.ops.allreduce.meta_size()
+            return sgl_kernel.allreduce.meta_size()
 
         def register_buffer(
             fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
         ) -> None:
-            return sgl_kernel.ops.allreduce.register_buffer(fa, t, handles, offsets)
+            return sgl_kernel.allreduce.register_buffer(fa, t, handles, offsets)
 
         def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
-            return sgl_kernel.ops.allreduce.get_graph_buffer_ipc_meta(fa)
+            return sgl_kernel.allreduce.get_graph_buffer_ipc_meta(fa)
 
         def register_graph_buffers(
             fa: int, handles: List[str], offsets: List[List[int]]
         ) -> None:
-            sgl_kernel.ops.allreduce.register_graph_buffers(fa, handles, offsets)
+            sgl_kernel.allreduce.register_graph_buffers(fa, handles, offsets)
 
         def allocate_meta_buffer(size: int) -> torch.Tensor:
-            return sgl_kernel.ops.allreduce.allocate_meta_buffer(size)
+            return sgl_kernel.allreduce.allocate_meta_buffer(size)
 
         def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
-            return sgl_kernel.ops.allreduce.get_meta_buffer_ipc_handle(inp)
+            return sgl_kernel.allreduce.get_meta_buffer_ipc_handle(inp)
 
     else:
         # TRTLLM custom allreduce
@@ -123,7 +125,7 @@ else:
             barrier_in: List[int],
             barrier_out: List[int],
         ) -> int:
-            return sgl_kernel.ops.init_custom_reduce(
+            return sgl_kernel.init_custom_reduce(
                 rank_id,
                 world_size,
                 rank_data_base,
@@ -134,15 +136,15 @@ else:
             )
 
         def all_reduce(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-            sgl_kernel.ops.custom_reduce(fa, inp, out)
+            sgl_kernel.custom_reduce(fa, inp, out)
 
         def dispose(fa: int) -> None:
-            sgl_kernel.ops.custom_dispose(fa)
+            sgl_kernel.custom_dispose(fa)
 
         def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-            return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
+            return sgl_kernel.get_graph_buffer_ipc_meta(fa)
 
         def register_graph_buffers(
             fa: int, handles: List[List[int]], offsets: List[List[int]]
         ) -> None:
-            sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
+            sgl_kernel.register_graph_buffers(fa, handles, offsets)

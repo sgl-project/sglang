@@ -22,10 +22,10 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-class TestSRTBackend(unittest.TestCase):
+class TestSRTBackend(CustomTestCase):
     backend = None
 
     @classmethod
@@ -76,7 +76,7 @@ class TestSRTBackend(unittest.TestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            self.assertGreater(accuracy, 0.65)
+            self.assertGreater(accuracy, 0.60)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()

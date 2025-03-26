@@ -1,100 +1,90 @@
 """
-    Bench the sglang-hosted vLM with benchmark MMMU
+Bench the sglang-hosted vLM with benchmark MMMU
 
-    Usage:
-        python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
+Usage:
+    python benchmark/mmmu/bench_sglang.py --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl
 
-    The eval output will be logged
+The eval output will be logged
 """
 
 import argparse
-import dataclasses
-import random
-import re
-from io import BytesIO
+import time
 
+import openai
 from data_utils import save_json
 from eval_utils import (
     EvalArgs,
     eval_result,
     get_sampling_params,
-    parse_multi_choice_response,
     prepare_samples,
+    process_result,
 )
 from tqdm import tqdm
 
-from sglang import Engine
-from sglang.srt.conversation import chat_templates
-from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
 def eval_mmmu(args):
-    server_args = ServerArgs.from_cli_args(args)
     eval_args = EvalArgs.from_cli_args(args)
-
-    if server_args.chat_template is None:
-        raise ValueError("Chat template must be provided for this benchmark")
-
-    samples = prepare_samples(eval_args)
-
-    backend = Engine(**dataclasses.asdict(server_args))
 
     out_samples = dict()
 
     sampling_params = get_sampling_params(eval_args)
 
-    conv = chat_templates[server_args.chat_template].copy()
-    image_token = conv.image_token
+    samples = prepare_samples(eval_args)
+
     answer_dict = {}
-    for sample in tqdm(samples):
+
+    # had to use an openai server, since SglImage doesn't support image data
+    client = openai.Client(api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1")
+
+    start = time.time()
+    for i, sample in enumerate(tqdm(samples)):
         prompt = sample["final_input_prompt"]
+        prefix = prompt.split("<")[0]
+        suffix = prompt.split(">")[1]
         image = sample["image"]
-        bytes_io = BytesIO()
-        image.save(bytes_io, format="PNG")
-        png_bytes = bytes_io.getvalue()
+        assert image is not None
+        image_path = sample["image_path"]
+        # TODO: batch
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prefix,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_path},
+                        },
+                        {
+                            "type": "text",
+                            "text": suffix,
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            max_completion_tokens=sampling_params["max_new_tokens"],
+            max_tokens=sampling_params["max_new_tokens"],
+        )
+        response = response.choices[0].message.content
+        process_result(response, sample, answer_dict, out_samples)
 
-        prompt = re.sub(r"<[^>]*>", image_token, prompt)
+    print(f"Benchmark time: {time.time() - start}")
 
-        if image is not None:
-            gen_out = backend.generate(
-                prompt=prompt, image_data=[png_bytes], sampling_params=sampling_params
-            )["text"]
-
-            response = gen_out
-        else:  # multiple images actually
-            if sample["question_type"] == "multiple-choice":
-                all_choices = sample["all_choices"]
-                response = random.choice(all_choices)
-
-            else:
-                response = "INVALID GENERATION FOR MULTIPLE IMAGE INPUTS"
-
-        if sample["question_type"] == "multiple-choice":
-            pred_ans = parse_multi_choice_response(
-                response, sample["all_choices"], sample["index2ans"]
-            )
-        else:  # open question
-            pred_ans = response
-        out_samples[sample["id"]] = pred_ans
-
-        # set ground truth answer
-        answer_dict[sample["id"]] = {
-            "question_type": sample["question_type"],
-            "ground_truth": (
-                sample["correct_choice"]
-                if "correct_choice" in samples
-                else sample["answer"]
-            ),
-        }
-
-    args.output_path = f"{args.model_path}_val_sglang.json"
+    args.output_path = f"./val_sglang.json"
     save_json(args.output_path, out_samples)
-    eval_result(output_path=args.output_path, answer_dict=answer_dict)
+    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
+    args = add_common_sglang_args_and_parse(parser)
     EvalArgs.add_cli_args(parser)
     args = parser.parse_args()
 

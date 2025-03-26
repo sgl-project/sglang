@@ -33,46 +33,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  filter:
-    runs-on: ubuntu-latest
-    outputs:
-      run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      - name: Filter changes
-        id: filter
-        uses: dorny/paths-filter@v2
-        with:
-          filters: |
-            docs:
-              - 'docs/**'
-            scripts:
-              - 'scripts/**'
-            sglang:
-              - 'python/sglang/**'
-            test:
-              - 'test/**'
-            pyproject:
-              - 'python/pyproject.toml'
-      - name: Set run_tests output
-        id: set_run_tests
-        run: |
-          if [ "${{ steps.filter.outputs.sglang }}" == "true" ] || [ "${{ steps.filter.outputs.test }}" == "true" ] || [ "${{ steps.filter.outputs.pyproject }}" == "true" ]; then
-            echo "run_tests=true" >> $GITHUB_OUTPUT
-          else
-            echo "run_tests=false" >> $GITHUB_OUTPUT
-          fi
-
   unit-test-frontend:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -87,18 +54,16 @@ jobs:
           python3 run_suite.py --suite per-commit
 
   unit-test-backend-1-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
       matrix:
-        range: [0-6, 6-15, 15-22, 22-32, 32-40, 40-48, 48-100]
+        part: [0, 1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -109,21 +74,16 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          RANGE=${{ matrix.range }}
-          range_begin=${RANGE%-*}
-          range_end=${RANGE#*-}
           cd test/srt
-          python3 run_suite.py --suite per-commit --range-begin ${range_begin} --range-end ${range_end}
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
 
   unit-test-backend-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -167,15 +127,19 @@ jobs:
           cd test/srt
           python3 test_mla_tp.py
 
+      - name: Test lora tensor parallelism (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt/models/lora
+          python3 test_lora_tp.py
+
   performance-test-1-gpu-part-1:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -214,14 +178,12 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_eagle
 
   performance-test-1-gpu-part-2:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -248,14 +210,12 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
 
   performance-test-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -267,6 +227,8 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test/srt
+          USE_VLLM_CUSTOM_ALLREDUCE=1 python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
+
           python3 -m unittest test_bench_one_batch.TestBenchOneBatch.test_moe_tp2_bs1
 
       - name: Benchmark single latency + torch.compile (TP=2)
@@ -288,14 +250,12 @@ jobs:
           python3 -m unittest test_bench_serving.TestBenchServing.test_moe_offline_throughput_without_radix_cache
 
   accuracy-test-1-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 1-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -313,14 +273,12 @@ jobs:
           python3 test_eval_accuracy_large.py
 
   accuracy-test-2-gpu:
-    needs: filter
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false &&
-        needs.filter.outputs.run_tests == 'true'
+        github.event.pull_request.draft == false
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         env:
@@ -346,5 +304,14 @@ jobs:
     ]
     runs-on: ubuntu-latest
     steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

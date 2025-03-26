@@ -45,6 +45,8 @@ class GenerateReqInput:
     # The image input. It can be a file name, a url, or base64 encoded string.
     # See also python/sglang/srt/utils.py:load_image.
     image_data: Optional[Union[List[str], str]] = None
+    # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -103,6 +105,8 @@ class GenerateReqInput:
                 self.batch_size = len(self.text)
             self.input_embeds = None
         elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
             if isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
@@ -163,6 +167,13 @@ class GenerateReqInput:
             elif not isinstance(self.image_data, list):
                 self.image_data = [self.image_data] * num
             elif isinstance(self.image_data, list):
+                pass
+
+            if self.audio_data is None:
+                self.audio_data = [None] * num
+            elif not isinstance(self.audio_data, list):
+                self.audio_data = [self.audio_data] * num
+            elif isinstance(self.audio_data, list):
                 pass
 
             if self.sampling_params is None:
@@ -229,6 +240,7 @@ class GenerateReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i],
+            audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
@@ -257,8 +269,8 @@ class TokenizedGenerateReqInput:
     input_text: str
     # The input token ids
     input_ids: List[int]
-    # The image inputs
-    image_inputs: dict
+    # The multimodal inputs
+    mm_inputs: dict
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -538,7 +550,8 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    # List containing one serialized Dict[str, torch.Tensor] per TP worker
+    serialized_named_tensors: List[bytes]
     load_format: Optional[str]
     flush_cache: bool
 
@@ -645,6 +658,17 @@ class ProfileReqType(Enum):
     STOP_PROFILE = 2
 
 
+class ExpertDistributionReq(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+@dataclass
+class ExpertDistributionReqOutput:
+    pass
+
+
 @dataclass
 class ProfileReq:
     type: ProfileReqType
@@ -723,3 +747,15 @@ class SeparateReasoningReqInput:
 class VertexGenerateReqInput:
     instances: List[dict]
     parameters: Optional[dict] = None
+
+
+@dataclass
+class RpcReqInput:
+    method: str
+    parameters: Optional[Dict] = None
+
+
+@dataclass
+class RpcReqOutput:
+    success: bool
+    message: str

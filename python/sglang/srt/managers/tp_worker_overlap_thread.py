@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class TpModelWorkerClient:
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
         self.future_token_ids_map = torch.empty(
-            (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
+            (self.max_running_requests * 5,), dtype=torch.int64, device=self.device
         )
 
         # Launch threads
@@ -103,6 +103,9 @@ class TpModelWorkerClient:
             self.worker.model_runner.token_to_kv_pool_allocator,
         )
 
+    def get_kv_cache(self):
+        return self.worker.model_runner.token_to_kv_pool
+
     def forward_thread_func(self):
         try:
             with torch.get_device_module(self.device).stream(self.forward_stream):
@@ -112,7 +115,7 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGQUIT)
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2
@@ -203,7 +206,7 @@ class TpModelWorkerClient:
             -(self.future_token_ids_ct + 1),
             -(self.future_token_ids_ct + 1 + bs),
             -1,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
         self.future_token_ids_ct = (
