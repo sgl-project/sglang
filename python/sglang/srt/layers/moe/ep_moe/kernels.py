@@ -38,6 +38,7 @@ def deepep_permute_triton_kernel(
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
 
     src_ptr = input_ptr + src_idx * hidden_size
+    src_scales_ptr = scales_ptr + src_idx * scales_size
 
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
@@ -53,7 +54,7 @@ def deepep_permute_triton_kernel(
     for start_offset in tl.range(0, scales_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
         mask = offset < scales_size
-        scales_data = tl.load(scales_ptr + offset, mask=mask)
+        scales_data = tl.load(src_scales_ptr + offset, mask=mask)
 
         for idx in range(topk):
             dst_idx = tl.load(src2dst_ptr + idx)

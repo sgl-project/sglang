@@ -183,11 +183,6 @@ class DeepEPDispatcher:
         )
         self.src2dst = src2dst
 
-        print("gateup_input ", gateup_input)
-        print("input_scales ", input_scales)
-        print("reorder_topk_ids", reorder_topk_ids)
-        print("seg_indptr ", seg_indptr)
-
         return reorder_topk_ids, seg_indptr, gateup_input, input_scales
 
     def dispatch(
