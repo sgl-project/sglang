@@ -1314,26 +1314,30 @@ class RemoteModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            weights_iterator = self._get_weights_iterator_fs(client)
-            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-            for key, tensor in weights_iterator:
-                param_data = state_dict[key].data
-                param_shape = state_dict[key].shape
-                for dim, size in enumerate(tensor.shape):
-                    if size < param_shape[dim]:
-                        param_data = param_data.narrow(dim, 0, size)
-                if tensor.shape != param_shape:
-                    logger.warning(
-                        "loading tensor of shape %s into "
-                        "parameter '%s' of shape %s",
-                        tensor.shape,
-                        key,
-                        param_shape,
-                    )
-                param_data.copy_(tensor)
-                state_dict.pop(key)
-            if state_dict:
-                raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+            from sglang.srt.distributed import get_tp_group
+            if get_tp_group().world_size > 1:
+                state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+                weights_iterator = self._get_weights_iterator_fs(client)
+                for key, tensor in weights_iterator:
+                    param_data = state_dict[key].data
+                    param_shape = state_dict[key].shape
+                    for dim, size in enumerate(tensor.shape):
+                        if size < param_shape[dim]:
+                            param_data = param_data.narrow(dim, 0, size)
+                    if tensor.shape != param_shape:
+                        logger.warning(
+                            "loading tensor of shape %s into "
+                            "parameter '%s' of shape %s",
+                            tensor.shape,
+                            key,
+                            param_shape,
+                        )
+                    param_data.copy_(tensor)
+                    state_dict.pop(key)
+                if state_dict:
+                    raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+            else:
+                model.load_weights(self._get_weights_iterator_fs(client))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
