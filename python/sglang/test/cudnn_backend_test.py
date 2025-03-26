@@ -4,6 +4,7 @@ import torch
 import logging
 import math
 import cudnn
+import time
 
 @dataclass
 class InputParameters:
@@ -14,6 +15,17 @@ class InputParameters:
     max_num_reqs = 100
     max_context_lenght = 300
     num_seqs = 10
+
+@dataclass
+class InputParametersLarge:
+    num_token = 100
+    num_heads = 64
+    head_size = 128
+    max_total_num_tokens = 10000
+    max_num_reqs = 500
+    max_context_lenght = 10000
+    num_seqs = 100
+
 
 class CuDNNBackend():
     def __init__(self):
@@ -90,6 +102,8 @@ class CuDNNBackend():
         """
 
         assert query.shape[0] == seq_lens.shape[0], "batch size must be the same"
+        
+        start_time =time.perf_counter()
 
         max_seq_len = k_cache.shape[0]
         # Convert into CuDNN Query format (B, H, S, D)
@@ -182,6 +196,8 @@ class CuDNNBackend():
         graph.check_support()
         graph.build_plans()
 
+        build_graph_time = time.perf_counter()
+
         variant_pack = {
             q: q_gpu,
             container_k: container_k_gpu,
@@ -196,6 +212,13 @@ class CuDNNBackend():
 
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
         graph.execute(variant_pack, workspace)
+        print(output.shape)
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+
+        print(f"Graph Construction Time: {build_graph_time-start_time}")
+        print(f"Forward Time: {end_time-build_graph_time}")
+
         return output
 
 class TorchNativeAttnBackend():
@@ -363,7 +386,7 @@ class TorchNativeAttnBackend():
 
 
 def test_correctness():
-    input_parem = InputParameters()
+    input_parem = InputParametersLarge()
     cudnn_bknd = CuDNNBackend()
     # TODO: dtype
     query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
