@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _enable_jit_deepgemm,
     per_token_group_quant_fp8,
     static_quant_fp8,
     w8a8_block_fp8_matmul,
@@ -14,6 +15,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
+
+try:
+    import vllm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    VLLM_AVAILABLE = False
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
@@ -27,7 +35,7 @@ if _is_cuda:
 
     from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
-    if use_vllm_cutlass_w8a8_fp8_kernel:
+    if use_vllm_cutlass_w8a8_fp8_kernel and VLLM_AVAILABLE:
         from vllm import _custom_ops as ops
     else:
         from sgl_kernel import fp8_scaled_mm
@@ -74,7 +82,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
+    if not get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
@@ -122,9 +130,17 @@ def apply_w8a8_block_fp8_linear(
         )
         gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
     else:
-        q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False
-        )
+        if _enable_jit_deepgemm:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d,
+                block_size[1],
+                column_major_scales=True,
+                scale_tma_aligned=True,
+            )
+        else:
+            q_input, x_scale = per_token_group_quant_fp8(
+                input_2d, block_size[1], column_major_scales=False
+            )
         output = w8a8_block_fp8_matmul(
             q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
         )
@@ -219,24 +235,32 @@ def apply_fp8_linear(
             )
 
     if cutlass_fp8_supported:
-        if use_vllm_cutlass_w8a8_fp8_kernel:
-            # Fall back to vllm cutlass w8a8 fp8 kernel
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                weight,
-                out_dtype=input.dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                bias=bias,
-            )
-        else:
-            assert (
-                weight_scale.numel() == weight.shape[1]
-            ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
-            output = fp8_scaled_mm(
-                qinput, weight, x_scale, weight_scale, out_dtype=input.dtype, bias=bias
-            )
-        return output.view(*output_shape)
+        try:
+            if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+                # Fall back to vllm cutlass w8a8 fp8 kernel
+                output = ops.cutlass_scaled_mm(
+                    qinput,
+                    weight,
+                    out_dtype=input.dtype,
+                    scale_a=x_scale,
+                    scale_b=weight_scale,
+                    bias=bias,
+                )
+            else:
+                assert (
+                    weight_scale.numel() == weight.shape[1]
+                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
+            return output.view(*output_shape)
+        except (ImportError, NameError, AttributeError):
+            pass
 
     # torch.scaled_mm supports per tensor weights + activations only
     # so fallback to naive if per channel or per token

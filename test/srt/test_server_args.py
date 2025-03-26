@@ -3,9 +3,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestPrepareServerArgs(unittest.TestCase):
+class TestPrepareServerArgs(CustomTestCase):
     def test_prepare_server_args(self):
         server_args = prepare_server_args(
             [

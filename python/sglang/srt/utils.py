@@ -55,13 +55,13 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from packaging.version import Version, parse
+from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
-from torch.utils.cpp_extension import CUDA_HOME
+from torch.utils._contextlib import _DecoratorContextManager
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -75,6 +75,11 @@ show_time_cost = False
 time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -125,6 +130,63 @@ def is_flashinfer_available():
 
 def is_cuda_available():
     return is_cuda()
+
+
+_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
+    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
+)
+
+
+class DynamicGradMode(_DecoratorContextManager):
+    """
+    A combination of torch.no_grad and torch.inference_mode,
+    with their behavior controlled by an environment variable. Just refer to them.
+    """
+
+    @staticmethod
+    def set_inference_mode(mode: bool):
+        if isinstance(mode, bool):
+            global _ENABLE_TORCH_INFERENCE_MODE
+
+            _ENABLE_TORCH_INFERENCE_MODE = mode
+        else:
+            logger.warning("mode is not a boolean object")
+
+    def __init__(self, mode=True):
+        if not torch._jit_internal.is_scripting():
+            super().__init__()
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self.mode = mode
+        else:
+            self.prev = False
+
+    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
+        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
+            return super().__new__(cls)
+        return cls()(mode_or_orig_func)
+
+    def __enter__(self) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context = torch._C._InferenceMode(self.mode)
+            self._inference_mode_context.__enter__()
+        else:
+            self.prev = torch.is_grad_enabled()
+            torch.set_grad_enabled(False)
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
+        else:
+            torch.set_grad_enabled(self.prev)
+
+    def clone(self) -> "DynamicGradMode":
+        r"""
+        Create a copy of this class
+        """
+        if _ENABLE_TORCH_INFERENCE_MODE:
+            return self.__class__(self.mode)
+        else:
+            return self.__class__()
 
 
 def enable_show_time_cost():
@@ -199,7 +261,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        num_gpus = cuda_device_count_stateless()
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
@@ -444,9 +506,37 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file: Union[str, bytes]):
-    from PIL import Image
+def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+    # Use soundfile here, since librosa use it under the hood,
+    # and librosa will not support audio loading in the future
+    import soundfile as sf
+    from scipy.signal import resample
 
+    # print(f"loading {audio_file}")
+    # Load audio data
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    # Convert to mono if requested and audio is stereo
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
+
+
+def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     image = image_size = None
 
     if isinstance(image_file, bytes):
@@ -473,7 +563,10 @@ def load_image(image_file: Union[str, bytes]):
 
 
 def suppress_other_loggers():
-    from vllm.logger import logger as vllm_default_logger
+    try:
+        from vllm.logger import logger as vllm_default_logger
+    except ImportError:
+        return
 
     vllm_default_logger.setLevel(logging.WARN)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
@@ -562,11 +655,14 @@ def monkey_patch_p2p_access_check():
 
 
 def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.quantization.gguf import (
-        GGUFConfig,
-        GGUFEmbeddingMethod,
-        GGUFLinearMethod,
-    )
+    try:
+        from vllm.model_executor.layers.quantization.gguf import (
+            GGUFConfig,
+            GGUFEmbeddingMethod,
+            GGUFLinearMethod,
+        )
+    except ImportError:
+        return
 
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -658,6 +754,16 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
     format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
@@ -925,6 +1031,13 @@ def get_amdgpu_memory_capacity():
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )
+
+
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
 
 
 def get_nvgpu_memory_capacity():
@@ -1261,11 +1374,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 @lru_cache(maxsize=2)
