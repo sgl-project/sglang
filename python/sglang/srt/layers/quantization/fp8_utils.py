@@ -377,7 +377,9 @@ class Fp8LinearOp:
         # We also don't pad when using torch.compile,
         # as it breaks with dynamic shapes.
         if pad_output is None:
-            enable_torch_compile = os.environ.get("SGLANG_ENABLE_TORCH_COMPILE", "0").lower() in ("1", "true", "yes")
+            enable_torch_compile = os.environ.get(
+                "SGLANG_ENABLE_TORCH_COMPILE", "0"
+            ).lower() in ("1", "true", "yes")
             pad_output = not enable_torch_compile
         self.output_padding = 17 if pad_output else None
 

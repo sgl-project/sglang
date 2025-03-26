@@ -4,4 +4,3 @@ To support compressed_tensors format quantization models, we adapted https://git
 
 
 For practical purposes, we have only applied the compressed_tensors format of `w8a8_fp8`. If you have requirements for other formats, you can submit an issue through this [link](https://github.com/sgl-project/sglang/issues).
-

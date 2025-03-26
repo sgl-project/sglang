@@ -13,10 +13,10 @@
 # ==============================================================================
 """The arguments of the server."""
 
-import os
 import argparse
 import dataclasses
 import logging
+import os
 import random
 import tempfile
 from typing import List, Optional
@@ -342,7 +342,9 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning("Overlap scheduler is disabled for decode server")
 
-        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = "1" if self.enable_torch_compile else "0"
+        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
+            "1" if self.enable_torch_compile else "0"
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
