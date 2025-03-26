@@ -1,8 +1,8 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
-import asyncio
 import copy
+import logging
 import os
 import random
 import subprocess
@@ -62,7 +62,6 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-In
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
-
 
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
@@ -434,6 +433,11 @@ def popen_launch_server(
                     return process
             except requests.RequestException:
                 pass
+
+            return_code = process.poll()
+            if return_code is not None:
+                raise Exception(f"Server unexpectedly exits ({return_code=}).")
+
             time.sleep(10)
 
     kill_process_tree(process.pid)
@@ -887,7 +891,6 @@ def run_mulit_request_test(
     enable_overlap=False,
     chunked_prefill_size=32,
 ):
-
     def workload_func(base_url, model):
         def run_one(_):
             prompt = """
@@ -922,6 +925,10 @@ def run_mulit_request_test(
 
 
 def write_github_step_summary(content):
+    if not os.environ.get("GITHUB_STEP_SUMMARY"):
+        logging.warning("GITHUB_STEP_SUMMARY environment variable not set")
+        return
+
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
 
