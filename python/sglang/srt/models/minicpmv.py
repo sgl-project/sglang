@@ -52,9 +52,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
-    embed_image_inputs,
+    general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -862,24 +862,12 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            inputs_embeds: torch.Tensor = self.llm.get_input_embeddings(input_ids)
-        else:
-            # Clamp input ids. This is because the input_ids for the image tokens are
-            # filled with the hash values of the image for the prefix matching in the radix attention.
-            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-            image_inputs = forward_batch.merge_image_inputs()
-            inputs_embeds = embed_image_inputs(
-                image_input=image_inputs,
-                input_ids=input_ids,
-                input_embedding=self.get_input_embeddings(),
-                image_embedding_func=self.get_image_features,
-                placeholder_token_ids=[image_inputs.im_token_id]
-                + image_inputs.pad_values,
-            )
+        inputs_embeds = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            embed_tokens=self.get_input_embeddings(),
+            mm_data_embedding_func=self.get_image_features,
+        )
 
         hidden_states = self.llm.model(
             input_ids=None,
@@ -925,7 +913,7 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_image_features(self, image_inputs: ImageInputs) -> torch.Tensor:
+    def get_image_features(self, image_inputs: MultimodalInputs) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -1037,7 +1025,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
 
     def get_image_features(
         self,
-        image_inputs: ImageInputs,
+        image_inputs: MultimodalInputs,
     ) -> torch.Tensor:
         # list of tensors
         pixel_values = image_inputs.pixel_values
@@ -1075,7 +1063,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
