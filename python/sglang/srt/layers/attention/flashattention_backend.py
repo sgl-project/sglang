@@ -274,7 +274,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         # """Initialize forward metadata for replaying CUDA graph."""
-        seqlens_in_batch = seq_lens
+        seqlens_in_batch = seq_lens[:bs]
         metadata = self.decode_cuda_graph_metadata[bs]
         metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
         metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -282,7 +282,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         # Precompute maximum sequence length
         # This operation is on CPU
-        metadata.max_seq_len_k = seq_lens_cpu.max().item()
+        metadata.max_seq_len_k = seq_lens_cpu[:bs].max().item()
         # Only zero out the part out of max_len_k
         metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
         # Then do the copy
