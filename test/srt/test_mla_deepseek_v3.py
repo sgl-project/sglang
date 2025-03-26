@@ -9,11 +9,12 @@ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestMLADeepseekV3(unittest.TestCase):
+class TestMLADeepseekV3(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -48,13 +49,13 @@ class TestMLADeepseekV3(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestDeepseekV3MTP(unittest.TestCase):
+class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
-        if torch.cuda.is_available() and torch.version.cuda:
+        if torch.cuda.is_available() and (torch.version.cuda or torch.version.hip):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",

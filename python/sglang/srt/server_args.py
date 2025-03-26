@@ -185,6 +185,10 @@ class ServerArgs:
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
 
+    # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    disaggregation_mode: str = "null"
+    disaggregation_bootstrap_port: int = 8998
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -232,7 +236,10 @@ class ServerArgs:
         assert self.chunked_prefill_size % self.page_size == 0
 
         if self.enable_flashmla is True:
-            assert self.page_size == 64, "FlashMLA only support page_size=64"
+            logger.warning(
+                "FlashMLA only supports a page_size of 64, change page_size to 64."
+            )
+            self.page_size = 64
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
@@ -321,6 +328,18 @@ class ServerArgs:
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+
+        # PD disaggregation
+        if self.disaggregation_mode == "prefill":
+            self.disable_cuda_graph = True
+            logger.warning("KV cache is forced as chunk cache for decode server")
+            self.disable_overlap_schedule = True
+            logger.warning("Overlap scheduler is disabled for prefill server")
+        elif self.disaggregation_mode == "decode":
+            self.disable_radix_cache = True
+            logger.warning("Cuda graph is disabled for prefill server")
+            self.disable_overlap_schedule = True
+            logger.warning("Overlap scheduler is disabled for decode server")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -751,7 +770,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native"],
+            choices=["flashinfer", "triton", "torch_native", "fa3"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
@@ -1058,6 +1077,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        # Disaggregation
+        parser.add_argument(
+            "--disaggregation-mode",
+            type=str,
+            default="null",
+            choices=["null", "prefill", "decode"],
+            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-port",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port,
+            help="Bootstrap server port on the prefill server. Default is 8998.",
         )
 
     @classmethod
