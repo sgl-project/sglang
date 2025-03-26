@@ -94,7 +94,6 @@ class DeepEPDispatcher:
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: float = None,
         num_experts: int = None,
         num_local_experts: int = None,
         hidden_size: int = None,
@@ -103,30 +102,31 @@ class DeepEPDispatcher:
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
-        self.group = group
-        self.router_topk = router_topk
-        self.capacity_factor = capacity_factor
-        self.permute_fusion = permute_fusion
-        self.num_experts = num_experts
-        self.num_local_experts = num_local_experts
-        self.hidden_size = hidden_size
-        self.recv_expert_count = None
-        self.params_dtype = params_dtype
-        self.params_bytes = 2
-        self.deepep_low_latency = deepep_low_latency
-        self.buffer_normal = None
-        self.buffer_low_latency = None
         if not use_deepep:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        if self.deepep_low_latency == False:
+
+        self.group = group
+        self.router_topk = router_topk
+        self.permute_fusion = permute_fusion
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.hidden_size = hidden_size
+        self.params_dtype = params_dtype
+        self.params_bytes = 2
+
+        self.deepep_low_latency = deepep_low_latency
+        self.handle = None
+
+        if self.deepep_low_latency == False:  # for normal mode
             self.buffer_normal = get_buffer_normal(
                 self.group, self.hidden_size * self.params_bytes
             )
-            self.async_finish = async_finish  # for normal mode
-        else:
+            self.async_finish = async_finish
+            self.src2dst = None
+        else:  # for low latency mode
             """
             num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
             https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -138,17 +138,18 @@ class DeepEPDispatcher:
                 self.hidden_size,
                 self.num_experts,
             )
-            self.return_recv_hook = return_recv_hook  # for low latency mode
+            self.return_recv_hook = return_recv_hook
+            self.recv_expert_count = None
 
     def deepep_permute(
         self,
-        hidden_states,
-        topk_idx,
-        fp8_dtype=None,
-        use_fp8_w8a8=False,
-        use_block_quant=False,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        fp8_dtype: Optional[torch.dtype] = None,
+        use_fp8_w8a8: bool = False,
+        use_block_quant: bool = False,
     ):
-        reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+        reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
             topk_idx, self.num_experts
         )
         num_total_tokens = reorder_topk_ids.numel()
@@ -165,14 +166,14 @@ class DeepEPDispatcher:
         deepep_permute_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             gateup_input,
-            src2dst,
+            self.src2dst,
             topk_idx,
             None,
             self.router_topk,
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
-        return reorder_topk_ids, seg_indptr, src2dst, gateup_input
+        return reorder_topk_ids, seg_indptr, gateup_input
 
     def dispatch(
         self,
@@ -180,7 +181,6 @@ class DeepEPDispatcher:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
-        forward_mode: ForwardMode,
         num_max_dispatch_tokens_per_rank: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         topk_idx = topk_idx.to(torch.int64)
@@ -190,48 +190,35 @@ class DeepEPDispatcher:
         seg_indptr = torch.zeros(
             (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
         )
-        src2dst = torch.empty(
-            topk_idx.numel(), device=topk_idx.device, dtype=torch.int64
-        )
 
         if self.deepep_low_latency == False:
             (
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                num_recv_tokens_per_expert_list,
-                handle,
                 event,
             ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
-            if self.async_finish:
-                event.current_stream_wait()
+            event.current_stream_wait() if self.async_finish else ()
             if hidden_states.shape[0] > 0:
-                reorder_topk_ids, seg_indptr, src2dst, hidden_states = (
-                    self.deepep_permute(
-                        hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
-                    )
+                reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
+                    hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
         else:
-            hidden_states, recv_expert_count, handle, event, hook = (
-                self.dispatch_low_latency(
-                    hidden_states,
-                    topk_idx,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                    use_fp8=False,
-                )
+            hidden_states, event, hook = self.dispatch_low_latency(
+                hidden_states,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                use_fp8=False,
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
-            self.recv_expert_count = recv_expert_count
 
         return (
             hidden_states,
-            reorder_topk_ids,
-            seg_indptr,
-            src2dst,
             topk_idx,
             topk_weights,
-            handle,
+            reorder_topk_ids,
+            seg_indptr,
         )
 
     def dispatch_normal(
@@ -261,8 +248,8 @@ class DeepEPDispatcher:
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
-            handle,
+            _,  # num_recv_tokens_per_expert_list
+            self.handle,
             event,
         ) = self.buffer_normal.dispatch(
             x,
@@ -281,8 +268,6 @@ class DeepEPDispatcher:
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
-            handle,
             event,
         )
 
@@ -327,7 +312,7 @@ class DeepEPDispatcher:
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
 
-        packed_recv_hidden, packed_recv_count, handle, event, hook = (
+        packed_recv_hidden, self.recv_expert_count, self.handle, event, hook = (
             self.buffer_low_latency.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -338,20 +323,17 @@ class DeepEPDispatcher:
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        return packed_recv_hidden, packed_recv_count, handle, event, hook
+        return packed_recv_hidden, event, hook
 
     def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        src2dst: torch.Tensor,
-        forward_mode: ForwardMode,
-        handle: Tuple,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self.deepep_low_latency:
             if hidden_states.shape[0] > 0:
-                num_tokens = src2dst.shape[0] // self.router_topk
+                num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.empty(
                     (num_tokens, hidden_states.shape[1]),
                     device=hidden_states.device,
@@ -360,7 +342,7 @@ class DeepEPDispatcher:
                 deepep_post_reorder_triton_kernel[(num_tokens,)](
                     hidden_states,
                     output,
-                    src2dst,
+                    self.src2dst,
                     topk_idx,
                     topk_weights,
                     self.router_topk,
@@ -373,23 +355,22 @@ class DeepEPDispatcher:
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-            hidden_states, event = self.combine_normal(output, handle)
-            if self.async_finish:
-                event.current_stream_wait()
+            hidden_states, event = self.combine_normal(output)
+            event.current_stream_wait() if self.async_finish else ()
         else:
             hidden_states, event, hook = self.combine_low_latency(
-                hidden_states, topk_idx, topk_weights, handle
+                hidden_states, topk_idx, topk_weights
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
 
         return hidden_states
 
-    def combine_normal(self, x: torch.Tensor, handle: Tuple):
+    def combine_normal(self, x: torch.Tensor):
         previous_event = Buffer.capture() if self.async_finish else None
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
-            handle,
+            self.handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
@@ -401,16 +382,15 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        handle: Tuple,
     ):
-        combined_hidden_states, event_overlap, hook = (
+        combined_hidden_states, event, hook = (
             self.buffer_low_latency.low_latency_combine(
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                handle,
+                self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        return combined_hidden_states, event_overlap, hook
+        return combined_hidden_states, event, hook

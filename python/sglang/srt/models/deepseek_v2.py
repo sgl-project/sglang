@@ -312,18 +312,15 @@ class DeepseekV2MoE(nn.Module):
         if self.dp_size > 1:
             (
                 hidden_states,
-                reorder_topk_ids,
-                seg_indptr,
-                src2dst,
                 topk_idx,
                 topk_weights,
-                handle,
+                reorder_topk_ids,
+                seg_indptr,
             ) = self.deepep_dispatcher.dispatch(
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 self.num_experts,
-                forward_mode,
             )
         final_hidden_states = (
             self.experts(
@@ -339,9 +336,6 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
-                src2dst,
-                forward_mode,
-                handle,
             )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
