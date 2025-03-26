@@ -31,7 +31,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
-        self.use_fast = server_args.use_fast
+        self.use_fast = server_args.use_fast_image_processor
 
     async def _process_single_image(self, images, input_text):
         if isinstance(images, list) and len(images) == 0:

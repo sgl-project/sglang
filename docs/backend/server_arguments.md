@@ -178,6 +178,11 @@ Please consult the documentation below to learn more about the parameters you ma
 * `enable_p2p_check`: Turns off the default of allowing always p2p check when accessing GPU.
 * `triton_attention_reduce_in_fp32`: In triton kernels this will cast the intermediate attention result to `float32`.
 
+
+## Multimodal
+
+* `use_fast_image_processor`: Enables [fast image processors](https://github.com/huggingface/transformers/blob/main/docs/source/en/image_processors.md) in transformers.
+
 ## Optimization
 
 *Note: Some of these options are still in experimental stage.*

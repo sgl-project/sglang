@@ -145,8 +145,8 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
-    # MultiModal
-    use_fast: bool = False
+    # Multimodal
+    use_fast_image_processor: bool = False
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -894,9 +894,9 @@ class ServerArgs:
         )
         # Multimodal
         parser.add_argument(
-            "--use-fast",
+            "--use-fast-image-processor",
             action="store_true",
-            help="Enable fast image processor",
+            help="Enable fast image processor in transformers",
         )
 
         # Optimization/debug options

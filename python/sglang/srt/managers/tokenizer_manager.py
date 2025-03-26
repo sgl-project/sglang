@@ -179,7 +179,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=server_args.use_fast,
+                use_fast=server_args.use_fast_image_processor,
             )
 
             # We want to parallelize the image pre-processing so we create an executor for it

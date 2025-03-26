@@ -24,7 +24,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         self.IMAGE_TOKEN = "<start_of_image>"
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
-        self.device = "cuda" if server_args.use_fast else None
+        self.device = "cuda" if server_args.use_fast_image_processor else None
 
     async def _process_single_image(self, images, input_text) -> dict:
         if isinstance(images, list) and len(images) == 0:

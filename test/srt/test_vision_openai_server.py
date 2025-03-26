@@ -503,7 +503,7 @@ class TestQwen2VLServerUseFast(TestOpenAIVisionServer):
                 "qwen2-vl",
                 "--mem-fraction-static",
                 "0.4",
-                "--use-fast",
+                "--use-fast-image-processor",
             ],
         )
         cls.base_url += "/v1"
@@ -546,7 +546,7 @@ class TestQwen2_5_VLServerUseFast(TestOpenAIVisionServer):
                 "qwen2-vl",
                 "--mem-fraction-static",
                 "0.4",
-                "--use-fast",
+                "--use-fast-image-processor",
             ],
         )
         cls.base_url += "/v1"
