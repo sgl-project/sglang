@@ -530,6 +530,11 @@ class Fp8LinearOp:
                 # GEMM
                 # This computes C = (X * W).
                 # Output in fp32 to allow subsequent ops to happen in-place
+
+                global TORCH_DEVICE_IDENTITY
+                if TORCH_DEVICE_IDENTITY.device != weight.device:
+                    TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
+
                 output = torch._scaled_mm(
                     qinput,
                     weight,
