@@ -10,19 +10,19 @@ import torch
 from sglang.srt.connector import BaseFileConnector
 
 
-def _filter_allow(paths: list[str], patterns: list[str]) -> list[str]:
+def _filter_allow(paths: list[str], patterns: list[str], prefix: str) -> list[str]:
     return [
         path
         for path in paths
-        if any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+        if any(fnmatch.fnmatch(path, os.path.join(prefix, pattern)) for pattern in patterns)
     ]
 
 
-def _filter_ignore(paths: list[str], patterns: list[str]) -> list[str]:
+def _filter_ignore(paths: list[str], patterns: list[str], prefix: str) -> list[str]:
     return [
         path
         for path in paths
-        if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+        if not any(fnmatch.fnmatch(path, os.path.join(prefix, pattern)) for pattern in patterns)
     ]
 
 
@@ -56,12 +56,12 @@ def list_files(
     objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
     paths = [obj["Key"] for obj in objects.get("Contents", [])]
 
-    paths = _filter_ignore(paths, ["*/"])
+    paths = _filter_ignore(paths, ["*/"], prefix)
     if allow_pattern is not None:
-        paths = _filter_allow(paths, allow_pattern)
+        paths = _filter_allow(paths, allow_pattern, prefix)
 
     if ignore_pattern is not None:
-        paths = _filter_ignore(paths, ignore_pattern)
+        paths = _filter_ignore(paths, ignore_pattern, prefix)
 
     return bucket_name, prefix, paths
 
