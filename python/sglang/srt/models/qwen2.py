@@ -107,6 +107,7 @@ class Qwen2Attention(nn.Module):
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
+        orig_context_len: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
         previous_layer: Optional["Qwen2Attention"] = None,
         prefix: str = "",
@@ -212,12 +213,6 @@ class Qwen2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         dual_chunk_attention_config = getattr(
@@ -233,6 +228,9 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
             quant_config=quant_config,
             previous_layer=(
                 previous_layer.self_attn if previous_layer is not None else None
