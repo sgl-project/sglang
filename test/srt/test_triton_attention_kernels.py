@@ -15,9 +15,10 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTritonAttention(unittest.TestCase):
+class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
