@@ -1,3 +1,4 @@
+import logging
 from abc import ABC
 from contextlib import contextmanager
 
@@ -8,6 +9,7 @@ try:
 except ImportError:
     pass
 
+logger = logging.getLogger(__name__)
 
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
@@ -18,7 +20,7 @@ class TorchMemorySaverAdapter(ABC):
 
     def check_validity(self, caller_name):
         if not self.enabled:
-            print(
+            logger.warning(
                 f"`{caller_name}` will not save memory because torch_memory_saver is not enabled. "
                 f"Potential causes: `enable_memory_saver` is false, or torch_memory_saver has installation issues."
             )
