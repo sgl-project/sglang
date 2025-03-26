@@ -95,6 +95,11 @@ class TestLoRA(unittest.TestCase):
             srt_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
+            srt_outputs_lora_path_none = srt_runner.forward(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                lora_paths=[None] * len(prompts),
+            )
 
         with HFRunner(
             base_path, torch_dtype=torch_dtype, model_type="generation"
@@ -168,18 +173,20 @@ class TestLoRA(unittest.TestCase):
         print(f"{srt_outputs.output_strs=}")
         print(f"{hf_no_lora_outputs.output_strs=}")
         print(f"{srt_no_lora_outputs.output_strs=}")
+        print(f"{srt_outputs_lora_path_none.output_strs=}")
         for i in range(len(prompts)):
             assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
                 srt_outputs.output_strs[i].strip(" "),
                 hf_outputs.output_strs[i],
             )
-            # assert (
-            #     srt_no_lora_outputs.output_strs[i].strip(" ")
-            #     == hf_no_lora_outputs.output_strs[i]
-            # ), (
-            #     srt_no_lora_outputs.output_strs[i].strip(" "),
-            #     hf_no_lora_outputs.output_strs[i],
-            # )
+            assert (
+                srt_no_lora_outputs.output_strs[i].strip(" ")
+                == hf_no_lora_outputs.output_strs[i]
+            ), (
+                srt_no_lora_outputs.output_strs[i].strip(" "),
+                hf_no_lora_outputs.output_strs[i],
+            )
+            assert srt_outputs_lora_path_none == srt_no_lora_outputs
 
     def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing serving =======================")
@@ -256,7 +263,7 @@ class TestLoRA(unittest.TestCase):
             srt_no_lora_logprobs = torch.Tensor(
                 srt_no_lora_outputs.top_input_logprobs[i]
             )
-            srt_logprobs = torch.uensor(srt_outputs.top_input_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
             print("max_diff", torch.max(abs(srt_no_lora_logprobs - srt_logprobs)))
 
         print(f"{srt_no_lora_outputs.output_strs=}")
@@ -279,7 +286,7 @@ class TestLoRA(unittest.TestCase):
                 tp_size = 1
                 max_new_tokens = 32
                 self.inference(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
-                # self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
+                self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
                 # self.base_inference(
                 #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
                 # )
