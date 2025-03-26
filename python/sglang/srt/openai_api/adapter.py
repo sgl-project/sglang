@@ -1550,13 +1550,14 @@ async def v1_chat_completions(
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
-                if (
-                    finish_reason_type == "stop"
-                    and request.tool_choice != "none"
-                    and any([i in new_stream_buffer for i in TOOLS_TAG_LIST])
-                ):
-                    # if the stream ends with empty string after tool calls
-                    finish_reason_type = "tool_calls"
+                if finish_reason_type == "stop" and request.tool_choice != "none":
+                    parser = FunctionCallParser(
+                        tools=request.tools,
+                        tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                    )
+                    if parser.has_tool_call(new_stream_buffer):
+                        # if the stream ends with empty string after tool calls
+                        finish_reason_type = "tool_calls"
 
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
