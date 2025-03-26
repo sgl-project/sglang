@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import copy
+import logging
 import os
 import random
 import subprocess
@@ -922,6 +923,10 @@ def run_mulit_request_test(
 
 
 def write_github_step_summary(content):
+    if not os.environ.get("GITHUB_STEP_SUMMARY"):
+        logging.warning("GITHUB_STEP_SUMMARY environment variable not set")
+        return
+
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
 
