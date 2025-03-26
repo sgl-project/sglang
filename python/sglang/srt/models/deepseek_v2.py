@@ -68,6 +68,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.utils import ExpertDistributionRecorder
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
@@ -79,6 +80,8 @@ if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
 else:
     from vllm import _custom_ops as ops
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -239,6 +242,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
+                async_finish=True,  # TODO
             )
 
     def forward(
@@ -250,8 +254,6 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -264,13 +266,11 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
         topk_idx = torch.full(
             (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -294,7 +294,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.tp_size > 1:
-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
+            recv_hidden_states, reorder_topk_ids, seg_indptr = (
                 self.deepep_dispatcher.dispatch(
                     hidden_states,
                     topk_idx,
@@ -306,7 +306,8 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = (
             self.experts(
                 hidden_states=recv_hidden_states,
-                tokens_per_expert=tokens_per_expert,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
@@ -318,7 +319,7 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1162,6 +1163,7 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
         for i in range(len(self.layers)):
+            expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
