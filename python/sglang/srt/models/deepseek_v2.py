@@ -878,6 +878,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
+            rope_range=(self.kv_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim),
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
@@ -889,6 +894,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
+            rope_range=(self.qk_nope_head_dim, self.qk_head_dim),
             quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
@@ -1174,7 +1184,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
@@ -1286,7 +1303,17 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        if not self._fuse_rope_for_trtllm_mla(forward_batch):
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if (
+            (
+                not (
+                    forward_batch.hip_metadata_cache_pool is not None
+                    and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+                )
+            ) and (
+                not self._fuse_rope_for_trtllm_mla(forward_batch)
+            )
+        ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
@@ -1384,6 +1411,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if forward_batch.hip_metadata_cache_pool is not None:
+            raise ValueError("HiP Attention does not support fused MLA with RoPE")
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
@@ -2094,12 +2123,17 @@ class DeepseekV2Model(nn.Module):
             if forward_batch.can_run_tbo
             else total_num_layers
         )
+
+        forward_batch.on_model_start()
         for i in range(normal_num_layers):
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                forward_batch.on_layer_start(i)
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
-                )
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual, zero_allocator
+                    )
+                forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2115,6 +2149,7 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -2126,6 +2161,9 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
+    
+    # for hip attention
+    hip_attention_supported = True
 
     def __init__(
         self,
