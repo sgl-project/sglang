@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.test.test_utils import CustomTestCase
 
 
 # For test
@@ -121,7 +122,7 @@ def torch_w8a8_block_int8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
     ).sum(dim=1)
 
 
-class TestW8A8BlockINT8FusedMoE(unittest.TestCase):
+class TestW8A8BlockINT8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33, 64, 222]
     N = [128, 1024]

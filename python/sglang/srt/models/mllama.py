@@ -32,7 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
@@ -796,7 +796,7 @@ class MllamaForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         pixel_values = image_inputs.pixel_values
         pad_values = image_inputs.pad_values
 
@@ -815,7 +815,7 @@ class MllamaForConditionalGeneration(nn.Module):
 
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
-        for i, im in enumerate(forward_batch.image_inputs):
+        for i, im in enumerate(forward_batch.mm_inputs):
             if not forward_batch.encoder_cached[i] and im is not None:
                 max_num_images = max(max_num_images, im.pixel_values.shape[1])
                 max_num_tiles = max(max_num_tiles, im.pixel_values.shape[2])
@@ -842,7 +842,7 @@ class MllamaForConditionalGeneration(nn.Module):
             )
             i = 0
             encoder_lens_need = []
-            for k, im in enumerate(forward_batch.image_inputs):
+            for k, im in enumerate(forward_batch.mm_inputs):
                 if forward_batch.encoder_cached[k] or im is None:
                     continue
 
