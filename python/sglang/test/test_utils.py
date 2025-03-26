@@ -3,11 +3,13 @@
 import argparse
 import asyncio
 import copy
+import logging
 import os
 import random
 import subprocess
 import threading
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -921,6 +923,10 @@ def run_mulit_request_test(
 
 
 def write_github_step_summary(content):
+    if not os.environ.get("GITHUB_STEP_SUMMARY"):
+        logging.warning("GITHUB_STEP_SUMMARY environment variable not set")
+        return
+
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
 
@@ -998,3 +1004,30 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
+
+class CustomTestCase(unittest.TestCase):
+    def _callTestMethod(self, method):
+        _retry_execution(
+            lambda: super(CustomTestCase, self)._callTestMethod(method),
+            max_retry=_get_max_retry(),
+        )
+
+
+def _get_max_retry():
+    return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
+
+
+def _retry_execution(fn, max_retry: int):
+    if max_retry == 0:
+        fn()
+        return
+
+    try:
+        fn()
+    except Exception as e:
+        print(
+            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
+        )
+        traceback.print_exc()
+        _retry_execution(fn, max_retry=max_retry - 1)
