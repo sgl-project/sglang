@@ -21,6 +21,10 @@ from sglang.srt.utils import get_compiler_backend, is_cuda
 
 _is_cuda = is_cuda()
 
+from sglang.srt.managers.utils import ExpertDistributionRecorder
+
+expert_distribution_recorder = ExpertDistributionRecorder()
+
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
@@ -222,5 +226,7 @@ def select_experts(
             topk=top_k,
             renormalize=renormalize,
         )
+
+    expert_distribution_recorder.record_new_token(topk_ids)
 
     return topk_weights, topk_ids

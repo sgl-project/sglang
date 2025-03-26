@@ -23,7 +23,8 @@ compile:
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		NB_NAME=$$(basename {}); \
 		START_TIME=$$(date +%s); \
-		jupyter nbconvert --to notebook --execute --inplace "{}" \
+		retry --delay=0 --times=3 -- \
+			jupyter nbconvert --to notebook --execute --inplace "{}" \
 			--ExecutePreprocessor.timeout=600 \
 			--ExecutePreprocessor.kernel_name=python3; \
 		RET_CODE=$$?; \

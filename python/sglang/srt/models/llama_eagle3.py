@@ -105,7 +105,10 @@ class LlamaModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
-        self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+        if hasattr(config, "target_hidden_size"):
+            self.fc = torch.nn.Linear(config.target_hidden_size * 3, config.hidden_size)
+        else:
+            self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
