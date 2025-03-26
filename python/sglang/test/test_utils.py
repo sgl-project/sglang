@@ -8,6 +8,7 @@ import random
 import subprocess
 import threading
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -33,6 +34,15 @@ DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST = "neuralmagic/Meta-Llama-3-8B-Instruct
 DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
 )
+DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
+    "nvidia/Llama-3.1-8B-Instruct-FP8"
+)
+# TODO(yundai424): right now specifying to an older revision since the latest one
+#  carries kv cache quantization which doesn't work yet
+DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION = (
+    "13858565416dbdc0b4e7a4a677fadfbd5b9e5bb9"
+)
+
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -989,3 +999,30 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
+
+class CustomTestCase(unittest.TestCase):
+    def _callTestMethod(self, method):
+        _retry_execution(
+            lambda: super(CustomTestCase, self)._callTestMethod(method),
+            max_retry=_get_max_retry(),
+        )
+
+
+def _get_max_retry():
+    return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
+
+
+def _retry_execution(fn, max_retry: int):
+    if max_retry == 0:
+        fn()
+        return
+
+    try:
+        fn()
+    except Exception as e:
+        print(
+            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
+        )
+        traceback.print_exc()
+        _retry_execution(fn, max_retry=max_retry - 1)
