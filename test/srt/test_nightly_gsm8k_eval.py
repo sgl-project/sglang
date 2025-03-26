@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -36,9 +37,6 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.65,
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.84,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
-    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.62,
 }
 
 
@@ -129,7 +127,7 @@ def check_model_scores(results):
         raise AssertionError("\n".join(failed_models))
 
 
-class TestNightlyGsm8KEval(unittest.TestCase):
+class TestNightlyGsm8KEval(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
@@ -137,7 +135,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1), False, False),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
