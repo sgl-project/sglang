@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
-# we only want to download 3rd, but not build them. 
+# we only want to download 3rd, but not build them.
 # FetchContent_MakeAvailable will build it.
 cmake_policy(SET CMP0169 OLD)
 
@@ -61,7 +61,6 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    # ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -172,29 +171,3 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
-
-# JIT Logic
-# DeepGEMM
-install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
-        DESTINATION "deep_gemm"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
-
-# Link cutlass cute
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute" 
-           "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink 
-            "${repo-cutlass_SOURCE_DIR}/include/cute"
-            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink 
-            "${repo-cutlass_SOURCE_DIR}/include/cutlass"
-            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
-    DEPENDS ${repo-cutlass_SOURCE_DIR}/include/cute ${repo-cutlass_SOURCE_DIR}/include/cutlass
-    COMMENT "Creating symbolic links for Cutlass include directories"
-)
-
-add_custom_target(deepgemm_cutlass_links ALL
-    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute"
-            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
-)

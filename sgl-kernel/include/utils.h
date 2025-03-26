@@ -15,11 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
 #include <sstream>
 
+#ifndef USE_ROCM
 // Adapt from FlashInfer
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
@@ -114,17 +116,17 @@ limitations under the License.
     }                                                                                   \
   }()
 
-#define _DISPATCH_SWITCH_U16x2(var1_name, var2_name, cond1, cond2, ...)                       \
-  [&]() -> bool {                                                                             \
-    switch (pack_u16(cond1, cond2)) {                                                         \
-      __VA_ARGS__                                                                             \
-      default:                                                                                \
-        std::ostringstream oss;                                                               \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch (" var1_name ", " var2_name "): (" \
-            << int(cond1) << ", " << int(cond2) << ")";                                       \
-        TORCH_CHECK(false, oss.str());                                                        \
-        return false;                                                                         \
-    }                                                                                         \
+#define _DISPATCH_SWITCH_U16x2(var1_name, var2_name, cond1, cond2, ...)                                             \
+  [&]() -> bool {                                                                                                   \
+    switch (pack_u16(cond1, cond2)) {                                                                               \
+      __VA_ARGS__                                                                                                   \
+      default:                                                                                                      \
+        std::ostringstream oss;                                                                                     \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch (" var1_name ", " var2_name "): (" << int(cond1) << ", " \
+            << int(cond2) << ")";                                                                                   \
+        TORCH_CHECK(false, oss.str());                                                                              \
+        return false;                                                                                               \
+    }                                                                                                               \
   }()
 
 #define _DISPATCH_CASE(case_expr, case_var, ...) \
@@ -151,10 +153,8 @@ limitations under the License.
     }                                        \
   }()
 
-inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name,
-                        const char* b_name) {
-  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ",
-              b.dim());
+inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name, const char* b_name) {
+  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ", b.dim());
   for (int i = 0; i < a.dim(); ++i) {
     TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
   }
@@ -164,9 +164,14 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
   return (uint32_t(a) << 16) | uint32_t(b);
 }
 
-#define CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads)                   \
-  TORCH_CHECK(num_qo_heads % num_kv_heads == 0, "num_qo_heads(", num_qo_heads, \
-              ") must be divisible by num_kv_heads(", num_kv_heads, ")")
+#define CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads) \
+  TORCH_CHECK(                                               \
+      num_qo_heads % num_kv_heads == 0,                      \
+      "num_qo_heads(",                                       \
+      num_qo_heads,                                          \
+      ") must be divisible by num_kv_heads(",                \
+      num_kv_heads,                                          \
+      ")")
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
@@ -190,9 +195,9 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 #define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 inline bool is_float8_tensor(const at::Tensor& tensor) {
-  return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn ||
-         tensor.scalar_type() == at::ScalarType::Float8_e5m2;
+  return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn || tensor.scalar_type() == at::ScalarType::Float8_e5m2;
 }
+#endif
 
 struct cuda_error : public std::runtime_error {
   /**

@@ -12,12 +12,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
+#include <torch/library.h>
 
 #include "sgl_kernel_ops.h"
-
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <torch/library.h>
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*

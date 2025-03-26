@@ -15,9 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <ATen/ATen.h>
+#include <ATen/Tensor.h>
 #include <Python.h>
 #include <torch/library.h>
-#include <ATen/ATen.h> 
+#include <torch/torch.h>
 
 #include <vector>
 
