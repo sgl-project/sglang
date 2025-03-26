@@ -89,8 +89,6 @@ class CuDNNBackend():
             output: [num_tokens, num_heads, head_size]
         """
 
-        logging.info("Running decode")
-        print("output shape: ",output.shape)
         assert query.shape[0] == seq_lens.shape[0], "batch size must be the same"
 
         max_seq_len = k_cache.shape[0]
@@ -98,8 +96,6 @@ class CuDNNBackend():
         # where B is number of queries and S is sequence per query (1 in decoding)
         # [num_tokens, num_heads, head_size] -> [num_token, num_heads, 1,  head_size]
         query = query.unsqueeze(1).movedim(1,2)
-        print(query.shape)
-        print(query.device)
 
         # heads, tokens, head size
         # The tokens of queries are indexed by req_to_token
@@ -164,7 +160,7 @@ class CuDNNBackend():
             v=container_v,  # Container V: non contiguous container with V blocks
             is_inference=True,
             attn_scale=scaling,
-            use_causal_mask=True,
+            use_causal_mask=causal,
             use_padding_mask=True,
             seq_len_q=seq_len_q_tensor_info,
             seq_len_kv=seq_len_kv_tensor_info,
@@ -177,7 +173,6 @@ class CuDNNBackend():
         output = output.view(*query.shape)
         dims = output.shape
         strides = output.stride()
-        print("output shape: ",output.shape)
 
 
         o.set_output(True).set_dim(dims).set_stride(strides)
@@ -392,7 +387,7 @@ def test_correctness():
 
     logging.info("Start Extend")
 
-
+    
     output = cudnn_bknd._run_sdpa_forward_decode(
         query=query,
         output=output,
@@ -405,10 +400,10 @@ def test_correctness():
     )
 
     torch_native_backend = TorchNativeAttnBackend()
-
+    torch_output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
     torch_output = torch_native_backend._run_sdpa_forward_decode(
         query=query,
-        output=output,
+        output=torch_output,
         k_cache=k_cache,
         v_cache=v_cache,
         req_to_token=req_to_token,
@@ -417,11 +412,11 @@ def test_correctness():
         scaling=scaling
     )
 
-
+    print(output.shape,torch_output.shape)
+    output = output.squeeze()
+    torch_output = torch_output.squeeze()
     torch.testing.assert_close(output,torch_output)
-
-    # TODO correctness
-    print(output)
+    print("Decode Result Same")
 
 if __name__=='__main__':
     assert torch.cuda.is_available()
