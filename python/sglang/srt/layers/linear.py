@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
+    BlockQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
@@ -27,7 +28,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -687,10 +687,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    shard_id=0,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -719,6 +728,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
 
@@ -782,6 +793,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+        self.q_proj_shard_size = self.num_heads * self.head_size
+        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         input_size = self.hidden_size
         output_size = (
             (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size

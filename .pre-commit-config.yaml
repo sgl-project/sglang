@@ -26,6 +26,12 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black-jupyter
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+    - id: clang-format
+      types_or: [c++, cuda]
+      args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
     rev: 0.8.1
     hooks:

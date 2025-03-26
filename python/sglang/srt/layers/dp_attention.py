@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import functools
+import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -13,6 +15,8 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,7 +38,12 @@ def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_si
     return attn_tp_rank, attn_tp_size, dp_rank
 
 
-def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
+def initialize_dp_attention(
+    enable_dp_attention: bool,
+    tp_rank: int,
+    tp_size: int,
+    dp_size: int,
+):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -42,7 +51,11 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
     _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size
     )
-    _DP_SIZE = dp_size
+
+    if enable_dp_attention:
+        _DP_SIZE = dp_size
+    else:
+        _DP_SIZE = 1
 
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
@@ -50,7 +63,7 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, tp_size, _ATTN_TP_SIZE)
         ],
-        tp_rank,
+        tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
         SYNC_TOKEN_IDS_ACROSS_TP,
         False,
@@ -84,6 +97,27 @@ def get_attention_dp_rank():
 def get_attention_dp_size():
     assert _DP_SIZE is not None, "dp attention not initialized!"
     return _DP_SIZE
+
+
+@contextmanager
+def disable_dp_size():
+    """Patch the tp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding to run draft model
+    with different tp degree from that of target model workers.
+
+    Args:
+        tp_group (GroupCoordinator): the tp group coordinator
+    """
+    global _DP_SIZE
+    assert _DP_SIZE is not None, "dp attention not initialized!"
+
+    old_dp_size = _DP_SIZE
+    _DP_SIZE = 1
+    try:
+        yield
+    finally:
+        _DP_SIZE = old_dp_size
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
@@ -144,22 +178,22 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
-def dp_gather(
+def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
-    layer_id: Union[str, int],
+    is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
-    if local_tokens.shape[0] > 0 and (
-        layer_id != "embedding" or get_attention_tp_rank() == 0
-    ):
+
+    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
         assert (
-            global_tokens.storage().data_ptr() != local_tokens.storage().data_ptr()
+            global_tokens.untyped_storage().data_ptr()
+            != local_tokens.untyped_storage().data_ptr()
         ), "aliasing between global_tokens and local_tokens not allowed"
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -174,8 +208,25 @@ def dp_gather(
         torch.ops.sglang.inplace_all_reduce(
             global_tokens, group_name=get_tp_group().unique_name
         )
+
     else:
-        global_tokens = tensor_model_parallel_all_reduce(global_tokens)
+        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+
+
+def dp_gather_partial(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+):
+    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+
+
+def dp_gather_replicate(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+):
+    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
 
 
 def dp_scatter(
@@ -186,6 +237,7 @@ def dp_scatter(
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
@@ -197,16 +249,3 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
-
-
-def get_do_logits_dp_scatter(forward_batch: ForwardBatch):
-    def do_logits_dp_scatter(logits: torch.Tensor):
-        local_logits = torch.empty(
-            (forward_batch.input_ids.shape[0], *logits.shape[1:]),
-            dtype=logits.dtype,
-            device=logits.device,
-        )
-        dp_scatter(local_logits, logits, forward_batch)
-        return local_logits
-
-    return do_logits_dp_scatter
