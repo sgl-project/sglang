@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
@@ -456,8 +456,8 @@ class CLIPModel(nn.Module):
     ):
         assert get_embedding, "CLIPEmbeddingModel is only used for embedding"
         image_inputs = None
-        if forward_batch.image_inputs is not None:
-            image_inputs = forward_batch.image_inputs
+        if forward_batch.mm_inputs is not None:
+            image_inputs = forward_batch.mm_inputs
 
         if image_inputs is not None and image_inputs[0] is not None:
             vision_outputs = self.vision_model(image_inputs[0].pixel_values)
@@ -473,7 +473,7 @@ class CLIPModel(nn.Module):
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 
