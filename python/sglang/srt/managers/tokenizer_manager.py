@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -263,6 +265,9 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -311,6 +316,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    ExpertDistributionReqOutput,
+                    self.expert_distribution_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -637,6 +646,15 @@ class TokenizerManager:
     def stop_profile(self):
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
+
+    async def start_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+
+    async def stop_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+
+    async def dump_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
         self,
