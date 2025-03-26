@@ -7,6 +7,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -18,7 +19,7 @@ The story should span multiple events, challenges, and character developments ov
 """
 
 
-class TestMatchedStop(unittest.TestCase):
+class TestMatchedStop(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
