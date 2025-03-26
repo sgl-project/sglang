@@ -29,11 +29,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs, cpu_has_amx_support
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
@@ -53,6 +54,14 @@ class SiluAndMul(CustomOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if cpu_has_amx_support():
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+            return out
+        else:
+            return self.forward_native(x)
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
@@ -185,8 +194,8 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not _is_cuda and not _is_npu:
+if not (_is_cuda or _is_npu or _is_cpu_amx):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
