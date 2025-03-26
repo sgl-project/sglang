@@ -11,6 +11,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
