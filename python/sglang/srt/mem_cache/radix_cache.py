@@ -22,7 +22,8 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from functools import partial
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -67,7 +68,7 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-def _key_match(key0: List, key1: List):
+def _key_match_page_size1(key0: List, key1: List):
     i = 0
     for k0, k1 in zip(key0, key1):
         if k0 != k1:
@@ -76,16 +77,42 @@ def _key_match(key0: List, key1: List):
     return i
 
 
+def _key_match_paged(key0: List, key1: List, page_size: int):
+    min_len = min(len(key0), len(key1))
+
+    i = 0
+    while i < min_len:
+        if key0[i : i + page_size] != key1[i : i + page_size]:
+            break
+        i += page_size
+
+    return i
+
+
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        page_size: int,
         disable: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.page_size = page_size
         self.disable = disable
+
+        if self.token_to_kv_pool_allocator:
+            self.device = self.token_to_kv_pool_allocator.device
+        else:
+            self.device = torch.device("cpu")
+
+        if self.page_size == 1:
+            self.key_match_fn = _key_match_page_size1
+            self.get_child_key_fn = lambda key: key[0]
+        else:
+            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+            self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
 
     ##### Public API #####
@@ -109,14 +136,25 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        if self.disable:
-            return [], self.root_node
+        if self.disable or len(key) == 0:
+            return (
+                torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                self.root_node,
+            )
+
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.concat(value)
+            value = torch.cat(value)
         else:
-            value = torch.tensor([], dtype=torch.int32)
+            value = torch.empty((0,), dtype=torch.int64, device=self.device)
         return value, last_node
 
     def insert(self, key: List, value=None):
@@ -127,29 +165,33 @@ class RadixCache(BasePrefixCache):
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
 
-    def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
+    def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
         if self.disable:
-            if token_ids is None:
-                token_ids_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-            else:
-                token_ids_len = len(token_ids)
-
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :token_ids_len
+                req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        if token_ids is None:
-            token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.clone()
+
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(token_ids, kv_indices.clone())
+        new_prefix_len = self.insert(
+            token_ids[:page_aligned_len], page_aligned_kv_indices
+        )
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
@@ -158,27 +200,32 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
+    def cache_unfinished_req(self, req: Req):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
-        if token_ids is None:
-            token_ids = req.fill_ids
-
+        token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.clone()
+        page_aligned_token_ids = token_ids[:page_aligned_len]
+
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(token_ids, kv_indices.clone())
+        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node = self.match_prefix(token_ids)
-        assert len(new_indices) == len(token_ids)
+        new_indices, new_last_node = self.match_prefix(page_aligned_token_ids)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
@@ -186,7 +233,14 @@ class RadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
-        req.prefix_indices = new_indices
+
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        if self.page_size != 1:
+            req.prefix_indices = torch.cat(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
+        else:
+            req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -196,7 +250,7 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int, evict_callback: Callable):
+    def evict(self, num_tokens: int):
         if self.disable:
             return
 
@@ -212,7 +266,7 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            evict_callback(x.value)
+            self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -254,15 +308,29 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def all_values_flatten(self):
+        values = []
+
+        def _dfs_helper(node: TreeNode):
+            for _, child in node.children.items():
+                values.append(child.value)
+                _dfs_helper(child)
+
+        _dfs_helper(self.root_node)
+        return torch.cat(values)
+
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
+
+        child_key = self.get_child_key_fn(key)
+
         value = []
-        while len(key) > 0 and key[0] in node.children.keys():
-            child = node.children[key[0]]
+        while len(key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
             child.last_access_time = time.time()
-            prefix_len = _key_match(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -272,12 +340,16 @@ class RadixCache(BasePrefixCache):
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
+
+                if len(key):
+                    child_key = self.get_child_key_fn(key)
+
         return value, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
         new_node = TreeNode()
-        new_node.children = {key[split_len]: child}
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
@@ -285,7 +357,7 @@ class RadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
-        new_node.parent.children[key[0]] = new_node
+        new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
@@ -293,11 +365,13 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return 0
 
+        child_key = self.get_child_key_fn(key)
+
         total_prefix_length = 0
-        while len(key) > 0 and key[0] in node.children.keys():
-            node = node.children[key[0]]
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
             node.last_access_time = time.time()
-            prefix_len = _key_match(node.key, key)
+            prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -306,12 +380,15 @@ class RadixCache(BasePrefixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            node.children[key[0]] = new_node
+            node.children[child_key] = new_node
             self.evictable_size_ += len(value)
         return total_prefix_length
 
@@ -326,8 +403,12 @@ class RadixCache(BasePrefixCache):
                 current_node.key[:10],
                 f"r={current_node.lock_ref}",
             )
-            for _, child in current_node.children.items():
+            for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
+
+                assert key == self.get_child_key_fn(
+                    child.key
+                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
         for k, v in node.parent.children.items():
@@ -363,7 +444,7 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, False)
+    tree = RadixCache(None, None, page_size=1, disable=False)
 
     tree.insert("Hello")
     tree.insert("Hello")

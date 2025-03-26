@@ -88,7 +88,12 @@ def benchmark_config(
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
     if use_fp8_w8a8 or use_int8_w8a8:
-        if block_shape is None:
+        if use_int8_w8a8 and block_shape is None:
+            w1_scale = torch.randn(
+                num_experts, shard_intermediate_size, dtype=torch.float32
+            )
+            w2_scale = torch.randn(num_experts, hidden_size, dtype=torch.float32)
+        elif block_shape is None:
             w1_scale = torch.randn(num_experts, dtype=torch.float32)
             w2_scale = torch.randn(num_experts, dtype=torch.float32)
             a1_scale = torch.randn(1, dtype=torch.float32)
@@ -262,6 +267,7 @@ class BenchmarkWorker:
                 topk,
                 dtype_str,
                 False,
+                block_shape,
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]

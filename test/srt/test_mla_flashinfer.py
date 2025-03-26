@@ -6,16 +6,15 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestFlashinferMLA(unittest.TestCase):
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -57,7 +56,7 @@ class TestFlashinferMLA(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLANoRagged(unittest.TestCase):
+class TestFlashinferMLANoRagged(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -69,7 +68,7 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
                     "--enable-torch-compile",
                     "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--enable-flashinfer-mla",
                     "--flashinfer-mla-disable-ragged",
                 ]
@@ -101,7 +100,7 @@ class TestFlashinferMLANoRagged(unittest.TestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-class TestFlashinferMLAMTP(unittest.TestCase):
+class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -111,7 +110,7 @@ class TestFlashinferMLAMTP(unittest.TestCase):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",
-                    "2",
+                    "4",
                     "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",

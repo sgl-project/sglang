@@ -41,7 +41,9 @@ include_dirs = [
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/moe/moe_align_kernel.cu",
+    "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/torch_extension_rocm.cc",
+    "csrc/speculative/eagle_utils.cu",
 ]
 
 cxx_flags = ["-O3"]
@@ -79,7 +81,7 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=_get_version(),
-    packages=find_packages(),
+    packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},

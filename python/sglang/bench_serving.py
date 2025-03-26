@@ -129,7 +129,7 @@ async def async_request_trt_llm(
                         timestamp = time.perf_counter()
                         # First token
                         if ttft == 0.0:
-                            ttft = time.perf_counter() - st
+                            ttft = timestamp - st
                             output.ttft = ttft
 
                         # Decoding phase
@@ -503,6 +503,7 @@ def get_dataset(args, tokenizer):
             question_len=args.gsp_question_len,
             output_len=args.gsp_output_len,
             tokenizer=tokenizer,
+            args=args,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -790,6 +791,7 @@ def sample_generated_shared_prefix_requests(
     question_len: int,
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
+    args: argparse.Namespace,
 ) -> List[Tuple[str, int, int]]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
