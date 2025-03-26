@@ -33,5 +33,7 @@ exclude = [
 [tool.scikit-build]
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
+
+wheel.py-api = "cp39"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]

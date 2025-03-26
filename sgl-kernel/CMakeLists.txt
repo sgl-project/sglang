@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+# we only want to download 3rd, but not build them. 
+# FetchContent_MakeAvailable will build it.
+cmake_policy(SET CMP0169 OLD)
+
+find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
 
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
@@ -27,31 +31,28 @@ FetchContent_Declare(
     GIT_TAG        62750a2b75c802660e4894434dc55e839f322277
     GIT_SHALLOW    ON
 )
-FetchContent_MakeAvailable(repo-cutlass)
-
+FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
     GIT_TAG        c57699ac933a93651c34d365797c2d8b41a4765b
     GIT_SHALLOW    ON
 )
-FetchContent_MakeAvailable(repo-deepgemm)
-
+FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        e5a3befbe3e63025f0158bc96b218a9c5f402ac7
+    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
     GIT_SHALLOW    OFF
 )
-FetchContent_MakeAvailable(repo-flashinfer)
-
+FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention
     GIT_TAG        2f9ef0879a0935c3ca852f7a6a7b7a9c24f41e96
     GIT_SHALLOW    OFF
 )
-FetchContent_MakeAvailable(repo-flash-attention)
+FetchContent_Populate(repo-flash-attention)
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -66,7 +67,7 @@ include_directories(
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-set(CUDA_NVCC_FLAGS
+set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
     "-O3"
@@ -90,35 +91,35 @@ set(CUDA_NVCC_FLAGS
 )
 
 option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
-option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A" OFF)
+option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND CUDA_NVCC_FLAGS
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
     )
 else()
-    list(APPEND CUDA_NVCC_FLAGS
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-use_fast_math"
     )
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
-    list(APPEND CUDA_NVCC_FLAGS
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
-    list(APPEND CUDA_NVCC_FLAGS
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DFLASHINFER_ENABLE_BF16"
     )
 endif()
 
 if (SGL_KERNEL_ENABLE_FP8)
-    list(APPEND CUDA_NVCC_FLAGS
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DFLASHINFER_ENABLE_FP8"
         "-DFLASHINFER_ENABLE_FP8_E4M3"
         "-DFLASHINFER_ENABLE_FP8_E5M2"
@@ -161,12 +162,39 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
 )
 
-Python_add_library(common_ops MODULE ${SOURCES} WITH_SOABI)
+# Support abi3 for build
+Python_add_library(common_ops MODULE USE_SABI 3.9 WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
+target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+
+# JIT Logic
+# DeepGEMM
+install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
+        DESTINATION "deep_gemm"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+# Link cutlass cute
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute" 
+           "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink 
+            "${repo-cutlass_SOURCE_DIR}/include/cute"
+            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink 
+            "${repo-cutlass_SOURCE_DIR}/include/cutlass"
+            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
+    DEPENDS ${repo-cutlass_SOURCE_DIR}/include/cute ${repo-cutlass_SOURCE_DIR}/include/cutlass
+    COMMENT "Creating symbolic links for Cutlass include directories"
+)
+
+add_custom_target(deepgemm_cutlass_links ALL
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cute"
+            "${CMAKE_CURRENT_BINARY_DIR}/deep_gemm/include/cutlass"
+)

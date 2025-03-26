@@ -30,9 +30,10 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+#include "utils.h"
+
 #include "cutlass_extensions/gemm/collective/collective_builder.hpp"
 #include "cutlass_extensions/gemm/dispatch_policy.hpp"
-#include "utils.h"
 
 using namespace cute;
 

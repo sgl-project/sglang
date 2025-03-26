@@ -18,7 +18,7 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #define THREADS_PER_BLOCK 128
 
