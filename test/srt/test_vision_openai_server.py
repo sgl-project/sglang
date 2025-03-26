@@ -624,7 +624,6 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
                 "minicpmo",
                 "--mem-fraction-static",
                 "0.7",
-                "--tp=2",
             ],
         )
         cls.base_url += "/v1"
