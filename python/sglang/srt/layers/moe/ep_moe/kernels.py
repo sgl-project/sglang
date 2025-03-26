@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def deepep_permute_triton_kernel(
     input_ptr,
-    gateup_input_ptr,
+    scales_ptr,
+    gateup_input_ptr,  # output
+    input_scales_ptr,  # output
     src2dst_ptr,
     topk_ids_ptr,
     a1_scales_ptr,
@@ -30,7 +32,7 @@ def deepep_permute_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
-
+    scales_size = hidden_size // 128
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
@@ -47,6 +49,17 @@ def deepep_permute_triton_kernel(
             if dst_idx >= 0:
                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
                 tl.store(dst_ptr + offset, in_data, mask=mask)
+
+    for start_offset in tl.range(0, scales_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < scales_size
+        scales_data = tl.load(scales_ptr + offset, mask=mask)
+
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                dst_scales_ptr = input_scales_ptr + dst_idx * scales_size
+                tl.store(dst_scales_ptr + offset, scales_data, mask=mask)
 
 
 @triton.jit

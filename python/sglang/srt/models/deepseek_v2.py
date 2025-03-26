@@ -295,10 +295,15 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
+
+            print("topk_idx ", topk_idx)
+            print("origin hidden_states ", hidden_states)
         if self.tp_size > 1:
             # block_k=self.quant_method.quant_config.weight_block_size[1]
-            x = per_token_group_quant_fp8(hidden_states, 128)
-            # hidden,scale=x
+
+            x = sglang_per_token_group_quant_fp8(hidden_states, 128)
+            hidden, scale = x
+            print("ddddd ", hidden, hidden.dtype)
             recv_hidden_states, reorder_topk_ids, seg_indptr = (
                 self.deepep_dispatcher.dispatch(
                     x,
@@ -1387,4 +1392,5 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]

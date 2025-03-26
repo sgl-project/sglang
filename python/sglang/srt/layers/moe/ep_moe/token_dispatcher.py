@@ -145,6 +145,7 @@ class DeepEPDispatcher:
     def deepep_permute(
         self,
         hidden_states,
+        hidden_scales,
         fp8_dtype=None,
         use_fp8_w8a8=False,
         use_block_quant=False,
@@ -162,10 +163,17 @@ class DeepEPDispatcher:
                 else hidden_states.dtype
             ),
         )
+        input_scales = torch.empty(
+            (int(num_total_tokens), hidden_states.shape[1] // 128),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
         # PreReorder
         deepep_permute_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
+            hidden_scales,
             gateup_input,
+            input_scales,
             src2dst,
             self.topk_idx,
             None,
@@ -174,7 +182,13 @@ class DeepEPDispatcher:
             BLOCK_SIZE=512,
         )
         self.src2dst = src2dst
-        return reorder_topk_ids, seg_indptr, gateup_input
+
+        print("gateup_input ", gateup_input)
+        print("input_scales ", input_scales)
+        print("reorder_topk_ids", reorder_topk_ids)
+        print("seg_indptr ", seg_indptr)
+
+        return reorder_topk_ids, seg_indptr, gateup_input, input_scales
 
     def dispatch(
         self,
@@ -219,8 +233,10 @@ class DeepEPDispatcher:
 
         hidden_states, hidden_scales = x if isinstance(x, tuple) else (x, None)
         if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
-                hidden_states, fp8_dtype=hidden_states.dtype
+            reorder_topk_ids, seg_indptr, hidden_states, hidden_scales = (
+                self.deepep_permute(
+                    hidden_states, hidden_scales, fp8_dtype=hidden_states.dtype
+                )
             )
         else:
             reorder_topk_ids = torch.empty(

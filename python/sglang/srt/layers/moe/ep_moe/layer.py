@@ -894,7 +894,6 @@ class DeepEPMoE(EPMoE):
                 block_shape=self.block_shape,
                 is_w13=True,
             )
-
         # Act
         down_input = torch.empty(
             gateup_output.shape[0],

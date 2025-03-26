@@ -271,6 +271,7 @@ def sglang_per_token_group_quant_fp8(
     eps: float = 1e-10,
     dtype: torch.dtype = fp8_type_,
 ):
+
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
@@ -289,7 +290,8 @@ def sglang_per_token_group_quant_fp8(
         device=x.device,
         dtype=torch.float32,
     )
-
+    if x.numel() == 0:
+        return x_q, x_s
     sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
 
     return x_q, x_s
