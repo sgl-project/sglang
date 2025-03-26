@@ -55,14 +55,13 @@ import triton
 import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from packaging.version import Version, parse
+from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
-from torch.utils.cpp_extension import CUDA_HOME
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -507,9 +506,37 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file: Union[str, bytes]):
-    from PIL import Image
+def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarray:
+    # Use soundfile here, since librosa use it under the hood,
+    # and librosa will not support audio loading in the future
+    import soundfile as sf
+    from scipy.signal import resample
 
+    # print(f"loading {audio_file}")
+    # Load audio data
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    # Convert to mono if requested and audio is stereo
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
+
+
+def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     image = image_size = None
 
     if isinstance(image_file, bytes):
@@ -727,6 +754,16 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
     format = f"[%(asctime)s{prefix}] %(message)s"
     # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
     logging.basicConfig(
@@ -994,6 +1031,13 @@ def get_amdgpu_memory_capacity():
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )
+
+
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
 
 
 def get_nvgpu_memory_capacity():
