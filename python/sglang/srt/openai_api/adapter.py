@@ -20,19 +20,16 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Any, Dict, List, Set
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-try:
-    from outlines.fsm.json_schema import convert_json_schema_to_str
-except ImportError:
-    # Before outlines 0.0.47, convert_json_schema_to_str is under
-    # outlines.integrations.utils
-    from outlines.integrations.utils import convert_json_schema_to_str
-
+from sglang.srt.code_completion_parser import (
+    generate_completion_prompt_from_request,
+    is_completion_template_defined,
+)
 from sglang.srt.conversation import (
     Conversation,
     SeparatorStyle,
@@ -40,7 +37,7 @@ from sglang.srt.conversation import (
     generate_chat_conv,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
+from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -72,7 +69,8 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.utils import get_exception_traceback
+from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -869,6 +867,7 @@ def v1_chat_generate_request(
     input_ids = []
     sampling_params_list = []
     image_data_list = []
+    audio_data_list = []
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
@@ -882,7 +881,9 @@ def v1_chat_generate_request(
         #  - prompt: The full prompt string.
         #  - stop: Custom stop tokens.
         #  - image_data: None or a list of image strings (URLs or base64 strings).
+        #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
+        strict_tag = None
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -896,6 +897,10 @@ def v1_chat_generate_request(
                     ]
                 else:
                     tools = [item.function.model_dump() for item in request.tools]
+
+                tool_call_parser = tokenizer_manager.server_args.tool_call_parser
+                parser = FunctionCallParser(request.tools, tool_call_parser)
+                strict_tag = parser.get_structure_tag()
 
             if chat_template_name is None:
                 openai_compatible_messages = []
@@ -926,7 +931,7 @@ def v1_chat_generate_request(
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
-                    #  has a different tools input format that is not compatiable
+                    #  has a different tools input format that is not compatible
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
@@ -946,11 +951,13 @@ def v1_chat_generate_request(
                     prompt_ids += encoded
                 stop = request.stop
                 image_data = None
+                audio_data = None
                 modalities = []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 prompt = conv.get_prompt()
                 image_data = conv.image_data
+                audio_data = conv.audio_data
                 modalities = conv.modalities
                 stop = conv.stop_str or []
                 if request.stop:
@@ -964,6 +971,7 @@ def v1_chat_generate_request(
             prompt_ids = request.messages
             stop = request.stop
             image_data = None
+            audio_data = None
             modalities = []
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
@@ -1004,9 +1012,26 @@ def v1_chat_generate_request(
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 request.response_format.model_dump(by_alias=True)
             )
+
+        if strict_tag is not None:
+            if (
+                sampling_params.get("regex")
+                or sampling_params.get("ebnf")
+                or sampling_params.get("structural_tag")
+                or sampling_params.get("json_schema")
+            ):
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+            else:
+                sampling_params["structural_tag"] = convert_json_schema_to_str(
+                    strict_tag.model_dump(by_alias=True)
+                )
+
         sampling_params_list.append(sampling_params)
 
         image_data_list.append(image_data)
+        audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
         if isinstance(input_ids[0], str):
@@ -1015,6 +1040,7 @@ def v1_chat_generate_request(
             prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
+        audio_data_list = audio_data_list[0]
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
@@ -1029,6 +1055,7 @@ def v1_chat_generate_request(
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
         image_data=image_data_list,
+        audio_data=audio_data_list,
         sampling_params=sampling_params_list,
         return_logprob=return_logprobs,
         logprob_start_len=logprob_start_lens,

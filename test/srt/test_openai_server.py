@@ -18,11 +18,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -541,7 +542,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
 # -------------------------------------------------------------------------
-class TestOpenAIServerEBNF(unittest.TestCase):
+class TestOpenAIServerEBNF(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -624,7 +625,7 @@ class TestOpenAIServerEBNF(unittest.TestCase):
         )
 
 
-class TestOpenAIEmbedding(unittest.TestCase):
+class TestOpenAIEmbedding(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST

@@ -34,8 +34,9 @@ runtime_common = [
     "pydantic",
     "python-multipart",
     "pyzmq>=25.1.2",
+    "soundfile==0.13.1",
     "torchao>=0.7.0",
-    "transformers==4.48.3",
+    "transformers==4.50.0",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.16",
@@ -71,7 +72,7 @@ srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "torch"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver"]
+torch_memory_saver = ["torch_memory_saver>=0.0.3"]
 test = [
     "jsonlines",
     "matplotlib",

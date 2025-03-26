@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -129,7 +130,7 @@ def check_model_scores(results):
         raise AssertionError("\n".join(failed_models))
 
 
-class TestNightlyGsm8KEval(unittest.TestCase):
+class TestNightlyGsm8KEval(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
