@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
 )
@@ -26,7 +27,7 @@ def _process_return(ret):
     return np.array(ret)
 
 
-class TestGetWeightsByName(unittest.TestCase):
+class TestGetWeightsByName(CustomTestCase):
 
     def init_hf_model(self, model_name, tie_word_embeddings):
         self.hf_model = AutoModelForCausalLM.from_pretrained(
