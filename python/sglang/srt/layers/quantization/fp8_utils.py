@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -350,6 +351,7 @@ def maybe_create_device_identity():
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/w8a8_utils.py
 # TODO(luka): follow similar pattern for marlin and block-fp8-linear
 #  https://github.com/vllm-project/vllm/issues/14397
 class Fp8LinearOp:
@@ -374,8 +376,10 @@ class Fp8LinearOp:
         # This could change in the future.
         # We also don't pad when using torch.compile,
         # as it breaks with dynamic shapes.
-        # For SGLang fp8 linear, we directly set it to 17 when cutlass_fp8_supported is False.
-        self.output_padding = 17
+        if pad_output is None:
+            enable_torch_compile = os.environ.get("SGLANG_ENABLE_TORCH_COMPILE", "0").lower() in ("1", "true", "yes")
+            pad_output = not enable_torch_compile
+        self.output_padding = 17 if pad_output else None
 
     def apply(
         self,
