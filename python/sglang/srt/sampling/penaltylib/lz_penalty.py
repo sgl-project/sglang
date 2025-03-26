@@ -45,9 +45,9 @@ def compute_reversed_consecutive_counts(E: torch.BoolTensor) -> torch.Tensor:
     return counts.int()  # shape: (num_windows,)
 
 
-def compute_ngram_penalty_stateless(W_context: torch.Tensor, 
-                                    G_vocab: torch.Tensor, 
-                                    n: int) -> torch.Tensor:
+def compute_lz_penalty_stateless(W_context: torch.Tensor, 
+                                G_vocab: torch.Tensor, 
+                                n: int) -> torch.Tensor:
     '''
     Compute the n-gram penalty for a single request.
     '''
@@ -77,10 +77,10 @@ def compute_ngram_penalty_stateless(W_context: torch.Tensor,
     return log_vocab - RP
 
 
-def compute_ngram_penalty_naive(W_context: torch.Tensor, 
-                                    G_vocab: torch.Tensor, 
-                                    Ns: int
-                                    ) -> torch.Tensor:
+def compute_lz_penalty_naive(W_context: torch.Tensor, 
+                                G_vocab: torch.Tensor, 
+                                Ns: int
+                                ) -> torch.Tensor:
     '''
     Compute the n-gram penalty for each request in the batch.
     '''
@@ -88,13 +88,13 @@ def compute_ngram_penalty_naive(W_context: torch.Tensor,
     penalties = torch.zeros(batch_size, device=W_context.device)
     for i in range(batch_size):
         n = Ns[i]
-        penalties[i] = compute_ngram_penalty_stateless(W_context[i], G_vocab, n)
+        penalties[i] = compute_lz_penalty_stateless(W_context[i], G_vocab, n)
     return penalties
 
-def compute_ngram_penalty_batched(W_context: torch.Tensor, 
-                                    G_vocab: torch.Tensor, 
-                                    n: torch.Tensor
-                                    ) -> torch.Tensor:
+def compute_lz_penalty_batched(W_context: torch.Tensor, 
+                                G_vocab: torch.Tensor, 
+                                n: torch.Tensor
+                                ) -> torch.Tensor:
     '''
     Compute the n-gram penalty for each request in the batch.
     Implemented using vectorized operations.
@@ -131,25 +131,25 @@ class BatchedLZPenalizer(_BatchedPenalizer):
 
     def _is_required(self) -> bool:
         return any(
-            req.sampling_params.ngram_penalty != 0.0
+            req.sampling_params.lz_penalty != 0.0
             for req in self.orchestrator.reqs()
         )
 
     def _prepare(self):
         # Store ngram parameters for each request
-        self.ngram_penalties = torch.tensor(
-            [req.sampling_params.ngram_penalty for req in self.orchestrator.reqs()],
+        self.lz_penalties = torch.tensor(
+            [req.sampling_params.lz_penalty for req in self.orchestrator.reqs()],
             dtype=torch.float32,
             device=self.orchestrator.device
         )
-        self.ngram_ns = torch.tensor(
-            [req.sampling_params.ngram_n for req in self.orchestrator.reqs()],
+        self.lz_buffer_sizes = torch.tensor(
+            [req.sampling_params.lz_buffer_size for req in self.orchestrator.reqs()],
             dtype=torch.long,
             device=self.orchestrator.device
         )
 
-        self.ngram_windows = torch.tensor(
-            [req.sampling_params.ngram_lookback_window for req in self.orchestrator.reqs()],
+        self.lz_lookback_sizes = torch.tensor(
+            [req.sampling_params.lz_lookback_size for req in self.orchestrator.reqs()],
             dtype=torch.long,
             device=self.orchestrator.device
         )
@@ -158,8 +158,8 @@ class BatchedLZPenalizer(_BatchedPenalizer):
         # if not, we can support this but further optimization is needed
         # to pad the context and lookbacks during the penalty computation
         self._batched = torch.all(
-            self.ngram_windows == self.ngram_windows[0]) and torch.all(
-                self.ngram_ns == self.ngram_ns[0])
+            self.lz_lookback_sizes == self.lz_lookback_sizes[0]) and torch.all(
+                self.lz_buffer_sizes == self.lz_buffer_sizes[0])
 
 
         self.Ws = []
@@ -168,19 +168,19 @@ class BatchedLZPenalizer(_BatchedPenalizer):
             self.Ws.append(
                 torch.empty(0, dtype=torch.long, device=self.orchestrator.device))
         if self._batched:
-            self.Ws = torch.cat(self.Ws, dim=0).int()
+            self.Ws = torch.stack(self.Ws, dim=0).int()
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         if self._batched:
-            w = self.Ws[0].size(0)
-            winlen = self.ngram_windows[0]
+            w = self.Ws.size(1)
+            winlen = self.lz_lookback_sizes[0]
             if w >= winlen:
                 self.Ws = torch.cat([self.Ws[:, 1:], output_ids.unsqueeze(1)], dim=1)
             else:
                 self.Ws = torch.cat([self.Ws, output_ids.unsqueeze(1)], dim=1)
         else:
             for i, _W in enumerate(self.Ws):
-                winlen = self.ngram_windows[i]
+                winlen = self.lz_lookback_sizes[i]
                 w = _W.size(0)
                 if w >= winlen:
                     self.Ws[i] = torch.cat([_W[1:], output_ids[i].unsqueeze(0)], dim=0)
@@ -194,12 +194,12 @@ class BatchedLZPenalizer(_BatchedPenalizer):
         
         # compute the penalty for each request
         if self._batched:
-            penalties = compute_ngram_penalty_batched(self.Ws, G_vocab, self.ngram_ns[0])
+            penalties = compute_lz_penalty_batched(self.Ws, G_vocab, self.lz_buffer_sizes[0])
         else:
-            penalties = compute_ngram_penalty_naive(self.Ws, G_vocab, self.ngram_ns)
+            penalties = compute_lz_penalty_naive(self.Ws, G_vocab, self.lz_buffer_sizes)
         
         # scale the penalties by the user-specified penalty weights
-        scaled_penalties = penalties * self.ngram_penalties.unsqueeze(1)
+        scaled_penalties = penalties * self.lz_penalties.unsqueeze(1)
         
         # apply the penalty to the logits
         logits.sub_(scaled_penalties)
@@ -210,19 +210,19 @@ class BatchedLZPenalizer(_BatchedPenalizer):
         # Update Ws tensor by selecting rows based on keep_indices
         self.Ws = self.Ws[keep_indices]
         # Update tensors of parameters
-        self.ngram_penalties = self.ngram_penalties[keep_indices]
-        self.ngram_ns = self.ngram_ns[keep_indices]
-        self.ngram_windows = self.ngram_windows[keep_indices]
+        self.lz_penalties = self.lz_penalties[keep_indices]
+        self.lz_buffer_sizes = self.lz_buffer_sizes[keep_indices]
+        self.lz_lookback_sizes = self.lz_lookback_sizes[keep_indices]
 
     def _merge(self, their: "BatchedLZPenalizer"):
         # Merge parameter tensors
-        self.ngram_penalties = torch.cat([self.ngram_penalties, their.ngram_penalties], dim=0)
-        self.ngram_ns = torch.cat([self.ngram_ns, their.ngram_ns], dim=0)
-        self.ngram_windows = torch.cat([self.ngram_windows, their.ngram_windows], dim=0)
+        self.lz_penalties = torch.cat([self.lz_penalties, their.lz_penalties], dim=0)
+        self.lz_buffer_sizes = torch.cat([self.lz_buffer_sizes, their.lz_buffer_sizes], dim=0)
+        self.lz_lookback_sizes = torch.cat([self.lz_lookback_sizes, their.lz_lookback_sizes], dim=0)
         # need to check the batched flag is the same for both
         self._batched = torch.all(
-            self.ngram_windows == self.ngram_windows[0]) and torch.all(
-                self.ngram_ns == self.ngram_ns[0])
+            self.lz_lookback_sizes == self.lz_lookback_sizes[0]) and torch.all(
+                self.lz_buffer_sizes == self.lz_buffer_sizes[0])
 
         if self._batched:
             self.Ws = torch.cat([self.Ws, their.Ws], dim=0)
@@ -251,7 +251,7 @@ if __name__ == "__main__":
     n = 3
     
     # Compute stateless penalty
-    stateless_result = compute_ngram_penalty_stateless(context, vocab, n)
+    stateless_result = compute_lz_penalty_stateless(context, vocab, n)
     print(f"Stateless result: {stateless_result}")
     
     # Setup for batched computation
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     batched_n = torch.tensor([n], dtype=torch.long, device=device)
     
     # Compute batched penalty
-    batched_result = compute_ngram_penalty_batched(batched_context, vocab, batched_n)
+    batched_result = compute_lz_penalty_batched(batched_context, vocab, batched_n)
     print(f"Batched result: {batched_result.squeeze()}")
     
     # Check if results match
@@ -283,12 +283,12 @@ if __name__ == "__main__":
     ns = torch.tensor([2, 3, 4], dtype=torch.long, device=device)
     
     # Compute batched penalties
-    batched_results = compute_ngram_penalty_batched(batched_contexts, vocab, ns)
+    batched_results = compute_lz_penalty_batched(batched_contexts, vocab, ns)
     print(f"Batched results shape: {batched_results.shape}")
     
     # Compare with individual stateless calculations
     for i in range(batch_size):
-        stateless_result = compute_ngram_penalty_stateless(contexts[i], vocab, ns[i].item())
+        stateless_result = compute_lz_penalty_stateless(contexts[i], vocab, ns[i].item())
         print(f"Sequence {i+1}:")
         print(f"  Stateless: {stateless_result}")
         print(f"  Batched: {batched_results[i]}")
@@ -302,13 +302,13 @@ if __name__ == "__main__":
     short_context = torch.tensor([1, 2], dtype=torch.long, device=device)
     n_large = 3
     
-    stateless_result = compute_ngram_penalty_stateless(short_context, vocab, n_large)
+    stateless_result = compute_lz_penalty_stateless(short_context, vocab, n_large)
     print(f"Short context (stateless): {stateless_result}")
     
     # Empty context
     empty_context = torch.tensor([], dtype=torch.long, device=device)
     try:
-        stateless_result = compute_ngram_penalty_stateless(empty_context, vocab, 1)
+        stateless_result = compute_lz_penalty_stateless(empty_context, vocab, 1)
         print(f"Empty context (stateless): {stateless_result}")
     except Exception as e:
         print(f"Empty context error (expected): {e}")
@@ -322,12 +322,12 @@ if __name__ == "__main__":
     n_fixed = 2
     
     # Use naive batch implementation (loop-based)
-    naive_results = compute_ngram_penalty_naive(contexts, vocab, n_fixed)
+    naive_results = compute_lz_penalty_naive(contexts, vocab, n_fixed)
     print(f"Naive batched results: {naive_results}")
     
     # Use vectorized batch implementation
     batched_n = torch.tensor([n_fixed, n_fixed], dtype=torch.long, device=device)
-    vectorized_results = compute_ngram_penalty_batched(contexts, vocab, batched_n)
+    vectorized_results = compute_lz_penalty_batched(contexts, vocab, batched_n)
     print(f"Vectorized batched results: {vectorized_results}")
     
     # Check if results match
