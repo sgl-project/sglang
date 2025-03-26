@@ -27,15 +27,15 @@ FetchContent_Declare(
     GIT_TAG        62750a2b75c802660e4894434dc55e839f322277
     GIT_SHALLOW    ON
 )
-FetchContent_Populate(repo-cutlass)
+FetchContent_MakeAvailable(repo-cutlass)
 
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        3b3783d06cd4d06ac4ba048633e604151d1ee535
+    GIT_TAG        c57699ac933a93651c34d365797c2d8b41a4765b
     GIT_SHALLOW    ON
 )
-FetchContent_Populate(repo-deepgemm)
+FetchContent_MakeAvailable(repo-deepgemm)
 
 FetchContent_Declare(
     repo-flashinfer
@@ -43,7 +43,15 @@ FetchContent_Declare(
     GIT_TAG        e5a3befbe3e63025f0158bc96b218a9c5f402ac7
     GIT_SHALLOW    OFF
 )
-FetchContent_Populate(repo-flashinfer)
+FetchContent_MakeAvailable(repo-flashinfer)
+
+FetchContent_Declare(
+    repo-flash-attention
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention
+    GIT_TAG        2f9ef0879a0935c3ca852f7a6a7b7a9c24f41e96
+    GIT_SHALLOW    OFF
+)
+FetchContent_MakeAvailable(repo-flash-attention)
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -51,8 +59,8 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
-    ${repo-flashinfer_SOURCE_DIR}/include/gemm
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    # ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -129,15 +137,19 @@ set(SOURCES
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/cublas_grouped_gemm.cu"
-    "csrc/gemm/awq_kernel.cu"
-    "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
+    "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/per_token_group_quant_fp8.cu"
-    "csrc/gemm/per_token_quant_fp8.cu"
+    "csrc/gemm/nvfp4_quant_entry.cu"
+    "csrc/gemm/nvfp4_quant_kernels.cu"
+    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
+    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
+    "csrc/gemm/per_token_group_quant_8bit.cu"
+    "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/speculative/eagle_utils.cu"
