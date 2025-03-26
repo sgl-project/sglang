@@ -245,8 +245,7 @@ class CudaGraphRunner:
                 )
             else:
                 self.encoder_lens = None
-
-            if self.enable_dp_attention:
+            if self.enable_dp_attention or self.dp_size == 1:
                 self.gathered_buffer = torch.zeros(
                     (
                         self.max_bs * self.dp_size * self.num_tokens_per_bs,
@@ -288,7 +287,7 @@ class CudaGraphRunner:
             self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.dp_size == 1:
             total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
 
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
@@ -369,7 +368,7 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
 
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.dp_size == 1:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [
@@ -471,7 +470,7 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.dp_size == 1:
             index = bisect.bisect_left(
                 self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
             )
@@ -497,7 +496,7 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.dp_size == 1:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
