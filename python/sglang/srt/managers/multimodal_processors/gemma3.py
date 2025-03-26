@@ -24,6 +24,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         self.IMAGE_TOKEN = "<start_of_image>"
         self.IM_START_TOKEN_ID = hf_config.boi_token_index
         self.IM_END_TOKEN_ID = hf_config.eoi_token_index
+        self.device = "cuda" if server_args.use_fast else None
 
     async def _process_single_image(self, images, input_text) -> dict:
         if isinstance(images, list) and len(images) == 0:
@@ -34,13 +35,14 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             images=images,
             padding=True,
             return_tensors="pt",
+            device=self.device,
             # if RGBA, this needs to be set
             # images_kwargs={
             #     "input_data_format": ChannelDimension.FIRST
             # }
         )
 
-        pixel_values = getattr(result, "pixel_values", None)
+        pixel_values = getattr(result, "pixel_values", [])
 
         return {
             "input_ids": result.input_ids,

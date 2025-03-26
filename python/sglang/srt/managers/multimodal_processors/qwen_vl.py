@@ -1,6 +1,4 @@
-import asyncio
 import math
-import time
 from typing import List, Union
 
 import torch
@@ -33,13 +31,18 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
+        self.use_fast = server_args.use_fast
 
-    @staticmethod
-    def _process_images_task(images, input_text, _hf_config):
+    async def _process_single_image(self, images, input_text):
         if isinstance(images, list) and len(images) == 0:
             images = None
+        kwargs = {"device": "cuda"} if self.use_fast else {}
         result = get_global_processor().__call__(
-            text=[input_text], images=images, padding=True, return_tensors="pt"
+            text=[input_text],
+            images=images,
+            padding=True,
+            return_tensors="pt",
+            **kwargs,
         )
 
         return {
@@ -50,19 +53,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "video_grid_thws": getattr(result, "video_grid_thws", None),
         }
 
-    async def _process_single_image(self, images, input_text) -> dict:
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                self.executor,
-                Qwen2_5VLImageProcessor._process_images_task,
-                images,
-                input_text,
-                self.hf_config,
-            )
-        else:
-            return self._process_images_task(images, input_text, self.hf_config)
-
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -72,7 +62,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        start = time.time()
         if not image_data:
             return None
         if isinstance(image_data, str):

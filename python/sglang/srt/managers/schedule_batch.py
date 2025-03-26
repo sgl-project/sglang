@@ -258,7 +258,14 @@ class MultimodalInputs:
             assert (
                 self.pixel_values.shape[1:] == other.pixel_values.shape[1:]
             ), f"{self.pixel_values.shape[1:]} vs {other.pixel_values.shape[1:]}"
-            self.pixel_values = np.concatenate([self.pixel_values, other.pixel_values])
+            if isinstance(self.pixel_values, np.ndarray):
+                self.pixel_values = np.concatenate(
+                    [self.pixel_values, other.pixel_values]
+                )
+            else:
+                self.pixel_values = torch.concatenate(
+                    [self.pixel_values, other.pixel_values]
+                )
 
         # args would be stacked along first dim
         # usually these are already tensors

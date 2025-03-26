@@ -89,6 +89,7 @@ class BaseMultimodalProcessor(ABC):
             server_args.tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
+            use_fast=server_args.use_fast,
         )
 
     @abstractmethod

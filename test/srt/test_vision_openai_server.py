@@ -487,6 +487,28 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
+class TestQwen2VLServerUseFast(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "qwen2-vl",
+                "--mem-fraction-static",
+                "0.4",
+                "--use-fast",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 class TestQwen2_5_VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -503,6 +525,28 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
                 "qwen2-vl",
                 "--mem-fraction-static",
                 "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
+class TestQwen2_5_VLServerUseFast(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--chat-template",
+                "qwen2-vl",
+                "--mem-fraction-static",
+                "0.4",
+                "--use-fast",
             ],
         )
         cls.base_url += "/v1"
