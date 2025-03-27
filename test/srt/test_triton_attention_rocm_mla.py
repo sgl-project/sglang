@@ -11,9 +11,10 @@ from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
 )
 from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTritonAttentionMLA(unittest.TestCase):
+class TestTritonAttentionMLA(CustomTestCase):
 
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""

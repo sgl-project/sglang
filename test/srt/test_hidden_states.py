@@ -5,10 +5,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
 from sglang.srt.utils import get_device
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-class TestHiddenState(unittest.TestCase):
+class TestHiddenState(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = get_device()

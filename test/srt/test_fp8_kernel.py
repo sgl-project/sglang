@@ -7,9 +7,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 from sglang.srt.utils import get_device
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestFP8Base(unittest.TestCase):
+class TestFP8Base(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.M = 256
