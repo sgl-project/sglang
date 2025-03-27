@@ -59,12 +59,7 @@ class RadixAttention(nn.Module):
         self.v_scale_float = None
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-
-        else:
-            self.quant_method = UnquantizedLinearMethod()
-
-        assert self.quant_method is not None
-        self.quant_method.create_weights(self)
+            self.quant_method.create_weights(self)
 
     def forward(
         self,
