@@ -21,6 +21,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 
 - See [hyperparameter tuning](hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+- For docker and Kubernetes runs, you need to set up shared memory which is used for communication between processes. See `--shm-size` for docker and `/dev/shm` size update for Kubernetes manifests.
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 
 ```bash
