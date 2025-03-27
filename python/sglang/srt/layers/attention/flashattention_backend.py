@@ -57,6 +57,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.page_size = model_runner.page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
@@ -78,6 +79,11 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
+        # Precompute strided indices
+        # [0, page_size, 2 * page_size, ...]
+        self.strided_indices = torch.arange(
+            0, metadata.page_table.shape[1], self.page_size, device=device
+        )
         if forward_batch.forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -132,11 +138,24 @@ class FlashAttentionBackend(AttentionBackend):
         )
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+        key_cache = key_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        value_cache = value_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        )
+
+        if self.page_size > 1:
+            page_table = metadata.page_table[:, self.strided_indices] // self.page_size
+        else:
+            page_table = metadata.page_table
+
         o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k_cache=key_cache.unsqueeze(1),
-            v_cache=value_cache.unsqueeze(1),
-            page_table=metadata.page_table,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
             cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -191,11 +210,28 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         # Run attention with precomputed values
+        # import time
+        # start = time.time()
+        key_cache = key_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        value_cache = value_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        )
+
+        if self.page_size > 1:
+            page_table = metadata.page_table[:, self.strided_indices] // self.page_size
+        else:
+            page_table = metadata.page_table
+        # end = time.time()
+        # print(f"page_table time: {(end - start) * 1000 * 1000} us")
+
+        # torch.distributed.breakpoint()
         o = flash_attn_with_kvcache(
             q=q_reshaped,
-            k_cache=key_cache.unsqueeze(1),
-            v_cache=value_cache.unsqueeze(1),
-            page_table=metadata.page_table,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
             cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -208,6 +244,8 @@ class FlashAttentionBackend(AttentionBackend):
             v_descale=layer.v_scale,
         )
 
+        # cuda_end = time.time()
+        # print(f"cuda time: {(cuda_end - end) * 1000 * 1000 } us")
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
