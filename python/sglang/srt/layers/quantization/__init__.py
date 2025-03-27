@@ -9,7 +9,6 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
@@ -33,14 +32,15 @@ except ImportError:
     class DummyConfig:
         pass
 
-    AQLMConfig = AWQConfig = AWQMarlinConfig = BitsAndBytesConfig = (
-        CompressedTensorsConfig
-    ) = DummyConfig
+    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+        DummyConfig
+    )
     DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
         GPTQMarlin24Config
     ) = DummyConfig
     MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
+from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
