@@ -1316,7 +1316,10 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
-    import vllm.distributed.parallel_state as vllm_parrlel_state
+    try:
+        import vllm.distributed.parallel_state as vllm_parrlel_state
+    except ImportError:
+        return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:
