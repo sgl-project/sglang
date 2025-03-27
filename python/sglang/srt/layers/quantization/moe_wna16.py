@@ -4,7 +4,6 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
