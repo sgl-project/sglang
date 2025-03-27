@@ -4,19 +4,13 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
+      - "python/**"
       - "test/**"
-      - "docs/**"
-      - "scripts/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
+      - "python/**"
       - "test/**"
-      - "docs/**"
-      - "scripts/**"
   workflow_dispatch:
     inputs:
       version:
