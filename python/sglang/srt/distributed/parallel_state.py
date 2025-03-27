@@ -464,38 +464,11 @@ class GroupCoordinator:
         output: torch.Tensor, 
         input_list: List[torch.Tensor],
     ) -> None:
-
-        # NOTE: different backends support different features.
-        # pynccl: even scatter
-        # torch.dist:
-        #   reduce_scatter: uneven scatter
-        #   reduce_scatter_tensor: even scatter
-        """
-        total_size = input_.size(0)
-        if split_size_or_sections is None:
-            if total_size % self.world_size != 0:
-                split_size_or_sections = [total_size // self.world_size + (1 if i < total_size % self.world_size else 0) for i in range(self.world_size)]
-            else:
-                split_size_or_sections = [total_size // self.world_size] * self.world_size
-            assert sum(split_size_or_sections) == total_size
-        
-        if isinstance(split_size_or_sections, list):
-            input_list = list(torch.tensor_split(input_, split_size_or_sections, dim=0))
-            if len(input_list) != self.world_size:
-                raise ValueError("Number of splits must match world size")
-        elif isinstance(split_size_or_sections, int):
-            # todo
-            pass
-        else:
-            raise ValueError("split_size_or_sections must be int or list of ints")
-        """
+        # TODO(ch-wan): support other backends
         output = input_list[self.rank_in_group]
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
-
         return output
 
-
-        
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -512,21 +485,6 @@ class GroupCoordinator:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
-
-    # def all_gather_into_tensor(self, input_: torch.Tensor, shapes: list):
-    #     output_list = [torch.zeros(shape, dtype=input_.dtype, device=input_.device) for shape in shapes]
-    #     torch.distributed.all_gather(output_list, input_, group = self.device_group)
-    #     output = torch.cat(output_list, dim=0)
-    #     return output
-
-    # def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-    #     #if not supports_custom_op():
-    #     #    self._all_gather_into_tensor(output, input)
-    #     #else:
-    #     #    torch.ops.sglang.reg_all_gather_into_tensor(
-    #     #        output, input, group_name=self.unique_name
-    #     #    )
-    
 
     def all_gather(
         self, 

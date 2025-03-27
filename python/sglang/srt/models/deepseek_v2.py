@@ -1176,10 +1176,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.attn_tp_size != 1:
-            # TODO(ch-wan) supports the case where attn_dp_size != attn_tp_size
-            # can we reuse the buffer from dp attn?
             if self.input_is_scattered:
-                # TODO(ch-wan): use gathered_buffer
                 tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
                 hidden_states = tensor_list[self.attn_tp_rank]
                 tp_reduce_scatter(hidden_states, tensor_list)

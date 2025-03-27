@@ -59,7 +59,7 @@ class TestDPAttn(unittest.TestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "8",
+                "2",
                 "--dp",
                 "2",
                 "--enable-dp-attention",

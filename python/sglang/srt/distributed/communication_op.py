@@ -15,12 +15,10 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
 def tensor_model_parallel_reduce_scatter(
     input_: torch.Tensor, 
-    split_size_or_sections: Optional[Union[int, List[int]]] = None
 ) -> torch.Tensor:
     """Reduce-scatter the input tensor across model parallel group."""
     # TODO(ch-wan)
     pass
-    # return get_tp_group().reduce_scatter(input_, split_size_or_sections)
 
 
 def tensor_model_parallel_all_gather(
