@@ -46,6 +46,13 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+FetchContent_Declare(
+    repo-flash-attention
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention
+    GIT_TAG        2f9ef0879a0935c3ca852f7a6a7b7a9c24f41e96
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention)
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -54,6 +61,7 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -152,6 +160,9 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
 )
 
 # Support abi3 for build
