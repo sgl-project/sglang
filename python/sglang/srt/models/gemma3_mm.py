@@ -268,6 +268,12 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
+    def get_attention_sliding_window_size(self):
+        """
+        This value is used to initialize attention backends in `ForwardBatch`.
+        """
+        return self.language_model.get_attention_sliding_window_size()
+
     def get_image_feature(self, image_input: MultimodalInputs):
         """
         Projects the last hidden state from the vision model into language model space.

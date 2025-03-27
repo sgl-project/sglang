@@ -12,7 +12,7 @@ def _top_k_renorm_probs_internal(
     probs = probs.float()
     maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
     renorm_probs = torch.empty_like(probs)
-    torch.ops.sgl_kernel.top_k_renorm_probs_wrapper(
+    torch.ops.sgl_kernel.top_k_renorm_probs(
         probs,
         renorm_probs,
         maybe_top_k_arr,
