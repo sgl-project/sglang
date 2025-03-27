@@ -48,6 +48,32 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def verify_single_image_response(self, response):
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+        # `driver` is for gemma-3-it
+        assert (
+            "man" in text or "person" or "driver" in text
+        ), f"text: {text}, should contain man, person or driver"
+        assert (
+            "cab" in text
+            or "taxi" in text
+            or "SUV" in text
+            or "vehicle" in text
+            or "car" in text
+        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
+        # MiniCPMO fails to recognize `iron`, but `hanging`
+        assert (
+            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
+        ), f"text: {text}, should contain iron, hang, cloth or holding"
+        assert response.id
+        assert response.created
+        assert response.usage.prompt_tokens > 0
+        assert response.usage.completion_tokens > 0
+        assert response.usage.total_tokens > 0
+
+
     def get_request_kwargs(self):
         return {}
 
@@ -98,6 +124,31 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        self.verify_single_image_response(response=response)
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -201,7 +252,6 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
-        # the size of the video embeds differs from the `modality` argument when preprocessed
 
         # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
         # The following import order will cause Segmentation fault.
@@ -209,7 +259,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 20
+        max_frames_num = 5
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(

@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 import math
-import re
 from typing import Dict, List, Union
 
 import torch
@@ -14,28 +15,35 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen2_5_omni import Qwen2_5OmniModel
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
 
-# Compatible with Qwen2VL and Qwen2_5VL
+# Compatible with Qwen2VL, Qwen2_5VL and Qwen2_5_o
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5OmniModel,
+    ]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         # The single, pre-expanded image token.
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
-        # The regex that matches expanded image tokens.
-        self.IMAGE_TOKEN_REGEX = re.compile(
-            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-        )
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
-        self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
+        if self.arch == Qwen2_5OmniModel.__name__:
+            self.image_token_id = hf_config.thinker_config.image_token_index
+            self.image_start_id = hf_config.thinker_config.vision_start_token_id
+            self.image_end_id = hf_config.thinker_config.vision_end_token_id
+            self.audio_token_id = hf_config.thinker_config.audio_token_index
+            self.audio_start_id = hf_config.thinker_config.audio_start_token_id
+            self.audio_end_id = hf_config.thinker_config.audio_end_token_id
+            self.video_token_id = hf_config.thinker_config.video_token_index
+        else:
+            self.image_token_id = hf_config.image_token_id
+            self.image_start_id = hf_config.vision_start_token_id
+            self.image_end_id = hf_config.vision_end_token_id
+            self.video_token_id = hf_config.video_token_id
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
@@ -57,9 +65,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
+            audio_data=request_obj.audio_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.IMAGE_TOKEN,
-                image_token_regex=self.IMAGE_TOKEN_REGEX,
+                image_token=self.image_token_id,
+                audio_token=getattr(self, "audio_token_id", None),
+                video_token=getattr(self, "video_token_id", None),
             ),
             max_req_input_len=max_req_input_len,
         )
@@ -130,6 +140,17 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
+        ret = self.process_mm_data(
+            input_text=base_output.input_text,
+            images=None if images_are_preprocessed else base_output.images,
+            audio=base_output.audios,
+        )
+        input_ids = ret["input_ids"].flatten().tolist()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+        )
+
+        image_grid_thw = None
         video_grid_thw = None  # TODO
 
         combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
@@ -141,28 +162,57 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         video_grid_thw = None  # TODO
         second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=self.hf_config.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
-            input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=combined_mm_item.image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-        )
+        if "input_features" in ret and ret["input_features"] is not None:
+            item = MultimodalDataItem(
+                audio_features=ret["input_features"],
+                feature_attention_mask=ret["feature_attention_mask"],
+                attention_mask=ret["attention_mask"],
+                modality=Modality.AUDIO,
+            )
+            items += [item]
+
+        if self.hf_config.model_type == "qwen2_5_omni":
+            feature_attention_mask = ret.get("feature_attention_mask", None)
+            if feature_attention_mask is not None:
+                audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            else:
+                audio_feature_lengths = None
+            mrope_positions, mrope_position_delta = (
+                MRotaryEmbedding.get_rope_index_omni(
+                    input_ids=torch.tensor(input_ids).unsqueeze(0),
+                    config=self.hf_config.thinker_config,
+                    image_grid_thw=ret.get("image_grid_thw", None),
+                    video_grid_thw=ret.get("video_grid_thw", None),
+                    audio_seqlens=audio_feature_lengths,
+                    second_per_grids=ret.get("second_per_grids", None),
+                )
+            )
+        else:
+            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                image_token_id=self.IM_TOKEN_ID,
+                video_token_id=self.VIDEO_TOKEN_ID,
+                vision_start_token_id=self.image_start_id,
+                model_type=self.hf_config.model_type,
+                tokens_per_second=getattr(
+                    self.hf_config.vision_config, "tokens_per_second", None
+                ),
+                input_ids=input_ids.unsqueeze(0),
+                image_grid_thw=combined_mm_item.image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+            )
         mrope_positions = mrope_positions.squeeze(1)
 
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": [combined_mm_item],
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_start_id": self.image_start_id,
+            "im_end_id": self.image_end_id,
             "im_token_id": self.IM_TOKEN_ID,
+            "audio_start_id": getattr(self, "audio_start_id", None),
+            "audio_end_id": getattr(self, "audio_end_id", None),
+            "audio_token_id": getattr(self, "audio_token_id", None),
             "video_token_id": self.VIDEO_TOKEN_ID,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
