@@ -276,18 +276,13 @@ class FlashAttentionBackend(AttentionBackend):
         # """Initialize forward metadata for replaying CUDA graph."""
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        # If we need both CPU and GPU versions, keep CPU operations on CPU
-        # and GPU operations on GPU to minimize transfers
-
         # For CPU operations
         max_len = max(seq_lens_cpu[:bs])
-        metadata.max_seq_len_k = max_len  # Single CPU->GPU transfer
+        metadata.max_seq_len_k = max_len
 
-        # For GPU operations - avoid unnecessary CPU->GPU transfers
+        # For GPU operations
         seq_lens_in_batch = seq_lens[:bs]
-        metadata.cache_seqlens_int32 = seq_lens_in_batch.to(
-            torch.int32
-        )  # Direct GPU reference, no transfer
+        metadata.cache_seqlens_int32 = seq_lens_in_batch.to(torch.int32)
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
