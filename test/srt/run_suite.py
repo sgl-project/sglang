@@ -23,16 +23,12 @@ suites = {
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
         TestFile("test_abort.py", 51),
-        TestFile("test_awq.py"),
         TestFile("test_block_int8.py", 22),
         TestFile("test_chunked_prefill.py", 336),
         TestFile("test_eagle_infer.py", 447),
         TestFile("test_ebnf_constrained.py"),
         TestFile("test_fp8_kernel.py", 2),
         TestFile("test_embedding_openai_server.py", 36),
-        TestFile("test_expert_distribution.py", 31),
-        TestFile("test_gguf.py", 78),
-        TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 1),
         TestFile("test_input_embeddings.py", 38),
@@ -81,6 +77,12 @@ suites = {
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "vllm_dependency_test": [
+        TestFile("test_vllm_dependency.py"),
+        TestFile("test_awq.py"),
+        TestFile("test_gguf.py", 78),
+        TestFile("test_gptqmodel_dynamic.py", 72),
     ],
 }
 
