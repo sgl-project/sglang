@@ -1092,6 +1092,12 @@ class Scheduler(SchedulerOutputProcessorMixin):
                 self.running_batch.batch_is_full = True
                 break
 
+            if prefix_computed:
+                # recompute prefix if last node reference is dangling
+                prefix_computed = not (
+                    req.last_node.dangling or req.last_node_global.dangling
+                )
+
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
                 self.enable_hierarchical_cache,

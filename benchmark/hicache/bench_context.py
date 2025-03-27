@@ -1,21 +1,18 @@
 import json
 import queue
 import time
+
 import requests
-from tqdm.asyncio import tqdm
-
-from sglang.bench_serving import (
-    get_tokenizer,
-)
-
-
 from bench_multiturn import (
-    parse_args,
-    gen_payload,
     ReadyQueue,
     WorkloadGenerator,
+    gen_payload,
     log_to_jsonl_file,
+    parse_args,
 )
+from tqdm.asyncio import tqdm
+
+from sglang.bench_serving import get_tokenizer
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):

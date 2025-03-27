@@ -327,7 +327,7 @@ class WorkloadGenerator:
                 self.client_records[client_id]["history"] += response.generated_text
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
-                self.performance_metricsp["itl"].extend(response.itl)
+                self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.completed_requests += 1
 
@@ -444,9 +444,9 @@ if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]:
+    for request_rate in [32, 16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]:
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
-        log_to_jsonl_file(performance_data, args.logfile)
+        log_to_jsonl_file(performance_data, args.log_file)

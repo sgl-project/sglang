@@ -53,6 +53,9 @@ class TreeNode:
         # store the host indices of KV cache
         self.host_value = None
 
+        # indicating the node is removed from the tree but may still be referenced
+        self.dangling = False
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -416,6 +419,7 @@ class RadixCache(BasePrefixCache):
                 break
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
+        node.dangling = True
 
     def _total_size_helper(self):
         total_size = 0

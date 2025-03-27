@@ -225,6 +225,7 @@ class HiRadixCache(RadixCache):
                 if v == x:
                     break
             del x.parent.children[k]
+            x.dangling = True
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
