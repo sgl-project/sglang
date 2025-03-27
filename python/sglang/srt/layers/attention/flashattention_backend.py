@@ -277,7 +277,7 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         # For CPU operations
-        max_len = max(seq_lens_cpu[:bs])
+        max_len = seq_lens_cpu[:bs].max().item()
         metadata.max_seq_len_k = max_len
 
         # For GPU operations

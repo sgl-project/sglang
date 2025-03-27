@@ -1373,7 +1373,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            decode_seq_lens = self.seq_lens.cpu()
+            if (
+                global_server_args_dict["enable_flashinfer_mla"]
+                or global_server_args_dict["enable_flashmla"]
+                or global_server_args_dict["attention_backend"] == "fa3"
+            ):
+                decode_seq_lens = self.seq_lens.cpu()
+            else:
+                decode_seq_lens = None
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             decode_seq_lens = None
