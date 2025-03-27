@@ -119,7 +119,7 @@ class TpModelWorkerClient:
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2
-
+        print(f"!!! 111 forward_thread_func_")
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
@@ -169,7 +169,9 @@ class TpModelWorkerClient:
             self.output_queue.put((copy_done, logits_output, next_token_ids))
 
     def resolve_batch_result(self, bid: int):
+        print(f"!!! 111 resolve_batch_result")
         copy_done, logits_output, next_token_ids = self.output_queue.get()
+        print(f"!!! 222 resolve_batch_result")
         copy_done.synchronize()
         self.launch_done.wait()
 
