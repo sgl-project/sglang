@@ -355,7 +355,6 @@ class CudaGraphRunner:
                 save_gemlite_cache()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
-        print(f"capture one batch size: {bs}")
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -422,7 +421,6 @@ class CudaGraphRunner:
         )
 
         if self.model_runner.server_args.lora_paths is not None:
-            print(f"prepare lora batch in capture: {forward_batch.lora_paths}")
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
