@@ -82,6 +82,7 @@ class BenchArgs:
     output_len: Tuple[int] = (16,)
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
+    lz_penalty: float = 0.0
     # This is only used for correctness test
     cut_len: int = 4
     profile: bool = False
@@ -95,6 +96,9 @@ class BenchArgs:
         )
         parser.add_argument(
             "--input-len", type=int, nargs="+", default=BenchArgs.input_len
+        )
+        parser.add_argument(
+            "--lz-penalty", type=float, default=BenchArgs.lz_penalty
         )
         parser.add_argument(
             "--output-len", type=int, nargs="+", default=BenchArgs.output_len
@@ -168,6 +172,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
+        lz_penalty=bench_args.lz_penalty,
     )
 
     reqs = []

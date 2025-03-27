@@ -94,6 +94,9 @@ def gen(
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
+    lz_penalty: Optional[float] = 0.0,
+    lz_buffer_size: Optional[int] = 32,
+    lz_lookback_size: Optional[int] = 512,
 ):
     """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
 
@@ -133,6 +136,9 @@ def gen(
         dtype,
         regex,
         json_schema,
+        lz_penalty,
+        lz_buffer_size,
+        lz_lookback_size,
     )
 
 

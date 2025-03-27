@@ -37,6 +37,10 @@ class SglSamplingParams:
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
     regex: Optional[str] = None
+    # for n-gram penalty
+    lz_penalty: Optional[float] = 0.0
+    lz_buffer_size: Optional[int] = 32
+    lz_lookback_size: Optional[int] = 512
 
     def clone(self):
         return SglSamplingParams(
@@ -57,6 +61,11 @@ class SglSamplingParams:
             self.top_logprobs_num,
             self.return_text_in_logprobs,
             self.json_schema,
+            self.dtype,
+            self.regex,
+            self.lz_penalty,
+            self.lz_buffer_size,
+            self.lz_lookback_size,
         )
 
     def to_openai_kwargs(self):
@@ -132,6 +141,9 @@ class SglSamplingParams:
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
+            "lz_penalty": self.lz_penalty,
+            "lz_buffer_size": self.lz_buffer_size,
+            "lz_lookback_size": self.lz_lookback_size,
         }
 
 
@@ -175,6 +187,9 @@ class SglFunction:
         stream: bool = False,
         backend=None,
         use_thread: bool = True,
+        lz_penalty: Optional[float] = None,
+        lz_buffer_size: Optional[int] = None,
+        lz_lookback_size: Optional[int] = None,
         **kwargs,
     ):
         from sglang.lang.interpreter import run_program
@@ -201,6 +216,9 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            lz_penalty=lz_penalty,
+            lz_buffer_size=lz_buffer_size,
+            lz_lookback_size=lz_lookback_size,
         )
         backend = backend or global_config.default_backend
         return run_program(
@@ -236,6 +254,9 @@ class SglFunction:
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
         generator_style: bool = False,
+        lz_penalty: Optional[float] = None,
+        lz_buffer_size: Optional[int] = None,
+        lz_lookback_size: Optional[int] = None,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -278,6 +299,9 @@ class SglFunction:
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             return_text_in_logprobs=return_text_in_logprobs,
+            lz_penalty=lz_penalty,
+            lz_buffer_size=lz_buffer_size,
+            lz_lookback_size=lz_lookback_size,
         )
         backend = backend or global_config.default_backend
         return run_program_batch(
@@ -465,6 +489,9 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        lz_penalty: Optional[float] = None,
+        lz_buffer_size: Optional[int] = None,
+        lz_lookback_size: Optional[int] = None,
     ):
         """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
         super().__init__()
@@ -489,6 +516,9 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
             json_schema=json_schema,
+            lz_penalty=lz_penalty,
+            lz_buffer_size=lz_buffer_size,
+            lz_lookback_size=lz_lookback_size,
         )
 
     def __repr__(self):

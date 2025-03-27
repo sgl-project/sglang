@@ -49,6 +49,9 @@ class SamplingParams:
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
+        lz_penalty: float = 0.0,
+        lz_buffer_size: int = 32,
+        lz_lookback_size: int = 512,
         custom_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
@@ -75,6 +78,12 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
+        self.lz_penalty = lz_penalty
+        self.lz_buffer_size = lz_buffer_size
+        self.lz_lookback_size = lz_lookback_size
+
+        print('sampling params init')
+        print("temperature: ", self.temperature)
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -106,6 +115,12 @@ class SamplingParams:
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
+
+        if not 0.0 <= self.lz_penalty <= 2.0:
+            raise ValueError(
+                "lz_penalty must be in [0, 2], got " f"{self.lz_penalty}."
+            )
+
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
                 "repetition_penalty must be in [0, 2], got "
@@ -151,3 +166,4 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+        

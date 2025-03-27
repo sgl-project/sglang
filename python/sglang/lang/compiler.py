@@ -1,7 +1,7 @@
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from typing import List, Union
+from typing import List, Union, Optional
 
 from sglang.global_config import global_config
 from sglang.lang.interpreter import ProgramState, StreamExecutor, cache_program
@@ -124,15 +124,18 @@ class CompiledFunction:
 
     def run(
         self,
-        *,
+        *args,
         max_new_tokens: int = 128,
-        stop: Union[str, List[str]] = (),
+        stop: Optional[Union[str, List[str]]] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        lz_penalty: Optional[float] = 0.0,
+        lz_buffer_size: Optional[int] = 32,
+        lz_lookback_size: Optional[int] = 512,
         backend=None,
         **kwargs,
     ):
@@ -149,6 +152,9 @@ class CompiledFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            lz_penalty=lz_penalty,
+            lz_buffer_size=lz_buffer_size,
+            lz_lookback_size=lz_lookback_size,
         )
 
         return self.run_internal(backend, kwargs, default_sampling_para)
@@ -165,6 +171,9 @@ class CompiledFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        lz_penalty: Optional[float] = 0.0,
+        lz_buffer_size: Optional[int] = 32,
+        lz_lookback_size: Optional[int] = 512,
         backend=None,
         num_threads: Union[str, int] = "auto",
     ):
@@ -184,6 +193,9 @@ class CompiledFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            lz_penalty=lz_penalty,
+            lz_buffer_size=lz_buffer_size,
+            lz_lookback_size=lz_lookback_size,
         )
 
         # Extract prefix by tracing and cache it
