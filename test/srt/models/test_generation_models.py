@@ -33,7 +33,7 @@ from sglang.test.runners import (
     SRTRunner,
     check_close_model_outputs,
 )
-from sglang.test.test_utils import is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
 @dataclasses.dataclass
@@ -71,7 +71,7 @@ ALL_OTHER_MODELS = [
 TORCH_DTYPES = [torch.float16]
 
 
-class TestGenerationModels(unittest.TestCase):
+class TestGenerationModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
