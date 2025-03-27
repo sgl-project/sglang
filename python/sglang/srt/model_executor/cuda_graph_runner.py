@@ -257,6 +257,8 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
+            if self.model_runner.server_args.lora_paths is not None:
+                self.lora_paths = [None] * self.max_bs
 
         # Capture
         try:
@@ -353,6 +355,7 @@ class CudaGraphRunner:
                 save_gemlite_cache()
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        print(f"capture one batch size: {bs}")
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -391,7 +394,10 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
-
+        if self.model_runner.server_args.lora_paths is not None:
+            lora_paths = self.lora_paths[:bs]
+        else:
+            lora_paths = None
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -412,7 +418,12 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            lora_paths=lora_paths,
         )
+
+        if self.model_runner.server_args.lora_paths is not None:
+            print(f"prepare lora batch in capture: {forward_batch.lora_paths}")
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -444,6 +455,8 @@ class CudaGraphRunner:
             out = run_once()
 
         global_graph_memory_pool = graph.pool()
+        print(f"bs: {bs}, out: {out}")
+
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -499,6 +512,9 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if self.enable_dp_attention:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+        if self.model_runner.server_args.lora_paths is not None:
+            self.lora_paths[:raw_bs] = forward_batch.lora_paths
+            print(f"replay lora paths: {self.lora_paths[:raw_bs]}")
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
@@ -523,6 +539,7 @@ class CudaGraphRunner:
     def replay(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
+        print(f"before replay, self.output_buffers: {self.output_buffers}")
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch)
         else:
@@ -532,12 +549,13 @@ class CudaGraphRunner:
 
         # Replay
         self.graphs[self.bs].replay()
+        print(f"self.bs: {self.bs}")
+        print(f"self.output_buffers: {self.output_buffers}")
         next_token_logits, hidden_states = self.output_buffers[self.bs]
-
         logits_output = LogitsProcessorOutput(
-            next_token_logits=next_token_logits[: self.raw_num_token],
+            next_token_logits=next_token_logits[: self.raw_num_token].clone(),
             hidden_states=(
-                hidden_states[: self.raw_num_token]
+                hidden_states[: self.raw_num_token].clone()
                 if hidden_states is not None
                 else None
             ),

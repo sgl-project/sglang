@@ -133,10 +133,6 @@ class LoRAManager:
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
 
-        # FIXME: Handle lora uid with None more safely
-        if cur_uids == set([None]):
-            return
-
         # set up batch info shared by all lora moruldes
         bs = forward_batch.batch_size
         seg_lens = (
