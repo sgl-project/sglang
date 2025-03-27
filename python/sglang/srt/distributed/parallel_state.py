@@ -438,10 +438,10 @@ class GroupCoordinator:
             pynccl_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
-    
+
     def reduce_scatter(
-        self, 
-        output: torch.Tensor, 
+        self,
+        output: torch.Tensor,
         input_list: List[torch.Tensor],
     ) -> None:
         # TODO(ch-wan): support other backends
@@ -457,7 +457,7 @@ class GroupCoordinator:
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )
-    
+
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if not supports_custom_op():
             self._all_gather_into_tensor(output, input)
@@ -467,20 +467,22 @@ class GroupCoordinator:
             )
 
     def all_gather(
-        self, 
-        input_: torch.Tensor, 
+        self,
+        input_: torch.Tensor,
         dim: int = -1,
-        tensor_list: List[torch.Tensor] = None
+        tensor_list: List[torch.Tensor] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        
+
         if tensor_list is not None:
             # TODO(ch-wan): support other backends
-            return torch.distributed.all_gather(tensor_list, input_, group=self.device_group)
-        
+            return torch.distributed.all_gather(
+                tensor_list, input_, group=self.device_group
+            )
+
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"

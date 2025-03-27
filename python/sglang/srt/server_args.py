@@ -294,7 +294,9 @@ class ServerArgs:
         # DeepEP MoE
         if self.enable_deepep_moe:
             self.ep_size = self.tp_size
-            self.enable_sp_layernorm = self.dp_size < self.tp_size if self.enable_dp_attention else True
+            self.enable_sp_layernorm = (
+                self.dp_size < self.tp_size if self.enable_dp_attention else True
+            )
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
