@@ -290,7 +290,7 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
-        
+
         self.enable_sp_layernorm = False
         # DeepEP MoE
         if self.enable_deepep_moe:
