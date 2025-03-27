@@ -7,6 +7,8 @@
 #include <cuda_bf16.h>
 #endif
 
+#include "nv_math_def.h"
+
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;
@@ -166,7 +168,12 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 // Single instruction dual-channel operation
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
+#if defined(CUDA_VERSION) && CUDA_VERSION <= 12020
+      weight_vec[i] = __half22bfloat162(__hmul2(
+          __hsub2(__bfloat1622half2(weight_vec[i]), __bfloat1622half2(zero_vec[i])), __bfloat1622half2(scale_vec[i])));
+#else
       weight_vec[i] = __hmul2(__hsub2(weight_vec[i], zero_vec[i]), scale_vec[i]);
+#endif
     }
 
     // Directly store to OutputT array (guaranteed contiguous memory)
