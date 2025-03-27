@@ -232,6 +232,10 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
+        # set load_format to BNB when quantization is detected from HF config
+        if self.model_config.quantization == "bitsandbytes":
+            self.server_args.load_format = "bitsandbytes"
+
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
