@@ -18,9 +18,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server import Engine
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 
 
@@ -39,11 +41,26 @@ class VerlEngine:
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
 
-        if first_rank_in_node:
+        if first_rank_in_node and "launch_server" not in kwargs:
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
             self._engine = Engine(
                 **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
             )
+        elif "launch_server" in kwargs and kwargs["launch_server"]:
+            del kwargs["launch_server"]
+            if "server_args" in kwargs:
+                # Directly load server_args
+                server_args = kwargs["server_args"]
+            else:
+                # Construct server_args from kwargs
+                if "log_level" not in kwargs:
+                    # Do not print logs by default
+                    kwargs["log_level"] = "error"
+                server_args = ServerArgs(**kwargs)
+            if self._tp_rank == 0:
+                self._engine = HttpServerEngineAdapter(server_args)
+            else:
+                self._engine = None
         else:
             self._engine = None
 

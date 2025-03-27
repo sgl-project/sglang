@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -402,6 +403,32 @@ async def init_weights_update_group(
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+def deserialize_from_http(encoded_data):
+    import base64
+    import pickle
+
+    # Convert from base64 string back to original data
+    pickled = base64.b64decode(encoded_data)
+    return pickle.loads(pickled)
+
+
+@app.post("/update_weights_from_tensor")
+async def update_weights_from_tensor(
+    obj: UpdateWeightsFromTensorReqInput, request: Request
+):
+    obj.serialized_named_tensors = [
+        deserialize_from_http(item) for item in obj.serialized_named_tensors
+    ]
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
     content = {"success": success, "message": message}
