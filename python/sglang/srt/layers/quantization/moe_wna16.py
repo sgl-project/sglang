@@ -9,12 +9,12 @@ from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.utils import check_marlin_supports_layer
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
@@ -62,7 +62,6 @@ class MoeWNA16Config(QuantizationConfig):
                     f"Minimum capability: {awq_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
-            self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
         else:
             raise ValueError("moe_wna16 only support gptq and awq.")
 
@@ -169,16 +168,9 @@ class MoeWNA16Config(QuantizationConfig):
                         layer, prefix
                     )
             elif self.linear_quant_method == "awq":
-                if self.use_marlin and check_marlin_supports_layer(
-                    layer, self.group_size
-                ):
-                    return AWQMarlinConfig.from_config(
-                        self.full_config
-                    ).get_quant_method(layer, prefix)
-                else:
-                    return AWQConfig.from_config(self.full_config).get_quant_method(
-                        layer, prefix
-                    )
+                return AWQConfig.from_config(self.full_config).get_quant_method(
+                    layer, prefix
+                )
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, FusedMoE):
