@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
 )
 
+
 class TestWaveAttention(unittest.TestCase):
 
     def _set_all_seeds(self, seed):
@@ -52,16 +53,20 @@ class TestWaveAttention(unittest.TestCase):
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
 
         b_req_idx = torch.arange(B, dtype=torch.int32, device="cuda")
-        req_to_tokens = torch.empty(
-            (B, max_len_in_batch), dtype=torch.int32, device="cuda"
-        )
         b_start_loc = torch.zeros((B,), dtype=torch.int32, device="cuda")
         b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
         b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device="cuda")
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
+
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix[:B], dim=0)
+        kv_indices = torch.zeros(
+            (b_seq_len_prefix.sum().item(),), dtype=torch.int32, device="cuda"
+        )
+
         for i in range(B):
-            req_to_tokens[i, : b_seq_len[i]] = torch.arange(
-                b_start_loc[i], b_start_loc[i] + b_seq_len[i]
+            kv_indices[kv_indptr[i] : kv_indptr[i + 1]] = torch.arange(
+                b_start_loc[i], b_start_loc[i] + b_seq_len_prefix[i]
             )
 
         total_token_num = torch.sum(b_seq_len).item()
@@ -91,14 +96,21 @@ class TestWaveAttention(unittest.TestCase):
                 (b_seq_len_extend[i], H_Q, D), dtype=dtype, device="cuda"
             ).normal_(mean=0.1, std=0.2)
 
+        o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
+        o_extend_mask = torch.empty(
+            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
+        )
         o_redundant = torch.empty(
             (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
         )
 
         b_seq_len_extend = b_seq_len - b_seq_len_prefix
-        b_start_loc_extend = torch.zeros_like(b_seq_len)
-        b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
         max_len_extend = torch.max(b_seq_len_extend, 0)[0].item()
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device="cuda")
+        qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend[:B], dim=0)
+
+        custom_mask = None
+        mask_indptr = None
 
         redundant_attention(
             q_extend,
@@ -112,9 +124,7 @@ class TestWaveAttention(unittest.TestCase):
             max_len_in_batch,
         )
 
-        o_extend = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
-        )
+        o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
         extend_attention_fwd(
             q_extend,
             k_extend,
@@ -122,27 +132,26 @@ class TestWaveAttention(unittest.TestCase):
             o_extend,
             k_buffer,
             v_buffer,
-            req_to_tokens,
-            b_req_idx,
-            b_seq_len,
-            b_seq_len_extend,
-            b_start_loc_extend,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
             max_len_extend,
         )
 
         o_wave = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-
         extend_attention_wave(
             q_extend,
             k_extend,
             v_extend,
             k_buffer,
             v_buffer,
-            req_to_tokens,
-            b_req_idx,
-            b_seq_len,
-            b_seq_len_extend,
-            b_start_loc_extend,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
             max_len_extend,
             o_wave,
             is_causal=True,
