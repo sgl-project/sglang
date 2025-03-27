@@ -11,7 +11,7 @@ So avoid getting hidden states and completions alternately.
 import requests
 
 from sglang.test.test_utils import is_in_ci
-from sglang.utils import print_highlight, terminate_process, wait_for_server
+from sglang.utils import terminate_process, wait_for_server
 
 if is_in_ci():
     from docs.backend.patch import launch_server_cmd
