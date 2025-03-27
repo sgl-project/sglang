@@ -82,9 +82,3 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
-        if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
-            logger.warning(
-                "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
-                "may cause accuracy issues. Please make sure k/v_scale "
-                "scaling factors are available in the fp8 checkpoint."
-            )

@@ -78,6 +78,7 @@ class GPT2Attention(nn.Module):
             scaling=self.scale,
             num_kv_heads=total_num_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
         )
 
     def forward(

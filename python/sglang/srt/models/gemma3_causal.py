@@ -185,6 +185,7 @@ class Gemma3Attention(nn.Module):
             layer_id=layer_id,
             logit_cap=getattr(self.config, "attn_logit_softcapping", None),
             sliding_window_size=self.sliding_window,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
