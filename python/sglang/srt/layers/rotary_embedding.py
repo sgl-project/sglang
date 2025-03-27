@@ -652,7 +652,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(positions, query, key, offsets)
+        if _is_cuda_available:
+            return self.forward_cuda(positions, query, key, offsets)
+        else:
+            return self.forward_native(positions, query, key, offsets)
 
     def forward_native(
         self,
