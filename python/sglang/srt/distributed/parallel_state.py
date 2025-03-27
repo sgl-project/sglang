@@ -445,7 +445,6 @@ class GroupCoordinator:
         input_list: List[torch.Tensor],
     ) -> None:
         # TODO(ch-wan): support other backends
-        output = input_list[self.rank_in_group]
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
