@@ -3,9 +3,9 @@ import logging
 import random
 import socket
 import time
+import unittest
 from typing import Any, List, Optional
 
-import pytest
 import ray
 import sgl_kernel.allreduce as custom_ops
 import torch
@@ -51,10 +51,12 @@ def multi_process_parallel(
     ray.shutdown()
 
 
-class TestCustomAllReduce:
-    # Set up class-level attributes (replaces setUpClass)
-    test_sizes = [512, 4096, 32768, 262144, 524288, 1048576, 2097152]
-    world_sizes = [2, 4, 8]
+class TestCustomAllReduce(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        random.seed(42)
+        cls.test_sizes = [512, 4096, 32768, 262144, 524288, 1048576, 2097152]
+        cls.world_sizes = [2, 4, 8]
 
     @staticmethod
     def create_shared_buffer(
@@ -239,4 +241,4 @@ class TestCustomAllReduce:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    unittest.main()
