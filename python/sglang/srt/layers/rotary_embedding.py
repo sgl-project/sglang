@@ -1,14 +1,19 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda
+from sglang.utils import logger
 
 _is_cuda = is_cuda()
 
@@ -881,6 +886,505 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    # https://github.com/huggingface/transformers/blob/397a5ede33863d6f7137c771a68d40036cac0396/src/transformers/models/qwen2_5_omni/modeling_qwen2_5_omni.py#L271
+    @staticmethod
+    def get_rope_index_omni(
+        input_ids: Optional[torch.Tensor],
+        config: PretrainedConfig,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        use_audio_in_video: bool = False,
+        audio_seqlens: Optional[torch.LongTensor] = None,
+        second_per_grids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_token_id = config.image_token_index
+        video_token_id = config.video_token_index
+        audio_token_id = config.audio_token_index
+        vision_start_token_id = config.vision_start_token_id
+        audio_start_token_id = config.audio_start_token_id
+        position_id_per_seconds = config.position_id_per_seconds
+        seconds_per_chunk = config.seconds_per_chunk
+        spatial_merge_size = config.vision_config.spatial_merge_size
+        try:
+            mrope_position_deltas = []
+            if input_ids is not None and (
+                image_grid_thw is not None or video_grid_thw is not None
+            ):
+                total_input_ids = input_ids
+                attention_mask = torch.ones_like(total_input_ids).to("cuda")
+                position_ids = torch.ones(
+                    3,
+                    input_ids.shape[0],
+                    input_ids.shape[1],
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                ).to("cuda")
+                image_idx, video_idx, audio_idx = 0, 0, 0
+                attention_mask = attention_mask.to(total_input_ids.device)
+                for i, input_ids in enumerate(total_input_ids):
+                    input_ids = input_ids[attention_mask[i] == 1]
+                    image_nums, video_nums, audio_nums = 0, 0, 0
+                    vision_start_indices = torch.argwhere(
+                        input_ids == vision_start_token_id
+                    ).squeeze(1)
+                    vision_tokens = input_ids[vision_start_indices + 1]
+                    audio_nums = torch.sum(input_ids == audio_start_token_id)
+                    image_nums = (vision_tokens == image_token_id).sum()
+                    video_nums = (
+                        (vision_tokens == audio_start_token_id).sum()
+                        if use_audio_in_video
+                        else (vision_tokens == video_token_id).sum()
+                    )
+                    input_tokens = input_ids.tolist()
+                    llm_pos_ids_list: list = []
+                    st = 0
+                    remain_images, remain_videos, remain_audios = (
+                        image_nums,
+                        video_nums,
+                        audio_nums,
+                    )
+                    multimodal_nums = (
+                        image_nums + audio_nums
+                        if use_audio_in_video
+                        else image_nums + video_nums + audio_nums
+                    )
+                    for _ in range(multimodal_nums):
+                        st_idx = (
+                            llm_pos_ids_list[-1].max() + 1
+                            if len(llm_pos_ids_list) > 0
+                            else 0
+                        )
+                        if image_token_id in input_tokens and remain_images > 0:
+                            ed_image = input_tokens.index(image_token_id, st)
+                        else:
+                            ed_image = len(input_tokens) + 1
+                        if video_token_id in input_tokens and remain_videos > 0:
+                            ed_video = input_tokens.index(video_token_id, st)
+                        else:
+                            ed_video = len(input_tokens) + 1
+                        if audio_token_id in input_tokens and remain_audios > 0:
+                            ed_audio = input_tokens.index(audio_token_id, st)
+                        else:
+                            ed_audio = len(input_tokens) + 1
+                        min_ed = min(ed_image, ed_video, ed_audio)
+                        if min_ed == ed_audio:
+                            text_len = min_ed - st - 1
+                            if text_len != 0:
+                                st_idx = (
+                                    llm_pos_ids_list[-1].max() + 1
+                                    if len(llm_pos_ids_list) > 0
+                                    else 0
+                                )
+                                llm_pos_ids_list.append(
+                                    torch.arange(text_len)
+                                    .view(1, -1)
+                                    .expand(3, -1)
+                                    .to("cuda")
+                                    + st_idx
+                                )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            bos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(bos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            audio_len = (
+                                (audio_seqlens[audio_idx] - 1) // 2 + 1 - 2
+                            ) // 2 + 1
+                            llm_pos_ids = (
+                                torch.arange(audio_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+                            llm_pos_ids_list.append(llm_pos_ids)
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            eos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(eos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st += text_len + bos_len + audio_len + eos_len
+                            audio_idx += 1
+                            remain_audios -= 1
+
+                        elif min_ed == ed_image:
+                            text_len = min_ed - st - 1
+                            if text_len != 0:
+                                st_idx = (
+                                    llm_pos_ids_list[-1].max() + 1
+                                    if len(llm_pos_ids_list) > 0
+                                    else 0
+                                )
+                                llm_pos_ids_list.append(
+                                    torch.arange(text_len)
+                                    .view(1, -1)
+                                    .expand(3, -1)
+                                    .to("cuda")
+                                    + st_idx
+                                )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            bos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(bos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            grid_t = image_grid_thw[image_idx][0]
+                            grid_hs = image_grid_thw[:, 1]
+                            grid_ws = image_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t).to("cuda")
+                                * 1
+                                * position_id_per_seconds
+                            ).long()
+                            llm_pos_ids = MRotaryEmbedding.get_llm_pos_ids_for_vision(
+                                st_idx,
+                                image_idx,
+                                spatial_merge_size,
+                                t_index,
+                                grid_hs,
+                                grid_ws,
+                            )
+                            image_len = image_grid_thw[image_idx].prod() // (
+                                spatial_merge_size**2
+                            )
+                            llm_pos_ids_list.append(llm_pos_ids)
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            eos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(eos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st += text_len + bos_len + image_len + eos_len
+                            image_idx += 1
+                            remain_images -= 1
+
+                        elif min_ed == ed_video and not use_audio_in_video:
+                            text_len = min_ed - st - 1
+                            if text_len != 0:
+                                st_idx = (
+                                    llm_pos_ids_list[-1].max() + 1
+                                    if len(llm_pos_ids_list) > 0
+                                    else 0
+                                )
+                                llm_pos_ids_list.append(
+                                    torch.arange(text_len)
+                                    .view(1, -1)
+                                    .expand(3, -1)
+                                    .to("cuda")
+                                    + st_idx
+                                )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            ).to("cuda")
+                            bos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(bos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+                            t_index = (
+                                torch.arange(grid_t).to("cuda")
+                                * second_per_grids[video_idx].cpu().float()
+                                * position_id_per_seconds
+                            ).long()
+                            llm_pos_ids = MRotaryEmbedding.get_llm_pos_ids_for_vision(
+                                st_idx,
+                                video_idx,
+                                spatial_merge_size,
+                                t_index,
+                                grid_hs,
+                                grid_ws,
+                            )
+                            video_len = video_grid_thw[video_idx].prod() // (
+                                spatial_merge_size**2
+                            )
+                            llm_pos_ids_list.append(llm_pos_ids)
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            eos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(eos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st += text_len + bos_len + video_len + eos_len
+                            video_idx += 1
+                            remain_videos -= 1
+
+                        elif min_ed == ed_video and use_audio_in_video:
+                            text_len = min_ed - st - 2
+                            if text_len != 0:
+                                st_idx = (
+                                    llm_pos_ids_list[-1].max() + 1
+                                    if len(llm_pos_ids_list) > 0
+                                    else 0
+                                )
+                                llm_pos_ids_list.append(
+                                    torch.arange(text_len)
+                                    .view(1, -1)
+                                    .expand(3, -1)
+                                    .to("cuda")
+                                    + st_idx
+                                )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            bos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(bos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+                            llm_pos_ids_list.append(
+                                torch.arange(bos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            audio_len = (
+                                (audio_seqlens[audio_idx] - 1) // 2 + 1 - 2
+                            ) // 2 + 1
+                            audio_llm_pos_ids = (
+                                torch.arange(audio_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+                            grid_t = video_grid_thw[video_idx][0]
+                            grid_hs = video_grid_thw[:, 1]
+                            grid_ws = video_grid_thw[:, 2]
+
+                            t_index = (
+                                (
+                                    torch.arange(grid_t).to("cuda")
+                                    * second_per_grids[video_idx].cpu().float()
+                                    * position_id_per_seconds
+                                )
+                                .long()
+                                .to("cuda")
+                            )
+                            video_llm_pos_ids = (
+                                MRotaryEmbedding.get_llm_pos_ids_for_vision(
+                                    st_idx,
+                                    video_idx,
+                                    spatial_merge_size,
+                                    t_index,
+                                    grid_hs,
+                                    grid_ws,
+                                )
+                            )
+
+                            t_ntoken_per_chunk = int(
+                                position_id_per_seconds * seconds_per_chunk
+                            )
+                            video_chunk_indexes = MRotaryEmbedding.get_chunked_index(
+                                video_llm_pos_ids, t_ntoken_per_chunk, st_idx
+                            )
+                            audio_chunk_indexes = MRotaryEmbedding.get_chunked_index(
+                                audio_llm_pos_ids, t_ntoken_per_chunk, st_idx
+                            )
+                            sub_len = 0
+                            for j in range(
+                                max(len(video_chunk_indexes), len(audio_chunk_indexes))
+                            ):
+                                video_chunk_index = (
+                                    video_chunk_indexes[j]
+                                    if j < len(video_chunk_indexes)
+                                    else None
+                                )
+                                audio_chunk_index = (
+                                    audio_chunk_indexes[j]
+                                    if j < len(audio_chunk_indexes)
+                                    else None
+                                )
+                                if video_chunk_index is not None:
+                                    sub_len += (
+                                        video_chunk_index[1] - video_chunk_index[0]
+                                    )
+
+                                    llm_pos_ids_list.append(
+                                        video_llm_pos_ids[
+                                            :,
+                                            video_chunk_index[0] : video_chunk_index[1],
+                                        ]
+                                    )
+                                if audio_chunk_index is not None:
+                                    sub_len += (
+                                        audio_chunk_index[1] - audio_chunk_index[0]
+                                    )
+
+                                    llm_pos_ids_list.append(
+                                        audio_llm_pos_ids[
+                                            :,
+                                            audio_chunk_index[0] : audio_chunk_index[1],
+                                        ]
+                                    )
+                            video_len = video_grid_thw[video_idx].prod() // (
+                                spatial_merge_size**2
+                            )
+
+                            st_idx = (
+                                llm_pos_ids_list[-1].max() + 1
+                                if len(llm_pos_ids_list) > 0
+                                else 0
+                            )
+                            eos_len = 1
+                            llm_pos_ids_list.append(
+                                torch.arange(eos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+                            llm_pos_ids_list.append(
+                                torch.arange(eos_len)
+                                .view(1, -1)
+                                .expand(3, -1)
+                                .to("cuda")
+                                + st_idx
+                            )
+
+                            st += (
+                                text_len
+                                + bos_len * 2
+                                + audio_len
+                                + video_len
+                                + eos_len * 2
+                            )
+
+                            audio_idx += 1
+                            video_idx += 1
+                            remain_videos -= 1
+                            remain_audios -= 1
+
+                    if st < len(input_tokens):
+                        st_idx = (
+                            llm_pos_ids_list[-1].max() + 1
+                            if len(llm_pos_ids_list) > 0
+                            else 0
+                        )
+                        text_len = len(input_tokens) - st
+                        llm_pos_ids_list.append(
+                            torch.arange(text_len).view(1, -1).expand(3, -1).to("cuda")
+                            + st_idx
+                        )
+
+                    llm_positions = (
+                        torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1).to("cuda")
+                    )
+
+                    position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
+                        position_ids.device
+                    )
+                    mrope_position_deltas.append(
+                        llm_positions.max() + 1 - len(input_ids)
+                    )
+                mrope_position_deltas = torch.tensor(
+                    mrope_position_deltas, device=input_ids.device
+                ).unsqueeze(1)
+
+                return position_ids, mrope_position_deltas
+            else:
+                assert input_ids is not None, input_ids
+                # position_ids = attention_mask.long().cumsum(-1) - 1
+                # position_ids.masked_fill_(attention_mask == 0, 1)
+                s = input_ids.shape[1]
+                position_ids = torch.arange(s)
+                position_ids = (
+                    position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+                )
+                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                    -1, keepdim=True
+                )[0]
+                mrope_position_deltas = max_position_ids + 1 - s
+
+                return position_ids, mrope_position_deltas
+        except Exception as e:
+            logger.info(f"Please consider disabling chunked_prefill: {e}")
+            raise
+
     # Copied from https://github.com/huggingface/transformers/blob/c8e0e603de9b3d49161a15fe6e8ea84badfb5d02/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1439
     @staticmethod
     def get_rope_index(
@@ -1056,6 +1560,78 @@ class MRotaryEmbedding(RotaryEmbedding):
                 for _ in range(3)
             ]
         )
+
+    @staticmethod
+    def get_llm_pos_ids_for_vision(
+        start_idx: int,
+        vision_idx: int,
+        spatial_merge_size: int,
+        t_index: List[int],
+        grid_hs: List[int],
+        grid_ws: List[int],
+    ):
+        llm_pos_ids_list = []
+        llm_grid_h = grid_hs[vision_idx] // spatial_merge_size
+        llm_grid_w = grid_ws[vision_idx] // spatial_merge_size
+        h_index = (
+            torch.arange(llm_grid_h, device=llm_grid_h.device)
+            .view(1, -1, 1)
+            .expand(len(t_index), -1, llm_grid_w)
+            .flatten()
+        )
+        w_index = (
+            torch.arange(llm_grid_w, device=llm_grid_w.device)
+            .view(1, 1, -1)
+            .expand(len(t_index), llm_grid_h, -1)
+            .flatten()
+        )
+        t_index = (
+            torch.Tensor(t_index)
+            .to(llm_grid_h.device)
+            .view(-1, 1)
+            .expand(-1, llm_grid_h * llm_grid_w)
+            .flatten()
+            .long()
+        )
+        _llm_pos_ids = torch.stack([t_index, h_index, w_index]).to("cuda")
+        llm_pos_ids_list.append(_llm_pos_ids + start_idx)  # + 1 ) # 12.09 by malinhan
+        llm_pos_ids = torch.cat(llm_pos_ids_list, dim=1)
+        return llm_pos_ids
+
+    @staticmethod
+    def _pad_to_list_of_tensors_1d(tensor_list, padding_value=0, padding_side="left"):
+        lengths = [len(tensor) for tensor in tensor_list]
+        max_length = max(lengths)
+        pad_len = [max_length - leng for leng in lengths]
+        for idx in range(len(tensor_list)):
+            if pad_len[idx] != 0:
+                if padding_side == "left":
+                    tensor_list[idx] = torch.cat(
+                        [
+                            torch.full(
+                                size=[pad_len[idx]],
+                                fill_value=padding_value,
+                                dtype=tensor_list[idx].dtype,
+                                device=tensor_list[idx].device,
+                            ),
+                            tensor_list[idx],
+                        ],
+                        dim=0,
+                    )
+                else:
+                    tensor_list[idx] = torch.cat(
+                        [
+                            tensor_list[idx],
+                            torch.full(
+                                size=[pad_len[idx]],
+                                fill_value=padding_value,
+                                dtype=tensor_list[idx].dtype,
+                                device=tensor_list[idx].device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+        return tensor_list
 
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}

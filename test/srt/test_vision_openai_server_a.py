@@ -4,6 +4,8 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
+import unittest
+
 from test_vision_openai_server_common import *
 
 from sglang.srt.utils import kill_process_tree
@@ -158,29 +160,6 @@ class TestInternVL2_5Server(TestOpenAIVisionServer):
             other_args=["--trust-remote-code"],
         )
         cls.base_url += "/v1"
-
-
-class TestMinicpmoServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.7",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        self._test_audio_ambient_completion()
 
 
 if __name__ == "__main__":

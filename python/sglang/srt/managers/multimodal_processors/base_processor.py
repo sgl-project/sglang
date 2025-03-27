@@ -56,12 +56,25 @@ class MultimodalSpecialTokens:
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
 
-    def __post_init__(self):
-        if self.image_token_regex is None and self.image_token is not None:
+    def compile_regex(self):
+        # TODO: move convert_to_strs to here, before compiling regex
+        if (
+            self.image_token_regex is None
+            and self.image_token is not None
+            and isinstance(self.image_token, str)
+        ):
             self.image_token_regex = re.compile(re.escape(self.image_token))
-        if self.video_token_regex is None and self.video_token is not None:
+        if (
+            self.video_token_regex is None
+            and self.video_token is not None
+            and isinstance(self.video_token, str)
+        ):
             self.video_token_regex = re.compile(re.escape(self.video_token))
-        if self.audio_token_regex is None and self.audio_token is not None:
+        if (
+            self.audio_token_regex is None
+            and self.audio_token is not None
+            and isinstance(self.audio_token, str)
+        ):
             self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
     def collect(self) -> re.Pattern:
@@ -277,6 +290,8 @@ class BaseMultimodalProcessor(ABC):
             image_data = []
 
         multimodal_tokens.convert_to_strs(self._processor)
+        # TODO: remove this
+        multimodal_tokens.compile_regex()
         multimodal_tokens_pattern = multimodal_tokens.collect()
 
         if isinstance(prompt, list) and return_text:
