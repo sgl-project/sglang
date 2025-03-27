@@ -9,7 +9,6 @@ from sglang.test.test_utils import (
     DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST,
     DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
     DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
-    DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -141,18 +140,21 @@ class TestEvalFP8ModelOptQuantAccuracy(CustomTestCase):
     @unittest.skipIf(
         torch.version.hip is not None, "modelopt quantization unsupported on ROCm"
     )
-    def test_mmlu_offline_only(self):
-        """Test with offline quantization only."""
-        self._run_test(
-            model=DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
-            other_args=[
-                "--quantization",
-                "modelopt",
-                "--revision",
-                DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION,
-            ],
-            expected_score=0.64,
-        )
+    def test_mmlu(self):
+        """Test with kv cache quantization using different fp8 formats."""
+        kv_cache_dtypes = ["auto", "fp8_e4m3", "fp8_e5m2"]
+        for kv_cache_dtype in kv_cache_dtypes:
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                self._run_test(
+                    model=DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
+                    other_args=[
+                        "--quantization",
+                        "modelopt",
+                        "--kv-cache-dtype",
+                        kv_cache_dtype,
+                    ],
+                    expected_score=0.64,
+                )
 
 
 if __name__ == "__main__":
