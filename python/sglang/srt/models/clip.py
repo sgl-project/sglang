@@ -446,6 +446,7 @@ class CLIPModel(nn.Module):
         self.text_model = text_model.text_model
         self.vision_model = vision_model.vision_model
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        monkey_patch_weight_loader()
 
     def forward(
         self,
@@ -502,6 +503,61 @@ class CLIPModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+
+# monkey patch weight loader to remove open_clip file
+def monkey_patch_weight_loader():
+    import glob
+    import os
+
+    from sglang.srt.model_loader.loader import DefaultModelLoader
+    from sglang.srt.model_loader.weight_utils import (
+        download_weights_from_hf,
+        filter_files_not_needed_for_inference,
+    )
+
+    def prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    ) -> Tuple[str, List[str], bool]:
+        model_name_or_path = (
+            self._maybe_download_from_modelscope(model_name_or_path, revision)
+            or model_name_or_path
+        )
+
+        is_local = os.path.isdir(model_name_or_path)
+        use_safetensors = False
+        allow_patterns = ["*.bin"]
+
+        if not is_local:
+            hf_folder = download_weights_from_hf(
+                model_name_or_path,
+                self.load_config.download_dir,
+                allow_patterns,
+                revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        else:
+            hf_folder = model_name_or_path
+
+        hf_weights_files: List[str] = []
+        for pattern in allow_patterns:
+            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+
+        hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
+
+        # remove open_clip file
+        hf_weights_files = [
+            file for file in hf_weights_files if "open_clip" not in file
+        ]
+
+        if len(hf_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{model_name_or_path}`"
+            )
+
+        return hf_folder, hf_weights_files, use_safetensors
+
+    setattr(DefaultModelLoader, "_prepare_weights", prepare_weights)
 
 
 EntryClass = CLIPModel
