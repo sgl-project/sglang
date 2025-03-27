@@ -60,6 +60,7 @@ class TestEAGLEMABEngine(TestEAGLEEngine):
         "speculative_eagle_mab_algorithm": "EG",
         "speculative_eagle_mab_configs": ["2_2_4", "3_4_8"],
         "speculative_mab_window_size": 100,
+        "mem_fraction_static": 0.65,
     }
     NUM_CONFIGS = 1  # Only test the MAB config
 
@@ -92,7 +93,7 @@ class TestEAGLEMABServer(TestEAGLEServer):
                 "--speculative-mab-window-size",
                 "100",
                 "--mem-fraction-static",
-                "0.7",
+                "0.65",
                 "--cuda-graph-max-bs",
                 "5",
             ],
