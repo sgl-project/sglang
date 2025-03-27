@@ -527,14 +527,21 @@ class GroupCoordinator:
     #     #        output, input, group_name=self.unique_name
     #     #    )
     
-    def all_gather_(self, tensor_list: List[torch.Tensor], input_: torch.Tensor) -> torch.Tensor:
-        return torch.distributed.all_gather(tensor_list, input_, group=self.device_group)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(
+        self, 
+        input_: torch.Tensor, 
+        dim: int = -1,
+        tensor_list: List[torch.Tensor] = None
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+        
+        if tensor_list is not None:
+            return torch.distributed.all_gather(tensor_list, input_, group=self.device_group)
+        
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
