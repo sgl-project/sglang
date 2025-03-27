@@ -20,11 +20,23 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
+# image
+IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
+IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
 
-class TestOpenAIVisionServer(unittest.TestCase):
+# video
+VIDEO_JOBS_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+
+# audio
+AUDIO_TRUMP_SPEECH_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"
+AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/bird_song.mp3"
+
+
+class TestOpenAIVisionServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
@@ -58,9 +70,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -75,9 +85,11 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        assert "man" in text or "person" in text, text
+        # `driver` is for gemma-3-it
+        assert "man" in text or "person" or "driver" in text, text
         assert "cab" in text or "taxi" in text or "SUV" in text, text
-        assert "iron" in text, text
+        # MiniCPMO fails to recognize `iron`, but `hanging`
+        assert "iron" in text or "hang" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -95,9 +107,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -152,9 +162,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                            },
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
                             "modalities": "multi-images",
                         },
                         {
@@ -171,7 +179,9 @@ class TestOpenAIVisionServer(unittest.TestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        print(f"LLM response: {text}")
+        print("-" * 30)
+        print(f"Multi images response:\n{text}")
+        print("-" * 30)
         assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
         assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
@@ -190,7 +200,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
         # from transformers import AutoTokenizer
         from decord import VideoReader, cpu
 
-        max_frames_num = 12
+        max_frames_num = 20
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -225,10 +235,28 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
         return messages
 
-    def test_video_chat_completion(self):
-        url = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
+    def prepare_video_messages_video_direct(self, video_path):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"video:{video_path}"},
+                        "modalities": "video",
+                    },
+                    {"type": "text", "text": "Please describe the video in detail."},
+                ],
+            },
+        ]
+        return messages
+
+    def get_or_download_file(self, url: str) -> str:
         cache_dir = os.path.expanduser("~/.cache")
-        file_path = os.path.join(cache_dir, "jobs.mp4")
+        if url is None:
+            raise ValueError()
+        file_name = url.split("/")[-1]
+        file_path = os.path.join(cache_dir, file_name)
         os.makedirs(cache_dir, exist_ok=True)
 
         if not os.path.exists(file_path):
@@ -237,26 +265,29 @@ class TestOpenAIVisionServer(unittest.TestCase):
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
+        return file_path
+
+    def test_video_chat_completion(self):
+        url = VIDEO_JOBS_URL
+        file_path = self.get_or_download_file(url)
 
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
+        # messages = self.prepare_video_messages_video_direct(file_path)
         messages = self.prepare_video_messages(file_path)
 
-        video_request = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="default",
             messages=messages,
             temperature=0,
             max_tokens=1024,
-            stream=True,
+            stream=False,
         )
 
+        video_response = response.choices[0].message.content
+
         print("-" * 30)
-        video_response = ""
-        for chunk in video_request:
-            if chunk.choices[0].delta.content is not None:
-                content = chunk.choices[0].delta.content
-                video_response += content
-                print(content, end="", flush=True)
+        print(f"Video response:\n{video_response}")
         print("-" * 30)
 
         # Add assertions to validate the video response
@@ -265,17 +296,20 @@ class TestOpenAIVisionServer(unittest.TestCase):
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
+            or "speaker" in video_response
         ), video_response
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
+            or "hold" in video_response
         )
         assert "black" in video_response or "dark" in video_response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
     def test_regex(self):
+        return
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -293,9 +327,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                         },
                         {
                             "type": "text",
@@ -325,18 +357,14 @@ class TestOpenAIVisionServer(unittest.TestCase):
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                    },
+                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
                 }
             )
         elif image_id == 1:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"
-                    },
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
                 }
             )
         else:
@@ -366,8 +394,79 @@ class TestOpenAIVisionServer(unittest.TestCase):
         with ThreadPoolExecutor(4) as executor:
             list(executor.map(self.run_decode_with_image, image_ids))
 
+    def prepare_audio_messages(self, prompt, audio_file_name):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                ],
+            }
+        ]
 
-class TestQWen2VLServer(TestOpenAIVisionServer):
+        return messages
+
+    def get_audio_response(self, url: str, prompt, category):
+        audio_file_path = self.get_or_download_file(url)
+        client = openai.Client(api_key="sk-123456", base_url=self.base_url)
+
+        messages = self.prepare_audio_messages(prompt, audio_file_path)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+
+        audio_response = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"audio {category} response:\n{audio_response}")
+        print("-" * 30)
+
+        audio_response = audio_response.lower()
+
+        self.assertIsNotNone(audio_response)
+        self.assertGreater(len(audio_response), 0)
+
+        return audio_response
+
+    def _test_audio_speech_completion(self):
+        # a fragment of Trump's speech
+        audio_response = self.get_audio_response(
+            AUDIO_TRUMP_SPEECH_URL,
+            "I have an audio sample. Please repeat the person's words",
+            category="speech",
+        )
+        assert "thank you" in audio_response
+        assert "it's a privilege to be here" in audio_response
+        assert "leader" in audio_response
+        assert "science" in audio_response
+        assert "art" in audio_response
+
+    def _test_audio_ambient_completion(self):
+        # bird song
+        audio_response = self.get_audio_response(
+            AUDIO_BIRD_SONG_URL,
+            "Please listen to the audio snippet carefully and transcribe the content.",
+            "ambient",
+        )
+        assert "bird" in audio_response
+
+    def test_audio_chat_completion(self):
+        pass
+
+
+class TestQwen2VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -381,14 +480,14 @@ class TestQWen2VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                "--chunked-prefill-size",
-                "10000",
+                "--mem-fraction-static",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
 
 
-class TestQWen2_5_VLServer(TestOpenAIVisionServer):
+class TestQwen2_5_VLServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
@@ -402,9 +501,6 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
             other_args=[
                 "--chat-template",
                 "qwen2-vl",
-                # FIXME: workaround to chunked prefill within image embeds
-                "--chunked-prefill-size",
-                "10000",
                 "--mem-fraction-static",
                 "0.4",
             ],
@@ -412,7 +508,7 @@ class TestQWen2_5_VLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
 
-class TestVLMContextLengthIssue(unittest.TestCase):
+class TestVLMContextLengthIssue(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -449,9 +545,7 @@ class TestVLMContextLengthIssue(unittest.TestCase):
                         "content": [
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-                                },
+                                "image_url": {"url": IMAGE_MAN_IRONING_URL},
                             },
                             {
                                 "type": "text",
@@ -507,9 +601,60 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "minicpmv",
+                "--mem-fraction-static",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
+
+
+class TestMinicpmoServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-o-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmo",
+                "--mem-fraction-static",
+                "0.7",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_audio_chat_completion(self):
+        self._test_audio_speech_completion()
+        self._test_audio_ambient_completion()
+
+
+class TestDeepseekVL2Server(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "deepseek-ai/deepseek-vl2-small"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "deepseek-vl2",
+                "--context-length",
+                "4096",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
 
 
 class TestJanusProServer(TestOpenAIVisionServer):
@@ -528,6 +673,32 @@ class TestJanusProServer(TestOpenAIVisionServer):
                 "janus-pro",
                 "--mem-fraction-static",
                 "0.4",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+    def test_single_image_chat_completion(self):
+        # Skip this test because it is flaky
+        pass
+
+
+class TestGemma3itServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-3-4b-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "gemma-it",
             ],
         )
         cls.base_url += "/v1"

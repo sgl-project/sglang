@@ -22,7 +22,11 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.layers.quantization import (
+    BASE_QUANTIZATION_METHODS,
+    QUANTIZATION_METHODS,
+    VLLM_AVAILABLE,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -51,13 +55,14 @@ class ModelConfig:
         self.quantization = quantization
 
         # Parse args
+        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
         self.hf_config = get_config(
-            model_path,
+            self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
@@ -134,6 +139,11 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "DeepseekVL2ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 256
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -229,7 +239,12 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        supported_quantization = [*QUANTIZATION_METHODS]
+        # Select supported quantization methods based on vllm availability
+        if VLLM_AVAILABLE:
+            supported_quantization = [*QUANTIZATION_METHODS]
+        else:
+            supported_quantization = [*BASE_QUANTIZATION_METHODS]
+
         rocm_supported_quantization = [
             "awq",
             "gptq",
@@ -267,7 +282,11 @@ class ModelConfig:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
+            # Only iterate through currently available quantization methods
+            available_methods = (
+                QUANTIZATION_METHODS if VLLM_AVAILABLE else BASE_QUANTIZATION_METHODS
+            )
+            for _, method in available_methods.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
                 )
@@ -318,6 +337,29 @@ class ModelConfig:
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         return eos_ids
 
+    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+        """
+        Pull the model config files to a temporary
+        directory in case of remote.
+
+        Args:
+            model: The model name or path.
+
+        """
+        from sglang.srt.connector import create_remote_connector
+        from sglang.srt.utils import is_remote_url
+
+        if is_remote_url(self.model_path):
+            logger.info("Pulling model configs from remote...")
+            # BaseConnector implements __del__() to clean up the local dir.
+            # Since config files need to exist all the time, so we DO NOT use
+            # with statement to avoid closing the client.
+            client = create_remote_connector(self.model_path)
+            if is_remote_url(self.model_path):
+                client.pull_files(allow_pattern=["*config.json"])
+                self.model_weights = self.model_path
+                self.model_path = client.get_local_dir()
+
 
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
@@ -338,6 +380,8 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         return config.text_config
+    if hasattr(config, "language_config"):
+        return config.language_config
     else:
         return config
 
@@ -367,9 +411,13 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type == "gemma2":
+                if config.model_type.startswith("gemma"):
+                    if config.model_type == "gemma":
+                        gemma_version = ""
+                    else:
+                        gemma_version = config.model_type[5]
                     logger.info(
-                        "For Gemma 2, we downcast float32 to bfloat16 instead "
+                        f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
                         "want to use float16."
                     )
@@ -418,6 +466,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
@@ -425,17 +474,20 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 
 multimodal_model_archs = [
-    "LlavaLlamaForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaMistralForCausalLM",
-    "LlavaVidForCausalLM",
+    "DeepseekVL2ForCausalLM",
+    "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    "LlavaLlamaForCausalLM",
+    "LlavaMistralForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaVidForCausalLM",
+    "MiniCPMO",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "MiniCPMV",
-    "MultiModalityCausalLM",
 ]
 
 

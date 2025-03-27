@@ -6,9 +6,10 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptFp8KVCacheMethod,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestModelOptFp8KVCacheMethod(unittest.TestCase):
+class TestModelOptFp8KVCacheMethod(CustomTestCase):
     def test_kv_cache_method_initialization(self):
         """Test that ModelOptFp8KVCacheMethod can be instantiated and
         inherits from BaseKVCacheMethod."""

@@ -113,6 +113,13 @@ void apply_rope_pos_ids_cos_sin_cache(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+void cutlass_scaled_fp4_mm(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -133,6 +140,8 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
+void scaled_fp4_quant(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_token_group_quant_fp8(
     at::Tensor input,
     at::Tensor output_q,
@@ -141,6 +150,14 @@ void sgl_per_token_group_quant_fp8(
     double eps,
     double fp8_min,
     double fp8_max);
+void sgl_per_token_group_quant_int8(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double int8_min,
+    double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void cublas_grouped_gemm(
@@ -173,12 +190,18 @@ void moe_align_block_size(
     torch::Tensor token_cnts_buffer,
     torch::Tensor cumsum_buffer);
 
+void topk_softmax(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& token_expert_indices,
+    torch::Tensor& gating_output);
+
 /*
  * From csrc/speculative
  */
 void tree_speculative_sampling_target_only(
-    at::Tensor predicts,
-    at::Tensor accept_index,
+    at::Tensor predicts,          // mutable
+    at::Tensor accept_index,      // mutable
     at::Tensor accept_token_num,  // mutable
     at::Tensor candidates,
     at::Tensor retrive_index,
@@ -187,7 +210,20 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples,
     at::Tensor target_probs,
     at::Tensor draft_probs,
+    double threshold_single = 1,
+    double threshold_acc = 1,
     bool deterministic = true,
+    int64_t cuda_stream = 0);
+
+void verify_tree_greedy(
+    at::Tensor predicts,          // mutable
+    at::Tensor accept_index,      // mutable
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor target_predict,
     int64_t cuda_stream = 0);
 
 void build_tree_kernel_efficient(
@@ -203,16 +239,8 @@ void build_tree_kernel_efficient(
     int64_t depth,
     int64_t draft_token_num);
 
-void build_tree_kernel(
-    at::Tensor parent_list,
-    at::Tensor selected_index,
-    at::Tensor verified_seq_len,
-    at::Tensor tree_mask,
-    at::Tensor positions,
-    at::Tensor retrive_index,
-    int64_t topk,
-    int64_t depth,
-    int64_t draft_token_num);
+void segment_packbits(
+    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
 
 /*
  * From FlashInfer
