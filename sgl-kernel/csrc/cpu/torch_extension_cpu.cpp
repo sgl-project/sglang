@@ -20,22 +20,20 @@ limitations under the License.
 #include "shm.h"
 
 // silu_and_mul
-void silu_and_mul_cpu(at::Tensor& out, at::Tensor& input);
+at::Tensor silu_and_mul_cpu(at::Tensor& input);
 
 // rmsnorm
-void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
 // topk
-void grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
-    at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk,
-    bool renormalize, int64_t num_expert_group, int64_t topk_group);
-
-void biased_grouped_topk_cpu(at::Tensor& topk_weights, at::Tensor& topk_ids,
-    at::Tensor& hidden_states, at::Tensor& gating_output, at::Tensor& correction_bias,
+std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
     int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
+
+std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
+    at::Tensor& correction_bias, int64_t topk, bool renormalize, int64_t num_expert_group, int64_t topk_group);
 
 // attention
 void decode_attention_cpu(at::Tensor& query, at::Tensor& output,

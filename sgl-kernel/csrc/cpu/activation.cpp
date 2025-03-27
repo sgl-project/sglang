@@ -7,22 +7,22 @@ template <typename scalar_t, typename func_t, typename vec_func_t>
 void act_and_mul_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
-    int num_tokens, int dim,
+    int64_t num_tokens, int64_t dim,
     const func_t& f,
     const vec_func_t& vf) {
 
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
-  constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, num_tokens, 0, [&](int begin, int end) {
-    for (int i = begin; i < end; ++i) {
+  constexpr int64_t kVecSize = bVec::size();
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       const scalar_t* __restrict__ input_ptr = input + i * 2 * dim;
       const scalar_t* __restrict__ input_other_ptr = input_ptr + dim;
       scalar_t* __restrict__ output_ptr = output + i * dim;
 
-      int d;
+      int64_t d;
       #pragma GCC unroll 4
       for (d = 0; d <= dim - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
@@ -56,11 +56,14 @@ void act_and_mul_kernel_impl(
 
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
-void silu_and_mul_cpu(at::Tensor& out, at::Tensor& input) {
-  RECORD_FUNCTION(
-    "sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({out, input}));
-  int d = input.size(-1) / 2;
-  int num_tokens = input.numel() / input.size(-1);
+at::Tensor silu_and_mul_cpu(at::Tensor& input) {
+  RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
+  auto sizes = input.sizes().vec();
+  int64_t last_dim = input.ndimension() - 1;
+  int64_t d = sizes[last_dim] / 2;
+  sizes[last_dim] = d;
+  int64_t num_tokens = input.numel() / input.size(-1);
+  at::Tensor out = at::empty(sizes, input.options());
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
     using Vec = at::vec::Vectorized<float>;
@@ -72,4 +75,5 @@ void silu_and_mul_cpu(at::Tensor& out, at::Tensor& input) {
         [](float x) { return x / (1.f + std::exp(-x)); },
         [](Vec x) { return x / (Vec(1.f) + x.neg().exp()); });
   });
+  return out;
 }

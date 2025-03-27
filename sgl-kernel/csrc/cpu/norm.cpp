@@ -164,9 +164,8 @@ void fused_add_rmsnorm_kernel_impl(
 
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
-void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION(
-    "sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({output, input, weight}));
+at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+  RECORD_FUNCTION("sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
 
   CHECK_INPUT(input);
   CHECK_INPUT(weight);
@@ -175,8 +174,7 @@ void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, doub
   CHECK_EQ(input.size(1), weight.size(0));
   int64_t batch_size = input.size(0);
   int64_t hidden_size = input.size(1);
-  CHECK_EQ(output.size(0), batch_size);
-  CHECK_EQ(output.size(1), hidden_size);
+  at::Tensor output = at::empty_like(input);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
     rmsnorm_kernel_impl<scalar_t>(
@@ -187,6 +185,7 @@ void rmsnorm_cpu(at::Tensor& output, at::Tensor& input, at::Tensor& weight, doub
         hidden_size,
         eps);
   });
+  return output;
 }
 
 // input   : {batch_size, hidden_size}

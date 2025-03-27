@@ -309,29 +309,24 @@ void biased_grouped_topk_kernel_impl(
 } // anonymous namespace
 
 // grouped topk for DeepSeek V2
-void grouped_topk_cpu(
-    at::Tensor& topk_weights,
-    at::Tensor& topk_ids,
+std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
     bool renormalize,
     int64_t num_expert_group,
     int64_t topk_group) {
-  RECORD_FUNCTION(
-    "sgl-kernel::grouped_topk_cpu", std::vector<c10::IValue>({topk_weights, topk_ids, hidden_states, gating_output}));
-
+  RECORD_FUNCTION("sgl-kernel::grouped_topk_cpu", std::vector<c10::IValue>({hidden_states, gating_output}));
   CHECK_INPUT(gating_output);
-  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
 
   const auto st = hidden_states.scalar_type();
   CHECK_EQ(gating_output.scalar_type(), st);
-  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
-  CHECK_EQ(topk_weights.scalar_type(), at::kFloat);
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
+  at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
+  at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "grouped_topk_kernel", [&] {
     switch (num_experts) {
@@ -348,12 +343,11 @@ void grouped_topk_cpu(
       default: TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
   });
+  return std::make_tuple(topk_weights, topk_ids);
 }
 
 // biased grouped topk DeepSeek V3/R1
-void biased_grouped_topk_cpu(
-    at::Tensor& topk_weights,
-    at::Tensor& topk_ids,
+std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     at::Tensor& correction_bias,
@@ -361,21 +355,22 @@ void biased_grouped_topk_cpu(
     bool renormalize,
     int64_t num_expert_group,
     int64_t topk_group) {
+  RECORD_FUNCTION("sgl-kernel::biased_grouped_topk_cpu",
+      std::vector<c10::IValue>({hidden_states, gating_output, correction_bias}));
 
   CHECK_INPUT(gating_output);
   CHECK_INPUT(correction_bias);
-  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
 
   const auto st = hidden_states.scalar_type();
   CHECK_EQ(gating_output.scalar_type(), st);
   CHECK_EQ(correction_bias.scalar_type(), st);
-  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
-  CHECK_EQ(topk_weights.scalar_type(), at::kFloat);
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
   TORCH_CHECK(correction_bias.numel() == num_experts, "Bias shape mismatch");
+  at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
+  at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "biased_grouped_topk_kernel", [&] {
     // NOW only support DSv3 configs
@@ -385,4 +380,5 @@ void biased_grouped_topk_cpu(
       default: TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
   });
+  return std::make_tuple(topk_weights, topk_ids);
 }
