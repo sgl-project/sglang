@@ -139,25 +139,6 @@ if supports_custom_op():
         fake_impl=outplace_all_reduce_fake,
     )
 
-    """
-    def inplace_reduce_scatter(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
-        assert group_name in _groups, f"Group {group_name} is not found."
-        group = _groups[group_name]()
-        if group is None:
-            raise ValueError(f"Group {group_name} is destroyed.")
-        group._reduce_scatter_in_place(output, input)
-
-    def inplace_reduce_scatter_fake(output: torch.Tensor, input: torch.Tensor, group_name: str) -> None:
-        return
-
-    direct_register_custom_op(
-        op_name="inplace_reduce_scatter",
-        op_func=inplace_reduce_scatter,
-        mutates_args=["tensor"],
-        fake_impl=inplace_reduce_scatter_fake,
-    )
-    """
-
     def reg_all_gather_into_tensor(
         output: torch.Tensor, input: torch.Tensor, group_name: str
     ) -> None:
@@ -458,7 +439,6 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
     
-
     def reduce_scatter(
         self, 
         output: torch.Tensor, 
@@ -498,6 +478,7 @@ class GroupCoordinator:
             return input_
         
         if tensor_list is not None:
+            # TODO(ch-wan): support other backends
             return torch.distributed.all_gather(tensor_list, input_, group=self.device_group)
         
         assert (

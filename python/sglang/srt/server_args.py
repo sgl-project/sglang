@@ -157,6 +157,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_sp_layernorm: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_torch_compile: bool = False
@@ -290,12 +291,13 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
-            # DeepEP MoE
-            if self.enable_deepep_moe:
-                self.ep_size = self.dp_size
-                logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
-                )
+        # DeepEP MoE
+        if self.enable_deepep_moe:
+            self.ep_size = self.tp_size
+            self.enable_sp_layernorm = self.dp_size < self.tp_size if self.enable_dp_attention else True
+            logger.info(
+                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -945,6 +947,11 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+        )
+        parser.add_argument(
+            "--enable-sp-layernorm",
+            action="store_true",
+            help="Enabling sequence parallelism for layernorm. Currently only DeepSeek-V2 with DeepEP is supported. It will be automatically set.",
         )
         parser.add_argument(
             "--enable-ep-moe",
