@@ -5,7 +5,6 @@ from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -14,11 +13,6 @@ if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
-
-GPTQ_MARLIN_TILE = 16
-GPTQ_MARLIN_MIN_THREAD_N = 64
-GPTQ_MARLIN_MIN_THREAD_K = 128
-GPTQ_MARLIN_MAX_PARALLEL = 16
 
 
 def is_fp8_fnuz() -> bool:
@@ -131,73 +125,6 @@ def requantize_with_max_scale(
             start = end
 
     return max_w_scale, weight
-
-
-def verify_marlin_supports_shape(
-    output_size_per_partition: int,
-    input_size_per_partition: int,
-    input_size: int,
-    group_size: int,
-) -> None:
-
-    # Validate output_size_per_partition
-    if output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N != 0:
-        raise ValueError(
-            f"Weight output_size_per_partition = "
-            f"{output_size_per_partition} is not divisible by "
-            f" min_thread_n = {GPTQ_MARLIN_MIN_THREAD_N}. "
-            "Consider reducing tensor_parallel_size or running "
-            "with --quantization gptq."
-        )
-
-    # Validate input_size_per_partition
-    if input_size_per_partition % GPTQ_MARLIN_MIN_THREAD_K != 0:
-        raise ValueError(
-            f"Weight input_size_per_partition = "
-            f"{input_size_per_partition} is not divisible "
-            f"by min_thread_k = {GPTQ_MARLIN_MIN_THREAD_K}. "
-            "Consider reducing tensor_parallel_size or running "
-            "with --quantization gptq."
-        )
-
-    if group_size < input_size and input_size_per_partition % group_size != 0:
-        raise ValueError(
-            f"Weight input_size_per_partition = {input_size_per_partition}"
-            f" is not divisible by group_size = {group_size}."
-            "Consider reducing tensor_parallel_size or running "
-            "with --quantization gptq."
-        )
-
-
-def check_marlin_supports_shape(
-    output_size_per_partition: int,
-    input_size_per_partition: int,
-    input_size: int,
-    group_size: int,
-) -> Tuple[bool, Optional[str]]:
-    try:
-        verify_marlin_supports_shape(
-            output_size_per_partition, input_size_per_partition, input_size, group_size
-        )
-    except ValueError as e:
-        return False, e.__str__()
-    return True, None
-
-
-def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
-
-    return check_marlin_supports_shape(
-        output_size_per_partition=output_size_per_partition,
-        input_size_per_partition=input_size_per_partition,
-        input_size=layer.input_size,
-        group_size=group_size,
-    )[0]
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
