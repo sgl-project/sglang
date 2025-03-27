@@ -287,7 +287,14 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
-        torch.get_device_module(self.device).set_device(self.gpu_id)
+        try:
+            torch.get_device_module(self.device).set_device(self.gpu_id)
+        except Exception:
+            logger.warning(
+                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
+            )
+            raise
+
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
