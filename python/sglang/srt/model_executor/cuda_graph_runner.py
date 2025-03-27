@@ -455,8 +455,6 @@ class CudaGraphRunner:
             out = run_once()
 
         global_graph_memory_pool = graph.pool()
-        print(f"bs: {bs}, out: {out}")
-
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
@@ -514,7 +512,6 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
         if self.model_runner.server_args.lora_paths is not None:
             self.lora_paths[:raw_bs] = forward_batch.lora_paths
-            print(f"replay lora paths: {self.lora_paths[:raw_bs]}")
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
@@ -539,7 +536,6 @@ class CudaGraphRunner:
     def replay(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        print(f"before replay, self.output_buffers: {self.output_buffers}")
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch)
         else:
@@ -549,13 +545,11 @@ class CudaGraphRunner:
 
         # Replay
         self.graphs[self.bs].replay()
-        print(f"self.bs: {self.bs}")
-        print(f"self.output_buffers: {self.output_buffers}")
         next_token_logits, hidden_states = self.output_buffers[self.bs]
         logits_output = LogitsProcessorOutput(
-            next_token_logits=next_token_logits[: self.raw_num_token].clone(),
+            next_token_logits=next_token_logits[: self.raw_num_token],
             hidden_states=(
-                hidden_states[: self.raw_num_token].clone()
+                hidden_states[: self.raw_num_token]
                 if hidden_states is not None
                 else None
             ),
