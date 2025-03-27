@@ -531,6 +531,7 @@ class VisionTransformerBlock(nn.Module):
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
+            qkv_backend="sdpa",
             use_qkv_parallel=True,
             use_context_forward=False,
             softmax_in_single_precision=False,
@@ -2034,7 +2035,13 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 continue
 
             # adapt to VisionAttention
-            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+            if "vision_model" in name and "qkv" not in name:
+                name = name.replace(r"self_attn.o_proj.", r"self_attn.proj..")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
+
             if "vision_model.vision_tower" in name:
                 name = name.replace("attn.qkv", "attn.qkv_proj")
 

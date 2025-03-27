@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 import math
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from PIL import Image
@@ -13,21 +15,39 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.qwen2_5_omni import Qwen2_5OmniModel
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 
+QWEN_DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant."""
+QWEN_AUDIO_SYSTEM_PROMPT = """You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."""
 
-# Compatible with Qwen2VL and Qwen2_5VL
+
+# Compatible with Qwen2VL, Qwen2_5VL and Qwen2_5_o
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5OmniModel,
+    ]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
+        if self.arch == Qwen2_5OmniModel.__name__:
+            self.image_token_id = hf_config.thinker_config.image_token_index
+            self.image_start_id = hf_config.thinker_config.vision_start_token_id
+            self.image_end_id = hf_config.thinker_config.vision_end_token_id
+
+            self.audio_token_id = hf_config.thinker_config.audio_token_index
+            self.audio_start_id = hf_config.thinker_config.audio_start_token_id
+            self.audio_end_id = hf_config.thinker_config.audio_end_token_id
+
+            self.video_token_id = hf_config.thinker_config.video_token_index
+        else:
+            self.image_token_id = hf_config.image_token_id
+            self.image_start_id = hf_config.vision_start_token_id
+            self.image_end_id = hf_config.vision_end_token_id
+            self.video_token_id = hf_config.video_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
@@ -47,12 +67,22 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ):
         if isinstance(image_data, str):
             image_data = [image_data]
-
-        image_token = self.IMAGE_TOKEN
+        audio_data = request_obj.audio_data
+        is_omni = self.arch == Qwen2_5OmniModel.__name__
+        if audio_data and is_omni:
+            # refer to https://github.com/huggingface/transformers/blob/5efaed689114030ffaf51c02f6f82adcbfc72389/src/transformers/models/qwen2_5_omni/processing_qwen2_5_omni.py#L289
+            prompt = prompt.replace(
+                QWEN_DEFAULT_SYSTEM_PROMPT, QWEN_AUDIO_SYSTEM_PROMPT, 1
+            )
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            audio_data=audio_data,
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.image_token_id,
+                audio_token=getattr(self, "audio_token_id", None),
+                video_token=getattr(self, "video_token_id", None),
+            ),
             max_req_input_len=max_req_input_len,
         )
 
@@ -124,6 +154,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ret = self.process_mm_data(
             input_text=base_output.input_text,
             images=base_output.images,
+            audios=base_output.audios,
         )
 
         items = []
@@ -140,6 +171,15 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                     modality=Modality.IMAGE,
                 )
             ]
+
+        if "input_features" in ret and ret["input_features"] is not None:
+            item = MultimodalDataItem(
+                audio_feature=ret["input_features"],
+                feature_attention_mask=ret["feature_attention_mask"],
+                attention_mask=ret["attention_mask"],
+                modality=Modality.AUDIO,
+            )
+            items += [item]
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
@@ -160,9 +200,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         return {
             "input_ids": input_ids,
             "mm_items": items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_start_id": self.image_start_id,
+            "im_end_id": self.image_end_id,
             "im_token_id": self.image_token_id,
+            "audio_start_id": getattr(self, "audio_start_id", None),
+            "audio_end_id": getattr(self, "audio_end_id", None),
             "video_token_id": self.video_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,

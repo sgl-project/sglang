@@ -41,6 +41,8 @@ class MultiModalityDataPaddingPattern:
 class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be enclosed by special token pairs (e.g. <image>...</image>, data_token_pairs)
 
+    The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
+
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
     """
 
@@ -176,7 +178,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
 def get_embedding_and_mask(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
-    embedding_items: List[MultimodalDataItem],
+    appearing_items: List[MultimodalDataItem],
     placeholder_tensor: torch.Tensor,
     input_ids: torch.Tensor,
 ):
@@ -185,7 +187,7 @@ def get_embedding_and_mask(
 
     """
     # 1. Get the embedding
-    embedding = data_embedding_func(embedding_items)
+    embedding = data_embedding_func(appearing_items)
 
     # 2. Check the embedding
     if embedding.dim() == 2:
@@ -308,7 +310,7 @@ def embed_mm_inputs(
             items = [item for item in appearing_items if item.is_image()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=image_data_embedding_func,
-                embedding_items=items,
+                appearing_items=items,
                 placeholder_tensor=(
                     # use the specified modality token to identify the location to embed
                     placeholder_tokens[Modality.IMAGE]
@@ -331,7 +333,7 @@ def embed_mm_inputs(
             items = [item for item in appearing_items if item.is_audio()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=audio_data_embedding_func,
-                embedding_items=items,
+                appearing_items=items,
                 placeholder_tensor=(
                     placeholder_tokens[Modality.AUDIO]
                     if using_all_items

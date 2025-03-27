@@ -24,7 +24,7 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Iterable, List, Optional, Set, Tuple, Type, TypedDict
 
 import torch
 import torch.nn as nn
@@ -155,8 +155,10 @@ class Qwen2VisionBlock(nn.Module):
             use_qkv_parallel=True,
             use_context_forward=use_context_forward,
             softmax_in_single_precision=softmax_in_single_precision,
+            rotary_embed="normal",
             flatten_batch=True,
             quant_config=quant_config,
+            proj_bias=True,
             prefix=add_prefix("attn", prefix),
         )
         self.mlp = Qwen2VisionMLP(
@@ -562,10 +564,19 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            if "visual" in name:
+                name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -596,6 +607,12 @@ class Qwen2VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            logger.warning(
+                f"Some weights are not initialized from checkpoints: {sorted(unloaded_params)}"
+            )
 
 
 EntryClass = Qwen2VLForConditionalGeneration

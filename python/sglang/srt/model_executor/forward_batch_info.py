@@ -436,7 +436,7 @@ class ForwardBatch:
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if mm_input is None:
+                if mm_input is None or not mm_input.contains_mm_input():
                     # text only
                     mrope_positions = torch.tensor(
                         [

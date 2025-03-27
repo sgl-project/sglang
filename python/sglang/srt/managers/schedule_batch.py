@@ -164,30 +164,31 @@ class MultimodalDataItem:
 
     modality: Modality
 
-    hash: int = None
-    pad_value: int = None
-
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
+    # modality: image
+    pixel_values: Union[torch.Tensor, np.array] = None
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
     image_sizes: Tuple[int, int] = None
     image_offsets: Optional[list] = None
-
-    # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.array]]
-    pixel_values: Union[torch.Tensor, np.array] = None
     image_grid_thws: Union[torch.Tensor, np.array] = None
-    video_grid_thws: Union[torch.Tensor, np.array] = None
-
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
+    # modality: video
+    video_grid_thws: Union[torch.Tensor, np.array] = None
 
-    audio_features: Union[torch.Tensor, np.array] = None
-    audio_feature_lens: Optional[List[torch.Tensor]] = None
+    # modality: audio
+    audio_feature: Union[torch.Tensor, np.array] = None
+    audio_feature_len: Optional[List[torch.Tensor]] = None
+
+    # general
+    attention_mask: Optional[torch.Tensor] = None
+    feature_attention_mask: Optional[torch.Tensor] = None
+    hash: int = None
+    pad_value: int = None
 
     @staticmethod
     def is_empty_list(l):
@@ -247,7 +248,7 @@ class MultimodalDataItem:
             return data_hash(f)
 
         if self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            self.hash = hash_feature(self.audio_feature)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -257,7 +258,7 @@ class MultimodalDataItem:
     def is_audio(self):
         return (
             self.modality == Modality.AUDIO
-        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+        ) and not MultimodalDataItem.is_empty_list(self.audio_feature)
 
     def is_image(self):
         return (
@@ -288,7 +289,7 @@ class MultimodalInputs:
 
     # QWen2-VL related
     mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[int] = None
 
     # image
     im_token_id: Optional[int] = None

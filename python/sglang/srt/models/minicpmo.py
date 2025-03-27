@@ -1553,11 +1553,11 @@ class MiniCPMO(MiniCPMBaseModel):
             List[List[torch.Tensor]]: audio embeddings
         """
         wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
+            [item.audio_feature for item in items if item.audio_feature]
         )
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
-            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+            [item.audio_feature_len for item in items if item.audio_feature_len]
         )
 
         # exist audio
@@ -1660,11 +1660,11 @@ class MiniCPMO(MiniCPMBaseModel):
         """
         # (bs, 80, frames) or [], multi audios need filled in advance
         wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
+            [item.audio_feature for item in items if item.audio_feature]
         )
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
-            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+            [item.audio_feature_len for item in items if item.audio_feature_len]
         )
 
         final_audio_embeds = []
@@ -1881,8 +1881,12 @@ class MiniCPMO(MiniCPMBaseModel):
                         name = param_name
 
             # adapt to VisionAttention
-            if "vpm" in name:
-                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+            if "vpm" in name and "out_proj" in name:
+                name = name.replace(r"attn.out_proj", r"attn.proj")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
 
             if not self.config.init_tts and "tts" in name:
                 continue
