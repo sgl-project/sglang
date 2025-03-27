@@ -38,7 +38,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -185,7 +185,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.post_init()
 
     def pad_input_ids(
-        self, input_ids: List[int], image_inputs: ImageInputs
+        self, input_ids: List[int], image_inputs: MultimodalInputs
     ) -> List[int]:
         """Pad input IDs with image tokens."""
         # Get special token IDs
@@ -268,7 +268,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_image_feature(self, image_input: ImageInputs):
+    def get_image_feature(self, image_input: MultimodalInputs):
         """
         Projects the last hidden state from the vision model into language model space.
 
@@ -286,11 +286,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
-    def embed_image_inputs(
+    def embed_mm_inputs(
         self,
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
-        image_input: ImageInputs,
+        image_input: MultimodalInputs,
     ) -> torch.Tensor:
         if input_ids is None:
             raise ValueError("Unimplemented")
@@ -401,10 +401,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         inputs_embeds = general_mm_embed_routine(
             input_ids=llm_input_ids,
-            positions=positions,
             forward_batch=forward_batch,
             embed_tokens=self.get_input_embeddings(),
-            image_embedding_func=self.get_image_feature,
+            mm_data_embedding_func=self.get_image_feature,
         )
 
         outputs = self.language_model(

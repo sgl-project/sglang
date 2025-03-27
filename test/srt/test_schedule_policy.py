@@ -8,9 +8,10 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestSchedulePolicy(unittest.TestCase):
+class TestSchedulePolicy(CustomTestCase):
 
     def setUp(self):
         self.tree_cache = RadixCache(None, None, False)

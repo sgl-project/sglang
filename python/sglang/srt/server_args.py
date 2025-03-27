@@ -16,6 +16,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 import random
 import tempfile
 from typing import List, Optional
@@ -340,6 +341,10 @@ class ServerArgs:
             logger.warning("Cuda graph is disabled for prefill server")
             self.disable_overlap_schedule = True
             logger.warning("Overlap scheduler is disabled for decode server")
+
+        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
+            "1" if self.enable_torch_compile else "0"
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -770,7 +775,7 @@ class ServerArgs:
         parser.add_argument(
             "--attention-backend",
             type=str,
-            choices=["flashinfer", "triton", "torch_native"],
+            choices=["flashinfer", "triton", "torch_native", "fa3"],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )

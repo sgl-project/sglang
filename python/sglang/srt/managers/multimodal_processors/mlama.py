@@ -1,15 +1,15 @@
 import asyncio
 from typing import List, Union
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
+from sglang.srt.managers.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor,
     get_global_processor,
 )
 from sglang.srt.models.mllama import MllamaForConditionalGeneration
 from sglang.srt.utils import load_image
 
 
-class MllamaImageProcessor(BaseImageProcessor):
+class MllamaImageProcessor(BaseMultimodalProcessor):
     models = [MllamaForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -34,7 +34,7 @@ class MllamaImageProcessor(BaseImageProcessor):
 
         return image_inputs
 
-    async def process_images_async(
+    async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
         if not image_data:
@@ -53,7 +53,7 @@ class MllamaImageProcessor(BaseImageProcessor):
             images = load_image(image_data[0])[0]
 
         image_inputs = await self._process_single_image(images, input_text)
-        image_inputs["image_hashes"] = [hash(str(image_data))]
+        image_inputs["data_hashes"] = [hash(str(image_data))]
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
         return image_inputs

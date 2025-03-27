@@ -21,9 +21,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
-
 
 def _get_version():
     with open(root / "pyproject.toml") as f:
@@ -43,6 +40,7 @@ sources = [
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/torch_extension_rocm.cc",
+    "csrc/speculative/eagle_utils.cu",
 ]
 
 cxx_flags = ["-O3"]
