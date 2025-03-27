@@ -398,11 +398,13 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Dict = await self.mm_processor.process_mm_data_async(
-            obj.image_data, input_text or input_ids, obj, self.max_req_input_len
-        )
-        if image_inputs and "input_ids" in image_inputs:
-            input_ids = image_inputs["input_ids"]
+        image_inputs: Optional[Dict] = None
+        if obj.contains_mm_input():
+            image_inputs = await self.mm_processor.process_mm_data_async(
+                obj.image_data, input_text or input_ids, obj, self.max_req_input_len
+            )
+            if image_inputs and "input_ids" in image_inputs:
+                input_ids = image_inputs["input_ids"]
         if self.is_generation:
             return_logprob = obj.return_logprob
             logprob_start_len = obj.logprob_start_len
