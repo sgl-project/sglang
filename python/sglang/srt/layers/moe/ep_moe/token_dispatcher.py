@@ -5,7 +5,7 @@ try:
 except ImportError:
     use_deepep = False
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -187,7 +187,7 @@ class DeepEPDispatcher:
 
     def dispatch(
         self,
-        x: Tuple[torch.Tensor, torch.Tensor],
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
@@ -244,7 +244,7 @@ class DeepEPDispatcher:
 
     def dispatch_normal(
         self,
-        x: Tuple[torch.Tensor, torch.Tensor],
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
