@@ -61,6 +61,7 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -159,6 +160,9 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
 )
 
 # Support abi3 for build
