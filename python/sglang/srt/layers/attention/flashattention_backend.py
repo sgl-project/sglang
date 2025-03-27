@@ -274,21 +274,31 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         # """Initialize forward metadata for replaying CUDA graph."""
-        seqlens_in_batch = seq_lens[:bs]
         metadata = self.decode_cuda_graph_metadata[bs]
-        metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+
+        # If we need both CPU and GPU versions, keep CPU operations on CPU
+        # and GPU operations on GPU to minimize transfers
+
+        # For CPU operations
+        max_len = max(seq_lens_cpu[:bs])
+        metadata.max_seq_len_k = max_len  # Single CPU->GPU transfer
+
+        # For GPU operations - avoid unnecessary CPU->GPU transfers
+        seq_lens_in_batch = seq_lens[:bs]
+        metadata.cache_seqlens_int32 = seq_lens_in_batch.to(
+            torch.int32
+        )  # Direct GPU reference, no transfer
         metadata.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            torch.cumsum(seq_lens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
-        # Precompute maximum sequence length
-        # This operation is on CPU
-        metadata.max_seq_len_k = seq_lens_cpu[:bs].max().item()
+
         # Only zero out the part out of max_len_k
         metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
         # Then do the copy
         metadata.page_table[:, : metadata.max_seq_len_k].copy_(
             self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
         )
+
         self.forward_decode_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
