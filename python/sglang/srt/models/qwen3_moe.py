@@ -230,6 +230,7 @@ class Qwen3MoeAttention(nn.Module):
         q = q_by_head.view(q.shape)
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm.forward_native(k_by_head)
+        k = k_by_head.view(k.shape)
         if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
             q = splitter(q)[self.tp_rank]
