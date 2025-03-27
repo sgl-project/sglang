@@ -7,6 +7,7 @@ import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
+    DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
@@ -16,7 +17,7 @@ from sglang.test.test_utils import (
 Integration test for python/sglang/srt/layers/attention/flashattention_backend.py
 """
 # Change to your own model if testing model is not public.
-MODEL_USED_FOR_TEST = "lmsys/sglang-ci-dsv3-test"
+MODEL_USED_FOR_TEST = DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST
 # Setting data path to None uses default data path in few_shot_gsm8k eval test.
 DATA_PATH = None
 
