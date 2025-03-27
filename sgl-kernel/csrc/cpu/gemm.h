@@ -65,6 +65,25 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
+// shared expert implememntation for int8 w8a8
+template <typename scalar_t>
+void shared_expert_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K);
+
 // tinygemm interface
 template <typename scalar_t>
 void tinygemm_kernel(

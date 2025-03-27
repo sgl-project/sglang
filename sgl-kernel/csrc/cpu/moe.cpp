@@ -99,6 +99,35 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   }
 }
 
+// out = input + input2 * scale
+template <typename scalar_t>
+inline void add_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input,
+    const scalar_t* __restrict__ input2, float scale, int64_t size) {
+
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const fVec s_vec = fVec(scale);
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec x0 = fVec::loadu(input + d);
+    fVec x1 = fVec::loadu(input + d + fVec::size());
+
+    bVec y_bvec = bVec::loadu(input2 + d);
+    fVec y0, y1;
+    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
+
+    x0 = x0 + y0 * s_vec;
+    x1 = x1 + y1 * s_vec;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
+  }
+}
+
 template <int BLOCK_M>
 int moe_align_block_size(
     int32_t* __restrict__ sorted_ids,
@@ -696,6 +725,190 @@ void fused_experts_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+void shared_expert_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ packed_w1,
+    const scalar_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+
+  // handle 2 tiles per block
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
+  const int64_t stride_n = K;
+
+  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+    // get local pointers
+    int tid = at::get_thread_num();
+    float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
+
+    bool is_brgemm_used = false;
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB;
+      int64_t nb = i % NB;
+
+      // nb0 from top half and nb1 from bottom half
+      int64_t nb0 = nb, nb1 = nb + NB;
+      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
+
+      //int64_t mb_start = mb * BLOCK_M;
+      //int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+
+      // A shape [m_size, K]
+      const scalar_t* A = input + mb * BLOCK_M * K;
+
+      // B shape [K, n_size] in vnni format
+      const scalar_t* __restrict__ B0 = packed_w1 + nb0 * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B1 = packed_w1 + nb1 * BLOCK_N * stride_n;
+
+      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+
+      if (use_brgemm) {
+        // 1.b gemm: C0 = A @ B0
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B0,
+            /* C     */ C0);
+
+        // 1.c gemm: C1 = A @ B1
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B1,
+            /* C     */ C1);
+
+        // 1.d silu and mul
+        silu_and_mul<scalar_t, BLOCK_N>(
+            ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+            C0,
+            C1,
+            m_size,
+            N);
+      } else {
+        // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B0    */ B0,
+            /* B1    */ B1,
+            /* C     */ ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ N);
+      }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+
+  // stage 2: output = intermediate_cache1 @ w2
+  //   w2 : [K, N] as [OC, IC]
+  const int64_t OC = K;  // rename K as OC
+  const int64_t IC = N;  // rename N as IC
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  const int64_t stride_oc = IC;
+
+  // parallel on [MB2, NB2]
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+    // get local pointers
+    int tid = at::get_thread_num();
+    // we won't be using C1 for gemm2
+    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    bool is_brgemm_used = false;
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB2;
+      int64_t nb = i % NB2;
+
+      int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+
+      // A shape [m_size, IC]
+      const scalar_t* __restrict__ A = ic1 + mb * BLOCK_M * N;
+
+      // B shape [IC, n_size] in vnni format
+      const scalar_t* __restrict__ B = packed_w2 + nb * BLOCK_N * stride_oc;
+
+      // 2.a gemm: C = A @ B
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C);
+      } else {
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N);
+      }
+
+      // 2.b copy from C to output and add fused_experts_out
+      scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
+      const scalar_t* __restrict__ fused_out = fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N;
+      for (int64_t m = 0; m < m_size; ++m) {
+        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
+      }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
+    }
+  });
+}
+
 } // anonymous namespace
 
 // hidden_states: [M, K]
@@ -884,6 +1097,130 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
+    }
+  });
+  return out_hidden_states;
+}
+
+// shared expert kernel
+//
+// hidden_states: [M, K]
+// w1: [2N, K]
+// w2: [K, N]
+// fused_experts_out
+at::Tensor shared_expert_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& fused_experts_out,
+    double routed_scaling_factor,
+    bool inplace,
+    bool use_int8_w8a8,
+    std::optional<at::Tensor>& w1_scale,
+    std::optional<at::Tensor>& w2_scale,
+    std::optional<at::Tensor>& a1_scale,
+    std::optional<at::Tensor>& a2_scale,
+    bool is_vnni) {
+
+  RECORD_FUNCTION("sgl-kernel::shared_expert_cpu", std::vector<c10::IValue>({hidden_states, w1, w2}));
+
+  auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
+  auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
+
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  const auto st = hidden_states.scalar_type();
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT(fused_experts_out);
+  CHECK_INPUT(w1);
+  CHECK_INPUT(w2);
+  CHECK_DIM(2, hidden_states);
+  CHECK_DIM(2, w1);
+  CHECK_DIM(2, w2);
+  CHECK_EQ(hidden_states.sizes(), fused_experts_out.sizes());
+  CHECK_EQ(hidden_states.scalar_type(), st);
+
+  int64_t M = hidden_states.size(0);
+  int64_t K = hidden_states.size(1);
+  int64_t N = w1.size(0) / 2;
+
+  // we use int32_t compensation for int8 w8a8
+  int64_t packed_K = get_row_size(K, use_int8_w8a8);
+  int64_t packed_N = get_row_size(N, use_int8_w8a8);
+
+  // check weight shapes
+  CHECK_EQ(w2.size(0), K);
+  CHECK_EQ(packed_w1.size(1), packed_K);
+  CHECK_EQ(packed_w2.size(1), packed_N);
+
+  if (use_int8_w8a8) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
+    TORCH_CHECK(!a1_scale.has_value(), "static quantization for activation not supported.");
+    TORCH_CHECK(!a2_scale.has_value(), "static quantization for activation not supported.");
+  }
+
+  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
+
+  // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
+  //   1. intermediate_cache1 : [M, N]
+  //   2. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
+  //
+  // for int8 w8a8:
+  //   3. Aq_tmp : [M, K] or [M, N]
+  //   4. As_tmp : [M]
+  //
+  int num_threads = at::get_num_threads();
+  int64_t buffer_size_nbytes = M * N * 2 + num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+
+  if (use_int8_w8a8) {
+    buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
+  }
+
+  auto buffer = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "share_experts_kernel_impl", [&] {
+    scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer.data_ptr<int8_t>()));
+    float* __restrict__ C_tmp = (float*)((void*)(intermediate_cache1 + M * N));
+
+    if (use_int8_w8a8) {
+      uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, M * N)));
+
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      TORCH_CHECK(w1s.numel() == 2 * N);
+      TORCH_CHECK(w2s.numel() == K);
+
+      shared_expert_int8_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache1,
+          C_tmp,
+          Aq_tmp,
+          As_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<int8_t>(),
+          packed_w2.data_ptr<int8_t>(),
+          w1s.data_ptr<float>(),
+          w2s.data_ptr<float>(),
+          fused_experts_out.data_ptr<scalar_t>(),
+          routed_scaling_factor,
+          M,
+          N,
+          K);
+    } else {
+      shared_expert_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache1,
+          C_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<scalar_t>(),
+          packed_w2.data_ptr<scalar_t>(),
+          fused_experts_out.data_ptr<scalar_t>(),
+          routed_scaling_factor,
+          M,
+          N,
+          K);
     }
   });
   return out_hidden_states;

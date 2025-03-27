@@ -75,6 +75,12 @@ at::Tensor fused_experts_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tens
     std::optional<at::Tensor>& a1_scale, std::optional<at::Tensor>& a2_scale,
     bool is_vnni);
 
+at::Tensor shared_expert_cpu(at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
+    at::Tensor& fused_experts_out, double routed_scaling_factor, bool inplace, bool use_int8_w8a8,
+    std::optional<at::Tensor>& w1_scale, std::optional<at::Tensor>& w2_scale,
+    std::optional<at::Tensor>& a1_scale, std::optional<at::Tensor>& a2_scale,
+    bool is_vnni);
+
 // shared memory init
 void initialize(int size, int rank);
 
@@ -122,6 +128,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   // moe
   m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");
+
+  // shared expert
+  m.def("shared_expert_cpu", &shared_expert_cpu, "shared expert kernel for CPU");
 
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");

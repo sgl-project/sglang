@@ -77,6 +77,35 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   }
 }
 
+// out = input + input2 * scale
+template <typename scalar_t>
+inline void add_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input,
+    const scalar_t* __restrict__ input2, float scale, int64_t size) {
+
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const fVec s_vec = fVec(scale);
+  int64_t d;
+  #pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec x0 = fVec::loadu(input + d);
+    fVec x1 = fVec::loadu(input + d + fVec::size());
+
+    bVec y_bvec = bVec::loadu(input2 + d);
+    fVec y0, y1;
+    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
+
+    x0 = x0 + y0 * s_vec;
+    x1 = x1 + y1 * s_vec;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
+  }
+}
+
 /// gemm for w13
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni {
@@ -516,7 +545,6 @@ void fused_experts_int8_kernel_impl(
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
-      //const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
       const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
       const float* __restrict__ As = As_tmp + offsets[mb];
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -573,3 +601,164 @@ void fused_experts_int8_kernel_impl(
 
 INSTANTIATE_MOE_INT8_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_INT8_TEMPLATE(at::Half);
+
+template <typename scalar_t>
+void shared_expert_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+
+  // handle 2 tiles per block
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  // stage 0: quantize input to uint8, [M, K]
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      quantize_row_int8<scalar_t>(
+          Aq_tmp + m * K,
+          As_tmp[m],
+          input + m * K,
+          K);
+    }
+  });
+
+   // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
+
+  // K and N are packed for int8
+  const int64_t packed_K = get_row_size<int8_t>(K);
+  const int64_t packed_N = get_row_size<int8_t>(N);
+  const int64_t stride_n = packed_K;
+
+  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB;
+      int64_t nb = i % NB;
+
+      // nb0 from top half and nb1 from bottom half
+      int64_t nb0 = nb, nb1 = nb + NB;
+      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
+
+      // A shape [m_size, K]
+      const uint8_t* A = Aq_tmp + mb * BLOCK_M * K;
+      const float* As = As_tmp + mb * BLOCK_M;
+
+      // B shape [K, n_size] in vnni format
+      const int8_t* __restrict__ B0 = packed_w1 + nb0 * BLOCK_N * stride_n;
+      const int8_t* __restrict__ B1 = packed_w1 + nb1 * BLOCK_N * stride_n;
+      const float* __restrict__ Bs0 = w1s + nb0 * BLOCK_N;
+      const float* __restrict__ Bs1 = w1s + nb1 * BLOCK_N;
+
+      // fused 1.b: silu_and_mul(A @ B0, A @ B1)
+      tinygemm_kernel(
+          /* A     */ A,
+          /* B0    */ B0,
+          /* B1    */ B1,
+          /* C     */ ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+          /* As    */ As,
+          /* Bs0   */ Bs0,
+          /* Bs1   */ Bs1,
+          /* M     */ m_size,
+          /* N     */ n_size,
+          /* K     */ K,
+          /* lda   */ K,
+          /* ldb   */ n_size,
+          /* ldc   */ N);
+    }
+  });
+
+  // stage 1.5: quantize ic1 to uint8, [M * topk, N]
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      quantize_row_int8<scalar_t>(
+          Aq_tmp + m * N,
+          As_tmp[m],
+          ic1 + m * N,
+          N);
+    }
+  });
+
+  // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
+  //   w2 : [K, N] as [OC, IC]
+  const int64_t OC = K;  // rename K as OC
+  const int64_t IC = N;  // rename N as IC
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  const int64_t stride_oc = packed_N;
+
+  // parallel on [MB2, NB2]
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+    // get local pointers
+    int tid = at::get_thread_num();
+    // we won't be using C1 for gemm2
+    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t mb = i / NB2;
+      int64_t nb = i % NB2;
+
+      int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      // A shape [m_size, IC]
+      const uint8_t* __restrict__ A = Aq_tmp + mb * BLOCK_M * N;
+      const float* __restrict__ As = As_tmp + mb * BLOCK_M;
+
+      // B shape [IC, n_size] in vnni format
+      const int8_t* __restrict__ B = packed_w2 + nb * BLOCK_N * stride_oc;
+      const float* __restrict__ Bs = w2s + nb * BLOCK_N;
+
+      // 2.a gemm: C = A @ B
+      tinygemm_kernel<scalar_t>(
+          /* A     */ A,
+          /* B     */ B,
+          /* C     */ C,
+          /* As    */ As,
+          /* Bs    */ Bs,
+          /* M     */ m_size,
+          /* N     */ n_size,
+          /* K     */ IC,
+          /* lda   */ IC,
+          /* ldb   */ n_size,
+          /* ldc   */ BLOCK_N);
+
+      // 2.b copy from C to output and add fused_experts_out
+      scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
+      const scalar_t* __restrict__ fused_out = fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N;
+      for (int64_t m = 0; m < m_size; ++m) {
+        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
+      }
+    }
+  });
+}
+
+#define INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(TYPE)                                        \
+  template void shared_expert_int8_kernel_impl<TYPE> (                                       \
+      TYPE* __restrict__ output, TYPE* __restrict__ ic1,                                     \
+      float* __restrict__ C_tmp, uint8_t* __restrict__ Aq_tmp,                               \
+      float* __restrict__ As_tmp, const TYPE* __restrict__ input,                            \
+      const int8_t* __restrict__ packed_w1, const int8_t* __restrict__ packed_w2,            \
+      const float* __restrict__ w1s, const float* __restrict__ w2s,                          \
+      const TYPE* __restrict__ fused_experts_out, float routed_scaling_factor,               \
+      int64_t M, int64_t N, int64_t K)
+
+INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(at::BFloat16);
+INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(at::Half);
