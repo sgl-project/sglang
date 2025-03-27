@@ -84,6 +84,7 @@ jobs:
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
+          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git && cd DeepGEMM && python3 setup.py develop
 
       - name: Run test
         timeout-minutes: 30
@@ -115,6 +116,7 @@ jobs:
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
+          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git && cd DeepGEMM && python3 setup.py develop
 
       - name: Run test
         timeout-minutes: 30
