@@ -11,6 +11,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
+from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 
@@ -44,7 +45,7 @@ def native_per_token_group_quant_fp8(
     return x_q, x_s
 
 
-class TestPerTokenGroupQuantFP8(unittest.TestCase):
+class TestPerTokenGroupQuantFP8(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16, torch.float32]
     NUM_TOKENS = [7, 83, 2048]
     D = [512, 4096, 5120, 13824]
@@ -111,7 +112,7 @@ def native_static_quant_fp8(x, x_s, dtype=torch.float8_e4m3fn):
     return x_q, x_s
 
 
-class TestStaticQuantFP8(unittest.TestCase):
+class TestStaticQuantFP8(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16, torch.float32]
     NUM_TOKENS = [7, 83, 2048]
     D = [512, 4096, 5120, 13824]
@@ -210,7 +211,7 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
     return C
 
 
-class TestW8A8BlockFP8Matmul(unittest.TestCase):
+class TestW8A8BlockFP8Matmul(CustomTestCase):
 
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
@@ -331,7 +332,7 @@ def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
     ).sum(dim=1)
 
 
-class TestW8A8BlockFP8FusedMoE(unittest.TestCase):
+class TestW8A8BlockFP8FusedMoE(CustomTestCase):
     DTYPES = [torch.float32, torch.half, torch.bfloat16]
     M = [1, 33, 64, 222, 1024 * 128]
     N = [128, 1024, 2048]
