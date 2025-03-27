@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, flatten_nested_list
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -98,6 +98,16 @@ class GenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_room: Optional[int] = None
+
+    def contains_mm_input(self) -> bool:
+        def has_valid_data(data) -> bool:
+            if data is None:
+                return False
+            if isinstance(data, list):
+                return any(has_valid_data(item) for item in flatten_nested_list(data))
+            return True
+
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         """

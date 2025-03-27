@@ -306,11 +306,13 @@ class ModelRunner:
             )
             server_args.chunked_prefill_size = -1
 
-            if self.model_config.hf_config.architectures == [
-                "Qwen2VLForConditionalGeneration"
-            ] or self.model_config.hf_config.architectures == [
-                "Qwen2_5_VLForConditionalGeneration"
-            ]:
+            if (
+                self.model_config.hf_config.architectures
+                == ["Qwen2VLForConditionalGeneration"]
+                or self.model_config.hf_config.architectures
+                == ["Qwen2_5_VLForConditionalGeneration"]
+                or self.model_config.hf_config.architectures == ["Qwen2_5OmniModel"]
+            ):
                 # TODO: qwen2-vl series does not support radix cache now, set disable_radix_cache=True automatically
                 logger.info("Automatically disable radix cache for qwen-vl series.")
                 server_args.disable_radix_cache = True
@@ -1084,7 +1086,26 @@ class ModelRunner:
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
         mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+
+        def has_rope_scaling(data):
+            if isinstance(data, dict):
+                if "rope_scaling" in data:
+                    return data["rope_scaling"]
+                for value in data.values():
+                    child = has_rope_scaling(value)
+                    if child is not None:
+                        return child
+            elif isinstance(data, (list, tuple)):
+                for item in data:
+                    child = has_rope_scaling(item)
+                    if child is not None:
+                        return child
+            return None
+
+        # rope_scaling = has_rope_scaling(self.model_config.hf_config)
+        rope_scaling = getattr(
+            self.model_config.hf_config, "rope_scaling", {}
+        ) or getattr(self.model_config.hf_text_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling

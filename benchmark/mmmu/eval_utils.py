@@ -105,17 +105,18 @@ def prepare_samples(eval_args: EvalArgs):
             assert len(value) == 1, "key {} has more than one value".format(key)
             eval_args.config[key] = value[0]
 
-    # run for each subject
+    # Parallel loading of datasets
     sub_dataset_list = []
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(
+                load_dataset, eval_args.dataset_path, subject, split=eval_args.split
+            )
+            for subject in CAT_SHORT2LONG.values()
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            sub_dataset_list.append(future.result())
 
-    for subject in tqdm(CAT_SHORT2LONG.values()):
-        sub_dataset = load_dataset(
-            eval_args.dataset_path, subject, split=eval_args.split
-        )
-        sub_dataset_list.append(sub_dataset)
-        # break
-
-    # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
 
     # Prepare images in parallel
