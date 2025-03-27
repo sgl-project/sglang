@@ -10,6 +10,9 @@ import triton.testing
 from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from vllm import _custom_ops as vllm_ops
 
+if not hasattr(vllm_ops, "silu_and_mul"):
+    vllm_ops = torch.ops._C
+
 
 def calculate_diff(
     kernel: str, dtype: torch.dtype, batch_size: int, seq_len: int, dim: int
