@@ -300,6 +300,9 @@ class ServerArgs:
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            logger.info(
+                f"DeepEP MoE is enabled. Sequence parallelism for layernorm is automatically set/unset."
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
