@@ -22,7 +22,7 @@ concurrency:
 jobs:
   accuracy-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+      github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
@@ -47,7 +47,7 @@ jobs:
         run: |
           docker exec ci_sglang pip install --upgrade pip
           docker exec ci_sglang pip uninstall sgl-kernel -y || true
-          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
           docker exec ci_sglang pip install -e "python[dev_hip]"
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
@@ -56,13 +56,13 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
-          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_accuracy_large.py
-          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_eval_fp8_accuracy.py
-          docker exec -w /sglang-checkout/test/srt ci_sglang python3 models/test_qwen_models.py
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_accuracy_large.py
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_fp8_accuracy.py
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 models/test_qwen_models.py
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
+      github.event.pull_request.draft == false
     runs-on: linux-mi300-gpu-1
     steps:
       - name: Checkout code
@@ -87,7 +87,7 @@ jobs:
         run: |
           docker exec ci_sglang pip install --upgrade pip
           docker exec ci_sglang pip uninstall sgl-kernel -y || true
-          docker exec -w /sglang-checkout/sgl-kernel ci_sglang python3 setup_rocm.py install
+          docker exec -w /sglang-checkout/sgl-kernel ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
           docker exec ci_sglang pip install -e "python[dev_hip]"
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
@@ -96,7 +96,7 @@ jobs:
       - name: MLA TEST
         timeout-minutes: 20
         run: |
-          docker exec -w /sglang-checkout/test/srt ci_sglang python3 test_mla.py
+          docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_mla.py
 
   finish:
     if: always()

@@ -346,7 +346,7 @@ async def stop_profile_async():
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
-    _global_state.tokenizer_manager.start_expert_distribution_record()
+    await _global_state.tokenizer_manager.start_expert_distribution_record()
     return Response(
         content="Start recording the expert distribution.\n",
         status_code=200,
@@ -356,7 +356,7 @@ async def start_expert_distribution_record_async():
 @app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
-    _global_state.tokenizer_manager.stop_expert_distribution_record()
+    await _global_state.tokenizer_manager.stop_expert_distribution_record()
     return Response(
         content="Stop recording the expert distribution.\n",
         status_code=200,
@@ -366,7 +366,7 @@ async def stop_expert_distribution_record_async():
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    _global_state.tokenizer_manager.dump_expert_distribution_record()
+    await _global_state.tokenizer_manager.dump_expert_distribution_record()
     return Response(
         content="Dump expert distribution record.\n",
         status_code=200,
@@ -761,8 +761,14 @@ def _wait_and_warmup(
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:

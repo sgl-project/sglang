@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -27,7 +28,7 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(unittest.TestCase):
+class TestSessionControl(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -560,7 +561,7 @@ class TestSessionControl(unittest.TestCase):
         )
 
 
-class TestSessionControlVision(unittest.TestCase):
+class TestSessionControlVision(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmms-lab/llava-onevision-qwen2-7b-ov"

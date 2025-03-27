@@ -12,7 +12,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
-#include <torch/extension.h>
 
 #include <cstdio>
 #include <cstdlib>
