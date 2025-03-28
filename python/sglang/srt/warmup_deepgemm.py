@@ -30,7 +30,7 @@ def warmup(model):
     if sources is None:
         return
 
-    infos = _compute_infos_from_sources(sources)
+    infos = list(_compute_infos_from_sources(sources))
     _warmup_by_infos(infos)
 
 
