@@ -105,6 +105,13 @@ class LoRAManager:
         # misc lora configs
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
 
+        if self.lora_backend == "flashinfer":
+            # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+            max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+            scaling = list(self.loras.values())[0].scaling
+            assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
+            assert all(x.scaling == scaling for x in self.loras.values())
+
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
 
@@ -128,6 +135,10 @@ class LoRAManager:
         cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(cur_uids, self.loras)
+
+        # FIXME: Handle lora uid with None more safely
+        if cur_uids == set([None]):
+            return
 
         # set up batch info shared by all lora moruldes
         bs = forward_batch.batch_size

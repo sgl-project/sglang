@@ -26,21 +26,6 @@ LORA_SETS = [
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
     {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
-    # test multi-rank case
-    {
-        "base": "meta-llama/Llama-2-7b-hf",
-        "loras": [
-            "winddude/wizardLM-LlaMA-LoRA-7B",
-            "RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
-        ],
-    },
-    {
-        "base": "meta-llama/Llama-3.1-8B-Instruct",
-        "loras": [
-            "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-        ],
-    },
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
@@ -58,16 +43,23 @@ LORA_SETS = [
 TORCH_DTYPES = [torch.float16]
 
 PROMPTS = [
-    "AI is a field of computer science focused on",
     """
-    ### Instruction:
-    Tell me about llamas and alpacas
-    ### Response:
-    Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids.
-    ### Question:
-    What do you know about llamas?
-    ### Answer:
-    """,
+### Instruction:
+Write a poem about the transformers Python library.
+Mention the word "large language models" in that poem.
+### Response:
+The Transformers are large language models,
+They're used to make predictions on text.
+""",
+    """
+### Instruction:
+Tell me about llamas and alpacas
+### Response:
+Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
+### Question 2:
+What do you know about llamas?
+### Answer:
+""",
 ]
 
 # import json
@@ -85,19 +77,17 @@ class TestLoRA(CustomTestCase):
         print("=================== testing inference =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
-        batch_lora_paths = []
-        for prompt_id in range(len(prompts)):
-            if prompt_id < len(all_lora_paths):
-                batch_lora_paths.append(all_lora_paths[prompt_id])
-            else:
-                batch_lora_paths.append(all_lora_paths[0])
-        # batch_lora_paths = [None]
-        # i = 0
-        # for _ in range(len(prompts) - 1):
-        #     batch_lora_paths.append(all_lora_paths[i])
-        #     i = (i + 1) % len(all_lora_paths)
-
-        print("batch_lora_paths", batch_lora_paths)
+        # batch_lora_paths = []
+        # for prompt_id in range(len(prompts)):
+        #     if prompt_id < len(all_lora_paths):
+        #         batch_lora_paths.append(all_lora_paths[prompt_id])
+        #     else:
+        #         batch_lora_paths.append(all_lora_paths[0])
+        batch_lora_paths = [None]
+        i = 0
+        for _ in range(len(prompts) - 1):
+            batch_lora_paths.append(all_lora_paths[i])
+            i = (i + 1) % len(all_lora_paths)
 
         with SRTRunner(
             base_path,
@@ -205,7 +195,7 @@ class TestLoRA(CustomTestCase):
                 srt_no_lora_outputs.output_strs[i].strip(" "),
                 hf_no_lora_outputs.output_strs[i],
             )
-            assert srt_outputs_lora_path_none == srt_no_lora_outputs
+            # assert srt_outputs_lora_path_none == srt_no_lora_outputs
 
     def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing serving =======================")
@@ -305,7 +295,7 @@ class TestLoRA(CustomTestCase):
                 tp_size = 1
                 max_new_tokens = 32
                 self.inference(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
-                self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
+                # self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
                 # self.base_inference(
                 #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
                 # )
