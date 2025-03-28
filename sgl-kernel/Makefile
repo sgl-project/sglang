@@ -19,13 +19,14 @@ submodule: ## Initialize and update git submodules
 	@git submodule update --init --recursive
 
 ln: submodule ## Create compilation database
-	@rm -rf build && bear python3 setup.py build
+	@rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=YES
+
 
 install: submodule ## Install package in development mode
 	@pip install -e .
 
 build: submodule ## Build and install wheel package
-	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && python3 setup.py bdist_wheel && pip3 install dist/*whl --force-reinstall --no-deps
+	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && uv build --wheel -Cbuild-dir=build . --verbose --color=always && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
