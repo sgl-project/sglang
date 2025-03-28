@@ -33,7 +33,7 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
-_enable_jit_deepgemm = False
+enable_jit_deepgemm = False
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -45,7 +45,7 @@ if _is_cuda:
 
     sm_version = get_device_sm()
     if sm_version >= 90 and int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "1")):
-        _enable_jit_deepgemm = True
+        enable_jit_deepgemm = True
 
 
 logger = logging.getLogger(__name__)
@@ -779,7 +779,7 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
+    if C.dtype == torch.bfloat16 and enable_jit_deepgemm:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
