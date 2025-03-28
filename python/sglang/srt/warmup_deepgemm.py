@@ -37,7 +37,8 @@ _INFOS_SOURCE_OF_MODEL = {
 
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
-    TODO
+    for info in infos:
+        TODO
 
 
 # --------------------------------------- capture -------------------------------------
