@@ -65,29 +65,6 @@ class BaseReqInput:
         self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
                                                                                  self.input_embeds)
 
-        # -----
-
-        # Derive the batch size
-        self.batch_size = 0
-        self.is_single = True
-
-        # check the batch size of text
-        if self.text is not None:
-            if isinstance(self.text, list):
-                self.batch_size += len(self.text)
-            else:
-                self.batch_size += 1
-
-        # check the batch size of input_ids
-        if self.input_ids is not None:
-            if isinstance(self.input_ids[0], list):
-                self.batch_size += len(self.input_ids)
-            else:
-                self.batch_size += 1
-
-        if self.batch_size > 1:
-            self.is_single = False
-
     @staticmethod
     def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
         if text is not None:
