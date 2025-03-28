@@ -35,11 +35,11 @@ def warmup(model):
     if not enable_jit_deepgemm:
         return
 
-    infos_source = _compute_infos(model)
-    if infos_source is None:
+    infos = _compute_infos(model)
+    if infos is None:
         return
 
-    _warmup_by_infos(infos_source())
+    _warmup_by_infos(infos)
 
 
 def _compute_infos(model) -> List[_Info]:
