@@ -42,7 +42,8 @@ except ImportError:
 
     # Define empty classes as placeholders when vllm is not available
     class DummyConfig:
-        pass
+        def override_quantization_method(self, *args, **kwargs):
+            return None
 
     AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
         DeepSpeedFPConfig
@@ -107,7 +108,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         )
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
-            f"{quantization} method requires some operators from vllm. "
+            f"{quantization} quantization requires some operators from vllm. "
             "Pleaes install vllm by `pip install vllm==0.7.2`"
         )
 
