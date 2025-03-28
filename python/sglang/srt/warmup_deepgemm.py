@@ -17,11 +17,11 @@ def warmup(model):
     if not enable_jit_deepgemm:
         return
 
-    infos = _INFOS_OF_MODEL.get(type(model))
-    if infos is None:
+    infos_source = _INFOS_SOURCE_OF_MODEL.get(type(model))
+    if infos_source is None:
         return
 
-    _warmup_by_infos(infos)
+    _warmup_by_infos(infos_source())
 
 
 def _compute_infos_deepseek():
@@ -30,7 +30,7 @@ def _compute_infos_deepseek():
     ]
 
 
-_INFOS_OF_MODEL = {
+_INFOS_SOURCE_OF_MODEL = {
     DeepseekV2ForCausalLM: _compute_infos_deepseek,
     DeepseekV3ForCausalLM: _compute_infos_deepseek,
 }
