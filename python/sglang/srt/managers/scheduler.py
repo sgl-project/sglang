@@ -419,7 +419,7 @@ class Scheduler(
         self.init_disaggregation()
 
         # Execute warmups
-        warmup_deepgemm.warmup()
+        warmup_deepgemm.warmup(server_args)
 
     def init_tokenizer(self):
         server_args = self.server_args

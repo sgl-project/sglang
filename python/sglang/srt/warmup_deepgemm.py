@@ -2,6 +2,7 @@
 import json
 import logging
 
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------- warmup -------------------------------------
 
-def warmup():
+def warmup(server_args: ServerArgs):
     TODO
 
 
