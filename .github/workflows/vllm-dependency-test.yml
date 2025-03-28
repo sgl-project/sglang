@@ -5,11 +5,13 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
+      - "scripts/**"
       - "test/**"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
+      - "scripts/**"
       - "test/**"
 
 concurrency:

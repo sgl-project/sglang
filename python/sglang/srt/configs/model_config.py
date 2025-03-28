@@ -235,7 +235,6 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        # Select supported quantization methods based on vllm availability
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
@@ -274,7 +273,6 @@ class ModelConfig:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            # Only iterate through currently available quantization methods
             for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
