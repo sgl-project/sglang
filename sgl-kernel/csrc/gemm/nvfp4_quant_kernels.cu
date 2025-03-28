@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <cuda.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
