@@ -1,0 +1,804 @@
+Submodule path '3rdparty/flashinfer': checked out '79fd1ae90d9b8098ca70dec6071da96f3f6da7b9'
+[34mDEBUG[39m uv 0.6.10
+[34mDEBUG[39m Found workspace root: `/sgl-workspace/sglang/sgl-kernel`
+[34mDEBUG[39m Adding root workspace member: `/sgl-workspace/sglang/sgl-kernel`
+[34mDEBUG[39m Searching for Python >=3.9 in virtual environments, managed installations, or search path
+[34mDEBUG[39m Searching for managed installations at `/root/.local/share/uv/python`
+[34mDEBUG[39m Found `cpython-3.10.12-linux-x86_64-gnu` at `/root/.pyenv/shims/python3` (first executable in the search path)
+[34mDEBUG[39m Using request timeout of 30s
+[1mBuilding wheel...[0m
+[34mDEBUG[39m No workspace root found, using project root
+[34mDEBUG[39m Using base executable for virtual environment: /usr/bin/python3
+[34mDEBUG[39m Ignoring empty directory
+[34mDEBUG[39m Resolving build requirements
+[34mDEBUG[39m Solving with installed Python version: 3.10.12
+[34mDEBUG[39m Solving with target Python version: >=3.10.12
+[34mDEBUG[39m Adding direct dependency: scikit-build-core>=0.10
+[34mDEBUG[39m Adding direct dependency: torch>=2.5.1, <2.5.1+
+[34mDEBUG[39m Adding direct dependency: wheel*
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/scikit-build-core/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/scikit-build-core/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/wheel/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/wheel/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/torch/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/torch/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/wheel/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/0b/2c/87f3254fd8ffd29e4c02732eee68a83a1d3c346ae39bc6822dcbcb697f2b/wheel-0.45.1-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/torch/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/scikit-build-core/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/41/54/79ec4bd01dc90d222c67d175c0324afb1c4998e523e96b44d67be0aafd28/scikit_build_core-0.11.1-py3-none-any.whl.metadata
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/2a/ef/834af4a885b31a0b32fff2d80e1e40f771e1566ea8ded55347502440786a/torch-2.5.1-cp310-cp310-manylinux1_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of torch (>=2.5.1, <2.5.1+)
+[34mDEBUG[39m Selecting: torch==2.5.1 [compatible] (torch-2.5.1-cp310-cp310-manylinux1_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: filelock*
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: typing-extensions>=4.8.0
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: networkx*
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: jinja2*
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: fsspec*
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cuda-nvrtc-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.127, <12.4.127+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cuda-runtime-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.127, <12.4.127+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cuda-cupti-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.127, <12.4.127+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cudnn-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=9.1.0.70, <9.1.0.70+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cublas-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.5.8, <12.4.5.8+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cufft-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=11.2.1.3, <11.2.1.3+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-curand-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=10.3.5.147, <10.3.5.147+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cusolver-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=11.6.1.9, <11.6.1.9+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-cusparse-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.3.1.170, <12.3.1.170+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-nccl-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=2.21.5, <2.21.5+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-nvtx-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.127, <12.4.127+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: nvidia-nvjitlink-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}>=12.4.127, <12.4.127+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: triton{python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'}>=3.1.0, <3.1.0+
+[34mDEBUG[39m Adding transitive dependency for torch==2.5.1: sympy{python_full_version >= '3.9'}>=1.13.1, <1.13.1+
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/filelock/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/filelock/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/typing-extensions/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/typing-extensions/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/networkx/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/networkx/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/jinja2/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/jinja2/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cuda-nvrtc-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cuda-nvrtc-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cuda-runtime-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cuda-runtime-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/fsspec/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/fsspec/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cuda-cupti-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cuda-cupti-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cublas-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cublas-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-curand-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-curand-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cusolver-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cusolver-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-nccl-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-nccl-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-nvjitlink-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-nvjitlink-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-nvtx-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-nvtx-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/sympy/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/sympy/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cudnn-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cudnn-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cufft-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cufft-cu12/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/triton/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/triton/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/nvidia-cusparse-cu12/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/nvidia-cusparse-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/sympy/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/networkx/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/b9/54/dd730b32ea14ea797530a4479b2ed46a6fb250f682a9cfb997e968bf0261/networkx-3.4.2-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/typing-extensions/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/e0/86/39b65d676ec5732de17b7e3c476e45bb80ec64eb50737a8dce1a4178aba1/typing_extensions-4.13.0-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cuda-cupti-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cublas-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-curand-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-nvjitlink-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/jinja2/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/triton/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cufft-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-nccl-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/filelock/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/4d/36/2a115987e2d8c300a974597416d9de88f2444426de9571f4b59b2cca3acc/filelock-3.18.0-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cusolver-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-nvtx-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cusparse-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/fsspec/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/56/53/eb690efa8513166adef3e0669afd31e95ffde69fb3c52ec2ac7223ed6018/fsspec-2025.3.0-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cuda-nvrtc-cu12/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cudnn-cu12/
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-nvrtc-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.127, <12.4.127+)
+[34mDEBUG[39m Selecting: nvidia-cuda-nvrtc-cu12==12.4.127 [compatible] (nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-nvrtc-cu12==12.4.127: nvidia-cuda-nvrtc-cu12==12.4.127
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-nvrtc-cu12==12.4.127: nvidia-cuda-nvrtc-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.127
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-nvrtc-cu12 (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-nvrtc-cu12==12.4.127 [compatible] (nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/2c/14/91ae57cd4db3f9ef7aa99f4019cfa8d54cb4caa7e00975df6467e9725a9f/nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-nvrtc-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-nvrtc-cu12==12.4.127 [compatible] (nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/nvidia-cuda-runtime-cu12/
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-runtime-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.127, <12.4.127+)
+[34mDEBUG[39m Selecting: nvidia-cuda-runtime-cu12==12.4.127 [compatible] (nvidia_cuda_runtime_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-runtime-cu12==12.4.127: nvidia-cuda-runtime-cu12==12.4.127
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-runtime-cu12==12.4.127: nvidia-cuda-runtime-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.127
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-runtime-cu12 (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-runtime-cu12==12.4.127 [compatible] (nvidia_cuda_runtime_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/ea/27/1795d86fe88ef397885f2e580ac37628ed058a92ed2c39dc8eac3adf0619/nvidia_cuda_runtime_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-runtime-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-runtime-cu12==12.4.127 [compatible] (nvidia_cuda_runtime_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-cupti-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.127, <12.4.127+)
+[34mDEBUG[39m Selecting: nvidia-cuda-cupti-cu12==12.4.127 [compatible] (nvidia_cuda_cupti_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-cupti-cu12==12.4.127: nvidia-cuda-cupti-cu12==12.4.127
+[34mDEBUG[39m Adding transitive dependency for nvidia-cuda-cupti-cu12==12.4.127: nvidia-cuda-cupti-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.127
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-cupti-cu12 (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-cupti-cu12==12.4.127 [compatible] (nvidia_cuda_cupti_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/67/42/f4f60238e8194a3106d06a058d494b18e006c10bb2b915655bd9f6ea4cb1/nvidia_cuda_cupti_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-cuda-cupti-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-cuda-cupti-cu12==12.4.127 [compatible] (nvidia_cuda_cupti_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-cudnn-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=9.1.0.70, <9.1.0.70+)
+[34mDEBUG[39m Selecting: nvidia-cudnn-cu12==9.1.0.70 [compatible] (nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cudnn-cu12==9.1.0.70: nvidia-cudnn-cu12==9.1.0.70
+[34mDEBUG[39m Adding transitive dependency for nvidia-cudnn-cu12==9.1.0.70: nvidia-cudnn-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==9.1.0.70
+[34mDEBUG[39m Searching for a compatible version of nvidia-cudnn-cu12 (==9.1.0.70)
+[34mDEBUG[39m Selecting: nvidia-cudnn-cu12==9.1.0.70 [compatible] (nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/9f/fd/713452cd72343f682b1c7b9321e23829f00b842ceaedcda96e742ea0b0b3/nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Adding transitive dependency for nvidia-cudnn-cu12==9.1.0.70: nvidia-cublas-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-cudnn-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==9.1.0.70)
+[34mDEBUG[39m Selecting: nvidia-cudnn-cu12==9.1.0.70 [compatible] (nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cudnn-cu12==9.1.0.70: nvidia-cublas-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-cublas-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.5.8, <12.4.5.8+)
+[34mDEBUG[39m Selecting: nvidia-cublas-cu12==12.4.5.8 [compatible] (nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cublas-cu12==12.4.5.8: nvidia-cublas-cu12==12.4.5.8
+[34mDEBUG[39m Adding transitive dependency for nvidia-cublas-cu12==12.4.5.8: nvidia-cublas-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.5.8
+[34mDEBUG[39m Searching for a compatible version of nvidia-cublas-cu12 (==12.4.5.8)
+[34mDEBUG[39m Selecting: nvidia-cublas-cu12==12.4.5.8 [compatible] (nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl.metadata
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/ae/71/1c91302526c45ab494c23f61c7a84aa568b8c1f9d196efa5993957faf906/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-cublas-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.5.8)
+[34mDEBUG[39m Selecting: nvidia-cublas-cu12==12.4.5.8 [compatible] (nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-cufft-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=11.2.1.3, <11.2.1.3+)
+[34mDEBUG[39m Selecting: nvidia-cufft-cu12==11.2.1.3 [compatible] (nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cufft-cu12==11.2.1.3: nvidia-cufft-cu12==11.2.1.3
+[34mDEBUG[39m Adding transitive dependency for nvidia-cufft-cu12==11.2.1.3: nvidia-cufft-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==11.2.1.3
+[34mDEBUG[39m Searching for a compatible version of nvidia-cufft-cu12 (==11.2.1.3)
+[34mDEBUG[39m Selecting: nvidia-cufft-cu12==11.2.1.3 [compatible] (nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/27/94/3266821f65b92b3138631e9c8e7fe1fb513804ac934485a8d05776e1dd43/nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-cufft-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==11.2.1.3)
+[34mDEBUG[39m Selecting: nvidia-cufft-cu12==11.2.1.3 [compatible] (nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-curand-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=10.3.5.147, <10.3.5.147+)
+[34mDEBUG[39m Selecting: nvidia-curand-cu12==10.3.5.147 [compatible] (nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-curand-cu12==10.3.5.147: nvidia-curand-cu12==10.3.5.147
+[34mDEBUG[39m Adding transitive dependency for nvidia-curand-cu12==10.3.5.147: nvidia-curand-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==10.3.5.147
+[34mDEBUG[39m Searching for a compatible version of nvidia-curand-cu12 (==10.3.5.147)
+[34mDEBUG[39m Selecting: nvidia-curand-cu12==10.3.5.147 [compatible] (nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/8a/6d/44ad094874c6f1b9c654f8ed939590bdc408349f137f9b98a3a23ccec411/nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-curand-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==10.3.5.147)
+[34mDEBUG[39m Selecting: nvidia-curand-cu12==10.3.5.147 [compatible] (nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusolver-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=11.6.1.9, <11.6.1.9+)
+[34mDEBUG[39m Selecting: nvidia-cusolver-cu12==11.6.1.9 [compatible] (nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cusolver-cu12==11.6.1.9
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cusolver-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==11.6.1.9
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusolver-cu12 (==11.6.1.9)
+[34mDEBUG[39m Selecting: nvidia-cusolver-cu12==11.6.1.9 [compatible] (nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/3a/e1/5b9089a4b2a4790dfdea8b3a006052cfecff58139d5a4e34cb1a51df8d6f/nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cublas-cu12*
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-nvjitlink-cu12*
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cusparse-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusolver-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==11.6.1.9)
+[34mDEBUG[39m Selecting: nvidia-cusolver-cu12==11.6.1.9 [compatible] (nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cublas-cu12*
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-nvjitlink-cu12*
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusolver-cu12==11.6.1.9: nvidia-cusparse-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusparse-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.3.1.170, <12.3.1.170+)
+[34mDEBUG[39m Selecting: nvidia-cusparse-cu12==12.3.1.170 [compatible] (nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusparse-cu12==12.3.1.170: nvidia-cusparse-cu12==12.3.1.170
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusparse-cu12==12.3.1.170: nvidia-cusparse-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.3.1.170
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusparse-cu12 (==12.3.1.170)
+[34mDEBUG[39m Selecting: nvidia-cusparse-cu12==12.3.1.170 [compatible] (nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/c2/f5/e1854cb2f2bcd4280c44736c93550cc300ff4b8c95ebe370d0aa7d2b473d/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/f6/74/86a07f1d0f42998ca31312f998bd3b9a7eff7f52378f4f270c8679c77fb9/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl.metadata
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/db/f7/97a9ea26ed4bbbfc2d470994b8b4f338ef663be97b8f677519ac195e113d/nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusparse-cu12==12.3.1.170: nvidia-nvjitlink-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-cusparse-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.3.1.170)
+[34mDEBUG[39m Selecting: nvidia-cusparse-cu12==12.3.1.170 [compatible] (nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-cusparse-cu12==12.3.1.170: nvidia-nvjitlink-cu12*
+[34mDEBUG[39m Searching for a compatible version of nvidia-nccl-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=2.21.5, <2.21.5+)
+[34mDEBUG[39m Selecting: nvidia-nccl-cu12==2.21.5 [compatible] (nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-nccl-cu12==2.21.5: nvidia-nccl-cu12==2.21.5
+[34mDEBUG[39m Adding transitive dependency for nvidia-nccl-cu12==2.21.5: nvidia-nccl-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==2.21.5
+[34mDEBUG[39m Searching for a compatible version of nvidia-nccl-cu12 (==2.21.5)
+[34mDEBUG[39m Selecting: nvidia-nccl-cu12==2.21.5 [compatible] (nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/df/99/12cd266d6233f47d00daf3a72739872bdc10267d0383508b0b9c84a18bb6/nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-nccl-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==2.21.5)
+[34mDEBUG[39m Selecting: nvidia-nccl-cu12==2.21.5 [compatible] (nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvtx-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.127, <12.4.127+)
+[34mDEBUG[39m Selecting: nvidia-nvtx-cu12==12.4.127 [compatible] (nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-nvtx-cu12==12.4.127: nvidia-nvtx-cu12==12.4.127
+[34mDEBUG[39m Adding transitive dependency for nvidia-nvtx-cu12==12.4.127: nvidia-nvtx-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.127
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvtx-cu12 (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-nvtx-cu12==12.4.127 [compatible] (nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/87/20/199b8713428322a2f22b722c62b8cc278cc53dffa9705d744484b5035ee9/nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvtx-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-nvtx-cu12==12.4.127 [compatible] (nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvjitlink-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (>=12.4.127, <12.4.127+)
+[34mDEBUG[39m Selecting: nvidia-nvjitlink-cu12==12.4.127 [compatible] (nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for nvidia-nvjitlink-cu12==12.4.127: nvidia-nvjitlink-cu12==12.4.127
+[34mDEBUG[39m Adding transitive dependency for nvidia-nvjitlink-cu12==12.4.127: nvidia-nvjitlink-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'}==12.4.127
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvjitlink-cu12 (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-nvjitlink-cu12==12.4.127 [compatible] (nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/ff/ff/847841bacfbefc97a00036e0fce5a0f086b640756dc38caea5e1bb002655/nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of nvidia-nvjitlink-cu12{platform_machine == 'x86_64' and sys_platform == 'linux'} (==12.4.127)
+[34mDEBUG[39m Selecting: nvidia-nvjitlink-cu12==12.4.127 [compatible] (nvidia_nvjitlink_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl)
+[34mDEBUG[39m Searching for a compatible version of triton{python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'} (>=3.1.0, <3.1.0+)
+[34mDEBUG[39m Selecting: triton==3.1.0 [compatible] (triton-3.1.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for triton==3.1.0: triton==3.1.0
+[34mDEBUG[39m Adding transitive dependency for triton==3.1.0: triton{python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'}==3.1.0
+[34mDEBUG[39m Searching for a compatible version of triton (==3.1.0)
+[34mDEBUG[39m Selecting: triton==3.1.0 [compatible] (triton-3.1.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/98/29/69aa56dc0b2eb2602b553881e34243475ea2afd9699be042316842788ff5/triton-3.1.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Adding transitive dependency for triton==3.1.0: filelock*
+[34mDEBUG[39m Searching for a compatible version of triton{python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux'} (==3.1.0)
+[34mDEBUG[39m Selecting: triton==3.1.0 [compatible] (triton-3.1.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl)
+[34mDEBUG[39m Adding transitive dependency for triton==3.1.0: filelock*
+[34mDEBUG[39m Searching for a compatible version of sympy{python_full_version >= '3.9'} (>=1.13.1, <1.13.1+)
+[34mDEBUG[39m Selecting: sympy==1.13.1 [compatible] (sympy-1.13.1-py3-none-any.whl)
+[34mDEBUG[39m Adding transitive dependency for sympy==1.13.1: sympy==1.13.1
+[34mDEBUG[39m Adding transitive dependency for sympy==1.13.1: sympy{python_full_version >= '3.9'}==1.13.1
+[34mDEBUG[39m Searching for a compatible version of sympy (==1.13.1)
+[34mDEBUG[39m Selecting: sympy==1.13.1 [compatible] (sympy-1.13.1-py3-none-any.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/b2/fe/81695a1aa331a842b582453b605175f419fe8540355886031328089d840a/sympy-1.13.1-py3-none-any.whl.metadata
+[34mDEBUG[39m Adding transitive dependency for sympy==1.13.1: mpmath>=1.1.0, <1.4
+[34mDEBUG[39m Searching for a compatible version of sympy{python_full_version >= '3.9'} (==1.13.1)
+[34mDEBUG[39m Selecting: sympy==1.13.1 [compatible] (sympy-1.13.1-py3-none-any.whl)
+[34mDEBUG[39m Adding transitive dependency for sympy==1.13.1: mpmath>=1.1.0, <1.4
+[34mDEBUG[39m Searching for a compatible version of scikit-build-core (>=0.10)
+[34mDEBUG[39m Selecting: scikit-build-core==0.11.1 [compatible] (scikit_build_core-0.11.1-py3-none-any.whl)
+[34mDEBUG[39m Adding transitive dependency for scikit-build-core==0.11.1: exceptiongroup{python_full_version < '3.11'}>=1.0
+[34mDEBUG[39m Adding transitive dependency for scikit-build-core==0.11.1: packaging>=23.2
+[34mDEBUG[39m Adding transitive dependency for scikit-build-core==0.11.1: pathspec>=0.10.1
+[34mDEBUG[39m Adding transitive dependency for scikit-build-core==0.11.1: tomli{python_full_version < '3.11'}>=1.2.2
+[34mDEBUG[39m Searching for a compatible version of wheel (*)
+[34mDEBUG[39m Selecting: wheel==0.45.1 [compatible] (wheel-0.45.1-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of filelock (*)
+[34mDEBUG[39m Selecting: filelock==3.18.0 [compatible] (filelock-3.18.0-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of typing-extensions (>=4.8.0)
+[34mDEBUG[39m Selecting: typing-extensions==4.13.0 [compatible] (typing_extensions-4.13.0-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of networkx (*)
+[34mDEBUG[39m Selecting: networkx==3.4.2 [compatible] (networkx-3.4.2-py3-none-any.whl)
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/mpmath/
+[34mDEBUG[39m Searching for a compatible version of jinja2 (*)
+[34mDEBUG[39m Selecting: jinja2==3.1.6 [compatible] (jinja2-3.1.6-py3-none-any.whl)
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/mpmath/
+[34mDEBUG[39m Adding transitive dependency for jinja2==3.1.6: markupsafe>=2.0
+[34mDEBUG[39m Searching for a compatible version of fsspec (*)
+[34mDEBUG[39m Selecting: fsspec==2025.3.0 [compatible] (fsspec-2025.3.0-py3-none-any.whl)
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/exceptiongroup/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/exceptiongroup/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/pathspec/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/pathspec/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/tomli/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/tomli/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/packaging/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/packaging/
+[34mDEBUG[39m Found stale response for: https://pypi.org/simple/markupsafe/
+[34mDEBUG[39m Sending revalidation request for: https://pypi.org/simple/markupsafe/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/mpmath/
+[34mDEBUG[39m Searching for a compatible version of mpmath (>=1.1.0, <1.4)
+[34mDEBUG[39m Selecting: mpmath==1.3.0 [compatible] (mpmath-1.3.0-py3-none-any.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/packaging/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/88/ef/eb23f262cca3c0c4eb7ab1933c3b1f03d021f2c48f54763065b6f0e321be/packaging-24.2-py3-none-any.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/tomli/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/markupsafe/
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/pathspec/
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/cc/20/ff623b09d963f88bfde16306a54e12ee5ea43e9b597108672ff3a408aad6/pathspec-0.12.1-py3-none-any.whl.metadata
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/22/35/137da042dfb4720b638d2937c38a9c2df83fe32d20e8c8f3185dbfef05f7/MarkupSafe-3.0.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata
+[34mDEBUG[39m Found not-modified response for: https://pypi.org/simple/exceptiongroup/
+[34mDEBUG[39m Searching for a compatible version of exceptiongroup{python_full_version < '3.11'} (>=1.0)
+[34mDEBUG[39m Selecting: exceptiongroup==1.2.2 [compatible] (exceptiongroup-1.2.2-py3-none-any.whl)
+[34mDEBUG[39m Adding transitive dependency for exceptiongroup==1.2.2: exceptiongroup==1.2.2
+[34mDEBUG[39m Adding transitive dependency for exceptiongroup==1.2.2: exceptiongroup{python_full_version < '3.11'}==1.2.2
+[34mDEBUG[39m Searching for a compatible version of exceptiongroup (==1.2.2)
+[34mDEBUG[39m Selecting: exceptiongroup==1.2.2 [compatible] (exceptiongroup-1.2.2-py3-none-any.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/02/cc/b7e31358aac6ed1ef2bb790a9746ac2c69bcb3c8588b41616914eb106eaf/exceptiongroup-1.2.2-py3-none-any.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of exceptiongroup{python_full_version < '3.11'} (==1.2.2)
+[34mDEBUG[39m Selecting: exceptiongroup==1.2.2 [compatible] (exceptiongroup-1.2.2-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of packaging (>=23.2)
+[34mDEBUG[39m Selecting: packaging==24.2 [compatible] (packaging-24.2-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of pathspec (>=0.10.1)
+[34mDEBUG[39m Selecting: pathspec==0.12.1 [compatible] (pathspec-0.12.1-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of tomli{python_full_version < '3.11'} (>=1.2.2)
+[34mDEBUG[39m Selecting: tomli==2.2.1 [compatible] (tomli-2.2.1-py3-none-any.whl)
+[34mDEBUG[39m Adding transitive dependency for tomli==2.2.1: tomli==2.2.1
+[34mDEBUG[39m Adding transitive dependency for tomli==2.2.1: tomli{python_full_version < '3.11'}==2.2.1
+[34mDEBUG[39m Searching for a compatible version of tomli (==2.2.1)
+[34mDEBUG[39m Selecting: tomli==2.2.1 [compatible] (tomli-2.2.1-py3-none-any.whl)
+[34mDEBUG[39m Found fresh response for: https://files.pythonhosted.org/packages/6e/c2/61d3e0f47e2b74ef40a68b9e6ad5984f6241a942f7cd3bbfbdbd03861ea9/tomli-2.2.1-py3-none-any.whl.metadata
+[34mDEBUG[39m Searching for a compatible version of tomli{python_full_version < '3.11'} (==2.2.1)
+[34mDEBUG[39m Selecting: tomli==2.2.1 [compatible] (tomli-2.2.1-py3-none-any.whl)
+[34mDEBUG[39m Searching for a compatible version of markupsafe (>=2.0)
+[34mDEBUG[39m Selecting: markupsafe==3.0.2 [compatible] (MarkupSafe-3.0.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl)
+[34mDEBUG[39m Tried 28 versions: exceptiongroup 1, filelock 1, fsspec 1, jinja2 1, markupsafe 1, mpmath 1, networkx 1, nvidia-cublas-cu12 1, nvidia-cuda-cupti-cu12 1, nvidia-cuda-nvrtc-cu12 1, nvidia-cuda-runtime-cu12 1, nvidia-cudnn-cu12 1, nvidia-cufft-cu12 1, nvidia-curand-cu12 1, nvidia-cusolver-cu12 1, nvidia-cusparse-cu12 1, nvidia-nccl-cu12 1, nvidia-nvjitlink-cu12 1, nvidia-nvtx-cu12 1, packaging 1, pathspec 1, scikit-build-core 1, sympy 1, tomli 1, torch 1, triton 1, typing-extensions 1, wheel 1
+[34mDEBUG[39m marker environment resolution took 0.109s
+[34mDEBUG[39m Installing in nvidia-cublas-cu12==12.4.5.8, nvidia-cuda-runtime-cu12==12.4.127, nvidia-cusolver-cu12==11.6.1.9, nvidia-cusparse-cu12==12.3.1.170, torch==2.5.1, nvidia-cuda-cupti-cu12==12.4.127, triton==3.1.0, filelock==3.18.0, nvidia-nvtx-cu12==12.4.127, jinja2==3.1.6, scikit-build-core==0.11.1, packaging==24.2, wheel==0.45.1, pathspec==0.12.1, networkx==3.4.2, nvidia-curand-cu12==10.3.5.147, markupsafe==3.0.2, nvidia-nvjitlink-cu12==12.4.127, nvidia-cudnn-cu12==9.1.0.70, exceptiongroup==1.2.2, typing-extensions==4.13.0, nvidia-nccl-cu12==2.21.5, nvidia-cuda-nvrtc-cu12==12.4.127, fsspec==2025.3.0, nvidia-cufft-cu12==11.2.1.3, mpmath==1.3.0, tomli==2.2.1, sympy==1.13.1 in /root/.cache/uv/builds-v0/.tmphtbwv9
+[34mDEBUG[39m Registry requirement already cached: nvidia-cublas-cu12==12.4.5.8
+[34mDEBUG[39m Registry requirement already cached: nvidia-cuda-runtime-cu12==12.4.127
+[34mDEBUG[39m Registry requirement already cached: nvidia-cusolver-cu12==11.6.1.9
+[34mDEBUG[39m Registry requirement already cached: nvidia-cusparse-cu12==12.3.1.170
+[34mDEBUG[39m Registry requirement already cached: torch==2.5.1
+[34mDEBUG[39m Registry requirement already cached: nvidia-cuda-cupti-cu12==12.4.127
+[34mDEBUG[39m Registry requirement already cached: triton==3.1.0
+[34mDEBUG[39m Registry requirement already cached: filelock==3.18.0
+[34mDEBUG[39m Registry requirement already cached: nvidia-nvtx-cu12==12.4.127
+[34mDEBUG[39m Registry requirement already cached: jinja2==3.1.6
+[34mDEBUG[39m Registry requirement already cached: scikit-build-core==0.11.1
+[34mDEBUG[39m Registry requirement already cached: packaging==24.2
+[34mDEBUG[39m Registry requirement already cached: wheel==0.45.1
+[34mDEBUG[39m Registry requirement already cached: pathspec==0.12.1
+[34mDEBUG[39m Registry requirement already cached: networkx==3.4.2
+[34mDEBUG[39m Registry requirement already cached: nvidia-curand-cu12==10.3.5.147
+[34mDEBUG[39m Registry requirement already cached: markupsafe==3.0.2
+[34mDEBUG[39m Registry requirement already cached: nvidia-nvjitlink-cu12==12.4.127
+[34mDEBUG[39m Registry requirement already cached: nvidia-cudnn-cu12==9.1.0.70
+[34mDEBUG[39m Registry requirement already cached: exceptiongroup==1.2.2
+[34mDEBUG[39m Registry requirement already cached: typing-extensions==4.13.0
+[34mDEBUG[39m Registry requirement already cached: nvidia-nccl-cu12==2.21.5
+[34mDEBUG[39m Registry requirement already cached: nvidia-cuda-nvrtc-cu12==12.4.127
+[34mDEBUG[39m Registry requirement already cached: fsspec==2025.3.0
+[34mDEBUG[39m Registry requirement already cached: nvidia-cufft-cu12==11.2.1.3
+[34mDEBUG[39m Registry requirement already cached: mpmath==1.3.0
+[34mDEBUG[39m Registry requirement already cached: tomli==2.2.1
+[34mDEBUG[39m Registry requirement already cached: sympy==1.13.1
+[34mDEBUG[39m Installing build requirements: nvidia-cublas-cu12==12.4.5.8, nvidia-cuda-runtime-cu12==12.4.127, nvidia-cusolver-cu12==11.6.1.9, nvidia-cusparse-cu12==12.3.1.170, torch==2.5.1, nvidia-cuda-cupti-cu12==12.4.127, triton==3.1.0, filelock==3.18.0, nvidia-nvtx-cu12==12.4.127, jinja2==3.1.6, scikit-build-core==0.11.1, packaging==24.2, wheel==0.45.1, pathspec==0.12.1, networkx==3.4.2, nvidia-curand-cu12==10.3.5.147, markupsafe==3.0.2, nvidia-nvjitlink-cu12==12.4.127, nvidia-cudnn-cu12==9.1.0.70, exceptiongroup==1.2.2, typing-extensions==4.13.0, nvidia-nccl-cu12==2.21.5, nvidia-cuda-nvrtc-cu12==12.4.127, fsspec==2025.3.0, nvidia-cufft-cu12==11.2.1.3, mpmath==1.3.0, tomli==2.2.1, sympy==1.13.1
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m File already exists (subsequent attempt), overwriting: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/nvidia/__init__.py
+[34mDEBUG[39m Creating PEP 517 build environment
+[34mDEBUG[39m Calling `scikit_build_core.build.get_requires_for_build_wheel()`
+[34mDEBUG[39m No workspace root found, using project root
+[34mDEBUG[39m Calling `scikit_build_core.build.build_wheel("/sgl-workspace/sglang/sgl-kernel/dist", {"build-dir":"build"}, None)`
+*** scikit-build-core 0.11.1 using CMake 3.31.1 (wheel)
+*** Configuring CMake...
+loading initial cache file build/CMakeInit.txt
+-- The CXX compiler identification is GNU 11.4.0
+-- The CUDA compiler identification is NVIDIA 12.4.131 with host compiler GNU 11.4.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/x86_64-linux-gnu-g++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/local/cuda/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Found Python: /root/.cache/uv/builds-v0/.tmphtbwv9/bin/python (found version "3.10.12") found components: Interpreter Development.Module Development.SABIModule
+-- Found CUDAToolkit: /usr/local/cuda/targets/x86_64-linux/include (found version "12.4.131")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Detected CUDA_VERSION=
+-- Found CUDA: /usr/local/cuda (found version "12.4")
+-- Found CUDAToolkit: /usr/local/cuda/include (found version "12.4.131")
+-- Caffe2: CUDA detected: 12.4
+-- Caffe2: CUDA nvcc is: /usr/local/cuda/bin/nvcc
+-- Caffe2: CUDA toolkit directory: /usr/local/cuda
+-- Caffe2: Header version is: 12.4
+-- Found Python: /root/.cache/uv/builds-v0/.tmphtbwv9/bin/python (found version "3.10.12") found components: Interpreter
+[33mCMake Warning at /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:140 (message):
+  Failed to compute shorthash for libnvrtc.so
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:24 (find_package)
+
+[0m
+[33mCMake Warning (dev) at /usr/local/share/cmake-3.31/Modules/FindPackageHandleStandardArgs.cmake:441 (message):
+  The package name passed to `find_package_handle_standard_args` (nvtx3) does
+  not match the name of the calling package (Caffe2).  This can lead to
+  problems in calling code that expects `find_package` result variables
+  (e.g., `_FOUND`) to follow a certain pattern.
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:174 (find_package_handle_standard_args)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:24 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+[0m
+-- Could NOT find nvtx3 (missing: nvtx3_dir)
+[33mCMake Warning at /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:180 (message):
+  Cannot find NVTX3, find old NVTX instead
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:24 (find_package)
+
+[0m
+-- USE_CUDNN is set to 0. Compiling without cuDNN support
+-- USE_CUSPARSELT is set to 0. Compiling without cuSPARSELt support
+-- USE_CUDSS is set to 0. Compiling without cuDSS support
+-- USE_CUFILE is set to 0. Compiling without cuFile support
+-- Autodetected CUDA architecture(s):  9.0 9.0 9.0 9.0 9.0 9.0 9.0 9.0
+-- Added CUDA NVCC flags for: -gencode;arch=compute_90,code=sm_90
+[33mCMake Warning at /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+  static library kineto_LIBRARY-NOTFOUND not found.
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:120 (append_torchlib_if_found)
+  CMakeLists.txt:24 (find_package)
+
+[0m
+-- Found Torch: /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/lib/libtorch.so
+-- Configuring done (82.6s)
+[33mCMake Warning (dev) at /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:182 (set_property):
+  The library that is being linked to, CUDA::nvToolsExt, is marked as being
+  deprecated by the owner.  The message provided by the developer is:
+
+  nvToolsExt has been superseded by nvtx3 since CUDA 10.0 and CMake 3.25.
+  Use CUDA::nvtx3 and include <nvtx3/nvToolsExt.h> instead.
+
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:24 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+[0m
+[33mCMake Warning (dev) at /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:182 (set_property):
+  The library that is being linked to, CUDA::nvToolsExt, is marked as being
+  deprecated by the owner.  The message provided by the developer is:
+
+  nvToolsExt has been superseded by nvtx3 since CUDA 10.0 and CMake 3.25.
+  Use CUDA::nvtx3 and include <nvtx3/nvToolsExt.h> instead.
+
+Call Stack (most recent call first):
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  /root/.cache/uv/builds-v0/.tmphtbwv9/lib/python3.10/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:24 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+[0m
+-- Generating done (0.0s)
+-- Build files have been written to: /sgl-workspace/sglang/sgl-kernel/build
+*** Building project with Ninja...
+[1/29] Building CXX object CMakeFiles/common_ops.dir/csrc/torch_extension.cc.o
+[2/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/gemm/bmm_fp8.cu.o
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:844: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:856: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:859: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:862: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:566: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:578: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:581: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:584: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:700: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:712: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:715: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:718: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:566: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:578: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:581: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:584: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:833: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:845: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:848: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:851: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:566: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:578: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:581: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:584: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:700: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:712: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:715: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:718: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:566: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:578: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:581: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/csrc/gemm/bmm_fp8.cu:45:584: warning: conversion from ‘long int’ to ‘int’ may change value [-Wconversion]
+   45 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ^
+[3/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/elementwise/activation.cu.o
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu: In function ‘void silu_and_mul(at::Tensor&, at::Tensor&, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:37:24: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘int’ may change value [-Wconversion]
+   37 |   int d = input.size(-1) / 2;
+      |         ~~~~~~~~~~~~~~~^~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:39:11: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   39 |   dim3 grid(num_tokens);
+      |           ^~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu: In function ‘void gelu_tanh_and_mul(at::Tensor&, at::Tensor&, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:53:24: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘int’ may change value [-Wconversion]
+   53 |   int d = input.size(-1) / 2;
+      |         ~~~~~~~~~~~~~~~^~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:55:11: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   55 |   dim3 grid(num_tokens);
+      |           ^~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu: In function ‘void gelu_and_mul(at::Tensor&, at::Tensor&, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:69:24: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘int’ may change value [-Wconversion]
+   69 |   int d = input.size(-1) / 2;
+      |         ~~~~~~~~~~~~~~~^~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/activation.cu:71:11: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   71 |   dim3 grid(num_tokens);
+      |           ^~~~~~~~~~
+[4/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/speculative/packbit.cu.o
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/quantization.cuh: In function ‘cudaError_t flashinfer::quantization::PackBits(bool*, uint8_t*, int64_t, flashinfer::quantization::BitOrder, cudaStream_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/quantization.cuh:87:179: warning: conversion from ‘long int’ to ‘unsigned int’ may change value [-Wconversion]
+   87 |   DISPATCH_BITORDER(bitorder, BITORDER, {
+      |                                                                                                                                                                                   ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/quantization.cuh:87:549: warning: conversion from ‘long int’ to ‘unsigned int’ may change value [-Wconversion]
+   87 |   DISPATCH_BITORDER(bitorder, BITORDER, {
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/packbit.cu: In function ‘void segment_packbits(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/packbit.cu:35:44: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   35 |   unsigned int batch_size = input_indptr.size(0) - 1;
+      |                       ~~~~~~~~~~~~~~~~~~~~~^~~~~
+[5/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/elementwise/rope.cu.o
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu: In function ‘void apply_rope_pos_ids_cos_sin_cache(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, bool, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu:46:41: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   46 |   unsigned int rotary_dim = cos_sin_cache.size(1);
+      |                       ~~~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu:47:31: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   47 |   unsigned int num_qo_heads = q.size(1);
+      |                         ~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu:48:31: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   48 |   unsigned int num_kv_heads = k.size(1);
+      |                         ~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu:49:27: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   49 |   unsigned int head_dim = q.size(2);
+      |                     ~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/elementwise/rope.cu:50:22: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   50 |   unsigned int nnz = q.size(0);
+      |                ~~~~~~^~~
+[6/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/speculative/speculative_sampling.cu.o
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu: In function ‘void tree_speculative_sampling_target_only(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, double, double, bool, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu:69:43: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   69 |   unsigned int batch_size = uniform_samples.size(0);
+      |                       ~~~~~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu:70:43: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   70 |   unsigned int num_spec_step = accept_index.size(1);
+      |                          ~~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu:71:44: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   71 |   unsigned int num_draft_tokens = candidates.size(1);
+      |                             ~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu:72:40: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   72 |   unsigned int vocab_size = target_probs.size(2);
+      |                       ~~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cuh: In instantiation of ‘cudaError_t flashinfer::sampling::TreeSpeculativeSamplingTargetOnly(IdType*, IdType*, IdType*, IdType*, IdType*, IdType*, IdType*, DType*, DType*, DType*, uint32_t, uint32_t, uint32_t, uint32_t, DType, DType, bool, cudaStream_t) [with DType = float; IdType = int; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cu:122:79:   required from here
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/speculative_sampling.cuh:180:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  180 |   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~
+[7/29] Building CUDA object CMakeFiles/common_ops.dir/_deps/repo-flashinfer-src/csrc/norm.cu.o
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In function ‘void rmsnorm(at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:32:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   32 |   unsigned int batch_size = input.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:33:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   33 |   unsigned int hidden_size = input.size(1);
+      |                        ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:38:310: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   38 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:38:294: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   38 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                      ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In function ‘void fused_add_rmsnorm(at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:62:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   62 |   unsigned int batch_size = input.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:63:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   63 |   unsigned int hidden_size = input.size(1);
+      |                        ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:66:320: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   66 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:66:304: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   66 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In function ‘void gemma_rmsnorm(at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:85:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   85 |   unsigned int batch_size = input.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:86:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   86 |   unsigned int hidden_size = input.size(1);
+      |                        ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:91:315: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   91 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:91:299: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   91 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In function ‘void gemma_fused_add_rmsnorm(at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:115:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  115 |   unsigned int batch_size = input.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:116:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  116 |   unsigned int hidden_size = input.size(1);
+      |                        ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:119:325: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+  119 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu: In lambda function:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:119:309: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+  119 |   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+      |                                                                                                                                                                                                                                                                                                                     ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::RMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __half; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:38:150:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:101:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  101 |   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::RMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __nv_bfloat16; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:38:134:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:101:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::FusedAddRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __half; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:66:158:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:204:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  204 |   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::FusedAddRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __nv_bfloat16; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:66:142:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:204:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::GemmaRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __half; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:91:155:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:226:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  226 |   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::GemmaRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __nv_bfloat16; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:91:139:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:226:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::GemmaFusedAddRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __half; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:119:163:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:246:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+  246 |   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh: In instantiation of ‘cudaError_t flashinfer::norm::GemmaFusedAddRMSNorm(T*, T*, T*, uint32_t, uint32_t, float, cudaStream_t) [with T = __nv_bfloat16; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/norm.cu:119:147:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/norm.cuh:246:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+[8/29] Building CUDA object CMakeFiles/common_ops.dir/csrc/speculative/eagle_utils.cu.o
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu: In function ‘void build_tree_kernel_efficient(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu:130:26: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘int’ may change value [-Wconversion]
+  130 |   int bs = parent_list.size(0);
+      |          ~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu:132:12: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  132 |   dim3 block(draft_token_num);
+      |            ^~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu: In function ‘void verify_tree_greedy(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu:230:38: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  230 |   unsigned int batch_size = candidates.size(0);
+      |                       ~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu:231:43: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  231 |   unsigned int num_spec_step = accept_index.size(1);
+      |                          ~~~~~~~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/csrc/speculative/eagle_utils.cu:232:44: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+  232 |   unsigned int num_draft_tokens = candidates.size(1);
+      |                             ~~~~~~~~~~~~~~~^~~
+[9/29] Building CUDA object CMakeFiles/common_ops.dir/_deps/repo-flashinfer-src/csrc/renorm.cu.o
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu: In function ‘void top_p_renorm_probs(at::Tensor, at::Tensor, std::optional<at::Tensor>, double, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:28:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   28 |   unsigned int batch_size = probs.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:29:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   29 |   unsigned int vocab_size = probs.size(1);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:33:237: warning: conversion from ‘double’ to ‘float’ may change value [-Wfloat-conversion]
+   33 |   cudaError_t status = sampling::TopPRenormProb<float>(
+      |                                                                                                                                                                                                                                             ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu: In function ‘void top_k_renorm_probs(at::Tensor, at::Tensor, std::optional<at::Tensor>, int64_t, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:47:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   47 |   unsigned int batch_size = probs.size(0);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:48:33: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   48 |   unsigned int vocab_size = probs.size(1);
+      |                       ~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:52:235: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+   52 |   cudaError_t status = sampling::TopKRenormProb<float>(
+      |                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu: In function ‘void top_k_mask_logits(at::Tensor, at::Tensor, std::optional<at::Tensor>, int64_t, int64_t)’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:67:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   67 |   unsigned int batch_size = logits.size(0);
+      |                       ~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:68:34: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘unsigned int’ may change value [-Wconversion]
+   68 |   unsigned int vocab_size = logits.size(1);
+      |                       ~~~~~~~~~~~^~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:72:235: warning: conversion from ‘int64_t’ {aka ‘long int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+   72 |   cudaError_t status = sampling::TopKMaskLogits<float>(
+      |                                                                                                                                                                                                                                           ^
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh: In instantiation of ‘cudaError_t flashinfer::sampling::TopPRenormProb(DType*, DType*, DType*, uint32_t, float, uint32_t, cudaStream_t) [with DType = float; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:33:55:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh:1157:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+ 1157 |   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh: In instantiation of ‘cudaError_t flashinfer::sampling::TopKRenormProb(DType*, DType*, IdType*, uint32_t, uint32_t, uint32_t, cudaStream_t) [with DType = float; IdType = int; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:52:55:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh:1176:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+ 1176 |   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh: In instantiation of ‘cudaError_t flashinfer::sampling::TopKMaskLogits(DType*, DType*, IdType*, uint32_t, uint32_t, uint32_t, cudaStream_t) [with DType = float; IdType = int; cudaError_t = cudaError; uint32_t = unsigned int; cudaStream_t = CUstream_st*]’:
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/csrc/renorm.cu:72:55:   required from here
+/sgl-workspace/sglang/sgl-kernel/build/_deps/repo-flashinfer-src/include/flashinfer/sampling.cuh:1198:36: warning: conversion from ‘std::common_type_t<long unsigned int, unsigned int>’ {aka ‘long unsigned int’} to ‘uint32_t’ {aka ‘unsigned int’} may change value [-Wconversion]
+ 1198 |   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+      |                           ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~

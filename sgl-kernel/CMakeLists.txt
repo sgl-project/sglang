@@ -41,8 +41,8 @@ FetchContent_Declare(
 FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
+    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
+    GIT_TAG        2b9f16eb79bd344e31725e8d7a92fe7fe980ffdf
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -178,4 +178,3 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
-
