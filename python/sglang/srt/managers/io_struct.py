@@ -62,34 +62,8 @@ class BaseReqInput:
                 "Exactly one of the text, input_ids or input_embeds should be provided."
             )
 
-        # Derive the batch size
-        if self.text is not None:
-            if isinstance(self.text, str):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.text)
-            self.input_embeds = None
-        elif self.input_ids is not None:
-            if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_ids)
-            self.input_embeds = None
-        else:
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.batch_size = len(self.input_embeds)
-
         # -----
-       
+
         # Derive the batch size
         self.batch_size = 0
         self.is_single = True
@@ -110,6 +84,34 @@ class BaseReqInput:
 
         if self.batch_size > 1:
             self.is_single = False
+
+    @staticmethod
+    def _compute_is_single_and_batch_size(text, input_ids, input_embeds):
+        # Derive the batch size
+        if text is not None:
+            if isinstance(text, str):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(text)
+            self.input_embeds = None
+        elif input_ids is not None:
+            if len(input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
+            if isinstance(input_ids[0], int):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(input_ids)
+            self.input_embeds = None
+        else:
+            if isinstance(input_embeds[0][0], float):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.batch_size = len(self.input_embeds)
 
 
 @dataclass
