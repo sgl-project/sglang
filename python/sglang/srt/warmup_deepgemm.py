@@ -30,7 +30,7 @@ def warmup(model):
     if sources is None:
         return
 
-    infos = list(_compute_infos_from_sources(sources))
+    infos = _compute_infos_from_sources(sources)
     _warmup_by_infos(infos)
 
 
@@ -58,11 +58,11 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 
 def _compute_infos_from_sources(sources):
     num_sms = deep_gemm.get_num_sms()
-    return _deduplicate(
+    return list(_deduplicate(
         _compute_infos_from_sources_raw(sources),
         key_fn=lambda info: deep_gemm.get_best_configs(
             m=info['m'], n=info['n'], k=info['k'], num_groups=1, num_sms=num_sms),
-    )
+    ))
 
 
 def _compute_infos_from_sources_raw(sources):
