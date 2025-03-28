@@ -1,6 +1,7 @@
 # TODO shall we put this file elsewhere?
 import json
 import logging
+from typing import Any, List, Dict
 
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.server_args import ServerArgs
@@ -20,7 +21,7 @@ def warmup(model):
     if infos is None:
         return
 
-    TODO
+    _warmup_by_infos(infos)
 
 
 def _compute_infos_deepseek():
@@ -33,6 +34,11 @@ _INFOS_OF_MODEL = {
     DeepseekV2ForCausalLM: _compute_infos_deepseek,
     DeepseekV3ForCausalLM: _compute_infos_deepseek,
 }
+
+
+def _warmup_by_infos(infos: List[Dict[str, Any]]):
+    TODO
+
 
 # --------------------------------------- capture -------------------------------------
 
