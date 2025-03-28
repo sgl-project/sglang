@@ -24,6 +24,7 @@ from typing import List, Optional
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
+    configure_ipv6,
     get_amdgpu_memory_capacity,
     get_device,
     get_hpu_memory_capacity,
@@ -52,7 +53,7 @@ class ServerArgs:
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
     quantization: Optional[str] = None
-    quantization_param_path: nullable_str = None
+    quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     device: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -140,7 +141,7 @@ class ServerArgs:
 
     # Double Sparsity
     enable_double_sparsity: bool = False
-    ds_channel_config_path: str = None
+    ds_channel_config_path: Optional[str] = None
     ds_heavy_channel_num: int = 32
     ds_heavy_token_num: int = 256
     ds_heavy_channel_type: str = "qk"
@@ -173,7 +174,7 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: str = None
+    tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     enable_flashinfer_mla: bool = False
@@ -290,12 +291,17 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
-            # DeepEP MoE
-            if self.enable_deepep_moe:
-                self.ep_size = self.dp_size
-                logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
-                )
+
+        self.enable_sp_layernorm = False
+        # DeepEP MoE
+        if self.enable_deepep_moe:
+            self.ep_size = self.tp_size
+            self.enable_sp_layernorm = (
+                self.dp_size < self.tp_size if self.enable_dp_attention else True
+            )
+            logger.info(
+                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1200,8 +1206,12 @@ class PortArgs:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
                 dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+            elif server_args.dist_init_addr.startswith("["):  # ipv6 address
+                port_num, host = configure_ipv6(server_args.dist_init_addr)
+                dist_init_addr = (host, str(port_num))
             else:
                 dist_init_addr = server_args.dist_init_addr.split(":")
+
             assert (
                 len(dist_init_addr) == 2
             ), "please provide --dist-init-addr as host:port of head node"
@@ -1210,10 +1220,10 @@ class PortArgs:
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
                 scheduler_input_port = (
-                    port_base + 2
+                    port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = port_base + 2 + 1 + dp_rank
+                scheduler_input_port = port_base + 3 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
