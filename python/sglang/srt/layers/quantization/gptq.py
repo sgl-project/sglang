@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
-    # compat: autogptq >=0.8.0 use checkpoint_format: str
+    # compat: gptqmodel and autogptq (eol) main use checkpoint_format: str
     # compat: autogptq <=0.7.1 is_marlin_format: bool
     return hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
         "is_marlin_format", False
