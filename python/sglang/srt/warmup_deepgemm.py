@@ -28,6 +28,13 @@ _INFOS_OF_MODEL = {
     DeepseekV3ForCausalLM: _compute_infos_deepseek,
 }
 
+
+def _compute_infos_deepseek():
+    return [
+        TODO,
+    ]
+
+
 # --------------------------------------- capture -------------------------------------
 
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
