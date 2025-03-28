@@ -3,7 +3,7 @@ import builtins
 import inspect
 import re
 from copy import deepcopy
-from typing import Any, Callable, Dict, Optional, Type, Union
+from typing import Callable, Dict, Optional, Type, Union
 
 import torch
 
@@ -34,8 +34,6 @@ try:
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -53,6 +51,7 @@ except ImportError:
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
