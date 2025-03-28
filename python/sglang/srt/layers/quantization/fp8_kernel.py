@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt import warmup_deepgemm
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
@@ -58,6 +59,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
+        warmup_deepgemm.on_execution((A, As), (B, Bs), C)
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
@@ -781,6 +783,7 @@ def w8a8_block_fp8_matmul(
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
+            warmup_deepgemm.on_execution((A, As), (B, Bs), C)
             deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
