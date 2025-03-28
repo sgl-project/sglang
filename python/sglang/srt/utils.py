@@ -1748,17 +1748,17 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
-                raise
+                raise Exception(f"retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise
+                raise Exception(f"retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
             )
 
             logger.warning(
-                f"retry() failed once. Will delay {delay:.2f}s and retry. Error: {e}"
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
             )
             traceback.print_exc()
 
