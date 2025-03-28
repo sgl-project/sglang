@@ -5,7 +5,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import wraps
-from typing import Callable, List, Optional, TypeVar, Union
+from typing import Any, Callable, List, Optional, TypeVar, Union
 
 import torch
 import torch.distributed as dist
