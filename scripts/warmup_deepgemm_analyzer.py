@@ -1,5 +1,5 @@
 import polars as pl
-from python.sglang.srt import warmup_deepgemm
+from sglang.srt import warmup_deepgemm
 
 
 def run():
