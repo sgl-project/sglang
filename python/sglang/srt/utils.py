@@ -1739,14 +1739,18 @@ def parse_connector_type(url: str) -> str:
 def retry(
     fn,
     max_retry: int,
-    initial_delay: float = 1.0,
+    initial_delay: float = 2.0,
     max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
 ):
     for try_index in itertools.count():
         try:
             fn()
         except Exception as e:
             if try_index >= max_retry:
+                raise
+
+            if not should_retry(e):
                 raise
 
             delay = min(initial_delay * (2 ** try_index), max_delay) * (0.75 + 0.25 * random.random())
