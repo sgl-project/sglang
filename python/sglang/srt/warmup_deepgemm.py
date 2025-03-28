@@ -92,6 +92,7 @@ def _deduplicate(items, key_fn: Callable):
 
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
+    logger.info("Warmup DeepGEMM...")
     with ProcessPoolExecutor(max_workers=psutil.cpu_count(logical=False)) as executor:
         iterator = executor.map(_warmup_by_info, infos)
         list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
