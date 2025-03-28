@@ -56,6 +56,9 @@ class BaseReqInput:
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
 
+    def normalize_batch_and_arguments(self):
+        TODO
+
 
 @dataclass
 class GenerateReqInput(BaseReqInput):
@@ -92,6 +95,8 @@ class GenerateReqInput(BaseReqInput):
     return_hidden_states: bool = False
 
     def normalize_batch_and_arguments(self):
+        super().normalize_batch_and_arguments()
+
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -312,6 +317,8 @@ class TokenizedGenerateReqInput:
 @dataclass
 class EmbeddingReqInput(BaseReqInput):
     def normalize_batch_and_arguments(self):
+        super().normalize_batch_and_arguments()
+
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(
