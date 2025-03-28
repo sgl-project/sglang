@@ -53,10 +53,12 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -105,7 +107,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import ExpertDistributionRecorder, validate_input_length
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1184,7 +1186,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
@@ -1701,18 +1703,12 @@ class Scheduler(
     def save_remote_model(self, params):
         url = params["url"]
 
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_remote_model(url)
 
     def save_sharded_model(self, params):
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_sharded_model(
             path=params["path"],
@@ -1789,6 +1785,9 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(
+            caller_name="release_memory_occupation"
+        )
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
@@ -1797,6 +1796,7 @@ class Scheduler(
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
@@ -1918,6 +1918,7 @@ class Scheduler(
             expert_distribution_recorder.dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
