@@ -69,6 +69,8 @@ def _per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 
 # Copied from DeepGEMM's `test_core.py`
 def _per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    from deep_gemm import ceil_div
+
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
