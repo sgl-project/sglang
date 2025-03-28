@@ -6,7 +6,6 @@ import logging
 import multiprocessing as mp
 import shutil
 import sys
-from concurrent.futures.process import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Callable
 
@@ -93,10 +92,12 @@ def _deduplicate(items, key_fn: Callable):
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
-    # TODO change max_workers
-    with ProcessPoolExecutor(max_workers=16) as executor:
-        iterator = executor.map(_warmup_by_info, infos)
-        list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
+    # TODO use process pool executor
+    # with ProcessPoolExecutor(max_workers=16) as executor:
+    #     iterator = executor.map(_warmup_by_info, infos)
+    #     list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
+    for info in tqdm(infos, total=len(infos), desc='Warmup DeepGEMM'):
+        _warmup_by_info(info)
 
 
 def _warmup_by_info(info: Dict[str, Any]):
