@@ -79,11 +79,21 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
+        # import time
+        # start = time.time()
+
         # Precompute strided indices
         # [0, page_size, 2 * page_size, ...]
-        self.strided_indices = torch.arange(
-            0, metadata.page_table.shape[1], self.page_size, device=device
-        )
+        if self.page_size > 1:
+            self.strided_indices = torch.arange(
+                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            )
+            metadata.page_table = (
+                metadata.page_table[:, self.strided_indices] // self.page_size
+            )
+        # end = time.time()
+        # print(f"page_table time: {(end - start) * 1000 * 1000} us")
+
         if forward_batch.forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -146,10 +156,7 @@ class FlashAttentionBackend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         )
 
-        if self.page_size > 1:
-            page_table = metadata.page_table[:, self.strided_indices] // self.page_size
-        else:
-            page_table = metadata.page_table
+        page_table = metadata.page_table
 
         o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -194,13 +201,11 @@ class FlashAttentionBackend(AttentionBackend):
         # Get KV cache
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache, value_cache = kv_cache[0], kv_cache[1]
-
         # Use precomputed metadata
         metadata = self.forward_metadata
 
         # Pre-reshape query tensor
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
@@ -210,8 +215,6 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         # Run attention with precomputed values
-        # import time
-        # start = time.time()
         key_cache = key_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         )
@@ -219,31 +222,30 @@ class FlashAttentionBackend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         )
 
-        if self.page_size > 1:
-            page_table = metadata.page_table[:, self.strided_indices] // self.page_size
-        else:
-            page_table = metadata.page_table
-        # end = time.time()
-        # print(f"page_table time: {(end - start) * 1000 * 1000} us")
+        page_table = metadata.page_table
 
-        # torch.distributed.breakpoint()
-        o = flash_attn_with_kvcache(
-            q=q_reshaped,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            page_table=page_table,
-            cache_seqlens=metadata.cache_seqlens_int32,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k_new=metadata.cu_seqlens_k,
-            max_seqlen_q=1,
-            softmax_scale=layer.scaling,
-            causal=True,
-            window_size=window_size,
-            softcap=layer.logit_cap,
-            k_descale=layer.k_scale,
-            v_descale=layer.v_scale,
-        )
-
+        try:
+            o = flash_attn_with_kvcache(
+                q=q_reshaped,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=1,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=layer.k_scale,
+                v_descale=layer.v_scale,
+            )
+        except Exception as e:
+            print(e)
+            torch.distributed.breakpoint()
+        # torch.cuda.synchronize()
+        # import time
         # cuda_end = time.time()
         # print(f"cuda time: {(cuda_end - end) * 1000 * 1000 } us")
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -261,7 +263,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {
             # Page table for token mapping (batch_size, max_context_len)
             "page_table": torch.zeros(
-                max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
             ),
         }
 
@@ -290,6 +298,7 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
             req_pool_indices, :
         ]
+
         if forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -326,12 +335,16 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         # Only zero out the part out of max_len_k
-        metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
+        # metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
         # Then do the copy
-        metadata.page_table[:, : metadata.max_seq_len_k].copy_(
-            self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
-        )
+        # torch.distributed.breakpoint()
+        metadata.page_table = self.req_to_token[
+            :, self.decode_cuda_graph_metadata["strided_indices"]
+        ]
+        metadata.page_table = metadata.page_table[req_pool_indices[:bs]]
 
+        # self.strided_indices = self.decode_cuda_graph_metadata["strided_indices"]
+        # metadata.page_table = metadata.page_table[:, self.strided_indices].clone() // self.page_size
         self.forward_decode_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
