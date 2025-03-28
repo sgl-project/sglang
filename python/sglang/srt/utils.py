@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
@@ -1735,16 +1736,26 @@ def parse_connector_type(url: str) -> str:
     return m.group(1)
 
 
-def retry(fn, max_retry: int):
-    if max_retry == 0:
-        fn()
-        return
+def retry(
+    fn,
+    max_retry: int,
+):
+    while True:
+        try:
+            fn()
+        except Exception as e:
+            logger.warning(f"retry failed once. Error: {e}")
+            traceback.print_exc()
 
-    try:
-        fn()
-    except Exception as e:
-        print(
-            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
-        )
-        traceback.print_exc()
-        retry(fn, max_retry=max_retry - 1)
+    # if max_retry == 0:
+    #     fn()
+    #     return
+    #
+    # try:
+    #     fn()
+    # except Exception as e:
+    #     print(
+    #         f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
+    #     )
+    #     traceback.print_exc()
+    #     retry(fn, max_retry=max_retry - 1)
