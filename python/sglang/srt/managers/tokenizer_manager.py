@@ -547,7 +547,7 @@ class TokenizerManager:
 
         generators = []
         rids = []
-        if getattr(obj, "parallel_sample_num", 1) == 1:
+        if obj.parallel_sample_num == 1:
             # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
