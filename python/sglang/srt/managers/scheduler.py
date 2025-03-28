@@ -1807,7 +1807,11 @@ class Scheduler(
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
-                recv_req.output_dir, recv_req.num_steps, recv_req.activities
+                recv_req.output_dir,
+                recv_req.num_steps,
+                recv_req.activities,
+                recv_req.with_stack,
+                recv_req.record_shapes,
             )
         else:
             return self.stop_profile()
@@ -1817,6 +1821,8 @@ class Scheduler(
         output_dir: Optional[str],
         num_steps: Optional[int],
         activities: Optional[List[str]],
+        with_stack: Optional[bool],
+        record_shapes: Optional[bool],
     ) -> None:
         if self.profiler_activities:
             return ProfileReqOutput(
@@ -1847,7 +1853,8 @@ class Scheduler(
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=True,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
 
