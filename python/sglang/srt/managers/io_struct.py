@@ -88,6 +88,22 @@ class BaseReqInput:
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
 
+            ######
+            if self.sampling_params is None:
+                self.sampling_params = {}
+            if self.rid is None:
+                self.rid = uuid.uuid4().hex
+
+            if self.sampling_params is None:
+                self.sampling_params = [{}] * num
+            elif not isinstance(self.sampling_params, list):
+                self.sampling_params = [self.sampling_params] * num
+
+            if self.rid is None:
+                self.rid = [uuid.uuid4().hex for _ in range(num)]
+            else:
+                assert isinstance(self.rid, list), "The rid should be a list."
+
     @staticmethod
     def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
         if text is not None:
@@ -163,10 +179,6 @@ class GenerateReqInput(BaseReqInput):
 
         # Fill in default arguments
         if self.is_single:
-            if self.sampling_params is None:
-                self.sampling_params = {}
-            if self.rid is None:
-                self.rid = uuid.uuid4().hex
             if self.return_logprob is None:
                 self.return_logprob = False
             if self.logprob_start_len is None:
@@ -195,16 +207,6 @@ class GenerateReqInput(BaseReqInput):
                 self.audio_data = [self.audio_data] * num
             elif isinstance(self.audio_data, list):
                 pass
-
-            if self.sampling_params is None:
-                self.sampling_params = [{}] * num
-            elif not isinstance(self.sampling_params, list):
-                self.sampling_params = [self.sampling_params] * num
-
-            if self.rid is None:
-                self.rid = [uuid.uuid4().hex for _ in range(num)]
-            else:
-                assert isinstance(self.rid, list), "The rid should be a list."
 
             if self.return_logprob is None:
                 self.return_logprob = [False] * num
