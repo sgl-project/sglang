@@ -57,6 +57,7 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 
 
 def _compute_infos_from_sources(sources):
+    num_sms = deep_gemm.get_num_sms()
     return _deduplicate(
         _compute_infos_from_sources_raw(sources),
         key_fn=lambda info: deep_gemm.get_best_configs(
@@ -70,7 +71,7 @@ def _compute_infos_from_sources_raw(sources):
             yield dict(m=m, n=source['n'], k=source['k'])
 
 
-def _deduplicate(items: Sequence[Any], key_fn: Callable):
+def _deduplicate(items, key_fn: Callable):
     seen_keys = set()
     for item in items:
         item_key = key_fn(item)
