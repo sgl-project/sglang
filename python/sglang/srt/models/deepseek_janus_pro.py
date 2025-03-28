@@ -252,7 +252,7 @@ def resample_patch_embed(
     try:
         from torch import vmap
     except ImportError:
-        from functorch import vmap
+        from torch.func import vmap
 
     assert len(patch_embed.shape) == 4, "Four dimensions expected"
     assert len(new_size) == 2, "New shape should only be hw"
@@ -1084,7 +1084,7 @@ def create_siglip_vit(
     )
 
     if ckpt_path:
-        state_dict = torch.load(ckpt_path, map_location="cpu")
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
         incompatible_keys = model.load_state_dict(state_dict, strict=False)
         print(
