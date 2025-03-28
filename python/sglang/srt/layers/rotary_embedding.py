@@ -148,7 +148,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda_available:
+        if _is_cuda_available and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -646,6 +646,18 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         return cache
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _is_cuda_available:
+            return self.forward_cuda(positions, query, key, offsets)
+        else:
+            return self.forward_native(positions, query, key, offsets)
+
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,

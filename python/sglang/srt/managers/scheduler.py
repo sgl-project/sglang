@@ -53,9 +53,12 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -88,7 +91,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ImageInputs,
+    MultimodalInputs,
     Req,
     ScheduleBatch,
     global_server_args_dict,
@@ -127,6 +130,8 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +408,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (ExpertDistributionReq, self.expert_distribution_handle),
             ]
         )
 
@@ -841,8 +847,8 @@ class Scheduler(
                 return
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -856,7 +862,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -960,7 +966,7 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
-            image_inputs = ImageInputs.from_dict(recv_req.image_inputs)
+            image_inputs = MultimodalInputs.from_dict(recv_req.image_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
@@ -974,7 +980,7 @@ class Scheduler(
                 )
                 logger.error(error_msg)
                 req.origin_input_ids = [0]
-                req.image_inputs = None
+                req.multimodal_inputs = None
                 req.sampling_params.max_new_tokens = 0
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -1180,7 +1186,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
         return ret
@@ -1697,18 +1703,12 @@ class Scheduler(
     def save_remote_model(self, params):
         url = params["url"]
 
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_remote_model(url)
 
     def save_sharded_model(self, params):
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_sharded_model(
             path=params["path"],
@@ -1785,6 +1785,9 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(
+            caller_name="release_memory_occupation"
+        )
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
@@ -1793,6 +1796,7 @@ class Scheduler(
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
         self.memory_saver_adapter.resume()
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
@@ -1891,6 +1895,17 @@ class Scheduler(
             self.send_to_tokenizer.send_pyobj(
                 ProfileReqOutput(success=True, message="Succeeded.")
             )
+
+    def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        if recv_req == ExpertDistributionReq.START_RECORD:
+            expert_distribution_recorder.start_record()
+        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+            expert_distribution_recorder.stop_record()
+        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+            expert_distribution_recorder.dump_record()
+        else:
+            raise ValueError("Unrecognized ExpertDistributionReq value")
+        return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error

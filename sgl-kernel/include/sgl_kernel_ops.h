@@ -15,8 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <ATen/ATen.h>
+#include <ATen/Tensor.h>
 #include <Python.h>
-#include <torch/extension.h>
+#include <torch/library.h>
+#include <torch/torch.h>
 
 #include <vector>
 
@@ -113,6 +116,13 @@ void apply_rope_pos_ids_cos_sin_cache(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+void cutlass_scaled_fp4_mm(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -133,6 +143,8 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
+void scaled_fp4_quant(
+    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_token_group_quant_fp8(
     at::Tensor input,
     at::Tensor output_q,
@@ -141,6 +153,14 @@ void sgl_per_token_group_quant_fp8(
     double eps,
     double fp8_min,
     double fp8_max);
+void sgl_per_token_group_quant_int8(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double int8_min,
+    double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void cublas_grouped_gemm(
@@ -236,23 +256,12 @@ void min_p_sampling_from_probs(
     double min_p_val,
     bool deterministic,
     int64_t cuda_stream);
-// top k renorm probs
-// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 void top_k_renorm_probs(
     at::Tensor probs,
     at::Tensor renorm_probs,
     std::optional<at::Tensor> maybe_top_k_arr,
-    unsigned int top_k_val,
-    int64_t cuda_stream);
-// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
-inline void top_k_renorm_probs_wrapper(
-    at::Tensor probs,
-    at::Tensor renorm_probs,
-    std::optional<at::Tensor> maybe_top_k_arr,
     int64_t top_k_val,
-    int64_t cuda_stream) {
-  top_k_renorm_probs(probs, renorm_probs, maybe_top_k_arr, static_cast<unsigned int>(top_k_val), cuda_stream);
-}
+    int64_t cuda_stream);
 void top_p_renorm_probs(
     at::Tensor probs,
     at::Tensor renorm_probs,

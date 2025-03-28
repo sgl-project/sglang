@@ -9,12 +9,8 @@ import torch
 
 try:
     from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
-    from vllm.model_executor.layers.quantization.awq import AWQConfig
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
     from vllm.model_executor.layers.quantization.deepspeedfp import DeepSpeedFPConfig
     from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
     from vllm.model_executor.layers.quantization.fbgemm_fp8 import FBGEMMFp8Config
@@ -26,6 +22,8 @@ try:
     from vllm.model_executor.layers.quantization.qqq import QQQConfig
     from vllm.model_executor.layers.quantization.tpu_int8 import Int8TpuConfig
 
+    from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -34,18 +32,21 @@ except ImportError:
     class DummyConfig:
         pass
 
-    AQLMConfig = AWQConfig = AWQMarlinConfig = BitsAndBytesConfig = (
-        CompressedTensorsConfig
-    ) = DummyConfig
+    AQLMConfig = AWQMarlinConfig = BitsAndBytesConfig = CompressedTensorsConfig = (
+        DummyConfig
+    )
     DeepSpeedFPConfig = ExpertsInt8Config = FBGEMMFp8Config = GGUFConfig = (
         GPTQMarlin24Config
     ) = DummyConfig
     MarlinConfig = QQQConfig = Int8TpuConfig = DummyConfig
 
+from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -55,10 +56,9 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,
-    "gptq_marlin": GPTQMarlinConfig,
-    "gptq": GPTQConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
+    "compressed-tensors": CompressedTensorsConfig,
 }
 
 # Add vllm-dependent methods if available
@@ -74,10 +74,11 @@ if VLLM_AVAILABLE:
         "gguf": GGUFConfig,
         "gptq_marlin_24": GPTQMarlin24Config,
         "awq_marlin": AWQMarlinConfig,
-        "compressed-tensors": CompressedTensorsConfig,
         "bitsandbytes": BitsAndBytesConfig,
         "qqq": QQQConfig,
         "experts_int8": ExpertsInt8Config,
+        "gptq_marlin": GPTQMarlinConfig,
+        "gptq": GPTQConfig,
     }
     QUANTIZATION_METHODS.update(VLLM_QUANTIZATION_METHODS)
 
