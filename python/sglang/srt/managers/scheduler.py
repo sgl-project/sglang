@@ -1703,18 +1703,12 @@ class Scheduler(
     def save_remote_model(self, params):
         url = params["url"]
 
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_remote_model(url)
 
     def save_sharded_model(self, params):
-        if isinstance(self.tp_worker, TpModelWorkerClient):
-            worker = self.tp_worker.worker
-        else:
-            worker = self.tp_worker
+        worker = self.tp_worker.worker
 
         worker.model_runner.save_sharded_model(
             path=params["path"],
