@@ -224,26 +224,22 @@ class FlashAttentionBackend(AttentionBackend):
 
         page_table = metadata.page_table
 
-        try:
-            o = flash_attn_with_kvcache(
-                q=q_reshaped,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
-                max_seqlen_q=1,
-                softmax_scale=layer.scaling,
-                causal=True,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
-            )
-        except Exception as e:
-            print(e)
-            torch.distributed.breakpoint()
+        o = flash_attn_with_kvcache(
+            q=q_reshaped,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k_new=metadata.cu_seqlens_k,
+            max_seqlen_q=1,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            k_descale=layer.k_scale,
+            v_descale=layer.v_scale,
+        )
         # torch.cuda.synchronize()
         # import time
         # cuda_end = time.time()
