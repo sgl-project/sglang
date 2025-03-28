@@ -53,6 +53,8 @@ class TpModelWorker:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
+        self.worker = self
+
         # Parse args
         self.tp_rank = tp_rank
 

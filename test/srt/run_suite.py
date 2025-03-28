@@ -15,7 +15,7 @@ suites = {
     "per-commit": [
         TestFile("models/lora/test_lora.py", 76),
         TestFile("models/lora/test_lora_backend.py", 420),
-        TestFile("models/lora/test_multi_lora_backend.py", 1),
+        TestFile("models/lora/test_multi_lora_backend.py", 144),
         TestFile("models/test_embedding_models.py", 119),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_grok_models.py", 60),
@@ -46,7 +46,6 @@ suites = {
         TestFile("test_openai_server.py", 124),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
-        TestFile("test_patch_torch.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 167),
         TestFile("test_reasoning_content.py", 89),

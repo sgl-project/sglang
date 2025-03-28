@@ -29,7 +29,7 @@ from sglang.srt.utils import get_bool_env_var, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
-DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
+DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
