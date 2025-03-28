@@ -1,5 +1,4 @@
 # NOTE: Currently this can only be run through HTTP requests.
-import json
 from concurrent.futures import ThreadPoolExecutor
 
 from json_decode import character_regex
