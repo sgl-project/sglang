@@ -1,9 +1,7 @@
 # TODO shall we put this file elsewhere?
-import dataclasses
 import json
 import logging
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -19,17 +17,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-# --------------------------------------- common -------------------------------------
-
-@dataclass(frozen=True)
-class _Info:
-    m: int
-    k: int
-    n: int
+_Info = Dict[str, Any]
 
 
 # --------------------------------------- warmup -------------------------------------
+
 
 def warmup(model):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
@@ -121,7 +113,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        _write_output(dataclasses.asdict(info))
+        _write_output(info)
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
@@ -131,7 +123,7 @@ def _compute_info_from_args(lhs, rhs):
     m, k = lhs[0].shape
     n, k_ = rhs[0].shape
     assert k == k_
-    return _Info(m=m, k=k, n=n)
+    return dict(m=m, k=k, n=n)
 
 
 # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
