@@ -23,17 +23,16 @@ def warmup(model):
     TODO
 
 
-_INFOS_OF_MODEL = {
-    DeepseekV2ForCausalLM: _compute_infos_deepseek,
-    DeepseekV3ForCausalLM: _compute_infos_deepseek,
-}
-
-
 def _compute_infos_deepseek():
     return [
         TODO,
     ]
 
+
+_INFOS_OF_MODEL = {
+    DeepseekV2ForCausalLM: _compute_infos_deepseek,
+    DeepseekV3ForCausalLM: _compute_infos_deepseek,
+}
 
 # --------------------------------------- capture -------------------------------------
 
