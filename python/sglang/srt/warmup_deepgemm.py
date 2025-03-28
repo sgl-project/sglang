@@ -1,6 +1,10 @@
 # TODO shall we put this file elsewhere?
 
+import logging
+
 from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
@@ -22,7 +26,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        TODO_print
+        logger.info(f"ON_EXECUTION_SEE_NEW_SHAPE {info}")
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
