@@ -244,7 +244,7 @@ def download_weights_from_hf(
         file_list = retry(
             lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
             should_retry=lambda e: isinstance(e, HfHubHTTPError) and e.response.status_code == 429,
-            max_retry=7,
+            initial_delay=5.0, max_delay=60.0, max_retry=7,
         )
 
         # depending on what is available we download different things
