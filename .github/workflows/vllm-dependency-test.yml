@@ -4,19 +4,15 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
 
 concurrency:
   group: vllm-dependency-test-${{ github.ref }}
