@@ -1,6 +1,5 @@
 # TODO shall we put this file elsewhere?
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -114,7 +113,9 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        logger.info(f"CAPTURER_NEW_INFO={json.dumps(info)}")
+
+        # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
+        TODO_write_to_disk
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
