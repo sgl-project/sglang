@@ -125,11 +125,9 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ):
         if layer.use_intel_amx_backend:
-            x_q, x_scale = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x)
-            return torch.ops.sgl_kernel.int8_scaled_mm_cpu(
-                x_q,
+            return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+                x,
                 layer.weight,
-                x_scale,
                 layer.weight_scale,
                 bias,
                 x.dtype,
