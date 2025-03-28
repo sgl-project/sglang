@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_with_kvcache
 
 
 @dataclass
