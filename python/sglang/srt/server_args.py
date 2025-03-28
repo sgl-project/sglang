@@ -1221,6 +1221,7 @@ class PortArgs:
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
+            port_base = dist_init_port + 1
             port_args = {}
             for name in (
                 "tokenizer_ipc_name",
@@ -1228,14 +1229,14 @@ class PortArgs:
                 "rpc_ipc_name",
             ):
                 port_args[name] = (
-                    f"tcp://{dist_init_host}:{dist_init_port + len(port_args)}"
+                    f"tcp://{dist_init_host}:{port_base + len(port_args)}"
                 )
             if dp_rank is None:
-                scheduler_input_port = dist_init_port + len(
+                scheduler_input_port = port_base + len(
                     port_args
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = dist_init_port + len(port_args) + 1 + dp_rank
+                scheduler_input_port = port_base + len(port_args) + 1 + dp_rank
 
             return PortArgs(
                 **port_args,
