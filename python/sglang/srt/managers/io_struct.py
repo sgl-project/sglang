@@ -326,6 +326,8 @@ class EmbeddingReqInput(BaseReqInput):
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
 
+        assert self.parallel_sample_num == 1
+
         if self.is_single:
             self.sampling_params["max_new_tokens"] = 0
         else:
