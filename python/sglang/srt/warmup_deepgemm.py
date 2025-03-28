@@ -1,5 +1,5 @@
 # TODO shall we put this file elsewhere?
-
+import json
 import logging
 
 from sglang.srt.utils import get_bool_env_var
@@ -26,7 +26,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        logger.info(f"ON_EXECUTION_SEE_NEW_SHAPE {info}")
+        logger.info(f"ON_EXECUTION_SEE_NEW_SHAPE {json.dumps(info)}")
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
@@ -36,4 +36,4 @@ def _compute_shape_from_args(lhs, rhs):
     m, k = lhs[0].shape
     n, k_ = rhs[0].shape
     assert k == k_
-    return m, k, n
+    return dict(m=m, k=k, n=n)
