@@ -17,12 +17,12 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
