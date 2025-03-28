@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_interface import flash_attn_with_kvcache
 
 
 @dataclass
@@ -58,6 +58,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
@@ -134,8 +135,10 @@ class FlashAttentionBackend(AttentionBackend):
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache, value_cache = kv_cache[0], kv_cache[1]
 
-        k_descale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
-        v_descale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
+        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
+        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
+
         o = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k_cache=key_cache.unsqueeze(1),
@@ -179,8 +182,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Get KV cache
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         key_cache, value_cache = kv_cache[0], kv_cache[1]
-        k_descale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
-        v_descale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
+        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
+        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
 
         # Use precomputed metadata
         metadata = self.forward_metadata

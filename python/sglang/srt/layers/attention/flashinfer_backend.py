@@ -84,6 +84,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -393,8 +394,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        k_scale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
-        v_scale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
+        k_scale = layer.k_scale_float if self.kv_cache_dtype_str != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype_str != "auto" else None
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -463,8 +464,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        k_scale = layer.k_scale_float if self.kv_cache_dtype != "auto" else None
-        v_scale = layer.v_scale_float if self.kv_cache_dtype != "auto" else None
+        k_scale = layer.k_scale_float if self.kv_cache_dtype_str != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype_str != "auto" else None
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
