@@ -586,5 +586,5 @@ def load_token_map(token_map_path: str) -> List[int]:
             ignore_patterns=["*.bin", "*.safetensors"],
         )
         token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
-    hot_token_id = torch.load(token_map_path)
+    hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int32)

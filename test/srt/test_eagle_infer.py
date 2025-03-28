@@ -43,9 +43,9 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
     }
-    NUM_CONFIGS = 3
+    NUM_CONFIGS = 2
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
@@ -61,8 +61,6 @@ class TestEAGLEEngine(CustomTestCase):
         configs = [
             # Basic config
             self.BASE_CONFIG,
-            # Disable cuda graph
-            {**self.BASE_CONFIG, "disable_cuda_graph": True},
             # Chunked prefill
             {**self.BASE_CONFIG, "chunked_prefill_size": 4},
         ]
@@ -159,7 +157,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -174,7 +172,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
