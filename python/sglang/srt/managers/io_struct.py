@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union, Tuple
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -86,32 +86,27 @@ class BaseReqInput:
             self.is_single = False
 
     @staticmethod
-    def _compute_is_single_and_batch_size(text, input_ids, input_embeds):
+    def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
         # Derive the batch size
         if text is not None:
             if isinstance(text, str):
-                self.is_single = True
-                self.batch_size = 1
+                return True, 1
             else:
-                self.is_single = False
-                self.batch_size = len(text)
+                return False, len(text)
             self.input_embeds = None
         elif input_ids is not None:
             if len(input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
             if isinstance(input_ids[0], int):
-                self.is_single = True
-                self.batch_size = 1
+                return True, 1
             else:
-                self.is_single = False
-                self.batch_size = len(input_ids)
+                return False, len(input_ids)
             self.input_embeds = None
         else:
             if isinstance(input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
+                return True, 1
             else:
-                self.batch_size = len(self.input_embeds)
+                return False, len(self.input_embeds)
 
 
 @dataclass
