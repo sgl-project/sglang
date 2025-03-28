@@ -38,19 +38,19 @@ class SessionParams:
 class BaseReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/sglang/srt/utils.py:load_image.
-    image_data: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
-    # The sampling_params. See descriptions below.
-    # For EmbeddingReqInput: Dummy sampling params for compatibility
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     # For EmbeddingReqInput: Dummy input embeds for compatibility
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # The image input. It can be a file name, a url, or base64 encoded string.
+    # See also python/sglang/srt/utils.py:load_image.
+    image_data: Optional[Union[List[str], str]] = None
+    # The sampling_params. See descriptions below.
+    # For EmbeddingReqInput: Dummy sampling params for compatibility
+    sampling_params: Optional[Union[List[Dict], Dict]] = None
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
