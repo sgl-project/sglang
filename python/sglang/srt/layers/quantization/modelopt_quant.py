@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -22,6 +21,7 @@ from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     requantize_with_max_scale,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -33,12 +33,19 @@ ACTIVATION_SCHEMES = ["static"]
 class ModelOptFp8Config(QuantizationConfig):
     """Configuration for ModelOpt FP8 quantization, including serialization and compatibility checks."""
 
-    def __init__(self, is_checkpoint_fp8_serialized: bool = False) -> None:
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        kv_cache_quant_method: Optional[str] = None,
+        exclude_modules: Optional[List[str]] = None,
+    ) -> None:
         """
         Args:
             is_checkpoint_fp8_serialized (bool): Indicates if the checkpoint uses serialized FP8 format.
         """
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.kv_cache_quant_method = kv_cache_quant_method
+        self.exclude_modules = exclude_modules
         if is_checkpoint_fp8_serialized:
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
@@ -63,6 +70,12 @@ class ModelOptFp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
         quant_method = cls.get_from_keys(config, ["quantization"]).get("quant_algo")
+        kv_cache_quant_method = cls.get_from_keys(config, ["quantization"]).get(
+            "kv_cache_quant_algo"
+        )
+        exclude_modules = cls.get_from_keys(config, ["quantization"]).get(
+            "exclude_modules"
+        )
 
         if "FP8" not in quant_method:
             raise ValueError(
@@ -70,15 +83,23 @@ class ModelOptFp8Config(QuantizationConfig):
                 "Check the `hf_quant_config.json` file for your model's configuration."
             )
 
-        return cls(is_checkpoint_fp8_serialized=True)
+        return cls(
+            is_checkpoint_fp8_serialized=True,
+            kv_cache_quant_method=kv_cache_quant_method,
+            exclude_modules=exclude_modules,
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        if self.exclude_modules and any(
+            module in prefix for module in self.exclude_modules
+        ):
+            return None
 
         if isinstance(layer, LinearBase):
             return ModelOptFp8LinearMethod(self)
-        if isinstance(layer, AttentionBackend):
+        if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
 
         return None
