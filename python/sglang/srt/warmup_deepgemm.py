@@ -108,12 +108,13 @@ class _Capturer:
 
     def on_execution(self, lhs, rhs):
         info = _compute_info_from_args(lhs=lhs, rhs=rhs)
+        info_str = json.dumps(info)
 
-        if info in self._seen_infos:
+        if info_str in self._seen_infos:
             return
 
-        self._seen_infos.add(info)
-        _write_output(info)
+        self._seen_infos.add(info_str)
+        _write_output(info_str)
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
@@ -127,12 +128,12 @@ def _compute_info_from_args(lhs, rhs):
 
 
 # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-def _write_output(data):
+def _write_output(info):
     tp_rank = get_tensor_model_parallel_rank()
     path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
     with path.open("a") as fp:
-        fp.write(f"{json.dumps(data)}\n")
-    print(f"WARMUP_DEEPGEMM_CAPTURE={json.dumps(data)}")
+        fp.write(f"{info}\n")
+    print(f"WARMUP_DEEPGEMM_CAPTURE={info}")
 
 
 def clear_output():
