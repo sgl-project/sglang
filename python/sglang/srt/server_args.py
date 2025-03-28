@@ -290,12 +290,17 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
-            # DeepEP MoE
-            if self.enable_deepep_moe:
-                self.ep_size = self.dp_size
-                logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
-                )
+
+        self.enable_sp_layernorm = False
+        # DeepEP MoE
+        if self.enable_deepep_moe:
+            self.ep_size = self.tp_size
+            self.enable_sp_layernorm = (
+                self.dp_size < self.tp_size if self.enable_dp_attention else True
+            )
+            logger.info(
+                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":

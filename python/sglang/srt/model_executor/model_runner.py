@@ -281,9 +281,6 @@ class ModelRunner:
 
         if server_args.enable_deepep_moe:
             logger.info("DeepEP is turned on.")
-            assert (
-                server_args.enable_dp_attention == True
-            ), "Currently DeepEP is bind to Attention DP. Set '--enable-dp-attention --enable-deepep-moe'"
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
