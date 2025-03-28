@@ -94,7 +94,7 @@ def _deduplicate(items, key_fn: Callable):
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
     # TODO change max_workers
-    with ProcessPoolExecutor(max_workers=4) as executor:
+    with ProcessPoolExecutor(max_workers=8) as executor:
         iterator = executor.map(_warmup_by_info, infos)
         list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
 
