@@ -95,7 +95,7 @@ def _per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
 
-def capturer_on_kernel_executed(lhs, rhs, out):
+def capturer_on_kernel_executed(lhs, rhs):
     if not _ENABLE_CAPTURE:
         return
     _capturer.on_execution(lhs=lhs, rhs=rhs)
