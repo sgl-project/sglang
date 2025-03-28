@@ -62,6 +62,9 @@ class BaseReqInput:
                 "Exactly one of the text, input_ids or input_embeds should be provided."
             )
 
+        self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
+                                                                                 self.input_embeds)
+
         # -----
 
         # Derive the batch size
