@@ -6,6 +6,10 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------- warmup -------------------------------------
+
+# --------------------------------------- capture -------------------------------------
+
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
 
