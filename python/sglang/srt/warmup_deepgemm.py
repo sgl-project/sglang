@@ -58,6 +58,7 @@ _INFOS_SOURCE_OF_MODEL = {
 
 def _warmup_by_infos(infos: List[_Info]):
     for info in infos:
+        print(f'hi warmup {info=}')
         x_fp8, y_fp8, out = _construct_gemm_inputs(m=info.m, k=info.k, n=info.n)
         # For simplicity, here we naively call the gemm
         # But alternatively, we may call `get_best_configs` or other configuration and deduplicate
