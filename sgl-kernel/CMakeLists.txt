@@ -41,8 +41,8 @@ FetchContent_Declare(
 FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
+    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -86,6 +86,7 @@ option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
 option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
+option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -115,6 +116,12 @@ if (SGL_KERNEL_ENABLE_FP8)
         "-DFLASHINFER_ENABLE_FP8"
         "-DFLASHINFER_ENABLE_FP8_E4M3"
         "-DFLASHINFER_ENABLE_FP8_E5M2"
+    )
+endif()
+
+if (SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DENABLE_NVFP4=1"
     )
 endif()
 

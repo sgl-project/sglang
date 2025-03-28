@@ -45,7 +45,8 @@ format: check-deps ## Format all source files
 	@pre-commit run --all-files
 
 FILES_TO_UPDATE = python/sgl_kernel/version.py \
-                 pyproject.toml
+                 pyproject.toml \
+                 pyproject_rocm.toml
 
 update: ## Update version numbers across project files. Usage: make update <new_version>
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \
