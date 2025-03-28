@@ -1,8 +1,10 @@
 # TODO shall we put this file elsewhere?
+
 import json
 import logging
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Tuple
 
+import torch
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -39,6 +41,20 @@ _INFOS_SOURCE_OF_MODEL = {
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     for info in infos:
         TODO
+
+
+# Copied from DeepGEMM's `test_core.py` :: `construct`
+def _construct_gemm_inputs(m: int, k: int, n: int) -> Tuple[
+    Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_out = x @ y.t()
+
+    x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+    # Transpose earlier so that the testing will not trigger transposing kernels
+    x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
+    return x_fp8, y_fp8, out, ref_out
 
 
 # --------------------------------------- capture -------------------------------------
