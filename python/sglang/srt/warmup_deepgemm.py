@@ -57,7 +57,11 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 
 
 def _compute_infos_from_sources(sources):
-    return _deduplicate(_compute_infos_from_sources_raw(sources), key_fn=TODO)
+    return _deduplicate(
+        _compute_infos_from_sources_raw(sources),
+        key_fn=lambda info: deep_gemm.get_best_configs(
+            m=info['m'], n=info['n'], k=info['k'], num_groups=1, num_sms=num_sms),
+    )
 
 
 def _compute_infos_from_sources_raw(sources):
