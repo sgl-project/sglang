@@ -81,6 +81,8 @@ class BaseReqInput:
             if self.sampling_params is None:
                 self.sampling_params = {}
         else:
+            num = self.batch_size * self.parallel_sample_num
+
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
