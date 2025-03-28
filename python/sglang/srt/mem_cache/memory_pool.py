@@ -773,9 +773,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float,
+        page_size: int,
         pin_memory: bool = True,
         device: str = "cpu",
-        page_size: int = 32,
     ):
         super().__init__(
             device_pool, host_to_device_ratio, pin_memory, device, page_size
@@ -849,9 +849,9 @@ class MLATokenToKVPoolHost(HostKVCache):
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
+        page_size: int,
         pin_memory: bool = True,
         device: str = "cpu",
-        page_size: int = 32,
     ):
         super().__init__(
             device_pool, host_to_device_ratio, pin_memory, device, page_size
