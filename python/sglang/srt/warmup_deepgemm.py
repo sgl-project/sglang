@@ -46,6 +46,7 @@ def warmup(model):
 def _compute_infos_deepseek() -> List[_Info]:
     return [
         # TODO fill in
+        _Info(n=7168, k=16384, m=256),  # TODO dummy value
     ]
 
 
