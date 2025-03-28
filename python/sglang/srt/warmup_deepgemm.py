@@ -10,6 +10,7 @@ from sglang.srt.utils import get_bool_env_var
 
 try:
     from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
+    import deep_gemm
 except ImportError:
     pass
 
@@ -44,21 +45,18 @@ _INFOS_SOURCE_OF_MODEL = {
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     for info in infos:
-        TODO
+        x_fp8, y_fp8, out = _construct_gemm_inputs(m=info['m'], k=info['k'], n=info['n'])
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
 
 # Copied from DeepGEMM's `test_core.py` :: `construct`
-def _construct_gemm_inputs(m: int, k: int, n: int) -> Tuple[
-    Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+def _construct_gemm_inputs(m: int, k: int, n: int):
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    ref_out = x @ y.t()
-
     x_fp8, y_fp8 = _per_token_cast_to_fp8(x), _per_block_cast_to_fp8(y)
-    # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-    return x_fp8, y_fp8, out, ref_out
+    return x_fp8, y_fp8, out
 
 
 # Copied from DeepGEMM's `test_core.py`
