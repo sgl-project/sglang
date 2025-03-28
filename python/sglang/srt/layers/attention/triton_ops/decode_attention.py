@@ -25,9 +25,12 @@ import logging
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
+
+if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter.mla import mla_decode_fwd
 
 logger = logging.getLogger(__name__)
 
@@ -688,6 +691,7 @@ def decode_attention_fwd(
     kv_indices,
     attn_logits,
     attn_lse,
+    kv_last_page_len,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -715,6 +719,19 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap,
         )
+    elif _is_hip and get_bool_env_var("CK_MOE"):
+        # ROCM MLA
+        mla_decode_fwd(
+            q,
+            k_buffer.view(-1, 1, 1, q.shape[-1]),
+            o,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            sm_scale,
+            logit_cap,
+        )
+        k_buffer = k_buffer.reshape(-1, 1, q.shape[-1])
     else:
         # GQA/MQA/MLA
         decode_attention_fwd_grouped(

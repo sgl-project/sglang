@@ -11,12 +11,17 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_bool_env_var, get_device_core_count
+from sglang.srt.utils import get_bool_env_var, get_device_core_count, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
+_is_hip = is_hip()
+
+if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter import flash_attn_varlen_func
 
 
 @triton.jit
@@ -76,9 +81,11 @@ class ForwardMetadata:
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
     max_extend_len: int
+    max_prefix_extend_len: int
     num_kv_splits: torch.Tensor
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
+    kv_last_page_len: torch.Tensor
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
@@ -187,6 +194,7 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
+        max_prefix_extend_len = 0
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -218,6 +226,7 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.float32,
                 device=self.device,
             )
+            kv_last_page_len = torch.ones(bs, dtype=torch.int)
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
@@ -262,6 +271,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+            kv_last_page_len = None
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -279,6 +289,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+            kv_last_page_len = None
         else:
             kv_indptr[1 : bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -306,16 +317,22 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
+            kv_last_page_len = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            max_prefix_extend_len = torch.max(
+                forward_batch.extend_seq_lens + forward_batch.extend_prefix_lens
+            ).item()
             num_kv_splits = None
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
             max_extend_len,
+            max_prefix_extend_len,
             num_kv_splits,
             kv_indptr,
             kv_indices,
+            kv_last_page_len,
             qo_indptr,
             custom_mask,
             mask_indptr,
@@ -337,6 +354,7 @@ class TritonAttnBackend(AttentionBackend):
         self.cuda_graph_num_kv_splits = torch.full(
             (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
+        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -365,6 +383,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         assert encoder_lens is None, "Not supported"
 
+        max_prefix_extend_len = 0
+
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
                 kv_indptr = self.kv_indptr
@@ -387,6 +407,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
+            kv_last_page_len = self.cuda_graph_kv_last_page_len
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
@@ -420,6 +441,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+            kv_last_page_len = None
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
@@ -429,9 +451,11 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits,
             attn_lse,
             max_extend_len,
+            max_prefix_extend_len,
             num_kv_splits,
             kv_indptr,
             kv_indices,
+            kv_last_page_len,
             qo_indptr,
             custom_mask,
             mask_indptr,
@@ -528,6 +552,82 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            max_extend_len = self.forward_metadata.max_extend_len
+            max_prefix_extend_len = self.forward_metadata.max_prefix_extend_len
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+            qo_indptr = self.forward_metadata.qo_indptr
+            K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            kv_lora_rank = V_Buffer.shape[-1]
+            qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
+            qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
+            assert len(q.shape) == 3
+            assert len(k.shape) == 3
+            assert len(v.shape) == 3
+            if _is_hip and kv_indices.shape[0] == 0:
+                o, *_ = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    qo_indptr,
+                    qo_indptr,
+                    max_extend_len,
+                    max_extend_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o
+            elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
+                cu_seqlens = qo_indptr + kv_indptr
+                max_seqlen = max_prefix_extend_len
+                K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
+                kvc, k_pe = torch.split(
+                    K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
+                )
+                kvprefix = layer.kv_b_proj(kvc.contiguous())[0]
+
+                kvprefix = kvprefix.view(
+                    -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+                )
+                k_prefix, v_prefix = torch.split(
+                    kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
+                )
+                k_prefix = torch.cat(
+                    [
+                        k_prefix,
+                        torch.broadcast_to(
+                            k_pe, (k_pe.shape[0], layer.tp_k_head_num, k_pe.shape[2])
+                        ),
+                    ],
+                    dim=-1,
+                )
+                assert (
+                    forward_batch.extend_prefix_lens.shape
+                    == forward_batch.extend_seq_lens.shape
+                )
+                k_prefix = torch.split(k_prefix, forward_batch.extend_prefix_lens_cpu)
+                k_extend = torch.split(k, forward_batch.extend_seq_lens_cpu)
+                assert len(k_prefix) == len(forward_batch.extend_prefix_lens_cpu)
+                k = torch.cat([x for el in zip(k_prefix, k_extend) for x in el])
+                v_prefix = torch.split(v_prefix, forward_batch.extend_prefix_lens_cpu)
+                v_extend = torch.split(v, forward_batch.extend_seq_lens_cpu)
+                v = torch.cat([x for el in zip(v_prefix, v_extend) for x in el])
+
+                o, *_ = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    qo_indptr,
+                    cu_seqlens,
+                    max_extend_len,
+                    max_seqlen,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -579,6 +679,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.kv_indices,
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
+            self.forward_metadata.kv_last_page_len,
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,

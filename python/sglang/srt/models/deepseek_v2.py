@@ -25,6 +25,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce,
@@ -73,7 +74,13 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_cuda_available,
+    is_hip,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -188,6 +195,9 @@ class DeepseekV2MoE(nn.Module):
         )
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
+            num_shared_experts=(
+                config.n_shared_experts if get_bool_env_var("CK_MOE") and _is_hip else 0
+            ),
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -197,10 +207,11 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
 
-        if config.n_shared_experts is not None:
+        if config.n_shared_experts is not None and not get_bool_env_var("CK_MOE"):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             if not global_server_args_dict["enable_deepep_moe"]:
@@ -256,10 +267,19 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+            if self.tp_size > 1:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            return final_hidden_states.view(final_hidden_states.shape)
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
@@ -624,6 +644,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
+            # TODO aiter dsv rope
+            # if _is_hip and get_bool_env_var("CK_MOE"):
+            #    self.rotary_emb.forward = self.rotary_emb.forward_new
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
 
@@ -647,6 +670,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             prefix=add_prefix("attn_mha", prefix),
         )
 
+        self.attn_mha.kv_b_proj = None
+
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
@@ -666,6 +691,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
+            )
+        elif _is_hip and get_bool_env_var("CK_MOE"):
+            return (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
             )
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
@@ -687,6 +718,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 not self.o_proj.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states
+
+        if self.attn_mha.kv_b_proj is None:
+            self.attn_mha.kv_b_proj = self.kv_b_proj
 
         if self.no_absorb(forward_batch):
             return self.forward_normal(positions, hidden_states, forward_batch)
@@ -1268,6 +1302,10 @@ class DeepseekV2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.dp_size = get_attention_dp_size()
+        self.aiter_init = False
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
 
     def forward(
         self,
@@ -1283,6 +1321,71 @@ class DeepseekV2Model(nn.Module):
             hidden_states = input_embeds
 
         residual = None
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            model_dim = hidden_states.shape[-1]
+            num_tokens = hidden_states.view(-1, model_dim).shape[0]
+            if not self.aiter_init:
+                self.aiter_init = True
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                top_k = self.num_experts_per_tok
+                num_experts = self.n_routed_experts
+                num_shared_experts = self.n_shared_experts
+                fake_expertid = num_experts + num_shared_experts
+
+                # TODO need find a formal way
+                assert num_tokens <= (4096 * 128)
+                num_tokens = 4096 * 128
+                # if enable_ep_moe, need to add shared experts and one fake expert,
+                # otherwise, only add shared experts
+                if global_server_args_dict["enable_ep_moe"]:
+                    num_topK_pad_experts = num_shared_experts + 1
+                else:
+                    num_topK_pad_experts = num_shared_experts
+                # all layers resuse same buffer
+                self.total_topk_ids = torch.empty(
+                    (num_tokens, top_k + num_topK_pad_experts),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split(
+                    [top_k, num_topK_pad_experts], dim=1
+                )
+                shared_expert_ids = [
+                    num_experts + i for i in range(num_topK_pad_experts)
+                ]
+                if global_server_args_dict["enable_ep_moe"]:
+                    s_topk_ids_list = [
+                        [fake_expertid] * (num_topK_pad_experts)
+                    ] * num_tokens
+                    for i in range(tp_rank, num_tokens, tp_size):
+                        s_topk_ids_list[i] = shared_expert_ids
+                else:
+                    s_topk_ids_list = [shared_expert_ids] * num_tokens
+                self.s_topk_ids[:] = torch.tensor(
+                    s_topk_ids_list, dtype=torch.int32, device="cuda"
+                )
+                self.total_topk_weights = torch.empty(
+                    (num_tokens, top_k + num_topK_pad_experts),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self.ns_topk_weights, self.s_topk_weights = (
+                    self.total_topk_weights.split([top_k, num_topK_pad_experts], dim=1)
+                )
+                shared_E_score = 1.0
+                self.s_topk_weights.fill_(shared_E_score)
+
+                # forward to all EP_MOE
+                for i in range(len(self.layers)):
+                    mlp = self.layers[i].mlp
+                    if not isinstance(mlp, DeepseekV2MoE):
+                        continue
+                    mlp.experts.total_topk_weights = self.total_topk_weights
+                    mlp.experts.total_topk_ids = self.total_topk_ids
+                    mlp.experts.ns_topk_weights = self.ns_topk_weights
+                    mlp.experts.ns_topk_ids = self.ns_topk_ids
+
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
@@ -1351,6 +1454,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
+            num_shared_experts=(
+                self.config.n_shared_experts
+                if get_bool_env_var("CK_MOE") and _is_hip
+                else 0
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1378,6 +1486,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
+                    continue
+                if (
+                    _is_hip
+                    and get_bool_env_var("CK_MOE")
+                    and "mlp.shared_experts" in name
+                ):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.

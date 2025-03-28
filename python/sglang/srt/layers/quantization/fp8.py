@@ -71,6 +71,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 _is_hip = is_hip()
 
 if _is_hip:
+    from aiter import biased_grouped_topk
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
 
@@ -481,8 +482,11 @@ class Fp8MoEMethod:
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        num_shared_experts: Optional[int] = 0,
         **extra_weight_attrs,
     ):
+        if _is_hip and get_bool_env_var("CK_MOE"):
+            num_experts += num_shared_experts
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -912,17 +916,32 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-        )
+        if _is_hip and get_bool_env_var("CK_MOE") and correction_bias is not None:
+            token = x.shape[0]
+            biased_grouped_topk(
+                router_logits,
+                correction_bias,
+                layer.ns_topk_weights[:token],
+                layer.ns_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+                layer.routed_scaling_factor,
+            )
+            topk_ids = layer.total_topk_ids[:token]
+            topk_weights = layer.total_topk_weights[:token]
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+            )
 
         if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
             # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
