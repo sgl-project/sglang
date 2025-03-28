@@ -3,6 +3,7 @@
 
 import json
 import logging
+import multiprocessing as mp
 import shutil
 import sys
 from concurrent.futures.process import ProcessPoolExecutor
@@ -199,4 +200,5 @@ def read_output() -> List[Dict[str, Any]]:
 
 
 if __name__ == '__main__':
+    mp.set_start_method("spawn", force=True)
     _warmup_raw(model_name=sys.argv[1])
