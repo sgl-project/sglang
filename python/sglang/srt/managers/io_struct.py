@@ -65,6 +65,20 @@ class BaseReqInput:
         self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
                                                                                  self.input_embeds)
 
+        # Fill in default arguments
+        if self.is_single:
+            if self.rid is None:
+                self.rid = uuid.uuid4().hex
+            if self.sampling_params is None:
+                self.sampling_params = {}
+        else:
+            if self.rid is None:
+                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            else:
+                assert isinstance(self.rid, list), "The rid should be a list."
+            if self.sampling_params is None:
+                self.sampling_params = [{}] * self.batch_size
+
     @staticmethod
     def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
         if text is not None:
@@ -307,21 +321,6 @@ class TokenizedGenerateReqInput:
 class EmbeddingReqInput(BaseReqInput):
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        # Fill in default arguments
-        if self.is_single:
-            if self.rid is None:
-                self.rid = uuid.uuid4().hex
-            if self.sampling_params is None:
-                self.sampling_params = {}
-        else:
-            if self.rid is None:
-                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
-            else:
-                assert isinstance(self.rid, list), "The rid should be a list."
-
-            if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
 
         if self.is_single:
             self.sampling_params["max_new_tokens"] = 0
