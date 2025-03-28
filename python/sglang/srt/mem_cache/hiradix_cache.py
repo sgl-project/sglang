@@ -329,7 +329,7 @@ class HiRadixCache(RadixCache):
         child_key = self.get_child_key_fn(key)
         value = []
 
-        while len(key) > 0 and key[0] in node.children.keys():
+        while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.time()
             prefix_len = self.key_match_fn(child.key, key)
