@@ -29,6 +29,8 @@ RUN git clone ${SGL_REPO} \
          git checkout ${SGL_BRANCH}; \
        fi \
     && cd sgl-kernel \
+    && rm -f pyproject.toml \
+    && mv pyproject_rocm.toml pyproject.toml \
     && python setup_rocm.py install \
     && cd .. \
     && if [ "$BUILD_TYPE" = "srt" ]; then \

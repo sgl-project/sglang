@@ -467,6 +467,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "CLIPModel" in model_architectures
     ):
         return False
     else:
@@ -488,6 +489,7 @@ multimodal_model_archs = [
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "CLIPModel",
 ]
 
 

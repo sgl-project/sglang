@@ -258,7 +258,12 @@ class TestOpenAIServer(CustomTestCase):
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
 
-            assert isinstance(data.content, str) or response.choices[0].finish_reason
+            assert (
+                isinstance(data.content, str)
+                or isinstance(data.reasoning_content, str)
+                or len(data.tool_calls) > 0
+                or response.choices[0].finish_reason
+            )
             assert response.id
             assert response.created
 
@@ -536,6 +541,12 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .message.content.strip()
             .startswith('"name": "SmartHome Mini",')
         )
+
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
 # -------------------------------------------------------------------------
