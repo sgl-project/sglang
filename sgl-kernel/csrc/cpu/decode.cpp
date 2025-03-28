@@ -11,18 +11,18 @@ namespace {
 //   4. provide amx kernel for index_gemm_kernel_nn when M = 16
 //
 
-inline void fill_stub(float* __restrict__ out, float val, int size) {
+inline void fill_stub(float* __restrict__ out, float val, int64_t size) {
   using Vec = at::vec::Vectorized<float>;
   const Vec data_vec(val);
   at::vec::map<float>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
 }
 
 template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int size) {
+inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   const fVec s_fvec = fVec(s);
-  int d = 0;
+  int64_t d = 0;
   for (; d <= size - bVec::size(); d += bVec::size()) {
     fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
     fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
@@ -44,14 +44,14 @@ struct tinygemm_kernel_nt {
   static inline void apply(
       const scalar_t* __restrict__ A, const scalar_t* __restrict__ B,
       float* __restrict__ C, const index_t* __restrict__ indices,
-      float scale, int lda, int ldb, int ldc, int K, int max_tokens) {
+      float scale, int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
 
-    for (int m = 0; m < BLOCK_M; ++m) {
-      for (int n = 0; n < BLOCK_N; ++n) {
+    for (int64_t m = 0; m < BLOCK_M; ++m) {
+      for (int64_t n = 0; n < BLOCK_N; ++n) {
         float sum = 0.f;
-        int b_idx = indices[n];
+        int64_t b_idx = indices[n];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        for (int k = 0; k < K; ++k) {
+        for (int64_t k = 0; k < K; ++k) {
           sum += scale * static_cast<float>(A[m * lda + k]) * static_cast<float>(B[b_idx * ldb + k]);
         }
         C[m * ldc + n] = sum;
@@ -66,7 +66,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B,
       float* __restrict__ C, const index_t* __restrict__ indices,
-      float scale, int lda, int ldb, int ldc, int K, int max_tokens) {
+      float scale, int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
 
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N;
@@ -82,7 +82,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     Unroll<ROWS * COLS>{}(loadc);
 
     // for main loop
-    auto compute = [&](auto i, int k) {
+    auto compute = [&](auto i, int64_t k) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
 
@@ -91,10 +91,10 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       }
       if constexpr (row == 0) {
         if constexpr (col + 1 < COLS) {
-          int b_idx_prefetch = indices[col + 1];
+          int64_t b_idx_prefetch = indices[col + 1];
            _mm_prefetch(B + b_idx_prefetch * ldb + k, _MM_HINT_T0);
         }
-        int b_idx = indices[col];
+        int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         vb[col] = (__m512bh)(_mm512_loadu_si512(B + b_idx * ldb + k));
       }
@@ -102,7 +102,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     };
 
     // for remainder
-    auto compute2 = [&](auto i, int k, __mmask32 mask) {
+    auto compute2 = [&](auto i, int64_t k, __mmask32 mask) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
 
@@ -110,18 +110,18 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
         va = (__m512bh)(_mm512_maskz_loadu_epi16(mask, A + row * lda + k));
       }
       if constexpr (row == 0) {
-        int b_idx = indices[col];
+        int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         vb[col] = (__m512bh)(_mm512_maskz_loadu_epi16(mask, B + b_idx * ldb + k));
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
 
-    int k = 0;
+    int64_t k = 0;
     for (; k <= K - 32; k += 32) {
       Unroll<ROWS * COLS>{}(compute, k);
     }
-    int count = K - k;
+    int64_t count = K - k;
     if (count > 0) {
       __mmask32 mask = (1ULL << count) - 1;
       Unroll<ROWS * COLS>{}(compute2, k, mask);
@@ -149,13 +149,13 @@ template <typename scalar_t, typename index_t>
 inline void tinygemm_kernel_nn_scalar(
     const float* __restrict__ A, const scalar_t* __restrict__ B,
     float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-    int M, int N, int K, int lda, int ldb, int ldc, int max_tokens) {
+    int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
 
-  for (int m = 0; m < M; ++m) {
-    for (int n = 0; n < N; ++n) {
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
       C[m * ldc + n] *= scale[m];
-      for (int k = 0; k < K; ++k) {
-        int b_idx = indices[k];
+      for (int64_t k = 0; k < K; ++k) {
+        int64_t b_idx = indices[k];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
         C[m * ldc + n] += A[m * lda + k] * static_cast<float>(B[b_idx * ldb + n]);
       }
@@ -173,7 +173,7 @@ struct tinygemm_kernel_nn {
   static inline void apply(
       const float* __restrict__ A, const scalar_t* __restrict__ B,
       float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-      int lda, int ldb, int ldc, int K, int max_tokens) {
+      int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
     tinygemm_kernel_nn_scalar(A, B, C, indices, scale, BLOCK_M, BLOCK_N, K, lda, ldb, ldc, max_tokens);
   }
 };
@@ -184,7 +184,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const float* __restrict__ A, const at::BFloat16* __restrict__ B,
       float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-      int lda, int ldb, int ldc, int K, int max_tokens) {
+      int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
 
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
@@ -208,7 +208,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     };
     Unroll<ROWS * COLS>{}(loadc);
 
-    auto compute = [&](auto i, int k) {
+    auto compute = [&](auto i, int64_t k) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
 
@@ -217,10 +217,10 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       }
       if constexpr (row == 0) {
         if (k + 1 < K) {
-          int b_idx_prefetch = indices[k + 1];
+          int64_t b_idx_prefetch = indices[k + 1];
           _mm_prefetch(B + b_idx_prefetch * ldb + col * 16, _MM_HINT_T0);
         }
-        int b_idx = indices[k];
+        int64_t b_idx = indices[k];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
 
         // for COLS = 2, 4, 6, 8 use 512 bit load
@@ -239,7 +239,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       vc[i] = _mm512_fmadd_ps(va, vb[col], vc[i]);
     };
 
-    for (int k = 0; k < K; ++k) {
+    for (int64_t k = 0; k < K; ++k) {
       Unroll<ROWS * COLS>{}(compute, k);
     }
 
@@ -263,17 +263,17 @@ template <typename scalar_t, typename index_t>
 void index_gemm_kernel_nt(
     const scalar_t* __restrict__ A, const scalar_t* __restrict__ B,
     float* __restrict__ C, const index_t* __restrict__ indices,
-    float scale, int M, int N, int K, int lda, int ldb, int ldc, int max_tokens) {
+    float scale, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
 
   // pattern: 1-8-8
   if (M == 1) {
-    constexpr int BLOCK_N = 8;
-    const int NB = div_up(N, BLOCK_N);
-    int mb_start = 0, lda = 1, ldc = 1;
+    constexpr int64_t BLOCK_N = 8;
+    const int64_t NB = div_up(N, BLOCK_N);
+    int64_t mb_start = 0, lda = 1, ldc = 1;
 
-    for (int nb = 0; nb < NB; ++nb) {
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(BLOCK_N, N - nb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
       switch(nb_size) {
         case 1: LAUNCH_TINYGEMM_KERNEL_NT(1, 1); break;
@@ -291,17 +291,17 @@ void index_gemm_kernel_nt(
   }
 
   // pattern: 1-6-24
-  constexpr int BLOCK_M = 4;
-  constexpr int BLOCK_N = 6;
-  const int MB = div_up(M, BLOCK_M);
-  const int NB = div_up(N, BLOCK_N);
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 6;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
 
-  for (int mb = 0; mb < MB; ++mb) {
-    int mb_start = mb * BLOCK_M;
-    int mb_size = std::min(BLOCK_M, M - mb_start);
-    for (int nb = 0; nb < NB; ++nb) {
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(BLOCK_N, N - nb_start);
+  for (int64_t mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
       switch(mb_size << 4 | nb_size) {
         // mb_size = 1
@@ -342,7 +342,7 @@ template <typename scalar_t, typename index_t>
 void index_gemm_kernel_nn(
     const float* __restrict__ A, const scalar_t* __restrict__ B,
     float* __restrict__ C, const index_t* __restrict__ indices, float* __restrict__ scale,
-    int M, int N, int K, int lda, int ldb, int ldc, int max_tokens) {
+    int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
 
   constexpr int kVecSize = 16;
   if ((N & (kVecSize - 1)) != 0) {
@@ -352,13 +352,13 @@ void index_gemm_kernel_nn(
 
   // pattern: 1-8-8
   if (M == 1) {
-    constexpr int BLOCK_N = 8 * kVecSize;
-    const int NB = div_up(N, BLOCK_N);
-    int mb_start = 0, lda = 1, ldc = 1;
+    constexpr int64_t BLOCK_N = 8 * kVecSize;
+    const int64_t NB = div_up(N, BLOCK_N);
+    int64_t mb_start = 0, lda = 1, ldc = 1;
 
-    for (int nb = 0; nb < NB; ++nb) {
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(BLOCK_N, N - nb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
       switch(nb_size >> 4) {
         case 1: LAUNCH_TINYGEMM_KERNEL_NN(1, 16); break;
@@ -375,17 +375,17 @@ void index_gemm_kernel_nn(
     return;
   }
 
-  constexpr int BLOCK_M = 4;
-  constexpr int BLOCK_N = 6 * kVecSize;
-  const int MB = div_up(M, BLOCK_M);
-  const int NB = div_up(N, BLOCK_N);
+  constexpr int64_t BLOCK_M = 4;
+  constexpr int64_t BLOCK_N = 6 * kVecSize;
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
 
-  for (int mb = 0; mb < MB; ++mb) {
-    int mb_start = mb * BLOCK_M;
-    int mb_size = std::min(BLOCK_M, M - mb_start);
-    for (int nb = 0; nb < NB; ++nb) {
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(BLOCK_N, N - nb_start);
+  for (int64_t mb = 0; mb < MB; ++mb) {
+    int64_t mb_start = mb * BLOCK_M;
+    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+    for (int64_t nb = 0; nb < NB; ++nb) {
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
       switch(mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
@@ -432,57 +432,57 @@ void decode_attention_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
-    int batches,
-    int num_heads,
-    int head_size,
-    int head_size_v,
-    int num_kv_splits,
-    int k_strideN,
-    int k_strideH,
-    int v_strideN,
-    int v_strideH,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
     float scaling,
     float logit_cap,
-    int max_num_reqs,
-    int max_context_len,
-    int max_total_num_tokens) {
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens) {
 
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
-  constexpr int BLOCK_N = 256;
+  constexpr int64_t BLOCK_N = 256;
 
   // strides
-  const int q_strideM = num_heads * head_size;
-  const int q_strideH = head_size;
-  const int l_stride1 = num_kv_splits * (head_size_v + 1);
-  const int l_stride2 = head_size_v + 1;
+  const int64_t q_strideM = num_heads * head_size;
+  const int64_t q_strideH = head_size;
+  const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride2 = head_size_v + 1;
 
   const bool has_logit_cap = logit_cap > 0;
   float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
 
   // parallel on [batches, num_heads, num_kv_splits]
-  at::parallel_for(0, batches * num_heads * num_kv_splits, 0, [&](int begin, int end) {
-    int bs{0}, head_id{0}, kv_id{0};
+  at::parallel_for(0, batches * num_heads * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_id{0}, kv_id{0};
     data_index_init(begin, bs, batches, head_id, num_heads, kv_id, num_kv_splits);
 
     // s_prime and s_delta
     alignas(64) float s_i[BLOCK_N];
     float* __restrict__ s_delta = s_i;
 
-    for (int i = begin; i < end; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       // get query
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + head_id * q_strideH;
 
       // get key/value
-      int seq_len_kv = seq_lens[bs];
-      int req_pool_id = req_pool_indices[bs];
+      int64_t seq_len_kv = seq_lens[bs];
+      int64_t req_pool_id = req_pool_indices[bs];
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
-      const int SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
-      const int kv_start = kv_id * SPLIT_SIZE;
-      const int kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
+      const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
+      const int64_t kv_start = kv_id * SPLIT_SIZE;
+      const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
 
       float m_prime = -std::numeric_limits<float>::infinity();
       float s_prime = 0.f;
@@ -492,8 +492,8 @@ void decode_attention_kernel_impl(
       fill_stub(v_prime, 0.f, head_size_v);
 
       // loop over K and V sequence with BLOCK_N
-      for (int n = kv_start; n < kv_end; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, kv_end - n);
+      for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
+        int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
         // calculate s_i <- scale * Q @ K
         index_gemm_kernel_nt<scalar_t, index_t>(
@@ -579,20 +579,20 @@ void decode_attention_kernel_impl(
   });
 
   // parallel on [batches, num_heads]
-  at::parallel_for(0, batches * num_heads, 0, [&] (int begin, int end) {
+  at::parallel_for(0, batches * num_heads, 0, [&] (int64_t begin, int64_t end) {
     // NB: here we use logits[b][h][0] as acc, since
     // for the first kv split (kv_id == 0):
     //   m_delta = std::exp(-inf) = 0
     //   e_logic = std::exp(0) = 1
     //   acc = acc * m_delta + tv * e_logic = tv
-    for (int i = begin; i < end; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
       float m_prime = -std::numeric_limits<scalar_t>::infinity();
 
       // update acc with from each kv_split
-      for (int kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
+      for (int64_t kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
         float* __restrict__ tv = acc + kv_id * l_stride2;
         const float tlogic = (acc + kv_id * l_stride2)[head_size_v];
 
@@ -624,48 +624,51 @@ void decode_attention_grouped_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
-    int batches,
-    int num_heads,
-    int num_heads_kv,
-    int head_size,
-    int head_size_v,
-    int num_kv_splits,
-    int k_strideN,
-    int k_strideH,
-    int v_strideN,
-    int v_strideH,
+    int64_t batches,
+    int64_t num_heads,
+    int64_t num_heads_kv,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t num_kv_splits,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
     float scaling,
     float logit_cap,
-    int max_num_reqs,
-    int max_context_len,
-    int max_total_num_tokens) {
+    int64_t max_num_reqs,
+    int64_t max_context_len,
+    int64_t max_total_num_tokens) {
 
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
-  constexpr int BLOCK_N = 256;
+  constexpr int64_t BLOCK_N = 256;
   // block length for heads
-  constexpr int BLOCK_H = 16;
+  // we parallel on [batches, divup(num_heads, BLOCK_H), num_kv_splits]
+  // use smaller BLOCK_H when batches is small to utilize all cores
+  constexpr int64_t kBLOCK_H = 16;
+  const int64_t BLOCK_H = std::min(4 * batches, kBLOCK_H);
 
   // strides
-  const int q_strideM = num_heads * head_size;
-  const int q_strideH = head_size;
-  const int l_stride0 = num_heads * num_kv_splits * (head_size_v + 1);
-  const int l_stride1 = num_kv_splits * (head_size_v + 1);
-  const int l_stride2 = head_size_v + 1;
+  const int64_t q_strideM = num_heads * head_size;
+  const int64_t q_strideH = head_size;
+  const int64_t l_stride0 = num_heads * num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride1 = num_kv_splits * (head_size_v + 1);
+  const int64_t l_stride2 = head_size_v + 1;
 
   const bool has_logit_cap = logit_cap > 0;
   float rlogit_cap = has_logit_cap ? 1 / logit_cap : 0.f;
 
   // partition the heads into blocks for parallel
-  const int num_groups = num_heads / num_heads_kv;
-  const int num_blocks = div_up(num_heads, std::min(BLOCK_H, num_groups));
-  const int num_groups_per_block = div_up(num_groups, BLOCK_H);
-  const int num_heads_per_block = std::min(num_groups, BLOCK_H);
+  const int64_t num_groups = num_heads / num_heads_kv;
+  const int64_t num_blocks = div_up(num_heads, std::min(BLOCK_H, num_groups));
+  const int64_t num_groups_per_block = div_up(num_groups, BLOCK_H);
+  const int64_t num_heads_per_block = std::min(num_groups, BLOCK_H);
 
   // parallel on [batches, num_blocks, num_kv_splits]
-  at::parallel_for(0, batches * num_blocks * num_kv_splits, 0, [&](int begin, int end) {
-    int bs{0}, head_id{0}, kv_id{0};
+  at::parallel_for(0, batches * num_blocks * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_id{0}, kv_id{0};
     data_index_init(begin, bs, batches, head_id, num_blocks, kv_id, num_kv_splits);
 
     alignas(64) float s_i[BLOCK_H * BLOCK_N];
@@ -675,37 +678,37 @@ void decode_attention_grouped_kernel_impl(
     alignas(64) float m_prime[BLOCK_H];
     alignas(64) float m_delta[BLOCK_H];
 
-    for (int i = begin; i < end; ++i) {
-      const int h_start = head_id * num_heads_per_block;
-      const int h_end = std::min(h_start + num_heads_per_block, num_heads);
-      const int h_size = h_end - h_start;
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t h_start = head_id * num_heads_per_block;
+      const int64_t h_end = std::min(h_start + num_heads_per_block, num_heads);
+      const int64_t h_size = h_end - h_start;
 
       // get query
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
 
       // kv head id and valid block head size
-      int head_kv_id = head_id / num_groups_per_block;
-      int seq_len_kv = seq_lens[bs];
-      int req_pool_id = req_pool_indices[bs];
+      int64_t head_kv_id = head_id / num_groups_per_block;
+      int64_t seq_len_kv = seq_lens[bs];
+      int64_t req_pool_id = req_pool_indices[bs];
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
 
-      const int SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
-      const int kv_start = kv_id * SPLIT_SIZE;
-      const int kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
+      const int64_t SPLIT_SIZE = div_up(seq_len_kv, num_kv_splits);
+      const int64_t kv_start = kv_id * SPLIT_SIZE;
+      const int64_t kv_end = std::min(kv_start + SPLIT_SIZE, seq_len_kv);
 
       fill_stub(s_prime, 0.f, BLOCK_H);
       fill_stub(m_prime, -std::numeric_limits<float>::infinity(), BLOCK_H);
 
       // get v_prime, and init to zero
       float* __restrict__ v_prime = attn_logits + bs * l_stride0 + h_start * l_stride1 + kv_id * l_stride2;
-      for (int h = 0; h < h_size; ++h) {
+      for (int64_t h = 0; h < h_size; ++h) {
         fill_stub(v_prime + h * l_stride1, 0.f, head_size_v);
       }
 
       // loop over K and V sequence with BLOCK_N
-      for (int n = kv_start; n < kv_end; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, kv_end - n);
+      for (int64_t n = kv_start; n < kv_end; n += BLOCK_N) {
+        int64_t n_size = std::min(BLOCK_N, kv_end - n);
 
         // calculate Q @ K
         index_gemm_kernel_nt<scalar_t, index_t>(
@@ -731,7 +734,7 @@ void decode_attention_grouped_kernel_impl(
         }
 
         // update the scaling coefficients
-        for (int h = 0; h < h_size; ++h) {
+        for (int64_t h = 0; h < h_size; ++h) {
           // m_i: max value per row
           float m_i = at::vec::reduce_all<float>(
               [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
@@ -777,7 +780,7 @@ void decode_attention_grouped_kernel_impl(
 
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
-        for (int h = 0; h < h_size; ++h) {
+        for (int64_t h = 0; h < h_size; ++h) {
           float s = 1 / s_prime[h];
           at::vec::map<float>(
               [s](Vec out) { return out * Vec(s); },
@@ -794,16 +797,16 @@ void decode_attention_grouped_kernel_impl(
   });
 
   // parallel on [batches, num_heads]
-  at::parallel_for(0, batches * num_heads, 0, [&] (int begin, int end) {
+  at::parallel_for(0, batches * num_heads, 0, [&] (int64_t begin, int64_t end) {
     // NB: same as above
-    for (int i = begin; i < end; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       float* __restrict__ acc = attn_logits + i * l_stride1;
 
       float s_prime = 0.f;
       float m_prime = -std::numeric_limits<scalar_t>::infinity();
 
       // update acc with from each kv_split
-      for (int kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
+      for (int64_t kv_id = 0; kv_id < num_kv_splits; ++kv_id) {
         float* __restrict__ tv = acc + kv_id * l_stride2;
         const float tlogic = (acc + kv_id * l_stride2)[head_size_v];
 
@@ -857,17 +860,17 @@ void decode_attention_cpu(
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
 
-  int num_seqs = seq_lens.size(0);
-  int max_num_reqs = req_to_token.size(0);
-  int max_context_len = req_to_token.size(1);
-  int max_total_num_tokens = k_buffer.size(0);
+  int64_t num_seqs = seq_lens.size(0);
+  int64_t max_num_reqs = req_to_token.size(0);
+  int64_t max_context_len = req_to_token.size(1);
+  int64_t max_total_num_tokens = k_buffer.size(0);
 
-  int num_heads = query.size(1);
-  int num_heads_kv = k_buffer.size(1);
-  int head_size = query.size(2);
-  int head_size_v = v_buffer.size(2);
+  int64_t num_heads = query.size(1);
+  int64_t num_heads_kv = k_buffer.size(1);
+  int64_t head_size = query.size(2);
+  int64_t head_size_v = v_buffer.size(2);
 
-  int num_kv_splits = attn_logits.size(2);
+  int64_t num_kv_splits = attn_logits.size(2);
 
   CHECK_EQ(attn_logits.size(0), num_seqs);
   CHECK_EQ(attn_logits.size(1), num_heads);
@@ -875,10 +878,10 @@ void decode_attention_cpu(
   CHECK_EQ(attn_logits.scalar_type(), at::kFloat);
 
   // strides for k_buffer and v_buffer
-  int k_strideN = k_buffer.stride(0);
-  int k_strideH = k_buffer.stride(1);
-  int v_strideN = v_buffer.stride(0);
-  int v_strideH = v_buffer.stride(1);
+  int64_t k_strideN = k_buffer.stride(0);
+  int64_t k_strideH = k_buffer.stride(1);
+  int64_t v_strideN = v_buffer.stride(0);
+  int64_t v_strideH = v_buffer.stride(1);
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
