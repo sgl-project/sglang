@@ -1,11 +1,10 @@
 [build-system]
 requires = [
-  "setuptools>=75.0",
   "scikit-build-core>=0.10",
   "torch==2.5.1",
   "wheel",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
@@ -30,3 +29,11 @@ exclude = [
   "dist*",
   "tests*",
 ]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+minimum-version = "build-system.requires"
+
+wheel.py-api = "cp39"
+wheel.license-files = []
+wheel.packages = ["python/sgl_kernel"]

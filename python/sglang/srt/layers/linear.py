@@ -23,6 +23,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    _ColumnvLLMParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -422,8 +423,6 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-
-        from sglang.srt.layers.parameter import _ColumnvLLMParameter
 
         if isinstance(param, _ColumnvLLMParameter):
             param.load_column_parallel_weight(
@@ -1247,7 +1246,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if isinstance(param, BasevLLMParameter):
+        if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(

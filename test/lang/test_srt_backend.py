@@ -22,10 +22,10 @@ from sglang.test.test_programs import (
     test_stream,
     test_tool_use,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
-class TestSRTBackend(unittest.TestCase):
+class TestSRTBackend(CustomTestCase):
     backend = None
 
     @classmethod

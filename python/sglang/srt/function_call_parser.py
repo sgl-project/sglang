@@ -290,7 +290,6 @@ class BaseFormatDetector(ABC):
                             calls=[
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
-                                    name="",
                                     parameters=argument_diff,
                                 )
                             ],

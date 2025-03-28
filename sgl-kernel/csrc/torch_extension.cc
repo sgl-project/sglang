@@ -12,8 +12,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-
 #include <ATen/core/dispatch/Dispatcher.h>
+#include <torch/all.h>
 #include <torch/library.h>
 
 #include "sgl_kernel_ops.h"
@@ -178,9 +178,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);
 
   m.def(
-      "top_k_renorm_probs_wrapper(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val, int "
+      "top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val, int "
       "cuda_stream) -> ()");
-  m.impl("top_k_renorm_probs_wrapper", torch::kCUDA, &top_k_renorm_probs_wrapper);
+  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
   m.def(
       "top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val, int "

@@ -37,7 +37,7 @@ class W8A8Fp8Config(QuantizationConfig):
     Note:
     - For models without offline quantization, weights will be quantized during model loading
     - If CUTLASS is supported: Per-channel weight quantization is used
-    - If CUTLASS is not supported: Falls back to per-token weight quantization
+    - If CUTLASS is not supported: Falls back to per-tensor weight quantization
     """
 
     def __init__(self, is_checkpoint_fp8_serialized: bool = False):

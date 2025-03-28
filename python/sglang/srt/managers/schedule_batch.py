@@ -1376,6 +1376,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if (
                 global_server_args_dict["enable_flashinfer_mla"]
                 or global_server_args_dict["enable_flashmla"]
+                or global_server_args_dict["attention_backend"] == "fa3"
             ):
                 decode_seq_lens = self.seq_lens.cpu()
             else:

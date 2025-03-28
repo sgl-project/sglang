@@ -4,9 +4,10 @@ import unittest
 import torch
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestGeluAndMul(unittest.TestCase):
+class TestGeluAndMul(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     NUM_TOKENS = [7, 83, 2048]
     D = [512, 4096, 5120, 13824]
