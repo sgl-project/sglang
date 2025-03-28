@@ -35,7 +35,11 @@ class SessionParams:
 
 
 @dataclass
-class GenerateReqInput:
+class BaseReqInput:
+    pass
+
+@dataclass
+class GenerateReqInput(BaseReqInput):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -302,7 +306,7 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
-class EmbeddingReqInput:
+class EmbeddingReqInput(BaseReqInput):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The image input. It can be a file name, a url, or base64 encoded string.
