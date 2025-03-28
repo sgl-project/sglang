@@ -193,22 +193,26 @@ class TestSRTEngine(CustomTestCase):
             model_path=model_path,
             is_embedding=True,
             random_seed=42,
-            disable_radix_cache=True
+            disable_radix_cache=True,
         )
-        
+
         # Get sync and async embeddings
         out1 = torch.tensor(engine.encode(prompt)["embedding"])
         loop = asyncio.get_event_loop()
-        out2 = torch.tensor(loop.run_until_complete(engine.async_encode(prompt))["embedding"])
-        
+        out2 = torch.tensor(
+            loop.run_until_complete(engine.async_encode(prompt))["embedding"]
+        )
+
         engine.shutdown()
 
         print("\n==== Shapes ====")
         print(f"sync shape: {out1.shape}")
         print(f"async shape: {out2.shape}")
-        
-        self.assertTrue(torch.allclose(out1, out2, atol=1e-5, rtol=1e-3),
-                       "Sync and async embeddings are not equal within tolerance")
+
+        self.assertTrue(
+            torch.allclose(out1, out2, atol=1e-5, rtol=1e-3),
+            "Sync and async embeddings are not equal within tolerance",
+        )
 
 
 if __name__ == "__main__":
