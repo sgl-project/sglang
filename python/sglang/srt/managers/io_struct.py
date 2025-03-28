@@ -87,13 +87,11 @@ class BaseReqInput:
 
     @staticmethod
     def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
-        # Derive the batch size
         if text is not None:
             if isinstance(text, str):
                 return True, 1
             else:
                 return False, len(text)
-            self.input_embeds = None
         elif input_ids is not None:
             if len(input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
@@ -101,12 +99,11 @@ class BaseReqInput:
                 return True, 1
             else:
                 return False, len(input_ids)
-            self.input_embeds = None
         else:
             if isinstance(input_embeds[0][0], float):
                 return True, 1
             else:
-                return False, len(self.input_embeds)
+                return False, len(input_embeds)
 
 
 @dataclass
