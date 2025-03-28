@@ -1740,7 +1740,7 @@ def retry(
     fn,
     max_retry: int,
 ):
-    while True:
+    for try_index in itertools.count():
         try:
             fn()
         except Exception as e:
