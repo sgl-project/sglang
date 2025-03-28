@@ -211,6 +211,29 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+        if self.server_args.enable_torch_compile and not self.cuda_graph_runner:
+            from sglang.srt.utils import set_torch_compile_config
+
+            set_torch_compile_config()
+            dynamic = False
+            if self.device == "xpu":
+                dynamic = True
+            try:
+                self.model.forward = torch.compile(
+                    torch.no_grad()(self.model.forward),
+                    mode=os.environ.get(
+                        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                    ),
+                    dynamic=dynamic,
+                )
+            except RuntimeError as e:
+                raise Exception(
+                    f"Try torch compile failed: {e}\n"
+                    "Possible solutions:\n"
+                    "disable torch compile by not using --enable-torch-compile\n"
+                    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+                )
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
