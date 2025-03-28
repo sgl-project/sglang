@@ -57,7 +57,7 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 
 
 def _compute_infos_from_sources(sources):
-    return TODO
+    return _deduplicate(_compute_infos_from_sources_raw(sources), key_fn=TODO)
 
 
 def _compute_infos_from_sources_raw(sources):
