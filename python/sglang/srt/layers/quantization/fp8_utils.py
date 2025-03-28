@@ -456,8 +456,8 @@ class Fp8LinearOp:
             if _is_cuda:
                 qinput, x_scale = sgl_scaled_fp8_quant(
                     input_2d,
-                    num_token_padding=self.output_padding,
                     input_scale,
+                    num_token_padding=self.output_padding,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
             else:
