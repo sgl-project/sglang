@@ -314,7 +314,6 @@ class EmbeddingReqInput(BaseReqInput):
                 self.rid = uuid.uuid4().hex
             if self.sampling_params is None:
                 self.sampling_params = {}
-            self.sampling_params["max_new_tokens"] = 0
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
@@ -323,6 +322,10 @@ class EmbeddingReqInput(BaseReqInput):
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
+
+        if self.is_single:
+            self.sampling_params["max_new_tokens"] = 0
+        else:
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
