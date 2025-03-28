@@ -77,12 +77,6 @@ class TestLoRA(CustomTestCase):
         print("=================== testing inference =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
-        # batch_lora_paths = []
-        # for prompt_id in range(len(prompts)):
-        #     if prompt_id < len(all_lora_paths):
-        #         batch_lora_paths.append(all_lora_paths[prompt_id])
-        #     else:
-        #         batch_lora_paths.append(all_lora_paths[0])
         batch_lora_paths = [None]
         i = 0
         for _ in range(len(prompts) - 1):
