@@ -1042,14 +1042,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             self.is_sparse = True
         else:
+            moe_dense_tp_size = global_server_args_dict["moe_dense_tp_size"]
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=TODO,
-                tp_size=TODO,
+                tp_rank=(get_tensor_model_parallel_rank() % moe_dense_tp_size) if moe_dense_tp_size else None,
+                tp_size=moe_dense_tp_size,
             )
             self.is_sparse = False
 
