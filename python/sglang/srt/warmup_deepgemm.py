@@ -8,6 +8,11 @@ import torch
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.utils import get_bool_env_var
 
+try:
+    from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,8 +50,6 @@ def _warmup_by_infos(infos: List[Dict[str, Any]]):
 # Copied from DeepGEMM's `test_core.py` :: `construct`
 def _construct_gemm_inputs(m: int, k: int, n: int) -> Tuple[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
-    from deep_gemm import get_col_major_tma_aligned_tensor
-
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
@@ -69,8 +72,6 @@ def _per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 
 # Copied from DeepGEMM's `test_core.py`
 def _per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    from deep_gemm import ceil_div
-
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
