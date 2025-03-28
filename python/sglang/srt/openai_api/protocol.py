@@ -28,6 +28,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    max_model_len: Optional[int] = None
 
 
 class ModelList(BaseModel):
