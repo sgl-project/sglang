@@ -16,6 +16,10 @@ def warmup(server_args: ServerArgs):
     if not enable_jit_deepgemm:
         return
 
+    infos = _INFOS_OF_MODEL.get(TODO)
+    if infos is None:
+        return
+
     TODO
 
 
