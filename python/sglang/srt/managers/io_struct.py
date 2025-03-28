@@ -82,27 +82,14 @@ class BaseReqInput:
                 self.sampling_params = {}
         else:
             if self.rid is None:
-                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+                self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
-            if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
-
-            ######
-            if self.sampling_params is None:
-                self.sampling_params = {}
-            if self.rid is None:
-                self.rid = uuid.uuid4().hex
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
             elif not isinstance(self.sampling_params, list):
                 self.sampling_params = [self.sampling_params] * num
-
-            if self.rid is None:
-                self.rid = [uuid.uuid4().hex for _ in range(num)]
-            else:
-                assert isinstance(self.rid, list), "The rid should be a list."
 
     @staticmethod
     def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
