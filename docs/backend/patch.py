@@ -1,4 +1,3 @@
-import os
 import weakref
 
 import nest_asyncio

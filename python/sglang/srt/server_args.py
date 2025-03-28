@@ -16,6 +16,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 import random
 import tempfile
 from typing import List, Optional
@@ -226,22 +227,6 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if self.schedule_conservativeness is None:
-            self.schedule_conservativeness = 0.3 if self.enable_dp_attention else 1.0
-
-        # Data parallelism attention
-        if self.enable_dp_attention:
-            assert (
-                self.dp_size > 1
-            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
-            assert self.tp_size % self.dp_size == 0
-            # DeepEP MoE
-            if self.enable_deepep_moe:
-                self.ep_size = self.dp_size
-                logger.info(
-                    f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the data parallel size[{self.dp_size}]."
-                )
-
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
@@ -299,6 +284,27 @@ class ServerArgs:
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.schedule_conservativeness is None:
+            self.schedule_conservativeness = 0.3 if self.enable_dp_attention else 1.0
+
+        # Data parallelism attention
+        if self.enable_dp_attention:
+            assert (
+                self.dp_size > 1
+            ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
+            assert self.tp_size % self.dp_size == 0
+
+        self.enable_sp_layernorm = False
+        # DeepEP MoE
+        if self.enable_deepep_moe:
+            self.ep_size = self.tp_size
+            self.enable_sp_layernorm = (
+                self.dp_size < self.tp_size if self.enable_dp_attention else True
+            )
+            logger.info(
+                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
@@ -343,6 +349,10 @@ class ServerArgs:
             logger.warning("Cuda graph is disabled for prefill server")
             self.disable_overlap_schedule = True
             logger.warning("Overlap scheduler is disabled for decode server")
+
+        os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
+            "1" if self.enable_torch_compile else "0"
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
