@@ -94,6 +94,8 @@ def _per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 
 # --------------------------------------- capture -------------------------------------
 
+# TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
+_dir_output = Path('/tmp/warmup_deepgemm_capture')
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
 
@@ -116,7 +118,7 @@ class _Capturer:
         self._seen_infos.add(info)
 
         # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-        path = Path(_dir_output) / f"rank{rank}.jsonl"
+        path = _dir_output / f"rank{rank}.jsonl"
         with path.open("a") as fp:
             fp.write(f"{json.dumps(info)}\n")
 
