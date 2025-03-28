@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- warmup -------------------------------------
 
 def warmup(server_args: ServerArgs):
+    from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
+    if not enable_jit_deepgemm:
+        return
+
     TODO
 
 
