@@ -21,7 +21,9 @@ def _compute_shape_from_args(lhs, rhs, out):
 
 class _Capturer:
     def __init__(self):
-        self._seen_mkn_arr = {}
+        self._seen_infos = {}
 
-    def on_execution(self, shape):
+    def on_execution(self, info):
+        if info in self._seen_infos:
+            return
         TODO
