@@ -6,7 +6,12 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+
 # --------------------------------------- warmup -------------------------------------
+
+def warmup():
+    TODO
+
 
 # --------------------------------------- capture -------------------------------------
 
