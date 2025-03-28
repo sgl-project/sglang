@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torchvision.transforms as T
 from PIL import Image, ImageOps
 from transformers import (
     AutoProcessor,
@@ -75,6 +74,16 @@ class ImageTransform(object):
         self.mean = mean
         self.std = std
         self.normalize = normalize
+
+        # only load torchvision.transforms when needed
+        try:
+            import torchvision.transforms as T
+
+            # FIXME: add version check for gguf
+        except ImportError as err:
+            raise ImportError(
+                "Please install torchvision via `pip install torchvision` to use Deepseek-VL2."
+            ) from err
 
         transform_pipelines = [T.ToTensor()]
 
