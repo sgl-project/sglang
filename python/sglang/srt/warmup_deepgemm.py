@@ -1,7 +1,8 @@
 # TODO shall we put this file elsewhere?
-
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple
 
 import torch
@@ -115,7 +116,9 @@ class _Capturer:
         self._seen_infos.add(info)
 
         # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-        TODO_write_to_disk
+        path = Path(_dir_output) / f"rank{rank}.jsonl"
+        with path.open("a") as fp:
+            fp.write(f"{json.dumps(info)}\n")
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
