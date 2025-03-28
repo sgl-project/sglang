@@ -14,7 +14,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
-import gguf
 import huggingface_hub
 import numpy as np
 import torch
@@ -1155,6 +1154,17 @@ class GGUFModelLoader(BaseModelLoader):
         See "Standardized tensor names" in
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
+
+        # only load the gguf module when needed
+        try:
+            import gguf
+
+            # FIXME: add version check for gguf
+        except ImportError as err:
+            raise ImportError(
+                "Please install gguf via `pip install gguf` to use gguf quantizer."
+            ) from err
+
         config = model_config.hf_config
         model_type = config.model_type
         # hack: ggufs have a different name than transformers
