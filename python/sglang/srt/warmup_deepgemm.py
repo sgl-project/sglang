@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import sys
+from concurrent.futures.process import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Callable
 
@@ -90,12 +91,17 @@ def _deduplicate(items, key_fn: Callable):
 
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
-    for info in tqdm(infos, total=len(infos), desc='Warmup DeepGEMM'):
-        print(f'hi warmup {info=}')
-        x_fp8, y_fp8, out = _construct_gemm_inputs(m=info['m'], k=info['k'], n=info['n'])
-        # For simplicity, here we naively call the gemm
-        # But alternatively, we may call `get_best_configs` or other configuration and deduplicate
-        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+    with ProcessPoolExecutor(max_workers=TODO) as executor:
+        iterator = executor.map(_warmup_by_info, infos)
+        list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
+
+
+def _warmup_by_info(info: Dict[str, Any]):
+    print(f'hi warmup {info=}')
+    x_fp8, y_fp8, out = _construct_gemm_inputs(m=info['m'], k=info['k'], n=info['n'])
+    # For simplicity, here we naively call the gemm
+    # But alternatively, we may call `get_best_configs` or other configuration and deduplicate
+    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
 
 # Copied from DeepGEMM's `test_core.py` :: `construct`
