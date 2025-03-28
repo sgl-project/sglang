@@ -73,6 +73,8 @@ class BaseReqInput:
                 self.text = [self.text]
             if self.input_ids is not None:
                 self.input_ids = [self.input_ids]
+            if self.input_embeds is not None:
+                self.input_embeds = [self.input_embeds]
 
         # Fill in default arguments
         if self.is_single:
