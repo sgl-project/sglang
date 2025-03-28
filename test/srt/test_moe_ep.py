@@ -7,11 +7,12 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestEpMoE(unittest.TestCase):
+class TestEpMoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -59,7 +60,7 @@ class TestEpMoE(unittest.TestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-class TestEpMoEFP8(unittest.TestCase):
+class TestEpMoEFP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST

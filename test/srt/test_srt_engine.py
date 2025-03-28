@@ -18,10 +18,11 @@ from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
 )
 
 
-class TestSRTEngine(unittest.TestCase):
+class TestSRTEngine(CustomTestCase):
 
     def test_1_engine_runtime_consistency(self):
         prompt = "Today is a sunny day and I like"

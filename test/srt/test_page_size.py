@@ -8,11 +8,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestPageSize(unittest.TestCase):
+class TestPageSize(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_DEBUG_MEMORY_POOL"] = "1"

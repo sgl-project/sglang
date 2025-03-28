@@ -39,6 +39,8 @@ spec:
             limits:
               nvidia.com/gpu: 1
           volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
             - name: hf-cache
               mountPath: /root/.cache/huggingface
               readOnly: true
@@ -52,6 +54,10 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 10
       volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Gi
         - name: hf-cache
           hostPath:
             path: /root/.cache/huggingface

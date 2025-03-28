@@ -22,7 +22,6 @@ from typing import (
 )
 
 import filelock
-import gguf
 import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
@@ -464,6 +463,8 @@ def pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
+    import gguf
+
     reader = gguf.GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
@@ -478,6 +479,8 @@ def gguf_quant_weights_iterator(
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
     """
+
+    import gguf
 
     reader = gguf.GGUFReader(gguf_file)
 

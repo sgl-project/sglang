@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     EmbeddingReqInput,
     ExpertDistributionReq,
+    ExpertDistributionReqOutput,
     FlushCacheReq,
     GenerateReqInput,
     GetInternalStateReq,
@@ -264,6 +265,9 @@ class TokenizerManager:
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -312,6 +316,10 @@ class TokenizerManager:
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
+                ),
+                (
+                    ExpertDistributionReqOutput,
+                    self.expert_distribution_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -639,17 +647,14 @@ class TokenizerManager:
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         self.send_to_scheduler.send_pyobj(req)
 
-    def start_expert_distribution_record(self):
-        req = ExpertDistributionReq.START_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def start_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
 
-    def stop_expert_distribution_record(self):
-        req = ExpertDistributionReq.STOP_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def stop_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
-    def dump_expert_distribution_record(self):
-        req = ExpertDistributionReq.DUMP_RECORD
-        self.send_to_scheduler.send_pyobj(req)
+    async def dump_expert_distribution_record(self):
+        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
     async def update_weights_from_disk(
         self,

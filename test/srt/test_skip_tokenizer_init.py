@@ -19,11 +19,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestSkipTokenizerInit(unittest.TestCase):
+class TestSkipTokenizerInit(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

@@ -17,11 +17,12 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
-from sglang.srt.managers.utils import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -53,10 +54,10 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
-    if _is_cuda:
+    if _is_cuda or _is_hip:
         from sgl_kernel import topk_softmax
     else:
-        from vllm import _custom_ops as ops
+        from vllm import _custom_ops as vllm_ops
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -70,7 +71,7 @@ def fused_topk(
         M, topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    if _is_cuda:
+    if _is_cuda or _is_hip:
         topk_softmax(
             topk_weights,
             topk_ids,
@@ -78,7 +79,7 @@ def fused_topk(
             gating_output.float(),
         )
     else:
-        ops.topk_softmax(
+        vllm_ops.topk_softmax(
             topk_weights,
             topk_ids,
             token_expert_indicies,
