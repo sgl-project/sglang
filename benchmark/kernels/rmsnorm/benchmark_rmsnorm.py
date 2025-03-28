@@ -3,9 +3,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton
-from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 from torch import nn
 from vllm import _custom_ops as vllm_ops
+
+from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 
 
 class HuggingFaceRMSNorm(nn.Module):

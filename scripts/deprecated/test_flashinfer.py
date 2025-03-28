@@ -1,10 +1,10 @@
 import pytest
 import torch
+
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
-
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
