@@ -3,7 +3,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Sequence
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -30,7 +30,8 @@ def warmup(model):
     if sources is None:
         return
 
-    _warmup_by_infos(sources)
+    infos = _compute_infos_from_sources(sources)
+    _warmup_by_infos(infos)
 
 
 def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
@@ -55,7 +56,15 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
     ]
 
 
-def _warmup_by_infos(infos: List[Dict[str, Any]]):
+def _compute_infos_from_sources(sources):
+    return TODO
+
+
+def _deduplicate():
+    return TODO
+
+
+def _warmup_by_infos(infos: Sequence[Dict[str, Any]]):
     for info in infos:
         print(f'hi warmup {info=}')
         x_fp8, y_fp8, out = _construct_gemm_inputs(m=info.m, k=info.k, n=info.n)
