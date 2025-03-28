@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- warmup -------------------------------------
 
 
-def warmup(model, first_rank_in_node):
+def warmup(server_args, model, first_rank_in_node):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
-    if (not enable_jit_deepgemm) or (not first_rank_in_node):
+    if server_args.disable_deepgemm_warmup or (not enable_jit_deepgemm) or (not first_rank_in_node):
         return
 
     _warmup_raw(model.__class__.__name__)

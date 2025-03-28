@@ -422,7 +422,7 @@ class Scheduler(
         # TODO improve computation of this
         tp_size_per_node = self.tp_size // server_args.nnodes
         first_rank_in_node = self.tp_rank % tp_size_per_node == 0
-        warmup_deepgemm.warmup(self.tp_worker.worker.model_runner.model, first_rank_in_node=first_rank_in_node)
+        warmup_deepgemm.warmup(server_args, self.tp_worker.worker.model_runner.model, first_rank_in_node=first_rank_in_node)
 
     def init_tokenizer(self):
         server_args = self.server_args
