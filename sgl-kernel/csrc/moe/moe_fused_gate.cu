@@ -4,7 +4,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 #include <stdio.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include <cfloat>
 #include <type_traits>
