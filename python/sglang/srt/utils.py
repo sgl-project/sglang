@@ -1745,7 +1745,7 @@ def retry(
 ):
     for try_index in itertools.count():
         try:
-            fn()
+            return fn()
         except Exception as e:
             if try_index >= max_retry:
                 raise
