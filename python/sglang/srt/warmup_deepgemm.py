@@ -2,6 +2,7 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, List, Dict, Tuple
 
 import torch
@@ -15,6 +16,15 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------- common -------------------------------------
+
+@dataclass
+class _Info:
+    m: int
+    k: int
+    n: int
 
 
 # --------------------------------------- warmup -------------------------------------
