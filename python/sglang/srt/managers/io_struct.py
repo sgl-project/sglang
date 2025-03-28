@@ -65,18 +65,7 @@ class BaseReqInput:
         self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
                                                                                  self.input_embeds)
 
-        # Handle parallel sampling
-        # When parallel sampling is used, we always treat the input as a batch.
-        if self.sampling_params is None:
-            self.parallel_sample_num = 1
-        elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-            assert all(
-                self.parallel_sample_num == sampling_params.get("n", 1)
-                for sampling_params in self.sampling_params
-            ), "The parallel_sample_num should be the same for all samples in sample params."
+        self.parallel_sample_num = self._compute_parallel_sample_num(self.sampling_params)
 
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
@@ -118,6 +107,21 @@ class BaseReqInput:
                 return True, 1
             else:
                 return False, len(input_embeds)
+
+    @staticmethod
+    def _compute_parallel_sample_num(sampling_params):
+        # When parallel sampling is used, we always treat the input as a batch.
+        if sampling_params is None:
+            return 1
+        elif isinstance(sampling_params, dict):
+            return sampling_params.get("n", 1)
+        else:  # isinstance(sampling_params, list):
+            parallel_sample_num = sampling_params[0].get("n", 1)
+            assert all(
+                parallel_sample_num == s.get("n", 1)
+                for s in sampling_params
+            ), "The parallel_sample_num should be the same for all samples in sample params."
+            return parallel_sample_num
 
 
 @dataclass
