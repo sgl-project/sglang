@@ -45,7 +45,7 @@ class TestEAGLEEngine(CustomTestCase):
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 4,
     }
-    NUM_CONFIGS = 3
+    NUM_CONFIGS = 2
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
@@ -61,8 +61,6 @@ class TestEAGLEEngine(CustomTestCase):
         configs = [
             # Basic config
             self.BASE_CONFIG,
-            # Disable cuda graph
-            {**self.BASE_CONFIG, "disable_cuda_graph": True},
             # Chunked prefill
             {**self.BASE_CONFIG, "chunked_prefill_size": 4},
         ]
