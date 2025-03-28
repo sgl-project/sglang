@@ -75,10 +75,10 @@ def _compute_infos_from_sources(sources):
 
 
 def _compute_deep_gemm_kernel_consts(info, num_sms):
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = (
-        deep_gemm.jit_kernels.gemm.get_best_configs(m=info['m'], n=info['n'], k=info['k'], num_groups=1,
-                                                    num_sms=num_sms))
-    return info['n'], info['k'], block_m, block_n, num_stages, num_tma_multicast
+    best_configs = deep_gemm.jit_kernels.gemm.get_best_configs(
+        m=info['m'], n=info['n'], k=info['k'], num_groups=1,
+        num_sms=num_sms)
+    return info['n'], info['k'], best_configs
 
 
 def _compute_infos_from_sources_raw(sources):
