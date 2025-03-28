@@ -4,6 +4,7 @@
 import json
 import logging
 import shutil
+import sys
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Callable
 
@@ -187,3 +188,7 @@ def read_output() -> List[Dict[str, Any]]:
         for row in path.read_text().split("\n")
         if row
     ]
+
+
+if __name__ == '__main__':
+    _warmup_raw(model_name=sys.argv[1])
