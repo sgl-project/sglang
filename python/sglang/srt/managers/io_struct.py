@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Union, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -57,15 +57,22 @@ class BaseReqInput:
     modalities: Optional[List[str]] = None
 
     def normalize_batch_and_arguments(self):
-        if (int(self.text is not None) + int(self.input_ids is not None) + int(self.input_embeds is not None)) != 1:
+        if (
+            int(self.text is not None)
+            + int(self.input_ids is not None)
+            + int(self.input_embeds is not None)
+        ) != 1:
             raise ValueError(
                 "Exactly one of the text, input_ids or input_embeds should be provided."
             )
 
-        self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
-                                                                                 self.input_embeds)
+        self.is_single, self.batch_size = self._compute_is_single_and_batch_size(
+            self.text, self.input_ids, self.input_embeds
+        )
 
-        self.parallel_sample_num = self._compute_parallel_sample_num(self.sampling_params)
+        self.parallel_sample_num = self._compute_parallel_sample_num(
+            self.sampling_params
+        )
 
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
@@ -96,7 +103,9 @@ class BaseReqInput:
                 self.sampling_params = [self.sampling_params] * num
 
     @staticmethod
-    def _compute_is_single_and_batch_size(text, input_ids, input_embeds) -> Tuple[bool, int]:
+    def _compute_is_single_and_batch_size(
+        text, input_ids, input_embeds
+    ) -> Tuple[bool, int]:
         if text is not None:
             if isinstance(text, str):
                 return True, 1
@@ -125,8 +134,7 @@ class BaseReqInput:
         else:  # isinstance(sampling_params, list):
             parallel_sample_num = sampling_params[0].get("n", 1)
             assert all(
-                parallel_sample_num == s.get("n", 1)
-                for s in sampling_params
+                parallel_sample_num == s.get("n", 1) for s in sampling_params
             ), "The parallel_sample_num should be the same for all samples in sample params."
             return parallel_sample_num
 
