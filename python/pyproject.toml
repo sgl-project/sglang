@@ -72,6 +72,7 @@ dependencies = [
 
 [project.optional-dependencies]
 decord = ["decord"]
+hip-attn = ["hip-attn>=1.2.1"]
 test = [
   "accelerate",
   "expecttest",
@@ -89,7 +90,7 @@ tracing = [
     "opentelemetry-exporter-otlp",
     "opentelemetry-exporter-otlp-proto-grpc",
 ]
-all = ["sglang[test]", "sglang[decord]"]
+all = ["sglang[test]", "sglang[decord]", "sglang[hip-attn]"]
 blackwell = ["sglang[test]", "sglang[decord]"]
 blackwell_aarch64 = ["sglang[test]"]
 dev = ["sglang[test]", "sglang[decord]"]
