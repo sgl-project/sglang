@@ -1,9 +1,10 @@
 # TODO shall we put this file elsewhere?
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -117,11 +118,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-
-        # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-        path = _dir_output / f"TP{get_tensor_model_parallel_rank()}.jsonl"
-        with path.open("a") as fp:
-            fp.write(f"{json.dumps(info)}\n")
+        _write_output(info)
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
@@ -132,3 +129,25 @@ def _compute_info_from_args(lhs, rhs):
     n, k_ = rhs[0].shape
     assert k == k_
     return _Info(m=m, k=k, n=n)
+
+
+# TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
+def _write_output(data):
+    tp_rank = get_tensor_model_parallel_rank()
+    path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
+    with path.open("a") as fp:
+        fp.write(f"{json.dumps(data)}\n")
+
+
+def clear_output():
+    shutil.rmtree(_dir_output, ignore_errors=True)
+    Path(_dir_output).mkdir(parents=True, exist_ok=True)
+
+
+def read_output() -> List[Dict[str, Any]]:
+    return [
+        json.loads(row)
+        for path in sorted(list(Path(_dir_output).glob("*.jsonl")))
+        for row in path.read_text().split("\n")
+        if row
+    ]
