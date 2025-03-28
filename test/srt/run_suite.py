@@ -22,6 +22,7 @@ suites = {
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 83),
         TestFile("models/test_gme_qwen_models.py", 45),
+        TestFile("models/test_clip_models.py", 100),
         TestFile("test_abort.py", 51),
         TestFile("test_auto_override_quant_config.py", 5),
         TestFile("test_awq.py"),
@@ -31,8 +32,6 @@ suites = {
         TestFile("test_ebnf_constrained.py"),
         TestFile("test_fp8_kernel.py", 2),
         TestFile("test_embedding_openai_server.py", 36),
-        TestFile("test_gguf.py", 78),
-        TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_hidden_states.py", 55),
         TestFile("test_int8_kernel.py", 1),
         TestFile("test_input_embeddings.py", 38),
@@ -41,6 +40,7 @@ suites = {
         TestFile("test_metrics.py", 32),
         TestFile("test_mla.py", 92),
         TestFile("test_mla_deepseek_v3.py", 221),
+        TestFile("test_mla_int8_deepseek_v3.py", 421),
         TestFile("test_mla_flashinfer.py", 395),
         TestFile("test_mla_fp8.py", 93),
         TestFile("test_no_chunked_prefill.py", 126),
@@ -80,6 +80,12 @@ suites = {
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
+    ],
+    "vllm_dependency_test": [
+        TestFile("test_vllm_dependency.py"),
+        TestFile("test_awq.py"),
+        TestFile("test_gguf.py", 78),
+        TestFile("test_gptqmodel_dynamic.py", 72),
     ],
 }
 

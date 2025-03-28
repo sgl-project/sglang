@@ -115,6 +115,12 @@ jobs:
           cd test/srt
           python3 test_verl_engine.py
 
+      - name: Test Patch Torch
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_patch_torch.py
+
       - name: Test expert parallelism (EP=2)
         timeout-minutes: 10
         run: |
@@ -126,6 +132,12 @@ jobs:
         run: |
           cd test/srt
           python3 test_mla_tp.py
+
+      - name: Test lora tensor parallelism (TP=2)
+        timeout-minutes: 10
+        run: |
+          cd test/srt/models/lora
+          python3 test_lora_tp.py
 
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&

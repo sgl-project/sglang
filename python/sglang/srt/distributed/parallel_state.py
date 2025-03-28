@@ -189,6 +189,9 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_message_queue_broadcaster: (
+        bool  # a hint of whether to use message queue broadcaster
+    )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
@@ -241,6 +244,7 @@ class GroupCoordinator:
         self.use_custom_allreduce = use_custom_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
+        self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -260,16 +264,22 @@ class GroupCoordinator:
         self.ca_comm: Optional[CustomAllreduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Setup Custom allreduce failed with {e}. To silence this "
+                    "warning, specify --disable-custom-all-reduce explicitly."
+                )
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
 
-        self.hpu_communicator: Optional[HpuCommunicator]
+        self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
             self.hpu_communicator = HpuCommunicator(group=self.device_group)
 
@@ -277,7 +287,7 @@ class GroupCoordinator:
             XpuCommunicator,
         )
 
-        self.xpu_communicator: Optional[XpuCommunicator]
+        self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
 
@@ -435,6 +445,15 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    def reduce_scatter(
+        self,
+        output: torch.Tensor,
+        input_list: List[torch.Tensor],
+    ) -> None:
+        # TODO(ch-wan): support other backends
+        torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
+        return output
+
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -452,11 +471,23 @@ class GroupCoordinator:
                 output, input, group_name=self.unique_name
             )
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        tensor_list: List[torch.Tensor] = None,
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+
+        if tensor_list is not None:
+            # TODO(ch-wan): support other backends
+            return torch.distributed.all_gather(
+                tensor_list, input_, group=self.device_group
+            )
+
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
@@ -1312,7 +1343,10 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
-    import vllm.distributed.parallel_state as vllm_parrlel_state
+    try:
+        import vllm.distributed.parallel_state as vllm_parrlel_state
+    except ImportError:
+        return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:

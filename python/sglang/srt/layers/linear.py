@@ -23,6 +23,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    _ColumnvLLMParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -423,8 +424,6 @@ class ColumnParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        from sglang.srt.layers.parameter import _ColumnvLLMParameter
-
         if isinstance(param, _ColumnvLLMParameter):
             param.load_column_parallel_weight(
                 loaded_weight,
@@ -687,10 +686,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    shard_id=0,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -719,6 +727,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
 
@@ -782,6 +792,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+        self.q_proj_shard_size = self.num_heads * self.head_size
+        self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         input_size = self.hidden_size
         output_size = (
             (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
@@ -1234,7 +1246,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if isinstance(param, BasevLLMParameter):
+        if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(
