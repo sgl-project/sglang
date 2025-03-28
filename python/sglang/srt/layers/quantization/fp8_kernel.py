@@ -59,7 +59,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        warmup_deepgemm.capturer_on_execution((A, As), (B, Bs), C)
+        warmup_deepgemm.capturer_on_kernel_executed((A, As), (B, Bs), C)
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
@@ -783,7 +783,7 @@ def w8a8_block_fp8_matmul(
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
-            warmup_deepgemm.capturer_on_execution((A, As), (B, Bs), C)
+            warmup_deepgemm.capturer_on_kernel_executed((A, As), (B, Bs), C)
             deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
