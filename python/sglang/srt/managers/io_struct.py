@@ -57,24 +57,9 @@ class BaseReqInput:
     modalities: Optional[List[str]] = None
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
+        if (int(self.text is not None) + int(self.input_ids is not None) + int(self.input_embeds is not None)) != 1:
             raise ValueError(
-                "At least one of text, input_ids, or image should be provided"
-            )
-        # text and input_ids cannot be provided at the same time
-        if self.text is not None and self.input_ids is not None:
-            raise ValueError("text and input_ids cannot be provided at the same time")
-
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
-            raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
+                "Exactly one of the text, input_ids or input_embeds should be provided."
             )
 
 
