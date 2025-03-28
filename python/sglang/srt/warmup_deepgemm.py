@@ -4,7 +4,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -42,7 +42,7 @@ def warmup(model):
     _warmup_by_infos(infos)
 
 
-def _compute_infos(model) -> List[_Info]:
+def _compute_infos(model) -> Optional[List[_Info]]:
     from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
     if isinstance(model, (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM)):
         return _compute_infos_deepseek()
