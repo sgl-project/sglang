@@ -26,7 +26,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        logger.info(f"ON_EXECUTION_SEE_NEW_SHAPE {json.dumps(info)}")
+        logger.info(f"CAPTURER_NEW_INFO={json.dumps(info)}")
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
