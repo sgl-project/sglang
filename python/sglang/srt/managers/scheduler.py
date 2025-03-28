@@ -379,7 +379,7 @@ class Scheduler(
         # Init profiler
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
-        self.torch_profiler_activities: Optional[List[str]] = None
+        self.profiler_activities: Optional[List[str]] = None
         self.profiler_target_forward_ct: Optional[int] = None
 
         # Init metrics stats
@@ -1807,7 +1807,11 @@ class Scheduler(
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
-                recv_req.output_dir, recv_req.num_steps, recv_req.activities
+                recv_req.output_dir,
+                recv_req.num_steps,
+                recv_req.activities,
+                recv_req.with_stack,
+                recv_req.record_shapes,
             )
         else:
             return self.stop_profile()
@@ -1817,8 +1821,10 @@ class Scheduler(
         output_dir: Optional[str],
         num_steps: Optional[int],
         activities: Optional[List[str]],
+        with_stack: Optional[bool],
+        record_shapes: Optional[bool],
     ) -> None:
-        if self.torch_profiler_activities:
+        if self.profiler_activities:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
@@ -1830,7 +1836,7 @@ class Scheduler(
             activities = ["CPU", "GPU"]
 
         self.torch_profiler_output_dir = output_dir
-        self.torch_profiler_activities = activities
+        self.profiler_activities = activities
         logger.info(
             "Profiling starts. Traces will be saved to: %s",
             self.torch_profiler_output_dir,
@@ -1847,12 +1853,16 @@ class Scheduler(
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=True,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
+
+        if "CUDA_PROFILER" in activities:
+            torch.cuda.cudart().cudaProfilerStart()
 
         if num_steps:
             self.profiler_target_forward_ct = self.forward_ct + num_steps
@@ -1862,7 +1872,7 @@ class Scheduler(
             return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(self) -> None:
-        if self.torch_profiler_activities is None:
+        if self.profiler_activities is None:
             return
 
         logger.info("Stop profiling...")
@@ -1875,7 +1885,7 @@ class Scheduler(
                 )
             )
 
-        if "MEM" in self.torch_profiler_activities:
+        if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_trace_dir,
                 str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
@@ -1883,13 +1893,16 @@ class Scheduler(
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
+        if "CUDA_PROFILER" in self.profiler_activities:
+            torch.cuda.cudart().cudaProfilerStop()
+
         logger.info(
             "Profiling done. Traces are saved to: %s",
             self.torch_profiler_output_dir,
         )
         self.torch_profiler = None
         self.torch_profiler_output_dir = None
-        self.torch_profiler_activities = None
+        self.profiler_activities = None
 
         if self.profiler_target_forward_ct:
             self.send_to_tokenizer.send_pyobj(
@@ -1957,7 +1970,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-
     # Generate the prefix
     if dp_rank is None:
         prefix = f" TP{tp_rank}"
