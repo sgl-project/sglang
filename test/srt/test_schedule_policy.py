@@ -17,20 +17,30 @@ class TestSchedulePolicy(CustomTestCase):
         self.tree_cache = RadixCache(None, None, False)
 
     def test_init_with_cache_aware_policy(self):
-        policy = SchedulePolicy(policy="lpm", tree_cache=self.tree_cache)
+        policy = SchedulePolicy(
+            policy="lpm", tree_cache=self.tree_cache, enable_hierarchical_cache=True
+        )
         self.assertEqual(policy.policy, CacheAwarePolicy.LPM)
 
     def test_init_with_cache_agnostic_policy(self):
-        policy = SchedulePolicy(policy="fcfs", tree_cache=self.tree_cache)
+        policy = SchedulePolicy(
+            policy="fcfs", tree_cache=self.tree_cache, enable_hierarchical_cache=True
+        )
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
     def test_init_with_unknown_policy(self):
         with self.assertRaises(ValueError):
-            SchedulePolicy(policy="invalid", tree_cache=self.tree_cache)
+            SchedulePolicy(
+                policy="invalid",
+                tree_cache=self.tree_cache,
+                enable_hierarchical_cache=True,
+            )
 
     def test_init_with_disabled_cache(self):
-        disabled_tree_cache = RadixCache(None, None, disable=True)
-        policy = SchedulePolicy(policy="lpm", tree_cache=disabled_tree_cache)
+        disabled_tree_cache = RadixCache(None, None, disable=True, page_size=1)
+        policy = SchedulePolicy(
+            policy="lpm", tree_cache=disabled_tree_cache, enable_hierarchical_cache=True
+        )
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
     def test_calc_priority_fcfs(self):
@@ -41,7 +51,9 @@ class TestSchedulePolicy(CustomTestCase):
             Req(2, "a", [1], SamplingParams()),
         ]
 
-        policy = SchedulePolicy(policy="fcfs", tree_cache=tree_cache)
+        policy = SchedulePolicy(
+            policy="fcfs", tree_cache=tree_cache, enable_hierarchical_cache=True
+        )
         policy.calc_priority(waiting_queue)
         # Check if FCFS keeps the original order
         self.assertEqual(waiting_queue[0].rid, 1)

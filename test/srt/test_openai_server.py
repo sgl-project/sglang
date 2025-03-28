@@ -542,6 +542,12 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
+
 
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
