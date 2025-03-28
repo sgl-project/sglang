@@ -74,6 +74,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
 ):
@@ -173,8 +174,8 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
-            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+        elif IS_CAUSAL:
+            qk = tl.where(mask_m[:, :] & mask_n[:, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -243,7 +244,7 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
+        elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
@@ -299,6 +300,7 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
+    is_causal,
     mask_indptr,
     max_len_extend,
     sm_scale=None,
@@ -411,6 +413,7 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,

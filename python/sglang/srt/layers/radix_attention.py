@@ -18,6 +18,18 @@ from torch import nn
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+class AttentionType:
+    """
+    Attention type.
+    Use string to be compatible with `torch.compile`.
+    """
+
+    # Decoder attention between previous layer Q/K/V
+    DECODER = "decoder"
+    # Encoder attention between previous layer Q/K/V
+    ENCODER_ONLY = "encoder_only"
+
+
 class RadixAttention(nn.Module):
     """
     The attention layer implementation.
@@ -34,6 +46,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        attn_type=AttentionType.DECODER,
         prefix: str = "",
     ):
         super().__init__()
@@ -50,6 +63,7 @@ class RadixAttention(nn.Module):
         self.is_cross_attention = is_cross_attention
         self.k_scale = None
         self.v_scale = None
+        self.attn_type = attn_type
 
     def forward(
         self,
