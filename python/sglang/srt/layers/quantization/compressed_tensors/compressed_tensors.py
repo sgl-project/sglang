@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
