@@ -139,6 +139,7 @@ def _write_output(data):
     path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
     with path.open("a") as fp:
         fp.write(f"{json.dumps(data)}\n")
+    print(f"WARMUP_DEEPGEMM_CAPTURE={json.dumps(data)}")
 
 
 def clear_output():
