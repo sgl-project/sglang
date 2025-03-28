@@ -9,4 +9,7 @@ def on_execution(lhs, rhs, out):
     if not _ENABLE_CAPTURE:
         return
 
+    m, k = lhs[0].shape
+    n, k_ = rhs[0].shape
+    assert k == k_
     TODO
