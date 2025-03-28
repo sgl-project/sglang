@@ -62,6 +62,55 @@ class BaseReqInput:
                 "Exactly one of the text, input_ids or input_embeds should be provided."
             )
 
+        # Derive the batch size
+        if self.text is not None:
+            if isinstance(self.text, str):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.text)
+            self.input_embeds = None
+        elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
+            if isinstance(self.input_ids[0], int):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.input_ids)
+            self.input_embeds = None
+        else:
+            if isinstance(self.input_embeds[0][0], float):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.batch_size = len(self.input_embeds)
+
+        # -----
+       
+        # Derive the batch size
+        self.batch_size = 0
+        self.is_single = True
+
+        # check the batch size of text
+        if self.text is not None:
+            if isinstance(self.text, list):
+                self.batch_size += len(self.text)
+            else:
+                self.batch_size += 1
+
+        # check the batch size of input_ids
+        if self.input_ids is not None:
+            if isinstance(self.input_ids[0], list):
+                self.batch_size += len(self.input_ids)
+            else:
+                self.batch_size += 1
+
+        if self.batch_size > 1:
+            self.is_single = False
+
 
 @dataclass
 class GenerateReqInput(BaseReqInput):
@@ -99,32 +148,6 @@ class GenerateReqInput(BaseReqInput):
 
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        # Derive the batch size
-        if self.text is not None:
-            if isinstance(self.text, str):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.text)
-            self.input_embeds = None
-        elif self.input_ids is not None:
-            if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_ids)
-            self.input_embeds = None
-        else:
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.batch_size = len(self.input_embeds)
 
         # Handle parallel sampling
         # When parallel sampling is used, we always treat the input as a batch.
@@ -310,27 +333,6 @@ class TokenizedGenerateReqInput:
 class EmbeddingReqInput(BaseReqInput):
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        # Derive the batch size
-        self.batch_size = 0
-        self.is_single = True
-
-        # check the batch size of text
-        if self.text is not None:
-            if isinstance(self.text, list):
-                self.batch_size += len(self.text)
-            else:
-                self.batch_size += 1
-
-        # check the batch size of input_ids
-        if self.input_ids is not None:
-            if isinstance(self.input_ids[0], list):
-                self.batch_size += len(self.input_ids)
-            else:
-                self.batch_size += 1
-
-        if self.batch_size > 1:
-            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
