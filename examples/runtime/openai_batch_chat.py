@@ -11,7 +11,6 @@ you should create the input.jsonl file with the following content:
 """
 
 import json
-import os
 import time
 
 import openai
