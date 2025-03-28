@@ -30,7 +30,11 @@ def warmup(model):
     if not enable_jit_deepgemm:
         return
 
-    sources = _compute_sources(model)
+    _warmup_raw(model.__class__.__name__)
+
+
+def _warmup_raw(model_name: str):
+    sources = _compute_sources(model_name)
     if sources is None:
         return
 
@@ -39,8 +43,7 @@ def warmup(model):
 
 
 def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
-    from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
-    if isinstance(model, (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM)):
+    if model in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']:
         return _compute_sources_deepseek()
     return None
 
