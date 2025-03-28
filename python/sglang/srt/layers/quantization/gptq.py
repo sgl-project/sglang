@@ -29,6 +29,11 @@ except ImportError:
 
     GPTQLinearMethod = MarlinLinearMethod = QuantizeMethodBase = Any
 
+    class scalar_types:
+        uint4b8 = "uint4b8"
+        uint8b128 = "uint8b128"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,6 +144,12 @@ class GPTQConfig(QuantizationConfig):
 class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
+    # (num_bits, is_sym) -> quant_type
+    TYPE_MAP = {
+        (4, True): scalar_types.uint4b8,
+        (8, True): scalar_types.uint8b128,
+    }
+
     def __init__(
         self,
         weight_bits: int,
@@ -195,10 +206,6 @@ class GPTQMarlinConfig(QuantizationConfig):
             )
 
         # (num_bits, is_sym) -> quant_type
-        GPTQMarlinConfig.TYPE_MAP = {
-            (4, True): scalar_types.uint4b8,
-            (8, True): scalar_types.uint8b128,
-        }
         self.quant_type = self.TYPE_MAP[(weight_bits, is_sym)]
 
     def __repr__(self) -> str:
