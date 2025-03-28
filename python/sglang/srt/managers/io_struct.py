@@ -57,7 +57,25 @@ class BaseReqInput:
     modalities: Optional[List[str]] = None
 
     def normalize_batch_and_arguments(self):
-        TODO
+        # at least one of text, input_ids, or image should be provided
+        if self.text is None and self.input_ids is None and self.image_data is None:
+            raise ValueError(
+                "At least one of text, input_ids, or image should be provided"
+            )
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
+
+        if (
+            self.text is None and self.input_ids is None and self.input_embeds is None
+        ) or (
+            self.text is not None
+            and self.input_ids is not None
+            and self.input_embeds is not None
+        ):
+            raise ValueError(
+                "Either text, input_ids or input_embeds should be provided."
+            )
 
 
 @dataclass
@@ -96,17 +114,6 @@ class GenerateReqInput(BaseReqInput):
 
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
-        ):
-            raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
-            )
 
         # Derive the batch size
         if self.text is not None:
@@ -318,16 +325,6 @@ class TokenizedGenerateReqInput:
 class EmbeddingReqInput(BaseReqInput):
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
-            raise ValueError(
-                "At least one of text, input_ids, or image should be provided"
-            )
-
-        # text and input_ids cannot be provided at the same time
-        if self.text is not None and self.input_ids is not None:
-            raise ValueError("text and input_ids cannot be provided at the same time")
 
         # Derive the batch size
         self.batch_size = 0
