@@ -675,6 +675,8 @@ class ProfileReq:
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
 
 
 @dataclass
