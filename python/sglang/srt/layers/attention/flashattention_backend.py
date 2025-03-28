@@ -59,6 +59,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.page_size = model_runner.page_size
         self.use_mla = (
             model_runner.model_config.attention_arch == AttentionArch.MLA
         ) and (not global_server_args_dict["disable_mla"])
@@ -83,6 +84,17 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
+
+        # Precompute strided indices
+        # [0, page_size, 2 * page_size, ...]
+        if self.page_size > 1:
+            self.strided_indices = torch.arange(
+                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            )
+            metadata.page_table = (
+                metadata.page_table[:, self.strided_indices] // self.page_size
+            )
+
         if forward_batch.forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -141,16 +153,24 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
 
+        page_table = metadata.page_table
+
         # # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
             o = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache.unsqueeze(1),
-                v_cache=value_cache.unsqueeze(1),
-                page_table=metadata.page_table,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -176,7 +196,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope.unsqueeze(1),
                 v_cache=c_kv.unsqueeze(1),
                 qv=q_nope,
-                page_table=metadata.page_table,
+                page_table=page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -231,12 +251,20 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
 
+        page_table = metadata.page_table
+
         if not self.use_mla:
             # Do multi-head attention
 
             # Get KV cache
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
 
             # Pre-reshape query tensor
             q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -244,9 +272,9 @@ class FlashAttentionBackend(AttentionBackend):
             # Run attention with precomputed values
             o = flash_attn_with_kvcache(
                 q=q_reshaped,
-                k_cache=key_cache.unsqueeze(1),
-                v_cache=value_cache.unsqueeze(1),
-                page_table=metadata.page_table,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -273,7 +301,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope.unsqueeze(1),
                 v_cache=c_kv.unsqueeze(1),
                 qv=q_nope,
-                page_table=metadata.page_table,
+                page_table=page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -300,7 +328,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {
             # Page table for token mapping (batch_size, max_context_len)
             "page_table": torch.zeros(
-                max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
             ),
         }
 
