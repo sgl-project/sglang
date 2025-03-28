@@ -29,7 +29,7 @@ def serialize_for_http(data):
 import dataclasses
 
 
-def server_args_to_launch_params(args: ServerArgs, timeout: float = 60.0):
+def server_args_to_launch_params(args: ServerArgs, timeout: float = 120.0):
     # 1. model path
     model = args.model_path
 
@@ -67,7 +67,6 @@ def server_args_to_launch_params(args: ServerArgs, timeout: float = 60.0):
 class HttpServerEngineAdapter:
     def __init__(self, server_args: ServerArgs):
         self.server_args = copy.deepcopy(server_args)
-        self.server_args.port = 2157
         print(f"launch_server_from_verl_engine {self.server_args.port}")
 
         model, base_url, timeout, api_key, other_args = server_args_to_launch_params(
@@ -78,7 +77,7 @@ class HttpServerEngineAdapter:
             base_url=base_url,
             timeout=timeout,
             api_key=api_key,
-            other_args=other_args,
+            other_args=other_args + ["--enable-memory-saver"],
         )
 
     def update_weights_from_tensor(

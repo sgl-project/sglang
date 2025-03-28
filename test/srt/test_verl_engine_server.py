@@ -7,7 +7,9 @@ import traceback
 import unittest
 from multiprocessing import Process
 
+import requests
 import torch
+from openai import OpenAI
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -21,6 +23,7 @@ from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
 from sglang.test.runners import (
     HFRunner,
@@ -36,48 +39,28 @@ _TORCH_DTYPE = torch.float16
 
 # Set to false to temporarily debug issues unrelated to weight update
 _ENABLE_UPDATE_WEIGHTS = True
-# _ENABLE_UPDATE_WEIGHTS = False
 
-# TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
-# CI_MODELS = [
-#     dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
-#     # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
-#     # dict(model_path="google/gemma-2-2b"),
-# ]
-# ALL_OTHER_MODELS = [
-#     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
-#     dict(model_path="Qwen/Qwen2-1.5B"),
-#     dict(
-#         model_path="Qwen/Qwen2.5-14B-Instruct",
-#         mem_fraction_static=0.4,
-#         tp_size=8,
-#         tight_memory=True,
-#         decode_tolerance=1.3,
-#     ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
-#     dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
-#     dict(model_path="allenai/OLMo-1B-0724-hf"),
-#     dict(
-#         model_path="THUDM/glm-4-9b-chat",
-#         mem_fraction_static=0.1,
-#         tp_size=8,
-#         tight_memory=True,
-#     ),
-#     dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
-#     dict(
-#         model_path="ibm-granite/granite-3.0-2b-instruct",
-#         prefill_tolerance=0.22,
-#         decode_tolerance=0.22,
-#     ),
-#     # Fail to run these models in test_generation_models.py, need to fix that first
-#     # dict(model_path="openai-community/gpt2"),
-#     # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
-# ]
 CI_MODELS = ALL_OTHER_MODELS = [
     dict(
         model_path="Qwen/Qwen2.5-1.5B",
         tp_size=2,
     )
 ]
+
+
+# TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
+
+
+PORT = find_available_port(2345)
 
 
 class TestVerlEngine(CustomTestCase):
@@ -204,41 +187,14 @@ def _run_subprocess(
             dtype=get_dtype_str(_TORCH_DTYPE),
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
             launch_server=True,
+            server_args=ServerArgs(
+                model_path=model_path,
+                tp_size=tp_size,
+                port=PORT,
+                mem_fraction_static=0.5,
+            ),
         )
         print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
-
-        if _ENABLE_UPDATE_WEIGHTS:
-            print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
-            engine.update_weights_from_tensor(
-                [(k, v) for k, v in fsdp_state_dict.items()]
-            )
-
-        # for enable_batch in [False, True]:
-        #     if enable_batch:
-        #         fn = SRTRunner.batch_forward_generation_raw
-        #     else:
-        #         fn = SRTRunner.forward_generation_raw
-
-        #     srt_outputs = fn(
-        #         prompts=_PROMPTS,
-        #         max_new_tokens=_MAX_NEW_TOKENS,
-        #         lora_paths=None,
-        #         engine=engine,
-        #     )
-        #     print(
-        #         f"subprocess[{tp_rank=}] call srt.forward {enable_batch=} {srt_outputs=}",
-        #         flush=True,
-        #     )
-
-        #     check_close_model_outputs(
-        #         hf_outputs=hf_outputs,
-        #         srt_outputs=srt_outputs,
-        #         prefill_tolerance=prefill_tolerance,
-        #         decode_tolerance=decode_tolerance,
-        #         rouge_l_tolerance=1,
-        #         check_logprobs=not enable_batch,
-        #         debug_text=f"{enable_batch=} {tp_rank=}",
-        #     )
 
         # test direct generate API
         print(f"subprocess[{tp_rank=}] testing direct generate API")
@@ -255,18 +211,30 @@ def _run_subprocess(
         time.sleep(1)
         engine.resume_memory_occupation()
         print("Memory resumed")
-
+        time.sleep(1)
         # openai API test for reference
-        from openai import OpenAI
-
-        client = OpenAI(api_key="None", base_url="http://localhost:2157/v1")
-        print(client.models.list().data[0].id)
-        import requests
-
-        url = f"http://localhost:{2157}/generate"
-        data = {"text": "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="}
-        response = requests.post(url, json=data)
-        print(response.json())
+        torch.distributed.barrier()
+        if tp_rank == 0:
+            client = OpenAI(api_key="None", base_url=f"http://localhost:{PORT}/v1")
+            print(client.models.list().data[0].id)
+            url = f"http://localhost:{PORT}/generate"
+            data = {"text": "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="}
+            response = requests.post(url, json=data)
+            print(response.json())
+        if _ENABLE_UPDATE_WEIGHTS:
+            print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
+            # check_tensor = [(k, v) for k, v in fsdp_state_dict.items()][0]
+            # update_tensor = [check_tensor[0], torch.zeros_like(check_tensor[1])]
+            engine.update_weights_from_tensor(
+                [(k, v) for k, v in fsdp_state_dict.items()]
+            )
+            # if tp_rank == 0:
+            #     response = requests.get(
+            #         f"http://localhost:{PORT}/get_weights_by_name",
+            #         json={"name": list(fsdp_state_dict.keys())[0], "truncate_size": 5},
+            #         timeout=20,
+            #     )
+            #     print(response.json())
 
         execution_ok = True
 
@@ -313,18 +281,6 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
-
-
-# TODO Ask: this is extracted from PortArgs.init_new, is it allowed to extract it, i.e. touch that old code
-def find_available_port(base_port: int):
-    port = base_port + random.randint(100, 1000)
-    while True:
-        if is_port_available(port):
-            return port
-        if port < 60000:
-            port += 42
-        else:
-            port -= 43
 
 
 if __name__ == "__main__":
