@@ -144,7 +144,7 @@ void sgl_per_token_group_quant_8bit(
           (float)eps,                                                                     \
           (float)min_8bit,                                                                \
           (float)max_8bit,                                                                \
-          scale_num_rows,                                                                       \
+          scale_num_rows,                                                                 \
           scale_stride);                                                                  \
     } else {                                                                              \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>( \
