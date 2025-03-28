@@ -1744,6 +1744,9 @@ def retry(
         try:
             fn()
         except Exception as e:
+            if try_index >= max_retry:
+                raise
+
             logger.warning(f"retry failed once. Error: {e}")
             traceback.print_exc()
 
