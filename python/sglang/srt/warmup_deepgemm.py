@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.utils import get_bool_env_var
 
@@ -118,7 +119,7 @@ class _Capturer:
         self._seen_infos.add(info)
 
         # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-        path = _dir_output / f"rank{rank}.jsonl"
+        path = _dir_output / f"TP{get_tensor_model_parallel_rank()}.jsonl"
         with path.open("a") as fp:
             fp.write(f"{json.dumps(info)}\n")
 
