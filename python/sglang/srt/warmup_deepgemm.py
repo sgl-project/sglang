@@ -2,6 +2,7 @@
 import json
 import logging
 
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -17,6 +18,11 @@ def warmup(server_args: ServerArgs):
 
     TODO
 
+
+_INFOS_OF_MODEL = {
+    DeepseekV2ForCausalLM: _compute_infos_deepseek,
+    DeepseekV3ForCausalLM: _compute_infos_deepseek,
+}
 
 # --------------------------------------- capture -------------------------------------
 
