@@ -163,7 +163,7 @@ class LoRAMemoryPool:
         if uid is None:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
-                    self.A_buffer[k][i][buffer_id] *= 0
+                    self.A_buffer[k][i][buffer_id] = 0
             return
 
         assert lora_adapter is not None
