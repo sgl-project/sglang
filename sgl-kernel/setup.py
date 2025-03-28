@@ -235,12 +235,6 @@ ext_modules = [
     ),
 ]
 
-
-def get_py_ver():
-    major, minor = sys.version_info[:2]
-    return f"cp{major}{minor}"
-
-
 setup(
     name="sgl-kernel",
     version=_get_version(),
@@ -251,5 +245,5 @@ setup(
         "build_ext": BuildExtension.with_options(use_ninja=True),
         "build_py": CustomBuildPy,
     },
-    options={"bdist_wheel": {"py_limited_api": get_py_ver()}},
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
