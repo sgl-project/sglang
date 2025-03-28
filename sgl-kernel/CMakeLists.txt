@@ -41,8 +41,8 @@ FetchContent_Declare(
 FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
+    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
