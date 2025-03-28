@@ -21,8 +21,6 @@ limitations under the License.
 
 #include "utils.h"
 
-#define WARP_SIZE 32
-
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
