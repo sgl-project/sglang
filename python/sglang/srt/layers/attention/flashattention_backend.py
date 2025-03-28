@@ -79,8 +79,6 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
-        # import time
-        # start = time.time()
 
         # Precompute strided indices
         # [0, page_size, 2 * page_size, ...]
@@ -91,8 +89,6 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
-        # end = time.time()
-        # print(f"page_table time: {(end - start) * 1000 * 1000} us")
 
         if forward_batch.forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
@@ -240,10 +236,6 @@ class FlashAttentionBackend(AttentionBackend):
             k_descale=layer.k_scale,
             v_descale=layer.v_scale,
         )
-        # torch.cuda.synchronize()
-        # import time
-        # cuda_end = time.time()
-        # print(f"cuda time: {(cuda_end - end) * 1000 * 1000 } us")
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -330,10 +322,6 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seq_lens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
 
-        # Only zero out the part out of max_len_k
-        # metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
-        # Then do the copy
-        # torch.distributed.breakpoint()
         metadata.page_table = self.req_to_token[
             :, self.decode_cuda_graph_metadata["strided_indices"]
         ]
@@ -341,7 +329,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # self.strided_indices = self.decode_cuda_graph_metadata["strided_indices"]
         # metadata.page_table = metadata.page_table[:, self.strided_indices].clone() // self.page_size
-        self.forward_decode_metadata = metadata
+        self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
