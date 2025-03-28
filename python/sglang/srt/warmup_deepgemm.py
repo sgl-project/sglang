@@ -3,11 +3,12 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional, Sequence, Callable
+from typing import List, Tuple, Dict, Any, Optional, Callable
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import get_bool_env_var
+from tqdm import tqdm
 
 try:
     from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
@@ -82,8 +83,8 @@ def _deduplicate(items, key_fn: Callable):
         yield item
 
 
-def _warmup_by_infos(infos: Sequence[Dict[str, Any]]):
-    for info in infos:
+def _warmup_by_infos(infos: List[Dict[str, Any]]):
+    for info in tqdm(infos, total=len(infos), desc='Warmup DeepGEMM'):
         print(f'hi warmup {info=}')
         x_fp8, y_fp8, out = _construct_gemm_inputs(m=info.m, k=info.k, n=info.n)
         # For simplicity, here we naively call the gemm
