@@ -1,4 +1,5 @@
 # TODO shall we put this file elsewhere?
+import dataclasses
 import json
 import logging
 import shutil
@@ -120,7 +121,7 @@ class _Capturer:
             return
 
         self._seen_infos.add(info)
-        _write_output(info)
+        _write_output(dataclasses.asdict(info))
 
 
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
