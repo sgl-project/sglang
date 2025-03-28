@@ -11,6 +11,7 @@ from sglang.srt.utils import get_bool_env_var
 
 try:
     from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
+    import deep_gemm.jit_kernels.gemm
     import deep_gemm
 except ImportError:
     pass
@@ -60,7 +61,7 @@ def _compute_infos_from_sources(sources):
     num_sms = deep_gemm.get_num_sms()
     return list(_deduplicate(
         _compute_infos_from_sources_raw(sources),
-        key_fn=lambda info: deep_gemm.get_best_configs(
+        key_fn=lambda info: deep_gemm.jit_kernels.gemm.get_best_configs(
             m=info['m'], n=info['n'], k=info['k'], num_groups=1, num_sms=num_sms),
     ))
 
