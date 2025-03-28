@@ -60,6 +60,12 @@ def _compute_infos_from_sources(sources):
     return TODO
 
 
+def _compute_infos_from_sources_raw(sources):
+    for source in sources:
+        for m in range(source['m_min'], source['m_max'] + 1):
+            yield dict(m=m, n=source['n'], k=source['k'])
+
+
 def _deduplicate(items: Sequence[Any], key_fn: Callable):
     seen_keys = set()
     for item in items:
