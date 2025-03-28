@@ -307,9 +307,9 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
 
-  int M = mat1.size(0);
-  int N = mat2.size(0);
-  int K = mat1.size(1);
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat1.size(1);
 
   // see [NOTE]: s8s8 igemm compensation in avx512-vnni
   CHECK_EQ(mat2.size(1), (int64_t)(is_vnni ? K + sizeof(int32_t) : K));
@@ -342,6 +342,77 @@ at::Tensor int8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
         N,
         K);
   });
+  return out;
+}
 
+// fused `per_token_quant_int8_cpu` and `int8_scaled_mm_cpu`
+at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
+    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
+
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_INPUT(scales2);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat1.size(1);
+  int64_t lda = mat1.stride(0);
+
+  // see [NOTE]: s8s8 igemm compensation in avx512-vnni
+  CHECK_EQ(mat2.size(1), (int64_t)(is_vnni ? K + sizeof(int32_t) : K));
+  CHECK_EQ(scales2.numel(), N);
+
+  const auto st = mat1.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf,
+      "int8_scaled_mm_with_quant: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == out_dtype,
+      "int8_scaled_mm_with_quant: expect A has same dtype with out_dtype.");
+  TORCH_CHECK(mat2.scalar_type() == at::kChar,
+      "int8_scaled_mm_with_quant: expect mat2 to be int8.");
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat,
+      "int8_scaled_mm_with_quant: expect scales to be float32.");
+
+  const int64_t buffer_size = M * K + M * sizeof(float);
+  auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
+  auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
+
+  const bool has_bias = bias.has_value();
+  const float* bias_data = nullptr;
+  if (has_bias) {
+    CHECK_EQ(bias.value().size(0), N);
+    bias_data = bias.value().data_ptr<float>();
+  }
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
+    uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
+    float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
+    const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
+
+    at::parallel_for(0, M, 0, [&] (int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        quantize_row_int8<scalar_t>(
+            Aq_data + m * K,
+            As_data[m],
+            A_data + m * lda,
+            K);
+      }
+    });
+
+    int8_scaled_mm_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        Aq_data,
+        packed_w.data_ptr<int8_t>(),
+        As_data,
+        scales2.data_ptr<float>(),
+        bias_data,
+        M,
+        N,
+        K);
+  });
   return out;
 }
