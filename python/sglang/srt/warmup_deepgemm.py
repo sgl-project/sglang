@@ -17,8 +17,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_Info = Dict[str, Any]
-
 
 # --------------------------------------- warmup -------------------------------------
 
@@ -35,29 +33,29 @@ def warmup(model):
     _warmup_by_infos(infos)
 
 
-def _compute_infos(model) -> Optional[List[_Info]]:
+def _compute_infos(model) -> Optional[List[Dict[str, Any]]]:
     from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
     if isinstance(model, (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM)):
         return _compute_infos_deepseek()
     return None
 
 
-def _compute_infos_deepseek() -> List[_Info]:
+def _compute_infos_deepseek() -> List[Dict[str, Any]]:
     return [
         # 8xH200 + DeepSeek V3
-        dict(n=4096, k=7168),
-        dict(n=7168, k=2048),
-        dict(n=7168, k=16384),
-        dict(n=24576, k=1536),
-        dict(n=4608, k=7168),
-        dict(n=7168, k=2304),
-        dict(n=32768, k=512),
-        dict(n=1536, k=7168),
-        dict(n=576, k=7168),
+        dict(n=4096, k=7168, m_min=1, m_max=8192),
+        dict(n=7168, k=2048, m_min=1, m_max=8192),
+        dict(n=7168, k=16384, m_min=1, m_max=8192),
+        dict(n=24576, k=1536, m_min=1, m_max=8192),
+        dict(n=4608, k=7168, m_min=1, m_max=8192),
+        dict(n=7168, k=2304, m_min=1, m_max=8192),
+        dict(n=32768, k=512, m_min=1, m_max=8192),
+        dict(n=1536, k=7168, m_min=1, m_max=8192),
+        dict(n=576, k=7168, m_min=1, m_max=8192),
     ]
 
 
-def _warmup_by_infos(infos: List[_Info]):
+def _warmup_by_infos(infos: List[Dict[str, Any]]):
     for info in infos:
         print(f'hi warmup {info=}')
         x_fp8, y_fp8, out = _construct_gemm_inputs(m=info.m, k=info.k, n=info.n)

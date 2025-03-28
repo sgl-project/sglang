@@ -9,7 +9,7 @@ with pl.Config(fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, 
     print(df)
 
 output_text = '\n'.join([
-    f'dict(n={row["n"]}, k={row["k"]}),'
+    f'dict(n={row["n"]}, k={row["k"]}, m_min=1, m_max=8192),'
     for row in df.iter_rows(named=True)
 ])
 print(output_text)
