@@ -1,4 +1,6 @@
 # TODO shall we put this file elsewhere?
+# TODO many things should be extracted to common warmup logic instead of deepgemm-specific logic
+
 import json
 import logging
 import shutil
