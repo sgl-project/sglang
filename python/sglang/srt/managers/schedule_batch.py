@@ -78,6 +78,7 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
 }
 
 logger = logging.getLogger(__name__)
