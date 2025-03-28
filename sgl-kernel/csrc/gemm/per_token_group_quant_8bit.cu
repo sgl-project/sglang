@@ -27,7 +27,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float eps,
     const float min_8bit,
     const float max_8bit,
-    const int num_rows = 0,
+    const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int threads_per_group = 16;
   const int local_group_id = threadIdx.x / threads_per_group;
@@ -44,8 +44,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   float* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
-    const int row_idx = global_group_id / num_rows;
-    const int col_idx = global_group_id % num_rows;
+    const int row_idx = global_group_id / scale_num_rows;
+    const int col_idx = global_group_id % scale_num_rows;
     scale_output = output_s + (col_idx * scale_stride + row_idx);
   } else {
     scale_output = output_s + global_group_id;
@@ -126,7 +126,7 @@ void sgl_per_token_group_quant_8bit(
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int num_rows = output_s.size(1);
+  const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                       \
@@ -144,7 +144,7 @@ void sgl_per_token_group_quant_8bit(
           (float)eps,                                                                     \
           (float)min_8bit,                                                                \
           (float)max_8bit,                                                                \
-          num_rows,                                                                       \
+          scale_num_rows,                                                                       \
           scale_stride);                                                                  \
     } else {                                                                              \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>( \

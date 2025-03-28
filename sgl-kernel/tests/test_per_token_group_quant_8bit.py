@@ -139,7 +139,10 @@ def triton_per_token_group_quant_8bit(
     fp8_max = finfo.max
 
     if _is_hip:
-        fp8_max = 224.0
+        if dtype == torch.int8:
+            fp8_max = 127.0
+        else:
+            fp8_max = 224.0
 
     fp8_min = -fp8_max
 
