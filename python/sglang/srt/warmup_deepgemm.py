@@ -26,21 +26,21 @@ def warmup(model):
     if not enable_jit_deepgemm:
         return
 
-    infos = _compute_infos(model)
-    if infos is None:
+    sources = _compute_sources(model)
+    if sources is None:
         return
 
-    _warmup_by_infos(infos)
+    _warmup_by_infos(sources)
 
 
-def _compute_infos(model) -> Optional[List[Dict[str, Any]]]:
+def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
     from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
     if isinstance(model, (DeepseekV2ForCausalLM, DeepseekV3ForCausalLM)):
-        return _compute_infos_deepseek()
+        return _compute_sources_deepseek()
     return None
 
 
-def _compute_infos_deepseek() -> List[Dict[str, Any]]:
+def _compute_sources_deepseek() -> List[Dict[str, Any]]:
     return [
         # 8xH200 + DeepSeek V3
         dict(n=4096, k=7168, m_min=1, m_max=8192),
