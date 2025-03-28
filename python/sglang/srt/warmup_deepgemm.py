@@ -3,7 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Dict, Tuple
+from typing import List, Tuple
 
 import torch
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------- common -------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class _Info:
     m: int
     k: int
@@ -41,7 +41,7 @@ def warmup(model):
     _warmup_by_infos(infos_source())
 
 
-def _compute_infos_deepseek():
+def _compute_infos_deepseek() -> List[_Info]:
     return [
         TODO,
     ]
@@ -53,9 +53,9 @@ _INFOS_SOURCE_OF_MODEL = {
 }
 
 
-def _warmup_by_infos(infos: List[Dict[str, Any]]):
+def _warmup_by_infos(infos: List[_Info]):
     for info in infos:
-        x_fp8, y_fp8, out = _construct_gemm_inputs(m=info['m'], k=info['k'], n=info['n'])
+        x_fp8, y_fp8, out = _construct_gemm_inputs(m=info.m, k=info.k, n=info.n)
         deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
 
@@ -106,7 +106,7 @@ class _Capturer:
         self._seen_infos = set()
 
     def on_execution(self, lhs, rhs):
-        info = _compute_shape_from_args(lhs=lhs, rhs=rhs)
+        info = _compute_info_from_args(lhs=lhs, rhs=rhs)
 
         if info in self._seen_infos:
             return
@@ -118,8 +118,8 @@ class _Capturer:
 _capturer = _Capturer() if _ENABLE_CAPTURE else None
 
 
-def _compute_shape_from_args(lhs, rhs):
+def _compute_info_from_args(lhs, rhs):
     m, k = lhs[0].shape
     n, k_ = rhs[0].shape
     assert k == k_
-    return dict(m=m, k=k, n=n)
+    return _Info(m=m, k=k, n=n)
