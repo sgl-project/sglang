@@ -155,7 +155,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="fa2",
+                        backend="fa3",
                     )
                 )
                 self.prefill_wrappers_verify.append(
