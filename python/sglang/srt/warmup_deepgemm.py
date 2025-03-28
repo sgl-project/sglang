@@ -3,7 +3,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional, Sequence
+from typing import List, Tuple, Dict, Any, Optional, Sequence, Callable
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -60,8 +60,14 @@ def _compute_infos_from_sources(sources):
     return TODO
 
 
-def _deduplicate():
-    return TODO
+def _deduplicate(items: Sequence[Any], key_fn: Callable):
+    seen_keys = set()
+    for item in items:
+        item_key = key_fn(item)
+        if item_key in seen_keys:
+            continue
+        seen_keys.add(item_key)
+        yield item
 
 
 def _warmup_by_infos(infos: Sequence[Dict[str, Any]]):
