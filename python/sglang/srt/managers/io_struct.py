@@ -65,6 +65,26 @@ class BaseReqInput:
         self.is_single, self.batch_size = self._compute_is_single_and_batch_size(self.text, self.input_ids,
                                                                                  self.input_embeds)
 
+        # Handle parallel sampling
+        # When parallel sampling is used, we always treat the input as a batch.
+        if self.sampling_params is None:
+            self.parallel_sample_num = 1
+        elif isinstance(self.sampling_params, dict):
+            self.parallel_sample_num = self.sampling_params.get("n", 1)
+        else:  # isinstance(self.sampling_params, list):
+            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            assert all(
+                self.parallel_sample_num == sampling_params.get("n", 1)
+                for sampling_params in self.sampling_params
+            ), "The parallel_sample_num should be the same for all samples in sample params."
+
+        if self.parallel_sample_num > 1 and self.is_single:
+            self.is_single = False
+            if self.text is not None:
+                self.text = [self.text]
+            if self.input_ids is not None:
+                self.input_ids = [self.input_ids]
+
         # Fill in default arguments
         if self.is_single:
             if self.rid is None:
@@ -136,26 +156,6 @@ class GenerateReqInput(BaseReqInput):
 
     def normalize_batch_and_arguments(self):
         super().normalize_batch_and_arguments()
-
-        # Handle parallel sampling
-        # When parallel sampling is used, we always treat the input as a batch.
-        if self.sampling_params is None:
-            self.parallel_sample_num = 1
-        elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-            assert all(
-                self.parallel_sample_num == sampling_params.get("n", 1)
-                for sampling_params in self.sampling_params
-            ), "The parallel_sample_num should be the same for all samples in sample params."
-
-        if self.parallel_sample_num > 1 and self.is_single:
-            self.is_single = False
-            if self.text is not None:
-                self.text = [self.text]
-            if self.input_ids is not None:
-                self.input_ids = [self.input_ids]
 
         # Fill in default arguments
         if self.is_single:
