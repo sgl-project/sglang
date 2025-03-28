@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING, Any, List, Tuple
 
 import torch
 from torch import Tensor
@@ -64,13 +64,18 @@ class MHATokenToHiPOffloadKVPool(KVCache):
     def get_fetched_prefix_kv_buffer(
         self,
         layer_id: int,
-        batch_id: int,
+        extend_seq_lens: Tensor,
+        extend_seq_lens_cpu: List[int],
         # you need to pass KV for extend
         cache_k: Tensor,
         cache_v: Tensor,
     ) -> Tuple[Tensor, Tensor, Any]:
         return self.offload_cache.get_fetched_prefix_kv_buffer(
-            layer_id, batch_id, cache_k, cache_v
+            layer_id,
+            cache_k=cache_k,
+            cache_v=cache_v,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
 
     def set_kv_buffer(
