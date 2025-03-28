@@ -326,9 +326,6 @@ class FlashAttentionBackend(AttentionBackend):
             :, self.decode_cuda_graph_metadata["strided_indices"]
         ]
         metadata.page_table = metadata.page_table[req_pool_indices[:bs]]
-
-        # self.strided_indices = self.decode_cuda_graph_metadata["strided_indices"]
-        # metadata.page_table = metadata.page_table[:, self.strided_indices].clone() // self.page_size
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
