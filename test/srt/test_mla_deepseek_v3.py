@@ -54,28 +54,25 @@ class TestDeepseekV3MTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = ["--trust-remote-code"]
-        if torch.cuda.is_available() and (torch.version.cuda or torch.version.hip):
-            other_args.extend(
-                [
-                    "--cuda-graph-max-bs",
-                    "2",
-                    "--disable-radix",
-                    "--enable-torch-compile",
-                    "--torch-compile-max-bs",
-                    "1",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-draft",
-                    "lmsys/sglang-ci-dsv3-test-NextN",
-                    "--speculative-num-steps",
-                    "2",
-                    "--speculative-eagle-topk",
-                    "4",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                ]
-            )
+        other_args = [
+            "--trust-remote-code",
+            "--cuda-graph-max-bs",
+            "2",
+            "--disable-radix",
+            "--enable-torch-compile",
+            "--torch-compile-max-bs",
+            "1",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft",
+            "lmsys/sglang-ci-dsv3-test-NextN",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "4",
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

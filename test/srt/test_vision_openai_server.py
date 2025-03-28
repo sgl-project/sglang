@@ -699,6 +699,8 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "gemma-it",
+                "--mem-fraction-static",
+                "0.75",
             ],
         )
         cls.base_url += "/v1"
