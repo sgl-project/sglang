@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
 
-def on_execution(lhs, rhs, out):
+def capturer_on_execution(lhs, rhs, out):
     if not _ENABLE_CAPTURE:
         return
     _capturer.on_execution(lhs=lhs, rhs=rhs)
