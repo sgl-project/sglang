@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt import warmup_deepgemm
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
@@ -31,7 +33,7 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
-enable_jit_deepgemm = False
+_enable_jit_deepgemm = False
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -43,11 +45,13 @@ if _is_cuda:
 
     sm_version = get_device_sm()
     if sm_version >= 90 and int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "1")):
-        enable_jit_deepgemm = True
+        _enable_jit_deepgemm = True
+
 
 logger = logging.getLogger(__name__)
 
 if supports_custom_op():
+
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -55,10 +59,8 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        from sglang.srt import warmup_deepgemm
         warmup_deepgemm.capturer_on_kernel_executed((A, As), (B, Bs), C)
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
-
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -68,7 +70,6 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -732,8 +733,6 @@ def w8a8_block_fp8_matmul(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    from sglang.srt import warmup_deepgemm
-
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -780,7 +779,7 @@ def w8a8_block_fp8_matmul(
     )
 
     # deepgemm only support bf16
-    if C.dtype == torch.bfloat16 and enable_jit_deepgemm:
+    if C.dtype == torch.bfloat16 and _enable_jit_deepgemm:
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
