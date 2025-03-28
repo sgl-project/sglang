@@ -99,10 +99,13 @@ class HiPAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
             offload_cache = None
+            k_chunk = v_chunk = None
+            offloading_metadata = None
 
         else:  # Offloading enabled
             assert isinstance(
@@ -114,75 +117,51 @@ class HiPAttentionBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, async_copy=True, push_to_gpu_cache=False
                     )
-            k_cache = v_cache = None
-            offload_cache = None
+
+            k_cache = v_cache = offload_cache = None
+            k_chunk, v_chunk, offloading_metadata = (
+                forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
+                    layer_id=layer.layer_id,
+                    extend_seq_lens=forward_batch.extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    cache_k=k,
+                    cache_v=v,
+                )
+            )
 
         q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # Output tensor
-        o = torch.empty_like(q_reshaped)
-
-        start_len = 0
-        decoding_reqs = []
-        decoding_reqs_positions = []
-        for idx_batch, seq_len in enumerate(forward_batch.extend_seq_lens_cpu):
-            if seq_len == 0:  # Skip empty sequences
-                decoding_reqs.append(idx_batch)
-                decoding_reqs_positions.append(start_len)
-
-            else:
-                if not self.is_kv_cache_offload_enabled:
-                    k_chunk = v_chunk = None
-                    offloading_metadata = None
-
-                else:  # Offloading enabled
-                    k_chunk, v_chunk, offloading_metadata = (
-                        forward_batch.token_to_kv_pool.get_fetched_prefix_kv_buffer(
-                            layer_id=layer.layer_id,
-                            batch_id=idx_batch,
-                            cache_k=k[start_len : start_len + seq_len].unsqueeze(0),
-                            cache_v=v[start_len : start_len + seq_len].unsqueeze(0),
-                        )
-                    )
-                    offload_cache = k_cache = v_cache = None
-
-                o_req, _ = self.forward_paged_hip(
-                    query=q_reshaped[start_len : start_len + seq_len],
-                    sm_scale=layer.scaling,
-                    batch_size=1,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    offload_cache=offload_cache,
-                    positions=forward_batch.positions[start_len : start_len + seq_len],
-                    seq_lens=forward_batch.seq_lens[idx_batch : idx_batch + 1],
-                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices[
-                        idx_batch : idx_batch + 1
-                    ],
-                    rope_cos=layer.rope_cos,
-                    rope_sin=layer.rope_sin,
-                    rope_range=layer.rope_range,
-                    layer_id=layer.layer_id,
-                    logit_cap=layer.logit_cap,
-                    orig_context_len=layer.orig_context_len,
-                    max_context_len=self.max_context_len,
-                    is_prefill=True,
-                    hip_config=self.hip_config,
-                    k=k_chunk,
-                    v=v_chunk,
-                    online_update_cache=(
-                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                        if self.is_kv_cache_offload_enabled
-                        else None
-                    ),
-                    offloading_metadata=offloading_metadata,
-                )
-
-                o[start_len : start_len + seq_len] = o_req
-
-            start_len += seq_len
-
-        assert len(decoding_reqs) == 0
+        o, _ = self.forward_paged_hip(
+            query=q_reshaped,
+            sm_scale=layer.scaling,
+            batch_size=forward_batch.batch_size,
+            k=k_chunk,
+            v=v_chunk,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            offload_cache=offload_cache,
+            positions=forward_batch.positions,
+            seq_lens=forward_batch.seq_lens,
+            req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            rope_cos=layer.rope_cos,
+            rope_sin=layer.rope_sin,
+            rope_range=layer.rope_range,
+            layer_id=layer.layer_id,
+            logit_cap=layer.logit_cap,
+            orig_context_len=layer.orig_context_len,
+            max_context_len=self.max_context_len,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            hip_config=self.hip_config,
+            online_update_cache=(
+                forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                if self.is_kv_cache_offload_enabled
+                else None
+            ),
+            is_decode=False,
+            offloading_metadata=offloading_metadata,
+        )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -220,7 +199,7 @@ class HiPAttentionBackend(AttentionBackend):
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            offload_cache = None
+            offload_cache = offloading_metadata = None
 
         else:  # Offloading enabled
             assert isinstance(
@@ -238,8 +217,10 @@ class HiPAttentionBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             )
 
+        q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+
         o, metadata = self.forward_paged_hip(
-            query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            query=q_reshaped,
             sm_scale=layer.scaling,
             batch_size=forward_batch.batch_size,
             k_cache=k_cache,
@@ -256,7 +237,6 @@ class HiPAttentionBackend(AttentionBackend):
             logit_cap=layer.logit_cap,
             orig_context_len=layer.orig_context_len,
             max_context_len=self.max_context_len,
-            is_prefill=False,
             hip_config=self.hip_config,
             cached_metadata=metadata,
             online_update_cache=(
@@ -265,6 +245,7 @@ class HiPAttentionBackend(AttentionBackend):
                 else None
             ),
             is_decode=True,
+            offloading_metadata=offloading_metadata,
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
