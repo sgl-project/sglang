@@ -290,7 +290,7 @@ class W8A8Int8MoEMethod:
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                True,  # inplace
+                False,  # inplace See [Note] inplace should be False in fused_experts.
                 True,  # use_int8_w8a8
                 False,  # use_fp8_w8a16
                 layer.w13_weight_scale,  # w1_scale
