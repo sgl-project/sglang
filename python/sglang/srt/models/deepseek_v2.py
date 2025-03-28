@@ -302,6 +302,7 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        self.shared_experts_is_int8 = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -318,6 +319,9 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
+            if self.shared_experts.gate_up_proj.weight.dtype == torch.int8:
+                assert self.shared_experts.down_proj.weight.dtype == torch.int8
+                self.shared_experts_is_int8 = True
 
         self.top_k = config.num_experts_per_tok
 
@@ -370,6 +374,11 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(hidden_states)
+            elif (
+                config.n_shared_experts is not None and self.num_fused_shared_experts == 0
+                and self.shared_experts.gate_up_proj.use_intel_amx_backend
+            ):
+                return self.forward_cpu(hidden_states)
             else:
                 return self.forward_normal(hidden_states)
         else:
@@ -407,6 +416,52 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # TODO: the below 2 lines are not on main. Check if can be removed
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        fused_experts_out = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+
+        assert (
+            self.shared_experts.gate_up_proj.use_intel_amx_backend
+            == self.shared_experts.down_proj.use_intel_amx_backend
+        )
+        # [Note] inplace should be False in fused_experts.
+        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+        # While hidden_states is still needed in shared_expert.
+        final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
+            hidden_states,
+            self.shared_experts.gate_up_proj.weight,
+            self.shared_experts.down_proj.weight,
+            fused_experts_out,
+            self.routed_scaling_factor,
+            True,  # inplace
+            self.shared_experts_is_int8,  # use_int8_w8a8
+            False,  # use_fp8_w8a16
+            (
+                self.shared_experts.gate_up_proj.weight_scale
+                if self.shared_experts_is_int8
+                else None
+            ),  # w1_scale
+            (
+                self.shared_experts.down_proj.weight_scale
+                if self.shared_experts_is_int8
+                else None
+            ),  # w2_scale
+            None,  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            True,  # is_vnni
+        )
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
