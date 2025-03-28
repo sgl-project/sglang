@@ -1750,7 +1750,8 @@ def retry(
                 raise
 
             delay = min(initial_delay * (2 ** try_index), max_delay) * (0.75 + 0.25 * random.random())
-            time.sleep(delay)
 
             logger.warning(f"retry() failed once. Will delay {delay:.2f}s and retry. Error: {e}")
             traceback.print_exc()
+
+            time.sleep(delay)
