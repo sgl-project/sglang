@@ -2,6 +2,7 @@ import multiprocessing
 import multiprocessing as mp
 import os
 import random
+import time
 import traceback
 import unittest
 from multiprocessing import Process
@@ -138,9 +139,6 @@ class TestVerlEngine(CustomTestCase):
         for index, model_info in enumerate(ALL_OTHER_MODELS):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
-    # def test_adhoc(self):
-    #     self.assert_fragment_e2e_execution(index=0, model_path="meta-llama/Llama-3.2-1B-Instruct")
-
 
 def _run_subprocess(
     tp_rank: int,
@@ -241,6 +239,24 @@ def _run_subprocess(
         #         check_logprobs=not enable_batch,
         #         debug_text=f"{enable_batch=} {tp_rank=}",
         #     )
+
+        # test direct generate API
+        print(f"subprocess[{tp_rank=}] testing direct generate API")
+        direct_response = engine.generate(
+            prompt="Hello, world!",
+            sampling_params={"temperature": 0.7, "max_new_tokens": 20},
+        )
+        print(f"Direct generate response: {direct_response}")
+
+        # test memory occupation APIs
+        print(f"subprocess[{tp_rank=}] testing memory occupation APIs")
+        engine.release_memory_occupation()
+        print("Memory released")
+        time.sleep(1)
+        engine.resume_memory_occupation()
+        print("Memory resumed")
+
+        # openai API test for reference
         from openai import OpenAI
 
         client = OpenAI(api_key="None", base_url="http://localhost:2157/v1")

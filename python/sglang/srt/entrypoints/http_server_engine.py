@@ -70,11 +70,6 @@ class HttpServerEngineAdapter:
         self.server_args.port = 2157
         print(f"launch_server_from_verl_engine {self.server_args.port}")
 
-        # server_thread = threading.Thread(
-        #     target=launch_server,
-        #     args=(self.server_args,),
-        #     daemon=True,
-        # )
         model, base_url, timeout, api_key, other_args = server_args_to_launch_params(
             self.server_args
         )
@@ -93,15 +88,6 @@ class HttpServerEngineAdapter:
         flush_cache: bool = False,
     ):
 
-        # obj = UpdateWeightsFromTensorReqInput(
-        #     serialized_named_tensors=[
-        #         MultiprocessingSerializer.serialize(named_tensors)
-        #         for _ in range(self.server_args.tp_size)
-        #     ],
-        #     load_format=load_format,
-        #     flush_cache=flush_cache,
-        # )
-
         print(f"update_weights_from_tensor of HttpServerEngineAdapter")
         return requests.post(
             f"http://localhost:{self.server_args.port}/update_weights_from_tensor",
@@ -119,3 +105,66 @@ class HttpServerEngineAdapter:
 
     def shutdown(self):
         kill_process_tree(self.process.pid)
+
+    def generate(
+        self,
+        prompt=None,
+        sampling_params=None,
+        input_ids=None,
+        image_data=None,
+        return_logprob=False,
+        logprob_start_len=None,
+        top_logprobs_num=None,
+        token_ids_logprob=None,
+        lora_path=None,
+        custom_logit_processor=None,
+    ):
+        """Implements text generation functionality by forwarding the request to the veRL Engine via HTTP.
+
+        This method packages all generation parameters into a JSON payload, filters out any None values,
+        and sends the request to the locally running server. It then returns the parsed response or
+        raises an exception if the generation fails.
+        """
+        payload = {
+            "text": prompt,
+            "sampling_params": sampling_params,
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "return_logprob": return_logprob,
+            "logprob_start_len": logprob_start_len,
+            "top_logprobs_num": top_logprobs_num,
+            "token_ids_logprob": token_ids_logprob,
+            "lora_path": lora_path,
+            "custom_logit_processor": custom_logit_processor,
+        }
+        # Filter out None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        response = requests.post(
+            f"http://localhost:{self.server_args.port}/generate", json=payload
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise Exception(f"Generate request failed: {response.text}")
+
+    def release_memory_occupation(self):
+        """release memory occupation by HTTP"""
+        response = requests.post(
+            f"http://localhost:{self.server_args.port}/release_memory_occupation",
+            json={},
+        )
+        if response.status_code != 200:
+            raise Exception(f"Failed to release memory: {response.text}")
+        return response
+
+    def resume_memory_occupation(self):
+        """resume memory occupation by HTTP"""
+        response = requests.post(
+            f"http://localhost:{self.server_args.port}/resume_memory_occupation",
+            json={},
+        )
+        if response.status_code != 200:
+            raise Exception(f"Failed to resume memory: {response.text}")
+        return response
