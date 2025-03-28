@@ -175,11 +175,7 @@ class GenerateReqInput(BaseReqInput):
             if not self.token_ids_logprob:  # covers both None and []
                 self.token_ids_logprob = None
         else:
-            if self.parallel_sample_num == 1:
-                num = self.batch_size
-            else:
-                # Expand parallel_sample_num
-                num = self.batch_size * self.parallel_sample_num
+            num = self.batch_size * self.parallel_sample_num
 
             if not self.image_data:
                 self.image_data = [None] * num
