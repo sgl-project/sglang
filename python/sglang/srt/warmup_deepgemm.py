@@ -26,10 +26,12 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- warmup -------------------------------------
 
 
-def warmup(model):
+def warmup(model, tp_rank):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
     if not enable_jit_deepgemm:
         return
+
+    first_rank_in_node = tp_rank % tp_size_per_node == 0
 
     _warmup_raw(model.__class__.__name__)
 
