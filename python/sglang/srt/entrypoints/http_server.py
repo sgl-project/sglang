@@ -767,14 +767,8 @@ def _wait_and_warmup(
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["input_ids"] = json_data["input_ids"][0]
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["text"] = json_data["text"][0]
 
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
