@@ -32,7 +32,8 @@ class BaseImageProcessorOutput:
     input_text: str
     videos: list[list[PIL.Image]]
     # defines the order in which each frame of video/image is provided in the input
-    media_order: list[Literal['image', 'video']]
+    media_order: list[Literal["image", "video"]]
+
 
 class BaseImageProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
@@ -191,17 +192,19 @@ class BaseImageProcessor(ABC):
                     hashes += [hash(image_file)] * len(frames)
                     images += frames
                     image_index += 1
-                    media_order += ['image'] * len(frames)
+                    media_order += ["image"] * len(frames)
                     if frames_to_process != 0:
                         new_text += image_token * len(frames)
                     assert frames_to_process == len(frames)
                 elif video_token and text_part == video_token:
                     # load as video
-                    video_frames, fps, resolution, duration = load_video(video_data[video_index])
+                    video_frames, fps, resolution, duration = load_video(
+                        video_data[video_index]
+                    )
                     hashes += [hash(video_data[video_index])]
                     videos.append(video_frames)
                     video_index += 1
-                    media_order += ['video']
+                    media_order += ["video"]
                     new_text += video_token
                 else:
                     # TODO(mick): handle video

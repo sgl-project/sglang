@@ -390,7 +390,10 @@ class TokenizerManager:
             input_ids = self.tokenizer.encode(input_text)
 
         image_inputs: Dict = await self.image_processor.process_images_async(
-            obj.image_data, input_text or input_ids, obj, self.max_req_input_len,
+            obj.image_data,
+            input_text or input_ids,
+            obj,
+            self.max_req_input_len,
             video_data=obj.video_data,
         )
         if image_inputs and "input_ids" in image_inputs:

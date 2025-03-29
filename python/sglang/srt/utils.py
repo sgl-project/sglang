@@ -534,6 +534,7 @@ def load_image(image_file: Union[str, bytes]):
 
     return image, image_size
 
+
 def read_video_from_file(video_file: Union[str, bytes]):
     from decord import VideoReader, cpu
     from PIL import Image
@@ -554,10 +555,11 @@ def read_video_from_file(video_file: Union[str, bytes]):
         # Get frame as numpy array
         frame = vr[i].asnumpy()
         # Convert to PIL image
-        img = Image.fromarray(frame.astype('uint8'))
+        img = Image.fromarray(frame.astype("uint8"))
         frames.append(img)
-    
+
     return frames, fps, resolution, duration
+
 
 def load_video(video_file: Union[str, bytes]):
     if isinstance(video_file, bytes):

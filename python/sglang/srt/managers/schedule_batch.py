@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -166,7 +167,7 @@ class ImageInputs:
     video_token_id: Optional[int] = None
     video_grid_thws: List[Tuple[int, int, int]] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
-    media_order: Optional[List[Literal['image', 'video']]] = None
+    media_order: Optional[List[Literal["image", "video"]]] = None
 
     # deepseek vl2 related
     image_seq_mask: Optional[List[torch.Tensor]] = None

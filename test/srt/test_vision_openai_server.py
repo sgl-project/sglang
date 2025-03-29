@@ -438,7 +438,9 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
                     {"type": "text", "text": "What's in this video?"},
                     {
                         "type": "video_url",
-                        "video_url": {"url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"},
+                        "video_url": {
+                            "url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"
+                        },
                     },
                 ],
             }
@@ -465,8 +467,11 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
         self.assertTrue(
-            any(term in video_response.lower() for term in ["control room", "control", "room"]),
-            "Response should mention 'Control Room'"
+            any(
+                term in video_response.lower()
+                for term in ["control room", "control", "room"]
+            ),
+            "Response should mention 'Control Room'",
         )
 
     def test_video_and_image_completion(self):
@@ -474,13 +479,18 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
 
         # Mixed video_url and image_url format
         messages = [
-            {"role": "system", "content": "You are an AI that analyzes both video and image inputs."},
+            {
+                "role": "system",
+                "content": "You are an AI that analyzes both video and image inputs.",
+            },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "video_url",
-                        "video_url": {"url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"},
+                        "video_url": {
+                            "url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"
+                        },
                     },
                     {
                         "type": "image_url",
@@ -488,10 +498,12 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
                             "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
                         },
                     },
-
                 ],
             },
-            {"role": "user", "content": "Analyze this video and image together and provide a detailed description of both"},
+            {
+                "role": "user",
+                "content": "Analyze this video and image together and provide a detailed description of both",
+            },
         ]
 
         response = client.chat.completions.create(
@@ -513,11 +525,18 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
 
         # Assert specific content expected in the response
         self.assertTrue(
-            any(term in combined_response.lower() for term in ["control room", "control", "room"]),
-            "Response should mention 'Control Room'"
+            any(
+                term in combined_response.lower()
+                for term in ["control room", "control", "room"]
+            ),
+            "Response should mention 'Control Room'",
         )
-        self.assertTrue("dog" in combined_response.lower(), "Response should mention 'dog'")
-        self.assertTrue("beach" in combined_response.lower(), "Response should mention 'beach'")
+        self.assertTrue(
+            "dog" in combined_response.lower(), "Response should mention 'dog'"
+        )
+        self.assertTrue(
+            "beach" in combined_response.lower(), "Response should mention 'beach'"
+        )
 
 
 class TestVLMContextLengthIssue(unittest.TestCase):

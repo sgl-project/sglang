@@ -587,7 +587,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
             image: ImageInputs
             for i, image in enumerate(forward_batch.image_inputs):
-                if image is None or (image.pixel_values is None and image.pixel_values_videos is None):
+                if image is None or (
+                    image.pixel_values is None and image.pixel_values_videos is None
+                ):
                     continue
                 start_idx = extend_start_loc_cpu[i]
                 prefix_len = prefix_lens_cpu[i]
@@ -615,7 +617,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                         np.array(image.video_grid_thws), device="cuda"
                     )
                     video_input = Qwen2VLVideoInputs(
-                        pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thws
+                        pixel_values_videos=pixel_values_videos,
+                        video_grid_thw=video_grid_thws,
                     )
                     video_embeds = self._process_video_input(video_input)
 
@@ -625,7 +628,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 for idx, image_offset in enumerate(image_offsets):
                     if image_offset < prefix_len:
                         continue
-                    if image.media_order[idx] == 'image':
+                    if image.media_order[idx] == "image":
                         num_tokens = self.calculate_num_image_tokens(
                             image_grid_thws[image_idx]
                         )
@@ -660,8 +663,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     end_dim = (rank + 1) * hidden_chunk_size
                     inputs_embeds[left_idx:right_idx, ..., start_dim:end_dim] = (
                         current_embeds[
-                            current_offset : current_offset
-                            + num_tokens,
+                            current_offset : current_offset + num_tokens,
                             ...,
                             start_dim:end_dim,
                         ]
