@@ -422,7 +422,7 @@ class Scheduler(
         warmup_deepgemm.warmup(
             server_args,
             self.tp_worker.worker.model_runner.model,
-            self.tp_rank,
+            gpu_id=gpu_id,
         )
 
     def init_tokenizer(self):

@@ -53,16 +53,13 @@ logger = logging.getLogger(__name__)
 # --------------------------------------- warmup -------------------------------------
 
 
-def warmup(server_args, model, tp_rank):
+def warmup(server_args, model, gpu_id):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
-
-    tp_size_per_node = server_args.tp_size // server_args.nnodes
-    first_rank_in_node = tp_rank % tp_size_per_node == 0
 
     if (
         server_args.disable_deepgemm_warmup
         or (not enable_jit_deepgemm)
-        or (not first_rank_in_node)
+        or (gpu_id != server_args.base_gpu_id)
     ):
         return
 
