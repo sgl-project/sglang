@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from sglang.utils import is_in_ci
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,8 @@ def download_weights_from_hf(
 
 
 def _should_hf_local_files_only():
-    if TODO:
+    if is_in_ci() and TODO:
+        logger.info("Set local_files_only=True to reduce traffic to HF server in CI")
         return True
 
     return huggingface_hub.constants.HF_HUB_OFFLINE
