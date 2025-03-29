@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+
+"""
+Support different attention backends.
+Now there are three backends: FlashInfer, Triton and FlashAttention.
+Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
+"""
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -558,6 +567,11 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k = metadata.cu_seqlens_k
 
         # Use Flash Attention for prefill
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
+
+        # # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
