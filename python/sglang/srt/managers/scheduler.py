@@ -418,13 +418,6 @@ class Scheduler(
         )
         self.init_disaggregation()
 
-        # Execute warmups
-        warmup_deepgemm.warmup(
-            server_args,
-            self.tp_worker.worker.model_runner.model,
-            gpu_id=gpu_id,
-        )
-
     def init_tokenizer(self):
         server_args = self.server_args
 

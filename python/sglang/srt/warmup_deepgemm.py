@@ -35,10 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 import torch
-from tqdm import tqdm
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import deduplicate, get_bool_env_var
+from tqdm import tqdm
 
 try:
     import deep_gemm
@@ -57,9 +56,9 @@ def warmup(server_args, model, gpu_id):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
 
     if (
-        server_args.disable_deepgemm_warmup
-        or (not enable_jit_deepgemm)
-        or (gpu_id != server_args.base_gpu_id)
+            server_args.disable_deepgemm_warmup
+            or (not enable_jit_deepgemm)
+            or (gpu_id != server_args.base_gpu_id)
     ):
         return
 
@@ -127,7 +126,7 @@ def _compute_infos_from_sources_raw(sources):
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
     with ProcessPoolExecutor(
-        max_workers=min(8, psutil.cpu_count(logical=False))
+            max_workers=min(4, psutil.cpu_count(logical=False))
     ) as executor:
         iterator = executor.map(_warmup_by_info, infos)
         list(tqdm(iterator, total=len(infos), desc="Warmup DeepGEMM"))
@@ -241,7 +240,7 @@ def _analyze():
 
     df = df_raw.group_by("n", "k").agg(pl.col("m").unique().sort()).sort("n", "k")
     with pl.Config(
-        fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1
+            fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1
     ):
         print(df)
 
