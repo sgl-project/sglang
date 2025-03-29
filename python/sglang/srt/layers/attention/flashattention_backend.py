@@ -156,17 +156,12 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        k_descale = (
-            layer.k_scale.expand(descale_shape)
-            if self.kv_cache_dtype_str != "auto"
-            else None
-        )
-        v_descale = (
-            layer.v_scale.expand(descale_shape)
-            if self.kv_cache_dtype_str != "auto"
-            else None
-        )
+        k_descale, v_descale = None, None
+        if self.kv_cache_dtype_str != "auto":
+            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
 
         page_table = metadata.page_table
 
@@ -182,9 +177,7 @@ class FlashAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             o = flash_attn_with_kvcache(
-                q=q.contiguous()
-                .to(key_cache.dtype)
-                .view(-1, layer.tp_q_head_num, layer.head_dim),
+                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -281,17 +274,12 @@ class FlashAttentionBackend(AttentionBackend):
 
         page_table = metadata.page_table
 
-        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        k_descale = (
-            layer.k_scale.expand(descale_shape)
-            if self.kv_cache_dtype_str != "auto"
-            else None
-        )
-        v_descale = (
-            layer.v_scale.expand(descale_shape)
-            if self.kv_cache_dtype_str != "auto"
-            else None
-        )
+        k_descale, v_descale = None, None
+        if self.kv_cache_dtype_str != "auto":
+            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
 
         if not self.use_mla:
             # Do multi-head attention
