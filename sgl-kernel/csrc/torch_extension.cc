@@ -66,6 +66,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("moe_align_block_size", moe_align_block_size);
   m.def("topk_softmax", topk_softmax);
 
+  m.def(
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk) -> "
+      "(Tensor[])");
+  m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+
   /*
    * From csrc/speculative
    */
