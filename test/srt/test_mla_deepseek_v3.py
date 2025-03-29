@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 class TestMLADeepseekV3(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.model = "sgl-project/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -52,7 +52,7 @@ class TestMLADeepseekV3(CustomTestCase):
 class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmsys/sglang-ci-dsv3-test"
+        cls.model = "sgl-project/sglang-ci-dsv3-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
@@ -65,7 +65,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-draft",
-            "lmsys/sglang-ci-dsv3-test-NextN",
+            "sgl-project/sglang-ci-dsv3-test-NextN",
             "--speculative-num-steps",
             "2",
             "--speculative-eagle-topk",
