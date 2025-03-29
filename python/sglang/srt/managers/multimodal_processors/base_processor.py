@@ -10,6 +10,7 @@ import numpy as np
 import PIL
 from decord import VideoReader, cpu
 from PIL import Image
+from transformers import BaseImageProcessorFast
 
 from sglang.srt.utils import encode_video, load_audio, load_image, logger
 
@@ -47,7 +48,7 @@ class MultimodalSpecialTokens:
 
 
 class BaseMultimodalProcessor(ABC):
-    models = []
+    models = None
 
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
@@ -78,6 +79,8 @@ class BaseMultimodalProcessor(ABC):
             kwargs["audios"] = audios
 
         processor = self._processor
+        if isinstance(processor.image_processor, BaseImageProcessorFast):
+            kwargs["device"] = "cuda"
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -110,6 +113,84 @@ class BaseMultimodalProcessor(ABC):
             estimated_frames_list.append(num_frames)
 
         return estimated_frames_list
+
+    @staticmethod
+    def _load_single_item(
+        data, is_video, is_audio, frame_count_limit=None, discard_alpha_channel=True
+    ):
+        """Static method that can be pickled for multiprocessing"""
+        try:
+            if is_audio:
+                return load_audio(data)
+            elif is_video:
+                path = data[len("video:") :]
+                return BaseMultimodalProcessor.encode_video(path, frame_count_limit)
+            else:
+                img, _ = load_image(data)
+                return img.convert("RGB") if discard_alpha_channel else img
+        except Exception as e:
+            raise RuntimeError(f"Error while loading data {data}: {e}")
+
+    def submit_data_loading_tasks(
+        self,
+        text_parts: List[str],
+        multimodal_tokens: MultimodalSpecialTokens,
+        image_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+        discard_alpha_channel: bool = True,
+    ):
+        """
+        load multimodal data parallelly
+        """
+
+        # TODO(mick): load from server_args, env, or sampling_params
+        MAX_NUM_FRAMES = 30
+        estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
+        total_frame_count = sum(estimated_frames_list)
+        # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
+        # e.g., 0.1 suggests that 1 frame out of 10 input frames should be used
+        scaling_factor = min(1.0, MAX_NUM_FRAMES / max(1, total_frame_count))
+
+        assert len(image_data) == len(estimated_frames_list)
+        # Submit all tasks
+        futures = []
+        task_info = []
+        image_index, audio_index = 0, 0
+
+        for text_part in text_parts:
+            if text_part == multimodal_tokens.image_token:
+                data = image_data[image_index]
+                is_video = isinstance(data, str) and data.startswith("video:")
+                estimated_frames = estimated_frames_list[image_index]
+                frame_count_limit = max(1, int(estimated_frames * scaling_factor))
+                futures.append(
+                    self.io_executor.submit(
+                        BaseMultimodalProcessor._load_single_item,
+                        data,
+                        is_video,
+                        False,
+                        frame_count_limit,
+                        discard_alpha_channel,
+                    )
+                )
+                task_info.append(("image", data, frame_count_limit))
+                image_index += 1
+            elif text_part == multimodal_tokens.audio_token:
+                data = audio_data[audio_index]
+                futures.append(
+                    self.io_executor.submit(
+                        BaseMultimodalProcessor._load_single_item,
+                        data,
+                        False,
+                        True,
+                        None,
+                        discard_alpha_channel,
+                    )
+                )
+                task_info.append(("audio", data, None))
+                audio_index += 1
+
+        return futures, task_info
 
     def load_mm_data(
         self,

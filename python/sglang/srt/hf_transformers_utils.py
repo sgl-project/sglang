@@ -215,6 +215,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    use_fast: Optional[bool] = True,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -231,6 +232,24 @@ def get_processor(
     if config.model_type in {"qwen2_vl"}:
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
+    # A hack to determine whether a fast image processor is available for this model type
+    # will be removed in future
+    has_fast_image_processor = False
+    for model_type, image_processors in IMAGE_PROCESSOR_MAPPING_NAMES.items():
+        if config.model_type == model_type:
+            if any(
+                image_processor.endswith("Fast") for image_processor in image_processors
+            ):
+                print(f"{model_type=}")
+                print(f"{image_processors=}")
+                has_fast_image_processor = True
+                break
+
+    print(f"{config.model_type=} {has_fast_image_processor=}")
+    if config.model_type not in {"llava"}:
+        kwargs["use_fast"] = has_fast_image_processor and use_fast
+        print(f"{kwargs=}")
 
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
