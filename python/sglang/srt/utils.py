@@ -534,6 +534,39 @@ def load_image(image_file: Union[str, bytes]):
 
     return image, image_size
 
+def read_video_from_file(video_file: Union[str, bytes]):
+    import av
+    container = av.open(video_file)
+    video = container.streams.video[0]
+    fps = video.average_rate
+    resolution = video.width, video.height
+    duration = container.duration / av.time_base
+
+    # Extract frames as PIL images
+    frames = []
+    for frame in container.decode(video=0):
+        img = frame.to_image()
+        frames.append(img)
+    
+    return frames, fps, resolution, duration
+
+def load_video(video_file: Union[str, bytes]):
+    if isinstance(video_file, bytes):
+        video_frames, fps, resolution, duration = read_video_from_file(video_file)
+    elif video_file.startswith("http://") or video_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(video_file, stream=True, timeout=timeout).raw
+        video_frames, fps, resolution, duration = read_video_from_file(response)
+    elif video_file.startswith("data:"):
+        # assume format data:video/mp4;base64,<video_data>
+        video_file = video_file.split(",")[1]
+        video_file = base64.b64decode(video_file)
+        video_file = BytesIO(video_file)
+        video_frames, fps, resolution, duration = read_video_from_file(video_file)
+    else:
+        raise ValueError(f"Invalid video: {video_file}")
+    return video_frames, fps, resolution, duration
+
 
 def suppress_other_loggers():
     try:
