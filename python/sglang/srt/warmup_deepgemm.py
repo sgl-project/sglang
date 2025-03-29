@@ -2,6 +2,7 @@
 ## How to support warmup of a new model
 
 1. Capture
+mkdir -p /tmp/warmup_deepgemm_capture && rm -rf /tmp/warmup_deepgemm_capture/*
 SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE=1 python3 -m sglang.launch_server ...args-for-your-case...
 
 2. Analyze
