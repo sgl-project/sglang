@@ -917,6 +917,7 @@ def v1_chat_generate_request(
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
+        prompt = ""
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None

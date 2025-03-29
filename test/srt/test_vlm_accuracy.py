@@ -3,6 +3,7 @@
 
 import unittest
 from io import BytesIO
+from typing import List
 
 import numpy as np
 import requests
@@ -195,13 +196,29 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             # sglang
             model = self.get_sglang_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
+
+            pixel_values = inputs["pixel_values"]
+            tgt_sizes = inputs["tgt_sizes"]
+            pixel_values_flat: List[torch.Tensor] = []
+            tgt_sizes_flat: List[torch.Tensor] = []
+            for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
+                # per image
+                if len(pixel_b) != len(tgt_b):
+                    raise ValueError(
+                        "Inconsistent N lengths, found: "
+                        f"{len(pixel_b)} vs {len(tgt_b)}"
+                    )
+                for pixel_n, tgt_n in zip(pixel_b, tgt_b):
+                    pixel_values_flat += [pixel_n]
+                    tgt_sizes_flat += [tgt_n]
             sglang_output = embed_mm_inputs(
                 mm_inputs=MultimodalInputs(
                     items=[
                         MultimodalDataItem(
-                            pixel_values=inputs["pixel_values"][0],
-                            tgt_size=inputs["tgt_sizes"][0],
+                            pixel_values=pixel_values_flat,
+                            tgt_size=tgt_sizes_flat,
                             modality="image",
+                            pad_value=self.processor.tokenizer.unk_token_id,
                         )
                     ]
                 ),

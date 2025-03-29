@@ -1551,8 +1551,6 @@ class MiniCPMO(MiniCPMBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        # print("audio embedding")
-
         wavforms = flatten_nested_list(
             [item.audio_features for item in items if item.audio_features]
         )
@@ -1659,7 +1657,6 @@ class MiniCPMO(MiniCPMBaseModel):
         Returns:
             List[List[torch.Tensor]]: audio embeddings
         """
-        # print("audio embedding")
         # (bs, 80, frames) or [], multi audios need filled in advance
         wavforms = flatten_nested_list(
             [item.audio_features for item in items if item.audio_features]

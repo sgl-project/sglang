@@ -63,8 +63,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        start = time.time()
-
         if not image_data:
             return None
         if isinstance(image_data, str):

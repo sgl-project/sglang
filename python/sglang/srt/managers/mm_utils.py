@@ -1,5 +1,5 @@
 """
-    Multimodality utils
+    Multi-modality utils
 """
 
 from abc import abstractmethod
@@ -178,7 +178,7 @@ class MultiModalityDataPaddingPatternImageTokens(MultiModalityDataPaddingPattern
 
 def get_embedding_and_mask(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
-    appearing_items: List[MultimodalDataItem],
+    embedding_items: List[MultimodalDataItem],
     placeholder_tensor: torch.Tensor,
     input_ids: torch.Tensor,
 ):
@@ -187,7 +187,7 @@ def get_embedding_and_mask(
 
     """
     # 1. Get the embedding
-    embedding = data_embedding_func(appearing_items)
+    embedding = data_embedding_func(embedding_items)
 
     # 2. Check the embedding
     if embedding.dim() == 2:
@@ -272,12 +272,14 @@ def embed_mm_inputs(
         inputs_embeds = input_embedding(input_ids)
     else:
         appearing_items = [
-            item for item in mm_inputs.items if item.pad_value in appearing_pad_values
+            item
+            for item in mm_inputs.items
+            if item.pad_value is not None and item.pad_value in appearing_pad_values
         ]
 
         using_all_items = False
         if len(appearing_items) == 0:
-            print_warning_once(
+            logger.warning_once(
                 "No multimodal data item's pad value exist in placeholder ids. Using all items"
             )
             using_all_items = True
@@ -286,19 +288,21 @@ def embed_mm_inputs(
         embeddings, masks = [], []
 
         # 2. Get multimodal embedding separately
+        # TODO: make this more generic
         # Try get image embedding if any
         if (
             any(True for item in appearing_items if item.is_image())
             and image_data_embedding_func
         ):
+            items = [item for item in appearing_items if item.is_image()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=image_data_embedding_func,
-                appearing_items=[item for item in appearing_items if item.is_image()],
+                embedding_items=items,
                 placeholder_tensor=(
                     placeholder_tensor
                     if using_all_items
                     else torch.tensor(
-                        [item.pad_value for item in appearing_items],
+                        [item.pad_value for item in items],
                         device=input_ids.device,
                     )
                 ),
@@ -312,14 +316,15 @@ def embed_mm_inputs(
             any(True for item in appearing_items if item.is_audio())
             and audio_data_embedding_func
         ):
+            items = [item for item in appearing_items if item.is_audio()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=audio_data_embedding_func,
-                appearing_items=[item for item in appearing_items if item.is_audio()],
+                embedding_items=items,
                 placeholder_tensor=(
                     placeholder_tensor
                     if using_all_items
                     else torch.tensor(
-                        [item.pad_value for item in appearing_items],
+                        [item.pad_value for item in items],
                         device=input_ids.device,
                     )
                 ),

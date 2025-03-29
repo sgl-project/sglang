@@ -3,8 +3,8 @@ from typing import List, Union
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
-    get_global_processor,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.clip import CLIPModel
 from sglang.srt.utils import load_image
 
@@ -16,20 +16,19 @@ class ClipImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
 
     @staticmethod
-    def _process_single_image_task(images, input_text):
+    def _process_single_image_task(images, input_text, processor):
         # input_ids', 'attention_mask', 'pixel_values', 'aspect_ratio_ids', 'aspect_ratio_mask', 'cross_attention_mask'
-        return get_global_processor()(
-            images=images, text=input_text, return_tensors="pt"
-        )
+        return processor(images=images, text=input_text, return_tensors="pt")
 
     async def _process_single_image(self, images, input_text):
-        if self.executor is not None:
+        if self.cpu_executor is not None:
             loop = asyncio.get_event_loop()
             image_inputs = await loop.run_in_executor(
-                self.executor,
+                self.cpu_executor,
                 ClipImageProcessor._process_single_image_task,
                 images,
                 input_text,
+                self._processor,
             )
         else:
             image_inputs = self._processor(
@@ -59,5 +58,10 @@ class ClipImageProcessor(BaseMultimodalProcessor):
         image_inputs = await self._process_single_image(images, input_text)
         image_inputs["data_hashes"] = [hash(str(image_data))]
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
+        image_inputs["items"] = [
+            MultimodalDataItem(
+                pixel_values=image_inputs["pixel_values"], modality="image"
+            )
+        ]
 
         return image_inputs

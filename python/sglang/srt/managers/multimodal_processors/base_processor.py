@@ -8,32 +8,12 @@ from typing import List, Optional
 
 import numpy as np
 import PIL
-import transformers
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.utils import load_audio, load_image, logger
 
 _global_processor = None
-
-
-def get_global_processor():
-    global _global_processor
-    return _global_processor
-
-
-def init_global_processor(server_args):
-    """
-    Init the global processor for multimodal models."""
-    global _global_processor
-    print("initializing global processor")
-    transformers.logging.set_verbosity_error()
-    _global_processor = get_processor(
-        server_args.tokenizer_path,
-        tokenizer_mode=server_args.tokenizer_mode,
-        trust_remote_code=server_args.trust_remote_code,
-    )
 
 
 @dataclasses.dataclass
@@ -84,16 +64,6 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-        )
-
-    def _build_processor(self, server_args):
-        """Init the global processor for multi modal models."""
-        from sglang.srt.hf_transformers_utils import get_processor
-
-        return get_processor(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
         )
 
     @abstractmethod

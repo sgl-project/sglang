@@ -1,4 +1,3 @@
-import asyncio
 from typing import List, Union
 
 import torch
@@ -141,7 +140,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             items += [item]
 
         if res["audio_features"] is not None and len(res["audio_features"]) != 0:
-            # res["audio_features"] = [res["audio_features"]]
             item = MultimodalDataItem(
                 audio_features=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],

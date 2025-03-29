@@ -44,10 +44,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -505,14 +502,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        # Get all special token IDs
-        # im_start_id: int = image_inputs.im_start_id
-        # im_end_id: int = image_inputs.im_end_id
-        #
-        # media_token_pairs = [(im_start_id, im_end_id)]
-        # pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-        #
-        # return pattern.pad_input_tokens(input_ids, image_inputs)
         return input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -520,8 +509,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thws = torch.stack([item.image_grid_thws for item in items], dim=0)
-        image_grid_thws = image_grid_thws.flatten(0, 1)
+        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thws.dim() == 2, image_grid_thws.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)

@@ -486,8 +486,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thws = torch.stack([item.image_grid_thws for item in items], dim=0)
-        image_grid_thws = image_grid_thws.flatten(0, 1)
+        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thws.dim() == 2, image_grid_thws.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)

@@ -191,6 +191,9 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
 
+    # multimodal
+    disable_fast_image_processor: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -1103,6 +1106,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+
+        # Multimodal
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Use normal image processor instead of fast image processor. For more detail, see: https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor ",
         )
 
     @classmethod
