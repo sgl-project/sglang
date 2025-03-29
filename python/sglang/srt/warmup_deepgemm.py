@@ -209,29 +209,33 @@ def read_output() -> List[Dict[str, Any]]:
 
 # --------------------------------------- analyze -------------------------------------
 
+def _analyze():
+    import polars as pl
 
-import polars as pl
-from sglang.srt import warmup_deepgemm
+    df_raw = pl.DataFrame(read_output())
+    print(df_raw)
 
-df_raw = pl.DataFrame(warmup_deepgemm.read_output())
-print(df_raw)
+    df = df_raw.group_by('n', 'k').agg(pl.col('m').unique().sort()).sort('n', 'k')
+    with pl.Config(fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1):
+        print(df)
 
-df = df_raw.group_by('n', 'k').agg(pl.col('m').unique().sort()).sort('n', 'k')
-with pl.Config(fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1):
-    print(df)
-
-output_text = '\n'.join([
-    f'dict(n={row["n"]}, k={row["k"]}, m_min=1, m_max=8192),'
-    for row in df.iter_rows(named=True)
-])
-print(output_text)
+    output_text = '\n'.join([
+        f'dict(n={row["n"]}, k={row["k"]}, m_min=1, m_max=8192),'
+        for row in df.iter_rows(named=True)
+    ])
+    print(output_text)
 
 
 # --------------------------------------- entrypoint -------------------------------------
 
 def run():
     mp.set_start_method("spawn", force=True)
-    _warmup_raw(model_name=sys.argv[1])
+
+    _, cmd, *args = sys.argv
+    if cmd == 'warmup':
+        _warmup_raw(model_name=args[0])
+    elif cmd == 'analyze':
+        _analyze()
 
 
 if __name__ == '__main__':
