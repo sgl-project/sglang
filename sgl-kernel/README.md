@@ -51,6 +51,47 @@ Steps to add a new kernel:
 4. Update [CMakeLists.txt](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/CMakeLists.txt) to include new CUDA source
 5. Expose Python interface in [python](https://github.com/sgl-project/sglang/blob/main/sgl-kernel/python/sgl_kernel)
 
+### Development Tips
+
+1. When implementing kernels in [csrc](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/csrc), only define pure CUDA files and C++ interfaces. If you need to use `Torch::tensor`, use `<torch/all.h>` instead of `<torch/extension.h>`. Using `<torch/extension.h>` will cause compilation errors when using SABI.
+
+2. When creating torch extensions, simply add the function definition with `m.def`:
+   ```cpp
+   m.def("register_graph_buffers", register_graph_buffers);
+   ```
+
+3. When exposing Python interfaces, avoid using kwargs in C++ interface kernels.
+
+    **Avoid this:**
+
+    ```cpp
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
+        q=query.view(query.shape[0], -1, head_size),
+        k=key.view(key.shape[0], -1, head_size),
+        q_rope=query.view(query.shape[0], -1, head_size),
+        k_rope=key.view(key.shape[0], -1, head_size),
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=positions.long(),
+        interleave=(not is_neox),
+        cuda_stream=get_cuda_stream(),
+    )
+    ```
+
+    **Use this instead:**
+
+    ```cpp
+    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        cos_sin_cache,
+        positions.long(),
+        (not is_neox),
+        get_cuda_stream(),
+    )
+    ```
+
 ### Build & Install
 
 Development build:
