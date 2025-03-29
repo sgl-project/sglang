@@ -1065,10 +1065,17 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 weight_name,
                 index,
             ) in model.bitsandbytes_stacked_params_mapping.items():
+                if "visual" in quant_param_name:
+                    break
                 if shard_name in quant_param_name:
                     shard_index = index
                     quant_param_name = quant_param_name.replace(shard_name, weight_name)
                     break
+
+            if "visual" in quant_param_name:
+                quant_param_name = quant_param_name.replace(
+                    r"attn.qkv.", r"attn.qkv_proj."
+                )
 
             if quant_param_name not in param_dict:
                 raise ValueError(
