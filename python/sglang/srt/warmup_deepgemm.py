@@ -145,7 +145,7 @@ def _compute_infos_from_sources_raw(sources):
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info(
-        "Warmup DeepGEMM... This will only happen once and will be cached in `~/.deep_gemm`. "
+        "Warmup DeepGEMM... Compilation will only happen once and will be cached in `~/.deep_gemm`. "
         "If you like to warmup DeepGEMM without occupying lots of GPUs, "
         "please execute `python3 -m sglang.srt.warmup_deepgemm warmup DeepseekV3ForCausalLM`."
     )
