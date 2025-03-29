@@ -226,8 +226,13 @@ output_text = '\n'.join([
 ])
 print(output_text)
 
+
 # --------------------------------------- entrypoint -------------------------------------
 
-if __name__ == '__main__':
+def run():
     mp.set_start_method("spawn", force=True)
     _warmup_raw(model_name=sys.argv[1])
+
+
+if __name__ == '__main__':
+    run()
