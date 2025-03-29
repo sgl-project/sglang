@@ -529,9 +529,9 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        is_causal = True
+        causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
-            is_causal = False
+            causal = False
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -544,7 +544,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             self.forward_metadata.custom_mask,
-            is_causal,
+            causal,
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
             layer.scaling,
