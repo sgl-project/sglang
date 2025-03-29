@@ -8,6 +8,7 @@ import torch
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     get_batch_sizes_to_capture,
+    get_capture_configs,
     get_global_graph_memory_pool,
     set_global_graph_memory_pool,
     set_torch_compile_config,
@@ -39,11 +40,13 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.enable_hip_attention = model_runner.server_args.enable_hip_attention
         server_args = model_runner.server_args
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.num_tokens_per_bs = server_args.speculative_eagle_topk
+        self.capture_configs = get_capture_configs(model_runner.server_args)
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -92,8 +95,9 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        recorded_batch_sizes = {bs for bs, *_ in self.graphs}
         is_bs_supported = (
-            forward_batch.batch_size in self.graphs
+            forward_batch.batch_size in recorded_batch_sizes
             if self.disable_padding
             else forward_batch.batch_size <= self.max_bs
         )
@@ -102,7 +106,9 @@ class EAGLEDraftCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, num_seqs: int, forward: Callable):
+    def capture_one_batch_size(
+        self, num_seqs: int, forward: Callable, capture_config: tuple
+    ):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
@@ -224,8 +230,11 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         # Replay
-        self.graphs[bs].replay()
-        out = self.output_buffers[bs]
+        graph_handle = (bs,)
+        if self.enable_hip_attention:
+            graph_handle = (bs, forward_batch.hip_metadata_cached_stages)
+        self.graphs[graph_handle].replay()
+        out = self.output_buffers[graph_handle]
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
