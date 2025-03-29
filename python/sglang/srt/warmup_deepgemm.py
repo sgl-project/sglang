@@ -1,4 +1,13 @@
 """
+## How to avoid warmup occupy GPUs
+
+By default, the warmup is executed during startup of SGLang. However, this means SGLang will occupy GPU memory during warmup.
+If the user wants to avoid this, it can be done by directly calling the following command without starting a SGLang server:
+
+```
+python3 -m sglang.srt.warmup_deepgemm warmup DeepseekV3ForCausalLM
+```
+
 ## How to support warmup of a new model
 
 1. Capture
