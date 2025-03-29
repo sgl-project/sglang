@@ -1100,8 +1100,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            assert not (self.attn_tp_size != 1 and self.input_is_scattered)
-
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
