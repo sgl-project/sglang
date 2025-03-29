@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
 from types import MappingProxyType
-from typing import List, Mapping, Tuple, Union
+from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
 
