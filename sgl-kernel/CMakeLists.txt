@@ -5,7 +5,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 # FetchContent_MakeAvailable will build it.
 cmake_policy(SET CMP0169 OLD)
 
-find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
@@ -41,8 +41,8 @@ FetchContent_Declare(
 FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
+    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -86,6 +86,7 @@ option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
 option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
+option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -115,6 +116,12 @@ if (SGL_KERNEL_ENABLE_FP8)
         "-DFLASHINFER_ENABLE_FP8"
         "-DFLASHINFER_ENABLE_FP8_E4M3"
         "-DFLASHINFER_ENABLE_FP8_E5M2"
+    )
+endif()
+
+if (SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DENABLE_NVFP4=1"
     )
 endif()
 
@@ -155,7 +162,7 @@ set(SOURCES
 )
 
 # Support abi3 for build
-Python_add_library(common_ops MODULE USE_SABI 3.9 WITH_SOABI ${SOURCES})
+Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
@@ -164,3 +171,17 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+
+# JIT Logic
+# DeepGEMM
+
+install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
+        DESTINATION "deep_gemm"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
+        DESTINATION "deep_gemm/include/cute")
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
+        DESTINATION "deep_gemm/include/cutlass")
