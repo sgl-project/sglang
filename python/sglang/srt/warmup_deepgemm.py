@@ -22,7 +22,7 @@ rm -rf ~/.deep_gemm
 3. Execute your command
 python3 -m sglang.launch_server ...args-for-your-case...
 
-4. Check whether there are any prints indicating DeepGEMM is compiling
+4. Check whether there are any prints indicating DeepGEMM is compiling during server execution.
 """
 
 import json
