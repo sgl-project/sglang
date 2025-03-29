@@ -75,7 +75,10 @@ class Conversation:
     image_token: str = "<image>"
     audio_token: str = "<audio>"
 
+    video_token: str = "<video>"
+
     image_data: Optional[List[str]] = None
+    video_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -334,6 +337,10 @@ class Conversation:
         """Append a new message."""
         self.audio_data.append(audio)
 
+    def append_video(self, video: str):
+        """Append a new message."""
+        self.video_data.append(video)
+
     def update_last_message(self, message: str):
         """Update the last output.
 
@@ -429,6 +436,7 @@ def generate_embedding_convs(
             sep2=conv_template.sep2,
             stop_str=conv_template.stop_str,
             image_data=[],
+            video_data=[],
             modalities=[],
             image_token=conv_template.image_token,
         )
@@ -468,6 +476,7 @@ def generate_chat_conv(
         stop_str=conv.stop_str,
         image_data=[],
         audio_data=[],
+        video_data=[],
         modalities=[],
         image_token=conv.image_token,
         audio_token=conv.audio_token,
@@ -496,10 +505,15 @@ def generate_chat_conv(
                 real_content = ""
                 # calculate number of image_url
                 num_image_url = 0
+                num_video_url = 0
                 for content in message.content:
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
+                    elif content.type == "video_url":
+                        num_video_url += 1
+                        conv.modalities.append(content.modalities)
+
                 if num_image_url > 1:
                     image_token = conv.image_token
                 else:
@@ -509,6 +523,10 @@ def generate_chat_conv(
                         else conv.image_token
                     )
                 audio_token = conv.audio_token
+                if num_video_url > 1:
+                    video_token = conv.video_token
+                else:
+                    video_token = conv.video_token + "\n"
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -522,6 +540,9 @@ def generate_chat_conv(
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
 
+                    elif content.type == "video_url":
+                        real_content += video_token
+                        conv.append_video(content.video_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
@@ -643,6 +664,20 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="qwen2.5-vl",
+        system_message="You are a helpful language and vision assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
     )
 )
 
