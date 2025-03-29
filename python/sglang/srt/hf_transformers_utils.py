@@ -215,6 +215,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    use_fast: bool = False,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -232,6 +233,8 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
+    if use_fast:
+        kwargs["use_fast"] = use_fast
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,

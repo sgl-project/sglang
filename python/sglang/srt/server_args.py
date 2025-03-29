@@ -147,6 +147,9 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # Multimodal
+    use_fast_image_processor: bool = False
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     disable_cuda_graph: bool = False
@@ -899,6 +902,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The type of heavy channels in double sparsity attention",
+        )
+        # Multimodal
+        parser.add_argument(
+            "--use-fast-image-processor",
+            action="store_true",
+            help="Enable fast image processor in transformers",
         )
 
         # Optimization/debug options
