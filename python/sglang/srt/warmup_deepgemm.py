@@ -4,7 +4,6 @@
 import json
 import logging
 import multiprocessing as mp
-import shutil
 import sys
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Callable
@@ -193,12 +192,7 @@ def _write_output(info):
     print(f"WARMUP_DEEPGEMM_CAPTURE={info}")
 
 
-def clear_output():
-    shutil.rmtree(_dir_output, ignore_errors=True)
-    Path(_dir_output).mkdir(parents=True, exist_ok=True)
-
-
-def read_output() -> List[Dict[str, Any]]:
+def _read_output() -> List[Dict[str, Any]]:
     return [
         json.loads(row)
         for path in sorted(list(Path(_dir_output).glob("*.jsonl")))
@@ -212,7 +206,7 @@ def read_output() -> List[Dict[str, Any]]:
 def _analyze():
     import polars as pl
 
-    df_raw = pl.DataFrame(read_output())
+    df_raw = pl.DataFrame(_read_output())
     print(df_raw)
 
     df = df_raw.group_by('n', 'k').agg(pl.col('m').unique().sort()).sort('n', 'k')
