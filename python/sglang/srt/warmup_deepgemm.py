@@ -230,6 +230,8 @@ def run():
         _warmup_raw(model_name=args[0])
     elif cmd == 'analyze':
         _analyze()
+    else:
+        raise Exception(f'Unsupported {cmd=}')
 
 
 if __name__ == '__main__':
