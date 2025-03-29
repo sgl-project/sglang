@@ -157,8 +157,16 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
-        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
+        k_descale = (
+            layer.k_scale.expand(descale_shape)
+            if self.kv_cache_dtype_str != "auto"
+            else None
+        )
+        v_descale = (
+            layer.v_scale.expand(descale_shape)
+            if self.kv_cache_dtype_str != "auto"
+            else None
+        )
 
         page_table = metadata.page_table
 
@@ -174,7 +182,9 @@ class FlashAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             o = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q=q.contiguous()
+                .to(key_cache.dtype)
+                .view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -186,8 +196,8 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=True,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
         else:
             # Do absorbed multi-latent attention
@@ -220,8 +230,8 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
                 softcap=layer.logit_cap,
-                k_descale=layer.k_scale,
-                v_descale=layer.v_scale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -272,8 +282,16 @@ class FlashAttentionBackend(AttentionBackend):
         page_table = metadata.page_table
 
         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
-        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
+        k_descale = (
+            layer.k_scale.expand(descale_shape)
+            if self.kv_cache_dtype_str != "auto"
+            else None
+        )
+        v_descale = (
+            layer.v_scale.expand(descale_shape)
+            if self.kv_cache_dtype_str != "auto"
+            else None
+        )
 
         if not self.use_mla:
             # Do multi-head attention
@@ -289,7 +307,11 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             # Pre-reshape query tensor
-            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_reshaped = (
+                q.contiguous()
+                .to(key_cache.dtype)
+                .view(-1, layer.tp_q_head_num, layer.head_dim)
+            )
 
             # Run attention with precomputed values
             o = flash_attn_with_kvcache(
