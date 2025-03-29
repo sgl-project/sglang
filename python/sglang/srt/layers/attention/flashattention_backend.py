@@ -385,7 +385,7 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
             req_pool_indices, :
         ]
-        if forward_mode == ForwardMode.DECODE:
+        if forward_mode.is_cuda_graph():
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
