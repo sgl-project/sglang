@@ -33,6 +33,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
+import psutil
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.utils import get_bool_env_var, deduplicate
@@ -115,7 +116,7 @@ def _compute_infos_from_sources_raw(sources):
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=min(8, psutil.cpu_count(logical=False))) as executor:
         iterator = executor.map(_warmup_by_info, infos)
         list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
 
