@@ -65,6 +65,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_process_tree,
+    process_and_transfer_signal,
     launch_dummy_health_check_server,
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
@@ -426,28 +427,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             "at https://docs.flashinfer.ai/installation.html.",
         )
 
-    def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                "Child process unexpectedly failed with an exit code %d. pid=%d",
-                exitcode,
-                pid,
-            )
-
-    signal.signal(signal.SIGCHLD, sigchld_handler)
-
-    # Register the signal handler.
-    # The child processes will send SIGQUIT to this process when any error happens
-    # This process then clean up the whole process tree
-    def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, sigquit_handler)
-
+    process_and_transfer_signal()
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
