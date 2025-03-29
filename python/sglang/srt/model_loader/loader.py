@@ -298,6 +298,9 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
+            logger.info(
+                f"Context: {hf_folder=} {list(glob.glob(os.path.join(hf_folder, '**/*')))=} {allow_patterns=}"
+            )
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
