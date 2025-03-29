@@ -299,7 +299,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         if len(hf_weights_files) == 0:
             logger.info(
-                f"Context: {hf_folder=} {list(glob.glob(os.path.join(hf_folder, '**')))=} {allow_patterns=}"
+                f"Context: {hf_folder=} {list(glob.glob(os.path.join(hf_folder, '**'), recursive=True))=} {allow_patterns=}"
             )
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`"
