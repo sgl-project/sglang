@@ -91,6 +91,7 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 
 
 def _compute_infos_from_sources(sources):
+    # TODO for two-batch-overlap, here we need to consider `num_sms-20` as well
     num_sms = deep_gemm.get_num_sms()
     return list(_deduplicate(
         _compute_infos_from_sources_raw(sources),
