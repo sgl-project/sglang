@@ -10,7 +10,6 @@ import numpy as np
 import PIL
 import transformers
 from decord import VideoReader, cpu
-from openai import BadRequestError
 from PIL import Image
 
 from sglang.srt.utils import load_audio, load_image, logger
@@ -252,9 +251,7 @@ class BaseMultimodalProcessor(ABC):
 
             except Exception as e:
                 logger.error(f"An exception occurred while loading images: {e}")
-                raise BadRequestError(
-                    f"An exception occurred while loading images: {e}"
-                )
+                raise RuntimeError(f"An exception occurred while loading images: {e}")
 
         out = BaseMultiModalProcessorOutput(
             mm_data_hashes=hashes,
