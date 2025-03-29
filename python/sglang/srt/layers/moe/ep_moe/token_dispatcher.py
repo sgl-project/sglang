@@ -5,7 +5,7 @@ try:
 except ImportError:
     use_deepep = False
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -145,6 +145,7 @@ class DeepEPDispatcher:
     def deepep_permute(
         self,
         hidden_states,
+        hidden_scales,
         fp8_dtype=None,
         use_fp8_w8a8=False,
         use_block_quant=False,
@@ -162,10 +163,17 @@ class DeepEPDispatcher:
                 else hidden_states.dtype
             ),
         )
+        input_scales = torch.empty(
+            (int(num_total_tokens), hidden_states.shape[1] // 128),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
         # PreReorder
         deepep_permute_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
+            hidden_scales,
             gateup_input,
+            input_scales,
             src2dst,
             self.topk_idx,
             None,
@@ -174,11 +182,12 @@ class DeepEPDispatcher:
             BLOCK_SIZE=512,
         )
         self.src2dst = src2dst
-        return reorder_topk_ids, seg_indptr, gateup_input
+
+        return reorder_topk_ids, seg_indptr, gateup_input, input_scales
 
     def dispatch(
         self,
-        hidden_states: torch.Tensor,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
@@ -189,26 +198,24 @@ class DeepEPDispatcher:
         # Todo: enable low latency dispatch
         if True:  # not forward_mode.is_decode():
             (
-                hidden_states,
+                x,
                 topk_idx,
                 topk_weights,
                 num_recv_tokens_per_expert_list,
                 handle,
                 event,
-            ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+            ) = self.dispatch_normal(x, topk_idx, topk_weights, num_experts)
             self.tokens_per_expert = torch.tensor(
                 num_recv_tokens_per_expert_list,
-                device=hidden_states.device,
+                device=topk_idx.device,
                 dtype=torch.int64,
             )
         else:
-            hidden_states, recv_expert_count, handle, event, hook = (
-                self.dispatch_low_latency(
-                    hidden_states,
-                    topk_idx,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                )
+            x, recv_expert_count, handle, event, hook = self.dispatch_low_latency(
+                x,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
             )
             self.recv_expert_count = recv_expert_count
 
@@ -218,9 +225,13 @@ class DeepEPDispatcher:
         self.handle = handle
         self.topk_idx = topk_idx
         self.topk_weights = topk_weights
+
+        hidden_states, hidden_scales = x if isinstance(x, tuple) else (x, None)
         if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
-                hidden_states, fp8_dtype=hidden_states.dtype
+            reorder_topk_ids, seg_indptr, hidden_states, hidden_scales = (
+                self.deepep_permute(
+                    hidden_states, hidden_scales, fp8_dtype=hidden_states.dtype
+                )
             )
         else:
             reorder_topk_ids = torch.empty(
@@ -229,11 +240,11 @@ class DeepEPDispatcher:
             seg_indptr = torch.zeros(
                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
             )
-        return hidden_states, reorder_topk_ids, seg_indptr
+        return (hidden_states, hidden_scales), reorder_topk_ids, seg_indptr
 
     def dispatch_normal(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
