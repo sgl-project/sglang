@@ -199,6 +199,9 @@ void topk_softmax(
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
 
+std::vector<at::Tensor>
+moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk);
+
 /*
  * From csrc/speculative
  */
