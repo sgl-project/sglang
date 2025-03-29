@@ -1042,7 +1042,7 @@ class DeepEPMoE(EPMoE):
             )
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
-        # """
+        """
 
         # GroupGemm-1
         _, m, k = down_input.size()
