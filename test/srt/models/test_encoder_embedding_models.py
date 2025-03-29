@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5)]
 
-ATTENTION_BACKEND = ["native_torch", "triton", "fa3"]
+ATTENTION_BACKEND = ["torch_native", "triton", "fa3"]
 TORCH_DTYPES = [torch.float32]
 
 
