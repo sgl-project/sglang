@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import warmup_deepgemm
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -177,6 +178,9 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        # Execute warmups
+        warmup_deepgemm.warmup(server_args, self.model, gpu_id=self.gpu_id)
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
