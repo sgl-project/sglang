@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -59,6 +61,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        self.page_size = model_runner.page_size
+        self.use_mla = (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+        ) and (not global_server_args_dict["disable_mla"])
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
@@ -80,6 +86,17 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
+
+        # Precompute strided indices
+        # [0, page_size, 2 * page_size, ...]
+        if self.page_size > 1:
+            self.strided_indices = torch.arange(
+                0, metadata.page_table.shape[1], self.page_size, device=self.device
+            )
+            metadata.page_table = (
+                metadata.page_table[:, self.strided_indices] // self.page_size
+            )
+
         if forward_batch.forward_mode == ForwardMode.DECODE:
             # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
@@ -107,23 +124,30 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
                 )
+                if not self.use_mla:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
 
         # Use precomputed metadata
         metadata = self.forward_metadata
 
-        # # Use Flash Attention for prefill
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
@@ -132,31 +156,75 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-
         descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
         k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
         v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
 
-        o = flash_attn_with_kvcache(
-            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k_cache=key_cache.unsqueeze(1),
-            v_cache=value_cache.unsqueeze(1),
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.cache_seqlens_int32,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k_new=metadata.cu_seqlens_k,
-            max_seqlen_q=metadata.max_seq_len_q,
-            softmax_scale=layer.scaling,
-            causal=True,
-            window_size=window_size,
-            softcap=layer.logit_cap,
-            k_descale=k_descale,
-            v_descale=v_descale,
-        )
+        page_table = metadata.page_table
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        # # Use Flash Attention for prefill
+        if not self.use_mla:
+            # Do multi-head attention
+            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+            o = flash_attn_with_kvcache(
+                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=layer.k_scale,
+                v_descale=layer.v_scale,
+            )
+        else:
+            # Do absorbed multi-latent attention
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_rope = kv_cache[:, :, layer.v_head_dim :]
+            c_kv = kv_cache[:, :, : layer.v_head_dim]
+            k_rope_cache = k_rope.view(
+                -1,
+                self.page_size,
+                layer.tp_k_head_num,
+                layer.head_dim - layer.v_head_dim,
+            )
+            c_kv_cache = c_kv.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
+
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = q_all[:, :, : layer.v_head_dim]
+            q_rope = q_all[:, :, layer.v_head_dim :]
+            o = flash_attn_with_kvcache(
+                q=q_rope,
+                k_cache=k_rope_cache,
+                v_cache=c_kv_cache,
+                qv=q_nope,
+                page_table=page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=layer.scaling,
+                causal=True,
+                softcap=layer.logit_cap,
+                k_descale=layer.k_scale,
+                v_descale=layer.v_scale,
+            )
+
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -169,28 +237,28 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Forward pass with FlashAttention using precomputed metadata."""
         # Save KV cache if needed
-        if k is not None and v is not None and save_kv_cache:
-            cache_loc = (
-                forward_batch.out_cache_loc
-                if not layer.is_cross_attention
-                else forward_batch.encoder_out_cache_loc
-            )
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-
-        # Get KV cache
-        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
-        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                if not self.use_mla:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
 
         # Use precomputed metadata
         metadata = self.forward_metadata
-
-        # Pre-reshape query tensor
-        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -200,25 +268,83 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-        # Run attention with precomputed values
-        o = flash_attn_with_kvcache(
-            q=q_reshaped,
-            k_cache=key_cache.unsqueeze(1),
-            v_cache=value_cache.unsqueeze(1),
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.cache_seqlens_int32,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k_new=metadata.cu_seqlens_k,
-            max_seqlen_q=1,
-            softmax_scale=layer.scaling,
-            causal=True,
-            window_size=window_size,
-            softcap=layer.logit_cap,
-            k_descale=k_descale,
-            v_descale=v_descale,
-        )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        page_table = metadata.page_table
+
+        descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+        k_descale = layer.k_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.k_scale_float != 1.0 else None
+        v_descale = layer.v_scale.expand(descale_shape) if self.kv_cache_dtype_str != "auto" and layer.v_scale_float != 1.0 else None
+
+        if not self.use_mla:
+            # Do multi-head attention
+
+            # Get KV cache
+            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            value_cache = value_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
+
+            # Pre-reshape query tensor
+            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+            # Run attention with precomputed values
+            o = flash_attn_with_kvcache(
+                q=q_reshaped,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=1,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+        else:
+            # Do absorbed multi-latent attention
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_rope = kv_cache[:, :, layer.v_head_dim :]
+            c_kv = kv_cache[:, :, : layer.v_head_dim]
+            k_rope_cache = k_rope.view(
+                -1,
+                self.page_size,
+                layer.tp_k_head_num,
+                layer.head_dim - layer.v_head_dim,
+            )
+            c_kv_cache = c_kv.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
+
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = q_all[:, :, : layer.v_head_dim]
+            q_rope = q_all[:, :, layer.v_head_dim :]
+
+            o = flash_attn_with_kvcache(
+                q=q_rope,
+                k_cache=k_rope_cache,
+                v_cache=c_kv_cache,
+                qv=q_nope,
+                page_table=page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=1,
+                softmax_scale=layer.scaling,
+                causal=True,
+                softcap=layer.logit_cap,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int):
         """Initialize CUDA graph state for the attention backend.
@@ -233,7 +359,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {
             # Page table for token mapping (batch_size, max_context_len)
             "page_table": torch.zeros(
-                max_bs, self.max_context_len, dtype=torch.int32, device=self.device
+                max_bs,
+                (self.max_context_len + self.page_size - 1) // self.page_size,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=self.device
             ),
         }
 
@@ -297,14 +429,14 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seq_lens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
 
-        # Only zero out the part out of max_len_k
-        metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
-        # Then do the copy
-        metadata.page_table[:, : metadata.max_seq_len_k].copy_(
-            self.req_to_token[req_pool_indices[:bs], : metadata.max_seq_len_k]
-        )
-
-        self.forward_decode_metadata = metadata
+        max_seq_pages = (metadata.max_seq_len_k + self.page_size - 1) // self.page_size
+        page_indices = self.req_to_token[
+            :, self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages]
+        ]
+        page_indices = page_indices[req_pool_indices[:bs]] // self.page_size
+        metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+        metadata.page_table[:, max_seq_pages:].fill_(0)
+        self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""

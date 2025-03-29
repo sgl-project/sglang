@@ -4,19 +4,15 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
   workflow_dispatch:
     inputs:
       version:
@@ -114,6 +110,12 @@ jobs:
         run: |
           cd test/srt
           python3 test_verl_engine.py
+
+      - name: Test Patch Torch
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 test_patch_torch.py
 
       - name: Test expert parallelism (EP=2)
         timeout-minutes: 10

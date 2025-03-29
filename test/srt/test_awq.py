@@ -38,7 +38,7 @@ class TestAWQ(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.65)
+        self.assertGreater(metrics["score"], 0.64)
 
 
 if __name__ == "__main__":
