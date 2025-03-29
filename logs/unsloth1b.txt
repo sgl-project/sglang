@@ -1,0 +1,1202 @@
+INFO 03-25 03:55:56 __init__.py:190] Automatically detected platform cuda.
+INFO 03-25 03:56:04 __init__.py:190] Automatically detected platform cuda.
+INFO 03-25 03:56:04 __init__.py:190] Automatically detected platform cuda.
+Model config: <sglang.srt.configs.model_config.ModelConfig object at 0x7fa9e1e67160>
+LlamaModel layers: ModuleList(
+  (0-15): 16 x LlamaDecoderLayer(
+    (self_attn): LlamaAttention(
+      (qkv_proj): QKVParallelLinear(in_features=2048, output_features=3072, bias=False, tp_size=1, gather_output=False)
+      (o_proj): RowParallelLinear(input_features=2048, output_features=2048, bias=False, tp_size=1, reduce_results=True)
+      (rotary_emb): Llama3RotaryEmbedding(head_size=64, rotary_dim=64, max_position_embeddings=131072, base=500000.0, is_neox_style=True)
+      (attn): RadixAttention()
+    )
+    (mlp): LlamaMLP(
+      (gate_up_proj): MergedColumnParallelLinear(in_features=2048, output_features=16384, bias=False, tp_size=1, gather_output=False)
+      (down_proj): RowParallelLinear(input_features=8192, output_features=2048, bias=False, tp_size=1, reduce_results=True)
+      (act_fn): SiluAndMul()
+    )
+    (input_layernorm): RMSNorm()
+    (post_attention_layernorm): RMSNorm()
+  )
+)
+Parameters: {'model.embed_tokens.weight': Parameter containing:
+tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        ...,
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0'), 'model.layers.0.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.0.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.0.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[  0],
+        [  0],
+        [128],
+        ...,
+        [251],
+        [127],
+        [ 63]], device='cuda:0', dtype=torch.uint8), 'model.layers.0.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.0.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.0.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.1.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.1.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.1.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[ 0],
+        [ 0],
+        [ 0],
+        ...,
+        [63],
+        [74],
+        [60]], device='cuda:0', dtype=torch.uint8), 'model.layers.1.mlp.down_proj.weight': Parameter containing:
+tensor([[  0],
+        [  0],
+        [  0],
+        ...,
+        [ 64],
+        [202],
+        [ 59]], device='cuda:0', dtype=torch.uint8), 'model.layers.1.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.1.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.2.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[  0],
+        [  0],
+        [128],
+        ...,
+        [ 12],
+        [ 11],
+        [ 60]], device='cuda:0', dtype=torch.uint8), 'model.layers.2.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.2.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.2.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.2.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.2.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.3.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[  0],
+        [  0],
+        [176],
+        ...,
+        [249],
+        [ 48],
+        [ 60]], device='cuda:0', dtype=torch.uint8), 'model.layers.3.self_attn.o_proj.weight': Parameter containing:
+tensor([[  0],
+        [  0],
+        [224],
+        ...,
+        [ 65],
+        [ 74],
+        [ 60]], device='cuda:0', dtype=torch.uint8), 'model.layers.3.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.3.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.3.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.3.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.4.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.4.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.4.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.4.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.4.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.4.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.5.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.5.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.5.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.5.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.5.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.5.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.6.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.6.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.6.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.6.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.6.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.6.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.7.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.7.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.7.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.7.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.7.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.7.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.8.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.8.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.8.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.8.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.8.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.8.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.9.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.9.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.9.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.9.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.9.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.9.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.10.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.10.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.10.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.10.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.10.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.10.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.11.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.11.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.11.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.11.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.11.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.11.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.12.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.12.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.12.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.12.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.12.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.12.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.13.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.13.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.13.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.13.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.13.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.13.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.14.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.14.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.14.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.14.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.14.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.14.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.15.self_attn.qkv_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.15.self_attn.o_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.15.mlp.gate_up_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.15.mlp.down_proj.weight': Parameter containing:
+tensor([[0],
+        [0],
+        [0],
+        ...,
+        [0],
+        [0],
+        [0]], device='cuda:0', dtype=torch.uint8), 'model.layers.15.input_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.layers.15.post_attention_layernorm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True), 'model.norm.weight': Parameter containing:
+tensor([1., 1., 1.,  ..., 1., 1., 1.], device='cuda:0', requires_grad=True)}
+Weights: <generator object DefaultModelLoader._get_all_weights at 0x7fa9e1d378b0>
+Loading weight for model.embed_tokens.weight with shape torch.Size([128256, 2048])
+Loading weight for model.layers.0.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.0.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.0.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.0.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.0.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.0.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.0.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.0.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.0.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.0.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.0.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.0.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.0.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.0.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.0.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.0.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.0.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.0.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.0.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.0.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.0.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.0.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.0.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.0.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.0.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.0.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.0.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.0.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.0.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.0.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.1.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.1.mlp.down_proj.weight with shape torch.Size([2048, 8192])
+Loading weight for model.layers.1.mlp.gate_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.1.mlp.up_proj.weight with shape torch.Size([8192, 2048])
+Loading weight for model.layers.1.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.1.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.1.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.1.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.1.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.1.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.1.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.1.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.1.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.1.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.1.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.1.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.1.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.1.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.1.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.1.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.1.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.1.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.1.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.1.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.10.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.10.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.10.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.10.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.10.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.10.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.10.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.10.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.10.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.10.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.10.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.10.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.10.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.10.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.10.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.10.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.10.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.10.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.10.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.10.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.10.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.10.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.10.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.10.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.10.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.10.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.10.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.10.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.10.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.10.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.11.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.11.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.11.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.11.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.11.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.11.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.11.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.11.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.11.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.11.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.11.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.11.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.11.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.11.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.11.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.11.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.11.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.11.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.11.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.11.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.11.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.11.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.11.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.11.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.11.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.11.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.11.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.11.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.11.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.11.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.12.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.12.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.12.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.12.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.12.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.12.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.12.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.12.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.12.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.12.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.12.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.12.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.12.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.12.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.12.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.12.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.12.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.12.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.12.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.12.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.12.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.12.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.12.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.12.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.12.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.12.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.12.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.12.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.12.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.12.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.13.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.13.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.13.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.13.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.13.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.13.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.13.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.13.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.13.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.13.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.13.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.13.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.13.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.13.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.13.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.13.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.13.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.13.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([170])
+Loading weight for model.layers.13.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.13.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.13.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.13.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.13.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.13.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.13.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.13.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.13.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.13.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.13.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.13.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.14.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.14.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.14.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.14.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.14.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.14.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.14.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.14.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.14.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.14.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.14.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.14.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.14.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.14.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.14.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.14.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.14.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.14.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.14.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.14.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.14.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.14.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.14.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.14.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.14.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.14.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.14.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.14.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.14.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.14.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([170])
+Loading weight for model.layers.15.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.15.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.15.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.15.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.15.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.15.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.15.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.15.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.15.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.15.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.15.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.15.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.15.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.15.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.15.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.15.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.15.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.15.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.15.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.15.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.15.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.15.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.15.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.15.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.15.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.15.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.15.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.15.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.15.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.15.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.2.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.2.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.2.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.2.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.2.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.2.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.2.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.2.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.2.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.2.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.2.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.2.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.2.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.2.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.2.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.2.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.2.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.2.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.2.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.2.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.2.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.2.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.2.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.2.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.2.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.2.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.2.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.2.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.2.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.2.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.3.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.3.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.3.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.3.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.3.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.3.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.3.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.3.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.3.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.3.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.3.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.3.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.3.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.3.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.3.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.3.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.3.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.3.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.3.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.3.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.3.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.3.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.3.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.3.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.3.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.3.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.3.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.3.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.3.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.3.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.4.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.4.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.4.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.4.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.4.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([170])
+Loading weight for model.layers.4.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.4.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.4.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.4.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.4.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.4.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.4.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.4.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.4.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.4.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.4.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.4.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.4.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.4.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.4.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.4.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.4.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.4.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.4.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.4.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.4.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.4.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.4.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.4.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.4.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.5.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.5.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.5.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.5.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.5.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.5.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.5.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.5.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.5.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.5.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.5.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.5.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.5.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.5.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.5.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.5.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.5.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.5.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.5.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.5.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.5.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.5.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.5.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.5.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.5.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.5.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.5.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.5.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.5.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.5.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([169])
+Loading weight for model.layers.6.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.6.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.6.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.6.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.6.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.6.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.6.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.6.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.6.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.6.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.6.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.6.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.6.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.6.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.6.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.6.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.6.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.6.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.6.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.6.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.6.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.6.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.6.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.6.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.6.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.6.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.6.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.6.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.6.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.6.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.7.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.7.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.7.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.7.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.7.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.7.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.7.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.7.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.7.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.7.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.7.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.7.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.7.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.7.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.7.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.7.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.7.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.7.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.7.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.7.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.7.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.7.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.7.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.7.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([170])
+Loading weight for model.layers.7.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.7.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.7.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.7.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.7.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.7.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.8.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.8.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.8.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.8.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.8.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.8.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.8.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.8.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.8.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.8.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.8.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.8.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.8.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.8.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.8.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.8.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.8.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.8.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.8.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.8.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.8.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.8.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.8.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.8.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.8.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.8.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.8.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.8.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.8.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.8.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([170])
+Loading weight for model.layers.9.input_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.9.mlp.down_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.9.mlp.down_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.9.mlp.down_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.9.mlp.down_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.mlp.down_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.mlp.down_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.9.mlp.gate_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.9.mlp.gate_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.9.mlp.gate_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.9.mlp.gate_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.mlp.gate_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.mlp.gate_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.9.mlp.up_proj.weight with shape torch.Size([8388608, 1])
+Loading weight for model.layers.9.mlp.up_proj.weight.absmax with shape torch.Size([262144])
+Loading weight for model.layers.9.mlp.up_proj.weight.nested_absmax with shape torch.Size([1024])
+Loading weight for model.layers.9.mlp.up_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.mlp.up_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.mlp.up_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.9.post_attention_layernorm.weight with shape torch.Size([2048])
+Loading weight for model.layers.9.self_attn.k_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.9.self_attn.k_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.9.self_attn.k_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.9.self_attn.k_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.k_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.self_attn.k_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([171])
+Loading weight for model.layers.9.self_attn.o_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.9.self_attn.o_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.9.self_attn.o_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.o_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.o_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.self_attn.o_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([173])
+Loading weight for model.layers.9.self_attn.q_proj.weight with shape torch.Size([2097152, 1])
+Loading weight for model.layers.9.self_attn.q_proj.weight.absmax with shape torch.Size([65536])
+Loading weight for model.layers.9.self_attn.q_proj.weight.nested_absmax with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.q_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.q_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.self_attn.q_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.layers.9.self_attn.v_proj.weight with shape torch.Size([524288, 1])
+Loading weight for model.layers.9.self_attn.v_proj.weight.absmax with shape torch.Size([16384])
+Loading weight for model.layers.9.self_attn.v_proj.weight.nested_absmax with shape torch.Size([64])
+Loading weight for model.layers.9.self_attn.v_proj.weight.nested_quant_map with shape torch.Size([256])
+Loading weight for model.layers.9.self_attn.v_proj.weight.quant_map with shape torch.Size([16])
+Loading weight for model.layers.9.self_attn.v_proj.weight.quant_state.bitsandbytes__nf4 with shape torch.Size([172])
+Loading weight for model.norm.weight with shape torch.Size([2048])
