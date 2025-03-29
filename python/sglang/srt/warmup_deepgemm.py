@@ -30,11 +30,11 @@ import logging
 import multiprocessing as mp
 import sys
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional, Callable
+from typing import List, Tuple, Dict, Any, Optional
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, deduplicate
 from tqdm import tqdm
 
 try:
@@ -93,7 +93,7 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 def _compute_infos_from_sources(sources):
     # TODO for two-batch-overlap, here we need to consider `num_sms-20` as well
     num_sms = deep_gemm.get_num_sms()
-    return list(_deduplicate(
+    return list(deduplicate(
         _compute_infos_from_sources_raw(sources),
         key_fn=lambda info: _compute_deep_gemm_kernel_deduplicate_key(info, num_sms),
     ))
@@ -110,16 +110,6 @@ def _compute_infos_from_sources_raw(sources):
     for source in sources:
         for m in range(source['m_min'], source['m_max'] + 1):
             yield dict(m=m, n=source['n'], k=source['k'])
-
-
-def _deduplicate(items, key_fn: Callable):
-    seen_keys = set()
-    for item in items:
-        item_key = key_fn(item)
-        if item_key in seen_keys:
-            continue
-        seen_keys.add(item_key)
-        yield item
 
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):

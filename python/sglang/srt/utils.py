@@ -1766,3 +1766,13 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+def deduplicate(items, key_fn: Callable):
+    seen_keys = set()
+    for item in items:
+        item_key = key_fn(item)
+        if item_key in seen_keys:
+            continue
+        seen_keys.add(item_key)
+        yield item
+
