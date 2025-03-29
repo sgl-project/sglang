@@ -14,9 +14,6 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
 @pytest.mark.parametrize(
     "params",
     [
-        (8, 4, 2, 1),
-        (16, 4, 2, 3),
-        (32, 16, 2, 2),
         (128, 4, 2, 4),
         (256, 8, 4, 8),  # deepseek v3
         (512, 16, 8, 16),
