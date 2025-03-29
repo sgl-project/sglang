@@ -237,7 +237,9 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
-    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+    local_files_only = huggingface_hub.constants.HF_HUB_OFFLINE
+
+    if not local_files_only:
         # Before we download we look at that is available:
         fs = HfFileSystem()
         file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
@@ -260,7 +262,7 @@ def download_weights_from_hf(
             cache_dir=cache_dir,
             tqdm_class=DisabledTqdm,
             revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            local_files_only=local_files_only,
         )
     return hf_folder
 
