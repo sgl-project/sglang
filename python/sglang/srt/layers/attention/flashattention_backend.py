@@ -297,7 +297,6 @@ class FlashAttentionBackend(AttentionBackend):
             # Pre-reshape query tensor
             q_reshaped = (
                 q.contiguous()
-                .to(key_cache.dtype)
                 .view(-1, layer.tp_q_head_num, layer.head_dim)
             )
 
