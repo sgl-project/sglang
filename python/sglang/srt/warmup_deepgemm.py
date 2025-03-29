@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 import torch
+from torch.cuda import OutOfMemoryError
 from tqdm import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -134,8 +135,13 @@ def _warmup_by_infos(infos: List[Dict[str, Any]]):
 
 
 def _warmup_by_info(info: Dict[str, Any]):
-    x_fp8, y_fp8, out = _construct_gemm_inputs(m=info["m"], k=info["k"], n=info["n"])
-    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+    try:
+        x_fp8, y_fp8, out = _construct_gemm_inputs(
+            m=info["m"], k=info["k"], n=info["n"]
+        )
+        deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+    except OutOfMemoryError as e:
+        logger.warning(f"warmup_by_info skip {info=} because of OOM ({e=})")
 
 
 # Copied from DeepGEMM's `test_core.py` :: `construct`
