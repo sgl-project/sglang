@@ -7,6 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
+from sglang.srt.utils import get_device, get_device_count
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -28,11 +29,15 @@ def _process_return(ret):
 
 
 class TestGetWeightsByName(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = get_device()
+        cls.num_gpus = get_device_count()
 
     def init_hf_model(self, model_name, tie_word_embeddings):
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype="bfloat16", tie_word_embeddings=tie_word_embeddings
-        ).to("cuda:0")
+        ).to(f"{self.device}:0")
 
     def init_backend(self, backend, dp, tp, model_name):
         self.backend = backend
@@ -61,7 +66,9 @@ class TestGetWeightsByName(CustomTestCase):
     def clean_up(self):
         del self.hf_model
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         if self.backend == "Engine":
             self.engine.shutdown()
         else:
@@ -132,11 +139,11 @@ class TestGetWeightsByName(CustomTestCase):
                 ("Runtime", 1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
                 ("Engine", 1, 1, DEFAULT_MODEL_NAME_FOR_TEST),
             ]
-            if torch.cuda.device_count() >= 2:
+            if self.num_gpus >= 2:
                 test_suits.append(("Engine", 1, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST))
                 test_suits.append(("Runtime", 2, 1, DEFAULT_MODEL_NAME_FOR_TEST))
 
-            if torch.cuda.device_count() >= 4:
+            if self.num_gpus >= 4:
                 test_suits.extend(
                     [
                         ("Engine", 2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
