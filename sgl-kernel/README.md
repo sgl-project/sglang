@@ -39,6 +39,7 @@ Third-party libraries:
 - [CCCL](https://github.com/NVIDIA/cccl)
 - [CUTLASS](https://github.com/NVIDIA/cutlass)
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
+- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
 
 ### Kernel Development
 
