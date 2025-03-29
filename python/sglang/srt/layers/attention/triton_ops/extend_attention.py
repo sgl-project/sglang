@@ -95,7 +95,11 @@ def _fwd_kernel(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
     offs_m = tl.arange(0, BLOCK_M)
-    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
+
+    if IS_CAUSAL:
+        mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
+    else:
+        mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len
 
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
@@ -129,7 +133,12 @@ def _fwd_kernel(
 
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_len_prefix
+
+        if IS_CAUSAL:
+            mask_n = (start_n + offs_n) < cur_seq_len_prefix
+        else:
+            mask_n = (start_n + offs_n) < cur_seq_len
+
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
         )
@@ -174,8 +183,8 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        elif IS_CAUSAL:
-            qk = tl.where(mask_m[:, :] & mask_n[:, :], qk, float("-inf"))
+        else:
+            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -200,7 +209,11 @@ def _fwd_kernel(
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_block_m_end
+
+        if IS_CAUSAL:
+            mask_n = (start_n + offs_n) < cur_block_m_end
+        else:
+            mask_n = (start_n + offs_n) < cur_seq_len
 
         # load k in transposed way
         offs_k = (
@@ -250,6 +263,10 @@ def _fwd_kernel(
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
+        else:
+            mask_non_causal = (cur_block_m * BLOCK_M + offs_m[:, None]) < cur_seq_len
+            mask_non_causal &= mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(mask_non_causal, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
