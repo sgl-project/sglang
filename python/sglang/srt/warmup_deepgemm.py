@@ -195,7 +195,6 @@ def _compute_info_from_args(lhs, rhs):
     return dict(m=m, k=k, n=n)
 
 
-# TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
 def _write_output(info):
     tp_rank = get_tensor_model_parallel_rank()
     path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
