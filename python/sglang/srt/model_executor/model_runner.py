@@ -179,7 +179,7 @@ class ModelRunner:
         self.load_model()
 
         # Execute warmups
-        warmup_deepgemm.warmup(server_args, self.model)
+        warmup_deepgemm.warmup(server_args, self.model, gpu_id=self.gpu_id)
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
