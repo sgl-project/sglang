@@ -29,6 +29,7 @@ import json
 import logging
 import multiprocessing as mp
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -114,12 +115,9 @@ def _compute_infos_from_sources_raw(sources):
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
-    # TODO use process pool executor
-    # with ProcessPoolExecutor(max_workers=16) as executor:
-    #     iterator = executor.map(_warmup_by_info, infos)
-    #     list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
-    for info in tqdm(infos, total=len(infos), desc='Warmup DeepGEMM'):
-        _warmup_by_info(info)
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        iterator = executor.map(_warmup_by_info, infos)
+        list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
 
 
 def _warmup_by_info(info: Dict[str, Any]):
