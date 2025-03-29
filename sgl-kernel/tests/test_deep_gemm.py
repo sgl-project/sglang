@@ -23,27 +23,23 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (
-        (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n),
-        (x_amax / 448.0).view(m, -1),
-    )
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, n
+    ), (x_amax / 448.0).view(m, -1)
 
 
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros(
-        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128),
-        dtype=x.dtype,
-        device=x.device,
+        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
     )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
-    return (
-        x_scaled.view_as(x_padded)[:m, :n].contiguous(),
-        (x_amax / 448.0).view(x_view.size(0), x_view.size(2)),
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(
+        x_view.size(0), x_view.size(2)
     )
 
 
@@ -57,9 +53,7 @@ def construct(m: int, k: int, n: int) -> Tuple[
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     ref_out = x @ y.t()
-
     x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
-    # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
@@ -76,7 +70,6 @@ def construct_grouped(
     y = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
     out = torch.empty((num_groups, m, n), device="cuda", dtype=torch.bfloat16)
     ref_out = torch.einsum("gmk,gnk->gmn", x, y)
-
     assert m % 4 == 0, f"TMA alignment error: {m}"
     x_fp8 = (
         torch.empty_like(x, dtype=torch.float8_e4m3fn),
@@ -91,83 +84,84 @@ def construct_grouped(
     for i in range(num_groups):
         x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-
-    # For non-masked input, we must merge the group and M dims
     if not is_masked:
         x_fp8 = (x_fp8[0].view(-1, k), per_token_cast_to_fp8(x.view(-1, k))[1])
         out, ref_out = out.view(-1, n), ref_out.view(-1, n)
-
-    # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
 
 
-def test_gemm():
-    print("Testing GEMM:")
-    for m in (64, 128, 4096):
-        for k, n in [
-            (7168, 2112),
-            (1536, 24576),
-            (512, 32768),
-            (16384, 7168),
-            (7168, 4096),
-            (2048, 7168),
-        ]:
-            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-            diff = calc_diff(out, ref_out)
-            assert diff < 0.001, f"{m=}, {k=}, {n=}, {diff:.5f}"
+@pytest.mark.parametrize(
+    "m,k,n",
+    [
+        (64, 7168, 2112),
+        (64, 1536, 24576),
+        (64, 512, 32768),
+        (64, 16384, 7168),
+        (64, 7168, 4096),
+        (64, 2048, 7168),
+        (128, 7168, 2112),
+        (128, 1536, 24576),
+        (128, 512, 32768),
+        (128, 16384, 7168),
+        (128, 7168, 4096),
+        (128, 2048, 7168),
+        (4096, 7168, 2112),
+        (4096, 1536, 24576),
+        (4096, 512, 32768),
+        (4096, 16384, 7168),
+        (4096, 7168, 4096),
+        (4096, 2048, 7168),
+    ],
+)
+def test_gemm(m: int, k: int, n: int):
+    x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+    deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+    diff = calc_diff(out, ref_out)
+    assert diff < 0.001, f"{m=}, {k=}, {n=}, {diff:.5f}"
 
 
-def test_m_grouped_gemm_contiguous():
-    print("Testing grouped contiguous GEMM:")
-    for num_groups, m, k, n in (
+@pytest.mark.parametrize(
+    "num_groups,m,k,n",
+    [
         (4, 8192, 7168, 4096),
         (4, 8192, 2048, 7168),
         (8, 4096, 7168, 4096),
         (8, 4096, 2048, 7168),
-    ):
-        # TODO: make a stronger test
-        x_fp8, y_fp8, out, ref_out = construct_grouped(
-            num_groups, m, k, n, is_masked=False
-        )
-        m_indices = torch.arange(0, num_groups, device="cuda", dtype=torch.int)
-        m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            x_fp8, y_fp8, out, m_indices
-        )
-        diff = calc_diff(out, ref_out)
-        assert diff < 0.001, f"m={m * num_groups}, {k=}, {n=}, {diff:.5f}"
+    ],
+)
+def test_m_grouped_gemm_contiguous(num_groups: int, m: int, k: int, n: int):
+    x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
+    m_indices = (
+        torch.arange(0, num_groups, device="cuda", dtype=torch.int)
+        .unsqueeze(-1)
+        .expand(num_groups, m)
+        .contiguous()
+        .view(-1)
+    )
+    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+    diff = calc_diff(out, ref_out)
+    assert diff < 0.001, f"m={m * num_groups}, {k=}, {n=}, {diff:.5f}"
 
 
-def test_m_grouped_gemm_masked():
-    print("Testing grouped masked GEMM:")
-    for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
-        for k, n in ((7168, 4096), (2048, 7168)):
-            # Test correctness
-            masked_m_candidates = list(
-                filter(lambda candidate: candidate <= m, (64, 128, 192, 256, 320, 384))
-            )
-            for i in range(10):
-                x_fp8, y_fp8, out, ref_out = construct_grouped(
-                    num_groups, m, k, n, is_masked=True
-                )
-                masked_m = torch.empty((num_groups,), device="cuda", dtype=torch.int)
-                for j in range(num_groups):
-                    masked_m[j] = random.choice(masked_m_candidates)
-                expected_m = min(int(masked_m.float().mean()) + 1, m)
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-                    x_fp8, y_fp8, out, masked_m, expected_m
-                )
-                for j in range(num_groups):
-                    diff = calc_diff(
-                        out[j, : masked_m[j].item()],
-                        ref_out[j, : masked_m[j].item()],
-                    )
-                    assert diff < 0.001, (
-                        f"{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, "
-                        f"{num_groups=}, {diff:.5f}"
-                    )
+@pytest.mark.parametrize("num_groups,m", [(1, 1024), (2, 512), (4, 256)])
+@pytest.mark.parametrize("k,n", [(7168, 4096), (2048, 7168)])
+@pytest.mark.parametrize("trial", range(10))
+def test_m_grouped_gemm_masked(num_groups: int, m: int, k: int, n: int, trial: int):
+    masked_m_candidates = [c for c in (64, 128, 192, 256, 320, 384) if c <= m]
+    x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+    masked_m = torch.empty((num_groups,), device="cuda", dtype=torch.int)
+    for j in range(num_groups):
+        masked_m[j] = random.choice(masked_m_candidates)
+    expected_m = min(int(masked_m.float().mean()) + 1, m)
+    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        x_fp8, y_fp8, out, masked_m, expected_m
+    )
+    for j in range(num_groups):
+        diff = calc_diff(out[j, : masked_m[j].item()], ref_out[j, : masked_m[j].item()])
+        assert (
+            diff < 0.001
+        ), f"{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}"
 
 
 class Capture:
@@ -194,10 +188,7 @@ class Capture:
 
 
 def test_jit():
-    # Runtime
     print(f"NVCC compiler: {jit.get_nvcc_compiler()}\n")
-
-    # Templates
     print("Generated code:")
     args = (
         ("lhs", torch.float8_e4m3fn),
@@ -216,12 +207,8 @@ def test_jit():
     body += "std::cout << reinterpret_cast<uint64_t>(stream) << std::endl;\n"
     code = jit.generate((), args, body)
     print(code)
-
-    # Build
     print("Building ...")
     func = jit.build("test_func", args, code)
-
-    # Test correctness
     print("Running ...")
     fp8_tensor = torch.empty((1,), dtype=torch.float8_e4m3fn, device="cuda")
     fp32_tensor = torch.empty((1,), dtype=torch.float, device="cuda")
@@ -237,14 +224,7 @@ def test_jit():
         )
         assert ret_val == 0, "Function did not return 0"
     output = capture.capture()
-    ref_output = (
-        f"{fp8_tensor.data_ptr()}\n"
-        f"{fp8_tensor.data_ptr()}\n"
-        f"{fp32_tensor.data_ptr()}\n"
-        f"{bf16_tensor.data_ptr()}\n"
-        f"1\n"
-        f"{torch.cuda.current_stream().cuda_stream}\n"
-    )
+    ref_output = f"{fp8_tensor.data_ptr()}\n{fp8_tensor.data_ptr()}\n{fp32_tensor.data_ptr()}\n{bf16_tensor.data_ptr()}\n1\n{torch.cuda.current_stream().cuda_stream}\n"
     assert output == ref_output, f"{output=}, {ref_output=}"
 
 
