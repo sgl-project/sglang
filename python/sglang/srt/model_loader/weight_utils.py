@@ -28,13 +28,12 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-from tqdm.auto import tqdm
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +236,7 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
-    local_files_only = huggingface_hub.constants.HF_HUB_OFFLINE
+    local_files_only = _should_hf_local_files_only()
 
     if not local_files_only:
         # Before we download we look at that is available:
@@ -265,6 +264,13 @@ def download_weights_from_hf(
             local_files_only=local_files_only,
         )
     return hf_folder
+
+
+def _should_hf_local_files_only():
+    if TODO:
+        return True
+
+    return huggingface_hub.constants.HF_HUB_OFFLINE
 
 
 def download_safetensors_index_file_from_hf(
