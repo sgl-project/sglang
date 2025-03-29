@@ -40,6 +40,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -138,27 +139,40 @@ class Qwen2VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        if attn_implementation == "sdpa":
-            use_context_forward = False
-            softmax_in_single_precision = False
-        elif attn_implementation == "flash_attention_2":
-            softmax_in_single_precision = False
-            use_context_forward = True
-        elif attn_implementation == "eager":
-            softmax_in_single_precision = True
-            use_context_forward = False
 
-        self.attn = VisionAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            projection_size=dim,
-            use_qkv_parallel=False,
-            use_context_forward=use_context_forward,
-            softmax_in_single_precision=softmax_in_single_precision,
-            flatten_batch=True,
-            quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
-        )
+        if attn_implementation == "radix":
+            self.attn = RadixAttention(
+                num_heads=num_heads,
+                head_dim=dim // num_heads,
+                scaling=1.0,
+                num_kv_heads=num_heads,
+                layer_id=0,  # Vision blocks don't need layer_id for caching
+                is_cross_attention=False,
+                prefix=prefix,
+            )
+        else:
+            if attn_implementation == "sdpa":
+                use_context_forward = False
+                softmax_in_single_precision = False
+            elif attn_implementation == "flash_attention_2":
+                softmax_in_single_precision = False
+                use_context_forward = True
+            elif attn_implementation == "eager":
+                softmax_in_single_precision = True
+                use_context_forward = False
+
+            self.attn = VisionAttention(
+                embed_dim=dim,
+                num_heads=num_heads,
+                projection_size=dim,
+                use_qkv_parallel=False,
+                use_context_forward=use_context_forward,
+                softmax_in_single_precision=softmax_in_single_precision,
+                flatten_batch=True,
+                quant_config=quant_config,
+                prefix=add_prefix("attn", prefix),
+            )
+
         self.mlp = Qwen2VisionMLP(
             dim,
             mlp_hidden_dim,
@@ -334,7 +348,7 @@ class Qwen2VisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
+                    attn_implementation="radix",
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                 )
