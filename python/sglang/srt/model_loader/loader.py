@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+DEFAULT_SHARDED_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -500,8 +501,6 @@ class ShardedStateLoader(BaseModelLoader):
     `examples/runtime/engine/save_sharded_state.py` for creating a sharded checkpoint.
     """
 
-    DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
-
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = (
@@ -509,7 +508,7 @@ class ShardedStateLoader(BaseModelLoader):
             if load_config.model_loader_extra_config is None
             else load_config.model_loader_extra_config.copy()
         )
-        self.pattern = extra_config.pop("pattern", self.DEFAULT_PATTERN)
+        self.pattern = extra_config.pop("pattern", DEFAULT_SHARDED_PATTERN)
         if extra_config:
             raise ValueError(
                 f"Unexpected extra config keys for load format "
@@ -1229,6 +1228,15 @@ class RemoteModelLoader(BaseModelLoader):
         super().__init__(load_config)
         # TODO @DellCurry: move to s3 connector only
         set_runai_streamer_env(load_config)
+        from sglang.srt.distributed import get_tp_group, get_tensor_model_parallel_rank
+        self.pattern = ["*.safetensors"]
+        if get_tp_group().world_size > 1:
+            self.pattern = [DEFAULT_SHARDED_PATTERN.format(rank=get_tensor_model_parallel_rank(), part="*")]
+        if load_config.model_loader_extra_config is not None:
+            if "sharded" in load_config.model_loader_extra_config and bool(load_config.model_loader_extra_config["sharded"]):
+                self.pattern = [DEFAULT_SHARDED_PATTERN.format(rank=get_tensor_model_parallel_rank(), part="*")]
+            if "pattern" in load_config.model_loader_extra_config:
+                self.pattern = list[str](load_config.model_loader_extra_config["pattern"])
 
     def _get_weights_iterator_kv(
         self,
@@ -1245,7 +1253,8 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.FS
-        return client.weight_iterator()
+        rank = get_tensor_model_parallel_rank()
+        return client.weight_iterator(self.pattern)
 
     def download_model(self, model_config: ModelConfig) -> None:
         pass
@@ -1315,7 +1324,30 @@ class RemoteModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            model.load_weights(self._get_weights_iterator_fs(client))
+            from sglang.srt.distributed import get_tp_group
+            if get_tp_group().world_size > 1:
+                state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+                weights_iterator = self._get_weights_iterator_fs(client)
+                for key, tensor in weights_iterator:
+                    param_data = state_dict[key].data
+                    param_shape = state_dict[key].shape
+                    for dim, size in enumerate(tensor.shape):
+                        if size < param_shape[dim]:
+                            param_data = param_data.narrow(dim, 0, size)
+                    if tensor.shape != param_shape:
+                        logger.warning(
+                            "loading tensor of shape %s into "
+                            "parameter '%s' of shape %s",
+                            tensor.shape,
+                            key,
+                            param_shape,
+                        )
+                    param_data.copy_(tensor)
+                    state_dict.pop(key)
+                if state_dict:
+                    raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+            else:
+                model.load_weights(self._get_weights_iterator_fs(client))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
