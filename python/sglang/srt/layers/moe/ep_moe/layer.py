@@ -4,8 +4,8 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 try:
-    import deep_gemm
     from deep_gemm import (
+        ceil_div,
         get_col_major_tma_aligned_tensor,
         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     )
@@ -790,6 +790,16 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         raise NotImplementedError
 
 
+def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, n
+    ), (x_amax / 448.0).view(m, -1)
+
+
 class DeepEPMoE(EPMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -834,24 +844,22 @@ class DeepEPMoE(EPMoE):
             activation,
         )
         self.deepep_low_latency = deepep_low_latency
-        # Todo
-        # if self.deepep_low_latency:
-        #     assert use_deep_gemm, "DeepEP low latency mode requires deep_gemm"
+        if self.deepep_low_latency:
+            assert use_deep_gemm, "DeepEP low latency mode requires deep_gemm"
+        self.w13_weight_fp8 = (self.w13_weight, self.w13_weight_scale_inv)
+        self.w2_weight_fp8 = (self.w2_weight, self.w2_weight_scale_inv)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
-        forward_mode: ForwardMode,
+        masked_m: torch.Tensor,
     ):
-        # Todo: use m_grouped_gemm_fp8_fp8_bf16_nt_masked after low_latency dispatch (decode)
         if not self.deepep_low_latency:
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         else:
-            return self.forward_deepgemm_masked(
-                hidden_states, reorder_topk_ids, seg_indptr
-            )
+            return self.forward_deepgemm_masked(hidden_states, masked_m)
 
     def forward_normal(
         self,
@@ -969,90 +977,96 @@ class DeepEPMoE(EPMoE):
     def forward_deepgemm_masked(
         self,
         hidden_states: torch.Tensor,
-        reorder_topk_ids: torch.Tensor,
-        seg_indptr: torch.Tensor,
+        masked_m: torch.Tensor,
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
+        assert (
+            hidden_states.size(0) % 4 == 0
+        ), f"TMA alignment error: {hidden_states.size(0)}"
 
-        # if self.activation_scheme == "dynamic" and not self.use_block_quant:
-        #     max_value = (
-        #         torch.max(hidden_states)
-        #         .repeat(self.num_experts_per_partition)
-        #         .to(torch.float32)
-        #     )
-        #     self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+        # GroupGemm-0
+        num_groups, m, k = hidden_states.size()
+        n = self.w13_weight.size(1)
+        expected_m = min(int(masked_m.float().mean()) + 1, m)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
+        )
 
-        # # GroupGemm-0
-        # gateup_output = torch.empty(
-        #     hidden_states.shape[0],
-        #     self.w13_weight.shape[1],
-        #     device=hidden_states.device,
-        #     dtype=hidden_states.dtype,
-        # )
-        # if hidden_states.shape[0] > 0:
-        #     # Transpose earlier so that the testing will not trigger transposing kernels
-        #     hidden_states = (
-        #         hidden_states[0],
-        #         get_col_major_tma_aligned_tensor(hidden_states[1]),
-        #     )
-        #     """
-        #     gateup_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-        #         hidden_states, self.w13_weight, out, masked_m, expected_m
-        #     )
-        #     """
+        hidden_states_fp8 = (
+            torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn),
+            torch.empty((num_groups, m, k // 128), device="cuda", dtype=torch.float),
+        )
+        for i in range(num_groups):
+            hidden_states_fp8[0][i], hidden_states_fp8[1][i] = per_token_cast_to_fp8(
+                hidden_states[i]
+            )
+        hidden_states_fp8 = (
+            hidden_states_fp8[0],
+            get_col_major_tma_aligned_tensor(hidden_states_fp8[1]),
+        )
 
-        # # Act
-        # down_input = torch.empty(
-        #     gateup_output.shape[0],
-        #     gateup_output.shape[1] // 2,
-        #     device=gateup_output.device,
-        #     dtype=(
-        #         self.fp8_dtype
-        #         if (self.use_fp8_w8a8 and not self.use_block_quant)
-        #         else hidden_states.dtype
-        #     ),
-        # )
-        # if self.w2_input_scale is None and not self.use_block_quant:
-        #     self.w2_input_scale = torch.ones(
-        #         self.num_experts_per_partition,
-        #         dtype=torch.float32,
-        #         device=hidden_states.device,
-        #     )
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+            hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
+        )
 
-        # if self.activation == "silu":
-        #     silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
-        #         gateup_output,
-        #         down_input,
-        #         gateup_output.shape[1],
-        #         reorder_topk_ids,
-        #         self.w2_input_scale,
-        #         0,
-        #         self.num_experts_per_partition - 1,
-        #         BLOCK_SIZE=512,
-        #     )
-        # else:
-        #     raise ValueError(f"Unsupported activation: {self.activation=}")
+        # Act
+        # Todo: Add activation
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=gateup_output.device,
+            dtype=gateup_output.dtype,
+        )
+        """
+        if self.w2_input_scale is None and not self.use_block_quant:
+            self.w2_input_scale = torch.ones(
+                self.num_experts_per_partition,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
 
-        # # GroupGemm-1
-        # down_output = torch.empty(
-        #     down_input.shape[0],
-        #     self.w2_weight.shape[1],
-        #     device=hidden_states.device,
-        #     dtype=hidden_states.dtype,
-        # )
-        # if down_input.shape[0] > 0:
-        #     # Transpose earlier so that the testing will not trigger transposing kernels
-        #     down_input = (
-        #         down_input[0],
-        #         get_col_major_tma_aligned_tensor(down_input[1]),
-        #     )
-        #     """
-        #     down_output = deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-        #         down_input, self.w2_weight, out, masked_m, expected_m
-        #     )
-        #     """
+        if self.activation == "silu":
+            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                self.w2_input_scale,
+                0,
+                self.num_experts_per_partition - 1,
+                BLOCK_SIZE=512,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation=}")
+        # """
 
-        # return down_output
-        simulated_gemm_x = hidden_states.clone()
-        return simulated_gemm_x
+        # GroupGemm-1
+        _, m, k = down_input.size()
+        n = self.w2_weight.size(1)
+        expected_m = min(int(masked_m.float().mean()) + 1, m)
+        down_output = torch.empty(
+            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
+        )
+
+        down_input_fp8 = (
+            torch.empty_like(down_input, dtype=torch.float8_e4m3fn),
+            torch.empty((num_groups, m, k // 128), device="cuda", dtype=torch.float),
+        )
+        for i in range(num_groups):
+            down_input_fp8[0][i], down_input_fp8[1][i] = per_token_cast_to_fp8(
+                down_input[i]
+            )
+        down_input_fp8 = (
+            down_input_fp8[0],
+            get_col_major_tma_aligned_tensor(down_input_fp8[1]),
+        )
+
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+        )
+
+        return down_output

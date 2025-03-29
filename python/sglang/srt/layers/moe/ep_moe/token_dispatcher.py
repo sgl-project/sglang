@@ -139,7 +139,6 @@ class DeepEPDispatcher:
                 self.num_experts,
             )
             self.return_recv_hook = return_recv_hook
-            self.recv_expert_count = None
 
     def deepep_permute(
         self,
@@ -190,6 +189,9 @@ class DeepEPDispatcher:
         seg_indptr = torch.zeros(
             (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
         )
+        masked_m = torch.empty(
+            (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
+        )
 
         if self.deepep_low_latency == False:
             (
@@ -204,7 +206,7 @@ class DeepEPDispatcher:
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
         else:
-            hidden_states, event, hook = self.dispatch_low_latency(
+            hidden_states, masked_m, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
@@ -219,6 +221,7 @@ class DeepEPDispatcher:
             topk_weights,
             reorder_topk_ids,
             seg_indptr,
+            masked_m,
         )
 
     def dispatch_normal(
@@ -312,7 +315,7 @@ class DeepEPDispatcher:
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
 
-        packed_recv_hidden, self.recv_expert_count, self.handle, event, hook = (
+        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             self.buffer_low_latency.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -323,7 +326,7 @@ class DeepEPDispatcher:
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        return packed_recv_hidden, event, hook
+        return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine(
         self,
