@@ -1,64 +1,118 @@
-# Supported Models
+# Supported models
 
-## Generative Models
-- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3
-- Mistral / Mixtral / Mistral NeMo / Mistral Small 3
-- Gemma / Gemma 2 / Gemma3
-- Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / Olympic Coder
-- DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
-- OLMoE
-- [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
-  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-ov --port=30000 --chat-template=chatml-llava`
-  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava`
-  - Query the server with the [OpenAI Vision API](https://platform.openai.com/docs/guides/vision). See examples at [test/srt/test_vision_openai_server.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server.py)
-- LLaVA 1.5 / 1.6 / NeXT
-  - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000 --tp-size=1 --chat-template=llava_llama_3`
-  - `python -m sglang.launch_server --model-path lmms-lab/llava-next-72b --port=30000 --tp-size=8 --chat-template=chatml-llava`
-  - Query the server with the [OpenAI Vision API](https://platform.openai.com/docs/guides/vision). See examples at [test/srt/test_vision_openai_server.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server.py)
-- Yi-VL
-- StableLM
-- Command-R
-- DBRX
-- Grok
-- ChatGLM
-- InternLM 2
-- Exaone 3
-- BaiChuan2
-- MiniCPM / MiniCPM 3 / MiniCPM-v / MiniCPM-o
-- XVERSE / XVERSE MoE
-- SmolLM
-- GLM-4
-- Phi-3 / Phi-4
-- Phi-3-Small
-- IBM Granite 3
-- Janus-Pro-1B / Janus-Pro-7B
-- Deepseek-VL2 / Deepseek-VL2-small
-- Gemma 3 (it)
+SGLang supports a variety of different models in various domains.
+For guidance how to use them see the corresponding sections in the docs as well as our [benchmark](https://github.com/simveit/sglang/tree/main/benchmark), [example](https://github.com/simveit/sglang/tree/main/examples) and [model test](https://github.com/sgl-project/sglang/tree/main/test/srt/models) scripts.
 
-## Embedding Models
+## LLMs
 
-- LlamaEmbeddingModel
-- Mistral embedding models
-- Qwen embedding models
-  - `python -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-7B-instruct --is-embedding`
-- Multi-modal embedding models
-  - `python -m sglang.launch_server --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct --is-embedding --chat-template gme-qwen2-vl`
-- CLIP
-  - `python -m sglang.launch_server --model-path openai/clip-vit-large-patch14-336 --is-embedding`
+The below models perform autoregressive language modelling.
 
-## Reward Models
+### Deepseek
+* `Deepseek`
+* `Deepseek 2`
+* `Deepseek 3`
+* `Deepseek R1`
 
-- LlamaForSequenceClassification
-  - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 --is-embedding`
-- Gemma2ForSequenceClassification
-  - `python -m sglang.launch_server --model-path Skywork/Skywork-Reward-Gemma-2-27B-v0.2 --is-embedding`
-- InternLM2ForRewardModel
-  - `python -m sglang.launch_server --model-path internlm/internlm2-7b-reward --is-embedding --trust-remote-code`
-- Qwen2ForRewardModel
-  - `python -m sglang.launch_server --model-path Qwen/Qwen2.5-Math-RM-72B --is-embedding --trust-remote-code --tp-size=4`
-- Qwen2ForSequenceClassification
-  - `python -m sglang.launch_server --model-path jason9693/Qwen2.5-1.5B-apeach --is-embedding --trust-remote-code`
-## How to Support a New Language Model
+### Gemma
+* `Gemma`
+* `Gemma 2`
+* `Gemma 3`
+
+### Llama
+* `Llama`
+* `Llama 2`
+* `Llama 3`
+* `Llama 3.1`
+* `Llama 3.2`
+* `Llama 3.3`
+
+### Mistral
+* `Mistral`
+* `Mistral NeMo`
+* `Mistral Small 3`
+* `Mixtral`
+
+### Phi
+* `Phi 3`
+* `Phi 3 small`
+* `Phi 4`
+
+### Qwen
+* `Qwen`
+* `Qwen 2`
+* `Qwen 2 MoE`
+* `Qwen 2.5`
+* `QwQ`
+
+### Further models
+* `BaiChuan2`
+* `ChatGLM`
+* `Command-R`
+* `DBRX`
+* `Exaone 3`
+* `GLM 4`
+* `Grok`
+* `IBM Granite 3.0`
+* `InternLM 2`
+* `MiniCPM`
+* `MiniCPM 3`
+* `SmolLM`
+* `StableLM`
+* `XVerse`
+* `XVerse MoE`
+
+## VLMs
+
+The below models perform multimodal autoregressive language modelling.
+
+### Deepseek
+* `Deepseek-VL2`
+* `Deepseek-VL2-small`
+* `Janus-Pro-1B`
+* `Janus-Pro-7B`
+
+### Mini CPM
+* `MiniCPM-v`
+* `MiniCPM-o`
+
+### LLaVA
+* `LLaVA-OneVision`
+* `LLaVA 1.5`
+* `LLaVA 1.6`
+* `LLaVA NeXT`
+
+### Qwen
+* `Qwen 2 VL`
+* `Qwen 2.5 VL`
+
+### Further models
+* `Gemma 3`
+* `Yi-VL`
+
+### Text Embedding
+
+The below models can be used to extract embeddings from them, i.e. `text -> vector`.
+
+* `Llama`
+* `Mistral`
+* `Qwen`
+
+### Multimodal Embedding
+
+The below models can be used to extract multimodal embeddings from them, i.e. `(text, image) -> vector`.
+
+* `Qwen2-VL`
+* `CLIP`
+
+### Reward
+
+The below models can be used to perform reward modelling, i.e. `text -> reward(s)`
+
+* `Skywork-Reward-Llama-3.1-8B-v0.2`
+* `Skywork-Reward-Gemma-2-27B-v0.2`
+* `internlm2-7b-reward`
+* `Qwen2.5-Math-RM-72B`
+* `Qwen2.5-1.5B-apeach`
 
 To support a new model in SGLang, you only need to add a single file under [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models).
 You can learn from existing model implementations and create new files for the new models.
