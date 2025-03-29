@@ -86,11 +86,13 @@ def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
 def _compute_sources_deepseek() -> List[Dict[str, Any]]:
     return [
         # TODO what is a good m_max value? (too big then we waste time warmup edge-case kernels; too small then we do not handle all cases)
+        dict(n=256, k=7168, m_min=1, m_max=8192),
         dict(n=576, k=7168, m_min=1, m_max=8192),
         dict(n=1536, k=7168, m_min=1, m_max=8192),
         dict(n=2304, k=7168, m_min=1, m_max=8192),
         dict(n=4096, k=7168, m_min=1, m_max=8192),
         dict(n=4608, k=7168, m_min=1, m_max=8192),
+        dict(n=7168, k=128, m_min=1, m_max=8192),
         dict(n=7168, k=1152, m_min=1, m_max=8192),
         dict(n=7168, k=2048, m_min=1, m_max=8192),
         dict(n=7168, k=2304, m_min=1, m_max=8192),
