@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt import warmup_deepgemm
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -49,6 +50,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 if supports_custom_op():
+
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -59,7 +61,6 @@ if supports_custom_op():
         warmup_deepgemm.capturer_on_kernel_executed((A, As), (B, Bs))
         deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
-
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -68,7 +69,6 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
-
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",

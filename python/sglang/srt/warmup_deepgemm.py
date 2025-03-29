@@ -31,18 +31,19 @@ import multiprocessing as mp
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 import torch
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.utils import get_bool_env_var, deduplicate
 from tqdm import tqdm
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.utils import deduplicate, get_bool_env_var
+
 try:
-    from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
-    import deep_gemm.jit_kernels.gemm
     import deep_gemm
+    import deep_gemm.jit_kernels.gemm
+    from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
 except ImportError:
     pass
 
@@ -54,7 +55,12 @@ logger = logging.getLogger(__name__)
 
 def warmup(server_args, model, first_rank_in_node):
     from sglang.srt.layers.quantization.fp8_kernel import enable_jit_deepgemm
-    if server_args.disable_deepgemm_warmup or (not enable_jit_deepgemm) or (not first_rank_in_node):
+
+    if (
+        server_args.disable_deepgemm_warmup
+        or (not enable_jit_deepgemm)
+        or (not first_rank_in_node)
+    ):
         return
 
     _warmup_raw(model.__class__.__name__)
@@ -70,7 +76,7 @@ def _warmup_raw(model_name: str):
 
 
 def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
-    if model in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']:
+    if model in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         return _compute_sources_deepseek()
     return None
 
@@ -95,42 +101,48 @@ def _compute_sources_deepseek() -> List[Dict[str, Any]]:
 def _compute_infos_from_sources(sources):
     # TODO for two-batch-overlap, here we need to consider `num_sms-20` as well
     num_sms = deep_gemm.get_num_sms()
-    return list(deduplicate(
-        _compute_infos_from_sources_raw(sources),
-        key_fn=lambda info: _compute_deep_gemm_kernel_deduplicate_key(info, num_sms),
-    ))
+    return list(
+        deduplicate(
+            _compute_infos_from_sources_raw(sources),
+            key_fn=lambda info: _compute_deep_gemm_kernel_deduplicate_key(
+                info, num_sms
+            ),
+        )
+    )
 
 
 def _compute_deep_gemm_kernel_deduplicate_key(info, num_sms):
     best_configs = deep_gemm.jit_kernels.gemm.get_best_configs(
-        m=info['m'], n=info['n'], k=info['k'], num_groups=1,
-        num_sms=num_sms)
-    return info['n'], info['k'], best_configs
+        m=info["m"], n=info["n"], k=info["k"], num_groups=1, num_sms=num_sms
+    )
+    return info["n"], info["k"], best_configs
 
 
 def _compute_infos_from_sources_raw(sources):
     for source in sources:
-        for m in range(source['m_min'], source['m_max'] + 1):
-            yield dict(m=m, n=source['n'], k=source['k'])
+        for m in range(source["m_min"], source["m_max"] + 1):
+            yield dict(m=m, n=source["n"], k=source["k"])
 
 
 def _warmup_by_infos(infos: List[Dict[str, Any]]):
     logger.info("Warmup DeepGEMM...")
-    with ProcessPoolExecutor(max_workers=min(8, psutil.cpu_count(logical=False))) as executor:
+    with ProcessPoolExecutor(
+        max_workers=min(8, psutil.cpu_count(logical=False))
+    ) as executor:
         iterator = executor.map(_warmup_by_info, infos)
-        list(tqdm(iterator, total=len(infos), desc='Warmup DeepGEMM'))
+        list(tqdm(iterator, total=len(infos), desc="Warmup DeepGEMM"))
 
 
 def _warmup_by_info(info: Dict[str, Any]):
-    x_fp8, y_fp8, out = _construct_gemm_inputs(m=info['m'], k=info['k'], n=info['n'])
+    x_fp8, y_fp8, out = _construct_gemm_inputs(m=info["m"], k=info["k"], n=info["n"])
     deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
 
 # Copied from DeepGEMM's `test_core.py` :: `construct`
 def _construct_gemm_inputs(m: int, k: int, n: int):
-    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     x_fp8, y_fp8 = _per_token_cast_to_fp8(x), _per_block_cast_to_fp8(y)
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out
@@ -142,25 +154,31 @@ def _per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), (x_amax / 448.0).view(m, -1)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, n
+    ), (x_amax / 448.0).view(m, -1)
 
 
 # Copied from DeepGEMM's `test_core.py`
 def _per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros((ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device)
+    x_padded = torch.zeros(
+        (ceil_div(m, 128) * 128, ceil_div(n, 128) * 128), dtype=x.dtype, device=x.device
+    )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     x_scaled = (x_view * (448.0 / x_amax)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(x_view.size(0), x_view.size(2))
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(
+        x_view.size(0), x_view.size(2)
+    )
 
 
 # --------------------------------------- capture -------------------------------------
 
 # TODO unify with fine_grained_benchmark, expert_distribution_recorder, etc
-_dir_output = Path('/tmp/warmup_deepgemm_capture')
+_dir_output = Path("/tmp/warmup_deepgemm_capture")
 _ENABLE_CAPTURE = get_bool_env_var("SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE")
 
 
@@ -214,36 +232,42 @@ def _read_output() -> List[Dict[str, Any]]:
 
 # --------------------------------------- analyze -------------------------------------
 
+
 def _analyze():
     import polars as pl
 
     df_raw = pl.DataFrame(_read_output())
     print(df_raw)
 
-    df = df_raw.group_by('n', 'k').agg(pl.col('m').unique().sort()).sort('n', 'k')
-    with pl.Config(fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1):
+    df = df_raw.group_by("n", "k").agg(pl.col("m").unique().sort()).sort("n", "k")
+    with pl.Config(
+        fmt_str_lengths=1000, fmt_table_cell_list_len=1000, tbl_cols=-1, tbl_rows=-1
+    ):
         print(df)
 
-    output_text = '\n'.join([
-        f'dict(n={row["n"]}, k={row["k"]}, m_min=1, m_max=8192),'
-        for row in df.iter_rows(named=True)
-    ])
+    output_text = "\n".join(
+        [
+            f'dict(n={row["n"]}, k={row["k"]}, m_min=1, m_max=8192),'
+            for row in df.iter_rows(named=True)
+        ]
+    )
     print(output_text)
 
 
 # --------------------------------------- entrypoint -------------------------------------
 
+
 def run():
     mp.set_start_method("spawn", force=True)
 
     _, cmd, *args = sys.argv
-    if cmd == 'warmup':
+    if cmd == "warmup":
         _warmup_raw(model_name=args[0])
-    elif cmd == 'analyze':
+    elif cmd == "analyze":
         _analyze()
     else:
-        raise Exception(f'Unsupported {cmd=}')
+        raise Exception(f"Unsupported {cmd=}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run()

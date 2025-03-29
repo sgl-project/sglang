@@ -1767,6 +1767,7 @@ def parse_connector_type(url: str) -> str:
 
     return m.group(1)
 
+
 def deduplicate(items, key_fn: Callable):
     seen_keys = set()
     for item in items:
@@ -1775,4 +1776,3 @@ def deduplicate(items, key_fn: Callable):
             continue
         seen_keys.add(item_key)
         yield item
-
