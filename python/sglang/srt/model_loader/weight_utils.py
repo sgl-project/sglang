@@ -27,7 +27,6 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
-from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
@@ -35,7 +34,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.utils import print_warning_once, retry
+from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -241,14 +240,7 @@ def download_weights_from_hf(
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
-        file_list = retry(
-            lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
-            should_retry=lambda e: isinstance(e, HfHubHTTPError)
-            and e.response.status_code == 429,
-            initial_delay=5.0,
-            max_delay=60.0,
-            max_retry=7,
-        )
+        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
 
         # depending on what is available we download different things
         for pattern in allow_patterns:
