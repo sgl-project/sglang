@@ -4,7 +4,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Literal, Optional
 
 import PIL
 import transformers
@@ -12,7 +12,7 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import load_image
+from sglang.srt.utils import load_image, load_video
 from sglang.utils import logger
 
 global global_processor
@@ -30,7 +30,9 @@ class BaseImageProcessorOutput:
     all_frames: [PIL.Image]
     # input_text, with each frame of video/image represented as an image_token
     input_text: str
-
+    videos: list[list[PIL.Image]]
+    # defines the order in which each frame of video/image is provided in the input
+    media_order: list[Literal['image', 'video']]
 
 class BaseImageProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
@@ -62,7 +64,7 @@ class BaseImageProcessor(ABC):
 
     @abstractmethod
     async def process_images_async(
-        self, image_data, input_text, max_req_input_len, **kwargs
+        self, image_data, input_text, max_req_input_len, video_data, **kwargs
     ):
         pass
 
@@ -117,6 +119,8 @@ class BaseImageProcessor(ABC):
         max_req_input_len: int,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
+        video_token: Optional[str] = None,
+        video_data: Optional[list[str]] = None,
     ) -> BaseImageProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -134,7 +138,11 @@ class BaseImageProcessor(ABC):
         if return_text:
             import re
 
-            pattern = "(" + "|".join(re.escape(sep) for sep in [image_token]) + ")"
+            tokens = [image_token]
+            if video_token:
+                tokens.append(video_token)
+
+            pattern = "(" + "|".join(re.escape(sep) for sep in tokens) + ")"
             # split text into list of normal text and special tokens
             text_parts = re.split(pattern, input_text)
 
@@ -148,8 +156,10 @@ class BaseImageProcessor(ABC):
 
         assert len(image_data) == len(estimated_frames_list)
 
-        image_index, audio_index = 0, 0
-        hashes, image_sizes, images, audios = [], [], [], []
+        image_index, audio_index, video_index = 0, 0, 0
+        hashes, image_sizes, images, audios, videos = [], [], [], [], []
+        media_order = []
+
         new_text = ""
         for index, text_part in enumerate(text_parts):
             try:
@@ -181,9 +191,18 @@ class BaseImageProcessor(ABC):
                     hashes += [hash(image_file)] * len(frames)
                     images += frames
                     image_index += 1
+                    media_order += ['image'] * len(frames)
                     if frames_to_process != 0:
                         new_text += image_token * len(frames)
                     assert frames_to_process == len(frames)
+                elif video_token and text_part == video_token:
+                    # load as video
+                    video_frames, fps, resolution, duration = load_video(video_data[video_index])
+                    hashes += [hash(video_data[video_index])]
+                    videos.append(video_frames)
+                    video_index += 1
+                    media_order += ['video']
+                    new_text += video_token
                 else:
                     # TODO(mick): handle video
                     # normal text
@@ -203,6 +222,8 @@ class BaseImageProcessor(ABC):
             image_sizes=image_sizes,
             all_frames=images,
             input_text=new_text,
+            videos=videos,
+            media_order=media_order,
         )
 
 

@@ -585,56 +585,87 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             inputs_embeds = self.model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            image: ImageInputs
             for i, image in enumerate(forward_batch.image_inputs):
-                if image is None or image.pixel_values is None:
+                if image is None or (image.pixel_values is None and image.pixel_values_videos is None):
                     continue
                 start_idx = extend_start_loc_cpu[i]
                 prefix_len = prefix_lens_cpu[i]
 
-                pixel_values = image.pixel_values.to(device="cuda")
-
-                image_grid_thws = torch.tensor(
-                    np.array(image.image_grid_thws), device="cuda"
-                )
+                # offsets are for both image and video since token is the same to detemine
+                # vision start and end
                 image_offsets = image.image_offsets
-                image_input = Qwen2VLImageInputs(
-                    pixel_values=pixel_values, image_grid_thw=image_grid_thws
-                )
-                image_embeds = self._process_image_input(image_input)
 
-                image_embeds_offset = 0
+                # one of the two will be None
+                image_embeds = None
+                video_embeds = None
+                if image.pixel_values is not None:
+                    pixel_values = image.pixel_values.to(device="cuda")
+                    image_grid_thws = torch.tensor(
+                        np.array(image.image_grid_thws), device="cuda"
+                    )
+                    image_input = Qwen2VLImageInputs(
+                        pixel_values=pixel_values, image_grid_thw=image_grid_thws
+                    )
+                    image_embeds = self._process_image_input(image_input)
+                if image.pixel_values_videos is not None:
+                    pixel_values_videos = image.pixel_values_videos.to(device="cuda")
+                    print(image.video_grid_thws)
+                    video_grid_thws = torch.tensor(
+                        np.array(image.video_grid_thws), device="cuda"
+                    )
+                    video_input = Qwen2VLVideoInputs(
+                        pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thws
+                    )
+                    video_embeds = self._process_video_input(video_input)
+
+                image_embeds_offset = image_idx = 0
+                video_embeds_offset = video_idx = 0
+
                 for idx, image_offset in enumerate(image_offsets):
                     if image_offset < prefix_len:
                         continue
-                    num_image_tokens = self.calculate_num_image_tokens(
-                        image_grid_thws[idx]
-                    )
+                    if image.media_order[idx] == 'image':
+                        num_tokens = self.calculate_num_image_tokens(
+                            image_grid_thws[image_idx]
+                        )
+                        current_embeds = image_embeds
+                        current_offset = image_embeds_offset
+                        image_embeds_offset += num_tokens
+                        image_idx += 1
+                    else:
+                        num_tokens = self.calculate_num_image_tokens(
+                            video_grid_thws[video_idx]
+                        )
+                        current_embeds = video_embeds
+                        current_offset = video_embeds_offset
+                        video_embeds_offset += num_tokens
+                        video_idx += 1
 
                     left_idx = start_idx + (image_offset - prefix_len)
-                    right_idx = left_idx + num_image_tokens
+                    right_idx = left_idx + num_tokens
 
                     tp_size = get_tensor_model_parallel_world_size()
 
-                    hidden_size = image_embeds.shape[-1]
+                    hidden_size = current_embeds.shape[-1]
 
                     if hidden_size % tp_size != 0:
                         padding_size = tp_size - (hidden_size % tp_size)
-                        image_embeds = F.pad(image_embeds, (0, padding_size))
+                        current_embeds = F.pad(current_embeds, (0, padding_size))
                         inputs_embeds = F.pad(inputs_embeds, (0, padding_size))
 
-                    hidden_chunk_size = image_embeds.shape[-1] // tp_size
+                    hidden_chunk_size = current_embeds.shape[-1] // tp_size
                     rank = get_tensor_model_parallel_rank()
                     start_dim = rank * hidden_chunk_size
                     end_dim = (rank + 1) * hidden_chunk_size
                     inputs_embeds[left_idx:right_idx, ..., start_dim:end_dim] = (
-                        image_embeds[
-                            image_embeds_offset : image_embeds_offset
-                            + num_image_tokens,
+                        current_embeds[
+                            current_offset : current_offset
+                            + num_tokens,
                             ...,
                             start_dim:end_dim,
                         ]
                     )
-                    image_embeds_offset += num_image_tokens
 
         hidden_states = self.model(
             input_ids=input_ids,

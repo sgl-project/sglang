@@ -355,6 +355,8 @@ class ForwardBatch:
 
         if isinstance(merged.pixel_values, np.ndarray):
             merged.pixel_values = torch.from_numpy(merged.pixel_values)
+        if isinstance(merged.pixel_values_videos, np.ndarray):
+            merged.pixel_values_videos = torch.from_numpy(merged.pixel_values_videos)
 
         return merged
 

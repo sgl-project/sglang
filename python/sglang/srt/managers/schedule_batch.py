@@ -32,13 +32,12 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
-
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -147,6 +146,7 @@ class ImageInputs:
     """The image related inputs."""
 
     pixel_values: Union[torch.Tensor, np.array]
+    pixel_values_videos: Optional[Union[torch.Tensor, np.array]] = None
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
@@ -166,6 +166,7 @@ class ImageInputs:
     video_token_id: Optional[int] = None
     video_grid_thws: List[Tuple[int, int, int]] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
+    media_order: Optional[List[Literal['image', 'video']]] = None
 
     # deepseek vl2 related
     image_seq_mask: Optional[List[torch.Tensor]] = None
@@ -213,6 +214,9 @@ class ImageInputs:
             "slice_end_id",
             "tgt_sizes",
             "images_emb_mask",
+            "pixel_values_videos",
+            "media_order",
+            "video_grid_thws",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -242,8 +246,11 @@ class ImageInputs:
             "aspect_ratio_ids",
             "aspect_ratio_mask",
             "image_grid_thws",
+            "video_grid_thws",
             "image_seq_mask",
             "image_spatial_crop",
+            "pixel_values_videos",
+            "media_order",
         ]
         for arg in optional_args:
             if getattr(self, arg, None) is not None:
