@@ -88,11 +88,7 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
 
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
-            print(
-                "similarity diff",
-                abs(similarity - 1),
-                abs(similarity - 1) < prefill_tolerance,
-            )
+            print("similarity diff", abs(similarity - 1))
 
             if len(prompts[i]) <= 1000:
                 assert torch.all(
