@@ -26,7 +26,12 @@ import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
 import torch
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import (
+    HfFileSystem,
+    hf_hub_download,
+    snapshot_download,
+    try_to_load_from_cache,
+)
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
@@ -35,6 +40,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +243,9 @@ def download_weights_from_hf(
     Returns:
         str: The path to the downloaded model weights.
     """
-    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+    local_files_only = _should_hf_local_files_only(repo_id=model_name_or_path)
+
+    if not local_files_only:
         # Before we download we look at that is available:
         fs = HfFileSystem()
         file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
@@ -260,9 +268,17 @@ def download_weights_from_hf(
             cache_dir=cache_dir,
             tqdm_class=DisabledTqdm,
             revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            local_files_only=local_files_only,
         )
     return hf_folder
+
+
+def _should_hf_local_files_only(repo_id):
+    if is_in_ci() and (try_to_load_from_cache(repo_id, "config.json") is not None):
+        logger.info("Set local_files_only=True to reduce traffic to HF server in CI")
+        return True
+
+    return huggingface_hub.constants.HF_HUB_OFFLINE
 
 
 def download_safetensors_index_file_from_hf(
