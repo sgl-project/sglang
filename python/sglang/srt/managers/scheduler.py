@@ -420,7 +420,7 @@ class Scheduler(
 
         # Execute warmups
         # TODO improve computation of this
-        tp_size_per_node = self.tp_size // server_args.nnodes
+        tp_size_per_node = server_args.tp_size // server_args.nnodes
         first_rank_in_node = self.tp_rank % tp_size_per_node == 0
         warmup_deepgemm.warmup(
             server_args,
