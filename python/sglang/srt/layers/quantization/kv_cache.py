@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -36,8 +37,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         # Initialize the KV cache scales to -1.0, which is an invalid value.
         # If the k/v_scale appears in the checkpoint, it will be
         # overwritten when loading weights.
-        layer.k_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
-        layer.v_scale = torch.nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+        layer.k_scale = torch.nn.Parameter(
+            torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
+        )
+        layer.v_scale = torch.nn.Parameter(
+            torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
+        )
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -47,7 +52,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: RadixAttention) -> None:
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
