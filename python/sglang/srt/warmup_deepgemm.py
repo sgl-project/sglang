@@ -1,5 +1,29 @@
-# TODO shall we put this file elsewhere?
-# TODO many things should be extracted to common warmup logic instead of deepgemm-specific logic
+"""
+## How to support warmup of a new model
+
+1. Capture
+SGLANG_ENABLE_WARMUP_DEEPGEMM_CAPTURE python3 -m sglang.launch_server ...args-for-your-case...
+
+2. Analyze
+python3 -m sglang.srt.warmup_deepgemm analyze
+
+3. Update code
+According to the results of `analyze` script, update places like `_compute_sources_deepseek`
+
+## How to test the warmup
+
+1. Hack DeepGEMM's compilation code
+vim /usr/local/lib/python3.10/dist-packages/deep_gemm/jit/compiler.py
+Add prints around the line of `subprocess.check_call` (calling NVCC)
+
+2. Clear cache
+rm -rf ~/.deep_gemm
+
+3. Execute your command
+python3 -m sglang.launch_server ...args-for-your-case...
+
+4. Check whether there are any prints indicating DeepGEMM is compiling
+"""
 
 import json
 import logging
