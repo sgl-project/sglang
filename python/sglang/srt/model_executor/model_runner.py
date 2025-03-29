@@ -230,6 +230,10 @@ class ModelRunner:
                 elif server_args.enable_flashmla:
                     logger.info("MLA optimization is turned on. Use flashmla decode.")
                     server_args.attention_backend = "flashmla"
+                elif server_args.attention_backend == "fa3":
+                    logger.info(
+                        f"MLA optimization is turned on. Use flash attention 3 backend."
+                    )
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
                     server_args.attention_backend = "triton"
@@ -879,7 +883,7 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             logger.warning(
-                "FlashAttention v3 Backend is in Beta. Multimodal, Page > 1, FP8, MLA and Speculative Decoding are not supported."
+                "FlashAttention v3 Backend is in Beta. Multimodal, FP8, and Speculative Decoding are not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
