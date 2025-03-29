@@ -94,11 +94,11 @@ def _compute_infos_from_sources(sources):
     num_sms = deep_gemm.get_num_sms()
     return list(_deduplicate(
         _compute_infos_from_sources_raw(sources),
-        key_fn=lambda info: _compute_deep_gemm_kernel_consts(info, num_sms),
+        key_fn=lambda info: _compute_deep_gemm_kernel_deduplicate_key(info, num_sms),
     ))
 
 
-def _compute_deep_gemm_kernel_consts(info, num_sms):
+def _compute_deep_gemm_kernel_deduplicate_key(info, num_sms):
     best_configs = deep_gemm.jit_kernels.gemm.get_best_configs(
         m=info['m'], n=info['n'], k=info['k'], num_groups=1,
         num_sms=num_sms)
