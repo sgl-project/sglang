@@ -72,7 +72,7 @@ dependencies = [
 
 [project.optional-dependencies]
 decord = ["decord"]
-hip-attn = ["hip-attn>=1.2.1"]
+hip-attn = ["hip-attn>=1.2.2"]
 test = [
   "accelerate",
   "expecttest",
