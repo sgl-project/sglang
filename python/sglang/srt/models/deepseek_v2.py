@@ -1054,7 +1054,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if global_server_args_dict["moe_dense_tp_size"] == 1:
+            if self._enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
@@ -1077,6 +1077,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
+    def _enable_moe_dense_fully_dp():
+        return global_server_args_dict["moe_dense_tp_size"] == 1
+
+    @staticmethod
     def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
         is_sparse = is_nextn or (
             config.n_routed_experts is not None
@@ -1085,7 +1089,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         execution_mode = (
             _DecoderLayerExecutionMode.MLP_ONE
-            if global_server_args_dict["enable_deepep_moe"] and is_sparse
+            if (global_server_args_dict["enable_deepep_moe"] and is_sparse) or \
+               (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
             else _DecoderLayerExecutionMode.MLP_ALL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, execution_mode=execution_mode)
