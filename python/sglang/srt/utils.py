@@ -563,6 +563,50 @@ def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
     return image, image_size
 
 
+def read_video_from_file(video_file: Union[str, bytes]):
+    from decord import VideoReader, cpu
+    from PIL import Image
+
+    # Open the video file
+    vr = VideoReader(video_file, ctx=cpu(0))
+    # Get metadata
+    fps = vr.get_avg_fps()
+    # Get the first frame to determine dimensions
+    first_frame = vr[0].asnumpy()
+    height, width = first_frame.shape[:2]
+    resolution = (width, height)
+    duration = len(vr) / fps  # Duration in seconds
+
+    # Extract frames as PIL images
+    frames = []
+    for i in range(len(vr)):
+        # Get frame as numpy array
+        frame = vr[i].asnumpy()
+        # Convert to PIL image
+        img = Image.fromarray(frame.astype("uint8"))
+        frames.append(img)
+
+    return frames, fps, resolution, duration
+
+
+def load_video(video_file: Union[str, bytes]):
+    if isinstance(video_file, bytes):
+        video_frames, fps, resolution, duration = read_video_from_file(video_file)
+    elif video_file.startswith("http://") or video_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(video_file, stream=True, timeout=timeout).raw
+        video_frames, fps, resolution, duration = read_video_from_file(response)
+    elif video_file.startswith("data:"):
+        # assume format data:video/mp4;base64,<video_data>
+        video_file = video_file.split(",")[1]
+        video_file = base64.b64decode(video_file)
+        video_file = BytesIO(video_file)
+        video_frames, fps, resolution, duration = read_video_from_file(video_file)
+    else:
+        raise ValueError(f"Invalid video: {video_file}")
+    return video_frames, fps, resolution, duration
+
+
 def suppress_other_loggers():
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
