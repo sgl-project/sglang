@@ -806,12 +806,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         last_loc: torch.Tensor,
     ):
         if self.tree_cache is not None:
-            tokens_required = (
-                self.new_page_count_next_decode
-                * self.token_to_kv_pool_allocator.page_size
-            )
-            if self.token_to_kv_pool_allocator.available_size() < tokens_required:
-                self.tree_cache.evict(tokens_required)
+            if (
+                self.token_to_kv_pool_allocator.available_size()
+                < len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+            ):
+                self.tree_cache.evict(
+                    len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
+                )
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
 
         if out_cache_loc is None:
