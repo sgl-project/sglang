@@ -53,6 +53,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     async def _process_single_image(self, images, input_text) -> dict:
         if self.executor is not None:
             loop = asyncio.get_event_loop()
+            # FIXME
             return await loop.run_in_executor(
                 self.executor,
                 Qwen2_5VLImageProcessor._process_images_task,
@@ -149,6 +150,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ret = await self._process_single_image(
             images=images, input_text=base_output.input_text
         )
+        
+        #debug
+        print(f"!!!!!! ret: {type(ret)}, {ret["image_grid_thw"]}")
 
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         video_grid_thws = None
