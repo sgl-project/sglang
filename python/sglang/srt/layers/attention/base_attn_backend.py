@@ -47,7 +47,7 @@ class AttentionBackend(ABC):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Init the metadata for a forward pass for replying a cuda graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):

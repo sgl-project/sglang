@@ -103,11 +103,14 @@ class LoRAManager:
             self.loras[name] = lora_adapter
 
         # misc lora configs
-        # FIXME remove the restrictions after implementing unified paging
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
-        self.scaling: float = list(self.loras.values())[0].scaling
-        assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
-        assert all(x.scaling == self.scaling for x in self.loras.values())
+
+        if self.lora_backend == "flashinfer":
+            # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+            max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+            scaling = list(self.loras.values())[0].scaling
+            assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
+            assert all(x.scaling == scaling for x in self.loras.values())
 
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
@@ -148,8 +151,18 @@ class LoRAManager:
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
         max_len = int(torch.max(seg_lens))
         weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+
+        lora_ranks = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+        )
+        scalings = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+        )
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+            lora = self.loras[lora_path]
+            lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+            scalings[weight_indices[i]] = lora.scaling
 
         batch_info = LoRABatchInfo(
             bs=bs,
@@ -157,6 +170,8 @@ class LoRAManager:
             seg_indptr=seg_indptr,
             max_len=max_len,
             weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
         )
         self.lora_backend.set_batch_info(batch_info)
 
@@ -189,9 +204,7 @@ class LoRAManager:
                     )
 
     def set_lora_module(self, module_name, module):
-        lora_module = get_lora_layer(
-            module, self.max_lora_dim, self.scaling, self.lora_backend
-        )
+        lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 

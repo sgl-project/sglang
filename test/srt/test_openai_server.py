@@ -18,11 +18,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestOpenAIServer(unittest.TestCase):
+class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -257,7 +258,12 @@ class TestOpenAIServer(unittest.TestCase):
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
 
-            assert isinstance(data.content, str) or response.choices[0].finish_reason
+            assert (
+                isinstance(data.content, str)
+                or isinstance(data.reasoning_content, str)
+                or len(data.tool_calls) > 0
+                or response.choices[0].finish_reason
+            )
             assert response.id
             assert response.created
 
@@ -536,12 +542,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
+    def test_model_list(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        models = list(client.models.list())
+        assert len(models) == 1
+        assert isinstance(getattr(models[0], "max_model_len", None), int)
+
 
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests
 # -------------------------------------------------------------------------
-class TestOpenAIServerEBNF(unittest.TestCase):
+class TestOpenAIServerEBNF(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -624,7 +636,7 @@ class TestOpenAIServerEBNF(unittest.TestCase):
         )
 
 
-class TestOpenAIEmbedding(unittest.TestCase):
+class TestOpenAIEmbedding(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
