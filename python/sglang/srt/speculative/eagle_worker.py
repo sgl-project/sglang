@@ -313,7 +313,7 @@ class EAGLEWorker(TpModelWorker):
                 seq_lens = prefix_lens + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
             else:
-                # In this case, the last partial page is duplicated.
+                # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
                 #
                 # | -------- | -- xxxx .. | -- xxxx .. | -- xxxx .. |
