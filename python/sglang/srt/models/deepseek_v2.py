@@ -1045,6 +1045,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
+        previous_layer_info = self._compute_info(config, layer_id=layer_id - 1, is_nextn=False)
 
         if self.info.is_sparse:
             self.mlp = DeepseekV2MoE(
@@ -1067,7 +1068,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
-        previous_layer_info = self._compute_info(config, layer_id=layer_id - 1, is_nextn=False)
         self.input_is_scattered = previous_layer_info.execution_mode == _DecoderLayerExecutionMode.MLP_ONE
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
