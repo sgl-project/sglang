@@ -152,8 +152,9 @@ class Engine:
         Please refer to `GenerateReqInput` for the documentation.
         """
         modalities_list = []
-        if image_data is not None:
-            modalities_list.append("image")
+        for item_image_data in image_data:
+            if item_image_data is not None:
+                modalities_list.append("image") 
 
         obj = GenerateReqInput(
             text=prompt,
