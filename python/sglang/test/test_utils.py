@@ -83,7 +83,7 @@ else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
     )
-DEFAULT_URL_FOR_TEST = "http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
