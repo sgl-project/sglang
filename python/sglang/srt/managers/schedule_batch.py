@@ -793,13 +793,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             raise RuntimeError(error_msg)
         return out_cache_loc
 
-    @property
-    def new_page_count_next_decode(self):
-        page_size = self.token_to_kv_pool_allocator.page_size
-        if page_size == 1:
-            return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
-
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1102,9 +1095,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
+    def new_page_count_next_decode(self):
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size == 1:
+            return len(self.reqs)
+        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+    
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
-            self.new_page_count_next_decode
+            self.new_page_count_next_decode()
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
