@@ -36,10 +36,10 @@ docker exec -it sglang_zhyncs /bin/zsh
 
 Third-party libraries:
 
-- [CCCL](https://github.com/NVIDIA/cccl)
 - [CUTLASS](https://github.com/NVIDIA/cutlass)
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
+- [FlashAttention](https://github.com/Dao-AILab/flash-attention)
 
 ### Kernel Development
 
