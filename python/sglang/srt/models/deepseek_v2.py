@@ -1093,14 +1093,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
+        mode = self._compute_mode()
+        if mode == _DecoderLayerForwardMode.MLP_ONE:
             return self.forward_mode_mlp_one(
                 positions, hidden_states, forward_batch, residual
             )
-        else:
+        elif mode == _DecoderLayerForwardMode.MLP_ALL:
             return self.forward_mode_mlp_all(
                 positions, hidden_states, forward_batch, residual
             )
+        else:
+            raise NotImplementedError
 
     def forward_mode_mlp_all(
         self,
