@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from tqdm import tqdm
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -166,6 +167,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.n_share_fusion_experts = int(os.getenv("SHARE_EXPERTS_FUSION_REPLICA", "0"))
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -187,8 +189,8 @@ class DeepseekV2MoE(nn.Module):
             else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
         )
         self.experts = MoEImpl(
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=config.n_routed_experts + self.n_share_fusion_experts,
+            top_k=config.num_experts_per_tok + min(self.n_share_fusion_experts, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
@@ -256,8 +258,10 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.n_shared_experts is not None:
+        if self.n_shared_experts is not None and self.n_share_fusion_experts == 0:
             shared_output = self.shared_experts(hidden_states)
+        else:
+            shared_output = None
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
@@ -1309,6 +1313,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.n_share_fusion_experts = int(os.getenv("SHARE_EXPERTS_FUSION_REPLICA", "0"))
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1342,7 +1347,33 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
+        if self.n_share_fusion_experts != 0:
+            weights_list = list(weights)
+            weights_dict = {k: v for (k, v) in weights_list}
+            suffix_list = [
+                'down_proj.weight', 'down_proj.weight_scale_inv',
+                'gate_proj.weight', 'gate_proj.weight_scale_inv',
+                'up_proj.weight', 'up_proj.weight_scale_inv'
+            ]
+            current_device = torch.cuda.current_device()
+            is_master = (current_device == 0)
+            for moe_layer in tqdm(range(self.config.num_hidden_layers),
+                                  desc=f"Cloning {self.n_share_fusion_experts} "
+                                  "replicas of shared expert into MoE",
+                                  disable=not is_master):
+                if moe_layer < self.config.first_k_dense_replace:
+                    continue
+                for num_repeat in range(self.n_share_fusion_experts):
+                    for suffix in suffix_list:
+                        weights_list.append((
+                            f"model.layers.{moe_layer}."
+                            f"mlp.experts."
+                            f"{self.config.n_routed_experts + num_repeat}"
+                            f".{suffix}", weights_dict[
+                                f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"]
+                            .clone()))
+            weights = weights_list
+        
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         MoEImpl = (
@@ -1354,7 +1385,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts + self.n_share_fusion_experts,
         )
 
         params_dict = dict(self.named_parameters())

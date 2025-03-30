@@ -638,6 +638,10 @@ def get_moe_configs(
     config_file_path = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
     )
+    if int(os.getenv("SHARE_EXPERTS_FUSION_REPLICA", "0")) > 0:
+        config_file_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "configs/share_experts_fusion", json_file_name
+        )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             logger.info("Using configuration from %s for MoE layer.", config_file_path)
