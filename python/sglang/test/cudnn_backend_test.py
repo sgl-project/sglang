@@ -463,7 +463,7 @@ class TorchNativeAttnBackend():
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             per_req_out_redudant = (
-                scaled_dot_product_attention(
+                torch.nn.functional.scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
@@ -566,10 +566,16 @@ def test_correctness():
     # the request index of inputs sequences in req_to_token
     req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
+    extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+    vals = [1, 2, 3, 4, 5, 3, 3, 3, 3, 3]  # sum is 30
+    extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
+    #extend_seq_lens = torch.randint(low=1,high=3,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+
     # req_to_token[request_index]: list of index of tokens in query and value for that request_index
     # sum(len(tokens_per_request)) = num_tokens in query
     req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
-    seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
+    #seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
+    seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
     scaling = 1/math.sqrt(input_parem.head_size)
 
 
@@ -606,11 +612,6 @@ def test_correctness():
 
 
     logging.info("Start Extend Test")
-
-    extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
-    vals = [1, 2, 3, 4, 5, 3, 3, 3, 3, 3]  # sum is 30
-    extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
-    #extend_seq_lens = torch.randint(low=1,high=3,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
     # Force sum(extend_seq_lens) = input_parem.num_token
     current_sum = extend_seq_lens.sum()
