@@ -544,10 +544,9 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(
-            tokenizer_manager, server_args.chat_template, server_args.model_path
-        )
+    load_chat_template_for_openai_api(
+        tokenizer_manager, server_args.chat_template, server_args.model_path
+    )
 
     if server_args.completion_template:
         load_completion_template_for_openai_api(server_args.completion_template)

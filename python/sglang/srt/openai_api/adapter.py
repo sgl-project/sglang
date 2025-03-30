@@ -71,6 +71,7 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+from sglang.srt.openai_api.utils import auto_select_chat_template
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
@@ -118,10 +119,32 @@ def create_streaming_error_response(
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, model_path):
     global chat_template_name
 
-    logger.info(
-        f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
-    )
+    if chat_template_arg is None:
+        from sglang.srt.openai_api.utils import auto_select_chat_template
 
+        model_type = tokenizer_manager.model_config.hf_config.model_type
+        logger.info(
+            f"Attempting auto-selection of chat template for model type '{model_type}'."
+        )
+        chosen_template = auto_select_chat_template(model_type)
+        if chosen_template:
+            tokenizer_manager.tokenizer.chat_template = chosen_template
+            chat_template_name = chosen_template
+            logger.info(
+                f"Auto-selected chat template: '{chosen_template}' for model type '{model_type}'."
+            )
+        else:
+            logger.warning(
+                f"No mapping found for model type '{model_type}'. "
+                "Using default HuggingFace text-only template (images will not be passed in)."
+            )
+            tokenizer_manager.tokenizer.chat_template = None
+            chat_template_name = None
+        return
+
+    logger.info(f"Using provided chat template: {chat_template_arg}")
+
+    # Existing logic for when a chat template is provided.
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -162,11 +185,6 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             chat_template_name = template["name"]
     else:
         chat_template_name = chat_template_arg
-
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
-    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
 
 
 async def v1_files_create(
