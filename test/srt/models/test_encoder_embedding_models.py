@@ -24,7 +24,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
-MODELS = [("BAAI/bge-small-en", 1, 1e-5)]
+MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("facebook/contriever", 1, 1e-5)]
 
 ATTENTION_BACKEND = ["torch_native", "triton", "fa3"]
 TORCH_DTYPES = [torch.float32]
