@@ -260,6 +260,8 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
+            if self.model_runner.server_args.lora_paths is not None:
+                self.lora_paths = [None] * self.max_bs
 
         # Capture
         try:
@@ -394,7 +396,10 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
-
+        if self.model_runner.server_args.lora_paths is not None:
+            lora_paths = self.lora_paths[:bs]
+        else:
+            lora_paths = None
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -415,7 +420,11 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
+            lora_paths=lora_paths,
         )
+
+        if self.model_runner.server_args.lora_paths is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -502,6 +511,8 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+        if self.model_runner.server_args.lora_paths is not None:
+            self.lora_paths[:raw_bs] = forward_batch.lora_paths
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
@@ -536,7 +547,6 @@ class CudaGraphRunner:
         # Replay
         self.graphs[self.bs].replay()
         next_token_logits, hidden_states = self.output_buffers[self.bs]
-
         logits_output = LogitsProcessorOutput(
             next_token_logits=next_token_logits[: self.raw_num_token],
             hidden_states=(

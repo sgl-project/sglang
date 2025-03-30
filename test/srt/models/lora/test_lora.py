@@ -90,7 +90,6 @@ class TestLoRA(CustomTestCase):
             tp_size=tp_size,
             lora_paths=all_lora_paths,
             max_loras_per_batch=3,
-            disable_cuda_graph=True,
             disable_radix_cache=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
@@ -209,7 +208,6 @@ class TestLoRA(CustomTestCase):
             model_type="generation",
             lora_paths=all_lora_paths,
             max_loras_per_batch=3,
-            disable_cuda_graph=True,
             disable_radix_cache=True,
         ) as srt_runner:
             srt_outputs = srt_runner.batch_forward(
