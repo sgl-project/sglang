@@ -1154,10 +1154,6 @@ class ServerArgs:
                 else:
                     self.lora_paths[lora_path] = lora_path
 
-    @property
-    def enable_moe_dense_fully_dp(self):
-        return self.moe_dense_tp_size == 1
-
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
