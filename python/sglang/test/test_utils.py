@@ -25,7 +25,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree
+from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -1010,26 +1010,10 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        _retry_execution(
+        max_retry = int(
+            os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0")
+        )
+        retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
-            max_retry=_get_max_retry(),
+            max_retry=max_retry,
         )
-
-
-def _get_max_retry():
-    return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
-
-
-def _retry_execution(fn, max_retry: int):
-    if max_retry == 0:
-        fn()
-        return
-
-    try:
-        fn()
-    except Exception as e:
-        print(
-            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
-        )
-        traceback.print_exc()
-        _retry_execution(fn, max_retry=max_retry - 1)
