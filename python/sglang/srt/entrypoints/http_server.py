@@ -45,6 +45,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    BatchUpdateWeightsFromDistributedReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -418,6 +419,23 @@ async def update_weights_from_distributed(
     """Update model parameter from distributed online."""
     success, message = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/batch_update_weights_from_distributed")
+async def batch_update_weights_from_distributed(
+    obj: BatchUpdateWeightsFromDistributedReqInput, request: Request
+):
+    """Update multiple model parameters from distributed in a single request."""
+    success, message = (
+        await _global_state.tokenizer_manager.batch_update_weights_from_distributed(
             obj, request
         )
     )

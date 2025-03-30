@@ -543,6 +543,11 @@ class UpdateWeightsFromDistributedReqInput:
 
 
 @dataclass
+class BatchUpdateWeightsFromDistributedReqInput:
+    parameters: List[Dict[str, Union[str, List[int]]]]
+
+
+@dataclass
 class UpdateWeightsFromDistributedReqOutput:
     success: bool
     message: str
