@@ -975,6 +975,12 @@ class _DecoderLayerExecutionMode(Enum):
     MLP_ALL = auto()
 
 
+@dataclass
+class _DecoderLayerInfo:
+    is_sparse: bool
+    execution_mode: _DecoderLayerExecutionMode
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1073,19 +1079,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _compute_is_sparse(config: PretrainedConfig, layer_id: int, is_nextn: bool):
-        return is_nextn or (
+    def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
+        is_sparse = is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         )
-
-    @staticmethod
-    def _compute_execution_mode(is_sparse: bool):
-        if global_server_args_dict["enable_deepep_moe"] and is_sparse:
-            return _DecoderLayerExecutionMode.MLP_ONE
-        else:
-            return _DecoderLayerExecutionMode.MLP_ALL
+        execution_mode = (
+            _DecoderLayerExecutionMode.MLP_ONE
+            if global_server_args_dict["enable_deepep_moe"] and is_sparse
+            else _DecoderLayerExecutionMode.MLP_ALL
+        )
+        return _DecoderLayerInfo(is_sparse=is_sparse, execution_mode=execution_mode)
 
     def forward(
         self,
