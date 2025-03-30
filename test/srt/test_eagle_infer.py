@@ -567,7 +567,7 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
                 "--max-running-requests",
                 8,
                 "--page-size",
-                4,
+                8,
             ],
         )
 
