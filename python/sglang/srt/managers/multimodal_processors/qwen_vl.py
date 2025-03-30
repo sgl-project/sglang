@@ -6,10 +6,8 @@ from typing import List, Union
 import torch
 from PIL import Image
 
-from sglang.srt.managers.multimodal_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
 from sglang.srt.managers.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
     MultimodalSpecialTokens,
     get_global_processor,
 )
@@ -151,9 +149,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         ret = await self._process_single_image(
             images=images, input_text=base_output.input_text
         )
-        
-        #debug
-        print(f"!!!!!! ret: {type(ret)}, {ret["image_grid_thw"]}")
 
         image_grid_thws = torch.concat([ret["image_grid_thw"]])
         video_grid_thws = None
