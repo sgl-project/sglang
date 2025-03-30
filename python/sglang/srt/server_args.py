@@ -237,7 +237,7 @@ class ServerArgs:
                 self.chunked_prefill_size = 8192
 
         assert self.chunked_prefill_size % self.page_size == 0
-       
+
         assert self.moe_dense_tp_size in {1, None}, f"moe_dense_tp_size only support 1 and None currently"
 
         if self.enable_flashmla is True:
@@ -1153,6 +1153,10 @@ class ServerArgs:
                     self.lora_paths[name] = path
                 else:
                     self.lora_paths[lora_path] = lora_path
+
+    @property
+    def enable_moe_dense_fully_dp(self):
+        return self.moe_dense_tp_size == 1
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
