@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -11,11 +13,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestEvalFP8Accuracy(unittest.TestCase):
+class TestEvalFP8Accuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST
@@ -42,7 +45,7 @@ class TestEvalFP8Accuracy(unittest.TestCase):
         self.assertGreaterEqual(metrics["score"], 0.61)
 
 
-class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
+class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
 
     def _run_test(self, model, other_args, expected_score):
         base_url = DEFAULT_URL_FOR_TEST
@@ -107,7 +110,7 @@ class TestEvalFP8DynamicQuantAccuracy(unittest.TestCase):
         )
 
 
-class TestEvalFP8ModelOptQuantAccuracy(unittest.TestCase):
+class TestEvalFP8ModelOptQuantAccuracy(CustomTestCase):
 
     def _run_test(self, model, other_args, expected_score):
         base_url = DEFAULT_URL_FOR_TEST
@@ -135,6 +138,9 @@ class TestEvalFP8ModelOptQuantAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
+    @unittest.skipIf(
+        torch.version.hip is not None, "modelopt quantization unsupported on ROCm"
+    )
     def test_mmlu_offline_only(self):
         """Test with offline quantization only."""
         self._run_test(

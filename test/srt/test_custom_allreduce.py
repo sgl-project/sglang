@@ -17,6 +17,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def get_open_port() -> int:
@@ -54,7 +55,7 @@ def multi_process_parallel(
     ray.shutdown()
 
 
-class TestCustomAllReduce(unittest.TestCase):
+class TestCustomAllReduce(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         random.seed(42)

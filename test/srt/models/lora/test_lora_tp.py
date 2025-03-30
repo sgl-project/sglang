@@ -21,7 +21,7 @@ import torch
 from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import calculate_rouge_l, is_in_ci
+from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
 
 CI_LORA_MODELS = [
     LoRAModelCase(
@@ -33,6 +33,9 @@ CI_LORA_MODELS = [
         ],
         max_loras_per_batch=1,
     ),
+]
+
+ALL_OTHER_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
@@ -43,9 +46,6 @@ CI_LORA_MODELS = [
         ],
         max_loras_per_batch=1,
     ),
-]
-
-ALL_OTHER_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-2-7b-hf",
         adaptors=[LoRAAdaptor(name="winddude/wizardLM-LlaMA-LoRA-7B")],
@@ -69,7 +69,7 @@ PROMPTS = [
 BACKEND = "triton"
 
 
-class TestLoRATP(unittest.TestCase):
+class TestLoRATP(CustomTestCase):
     def run_tp(
         self,
         prompt: str,
