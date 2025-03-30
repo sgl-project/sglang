@@ -970,7 +970,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-class _DecoderLayerForwardMode(Enum):
+class _DecoderLayerExecutionMode(Enum):
     MLP_ONE = auto()
     MLP_ALL = auto()
 
@@ -1079,11 +1079,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _compute_mode():
+    def _compute_execution_mode():
         if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
-            return _DecoderLayerForwardMode.MLP_ONE
+            return _DecoderLayerExecutionMode.MLP_ONE
         else:
-            return _DecoderLayerForwardMode.MLP_ALL
+            return _DecoderLayerExecutionMode.MLP_ALL
 
     def forward(
         self,
@@ -1092,12 +1092,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        mode = self._compute_mode()
-        if mode == _DecoderLayerForwardMode.MLP_ONE:
+        mode = self._compute_execution_mode()
+        if mode == _DecoderLayerExecutionMode.MLP_ONE:
             return self.forward_mode_mlp_one(
                 positions, hidden_states, forward_batch, residual
             )
-        elif mode == _DecoderLayerForwardMode.MLP_ALL:
+        elif mode == _DecoderLayerExecutionMode.MLP_ALL:
             return self.forward_mode_mlp_all(
                 positions, hidden_states, forward_batch, residual
             )
