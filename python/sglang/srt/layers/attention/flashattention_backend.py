@@ -295,10 +295,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             # Pre-reshape query tensor
-            q_reshaped = (
-                q.contiguous()
-                .view(-1, layer.tp_q_head_num, layer.head_dim)
-            )
+            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
             # Run attention with precomputed values
             o = flash_attn_with_kvcache(
