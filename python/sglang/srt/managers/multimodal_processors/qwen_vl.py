@@ -51,18 +51,19 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         }
 
     async def _process_single_image(self, images, input_text) -> dict:
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            # FIXME
-            return await loop.run_in_executor(
-                self.executor,
-                Qwen2_5VLImageProcessor._process_images_task,
-                images,
-                input_text,
-                self.hf_config,
-            )
-        else:
-            return self._process_images_task(images, input_text, self.hf_config)
+        # if self.executor is not None:
+        #     loop = asyncio.get_event_loop()
+        #     # FIXME
+        #     return await loop.run_in_executor(
+        #         self.executor,
+        #         Qwen2_5VLImageProcessor._process_images_task,
+        #         images,
+        #         input_text,
+        #         self.hf_config,
+        #     )
+        # else:
+        #     return self._process_images_task(images, input_text, self.hf_config)
+        return self._process_images_task(images, input_text, self.hf_config)
 
     async def process_mm_data_async(
         self,
