@@ -1099,11 +1099,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.execution_mode == _DecoderLayerExecutionMode.MLP_ONE:
+        if self.info.execution_mode == _DecoderLayerExecutionMode.MLP_ONE:
             return self.forward_mode_mlp_one(
                 positions, hidden_states, forward_batch, residual
             )
-        elif self.execution_mode == _DecoderLayerExecutionMode.MLP_ALL:
+        elif self.info.execution_mode == _DecoderLayerExecutionMode.MLP_ALL:
             return self.forward_mode_mlp_all(
                 positions, hidden_states, forward_batch, residual
             )
