@@ -388,6 +388,7 @@ class Conversation:
             stop_str=self.stop_str,
             image_token=self.image_token,
             audio_token=self.audio_token,
+            video_token=self.video_token,
         )
 
     def dict(self):
@@ -480,6 +481,7 @@ def generate_chat_conv(
         modalities=[],
         image_token=conv.image_token,
         audio_token=conv.audio_token,
+        video_token=conv.video_token,
     )
 
     if isinstance(request.messages, str):
