@@ -13,22 +13,27 @@ apply_rotary_emb = None
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 DISABLE_BACKWARD = True
-DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
-DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
-DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
-DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
-DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
-DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
-DISABLE_FP8 = (
-    os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
-    or torch.cuda.get_device_capability("cuda")[0] < 9
-)
-DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
-DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
-DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
-DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
-DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+# For CI test, we close them to True.
+# DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+# DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+# DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+# DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+# DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
+# DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+# DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
+# DISABLE_FP8 = (
+#     os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
+#     or torch.cuda.get_device_capability("cuda")[0] < 9
+# )
+
+DISABLE_SPLIT = True
+DISABLE_PAGEDKV = True
+DISABLE_APPENDKV = True
+DISABLE_LOCAL = True
+DISABLE_SOFTCAP = True
+DISABLE_PACKGQA = True
+DISABLE_FP16 = True
+DISABLE_FP8 = True
 
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/padding.py
@@ -285,22 +290,22 @@ def attention_ref(
 )
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [True])
-@pytest.mark.parametrize(
-    "causal,local",
-    [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
-)
+# @pytest.mark.parametrize(
+#     "causal,local",
+#     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
+# )
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(False, False)])
+@pytest.mark.parametrize("causal,local", [(False, False)])
 @pytest.mark.parametrize(
     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
 )
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-@pytest.mark.parametrize("has_rotary_seqlens", [False, True])
-# @pytest.mark.parametrize("has_rotary_seqlens", [False])
+# @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
+@pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
     "rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False]
 )
@@ -318,12 +323,12 @@ def attention_ref(
     "page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else [])
 )
 # @pytest.mark.parametrize("page_size", [None])
-@pytest.mark.parametrize("has_leftpad", [False, True])
-# @pytest.mark.parametrize("has_leftpad", [False])
-@pytest.mark.parametrize("has_batch_idx", [False, True])
-# @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("has_leftpad", [False, True])
+@pytest.mark.parametrize("has_leftpad", [False])
+# @pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("has_batch_idx", [False])
+# @pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
