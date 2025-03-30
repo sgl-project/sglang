@@ -132,6 +132,9 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
+        # A reference make this class has the same member as TpModelWorkerClient
+        self.worker = self
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,

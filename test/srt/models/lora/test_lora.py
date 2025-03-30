@@ -29,7 +29,7 @@ LORA_SETS = [
     # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
-    #     "base": "mistralai/Mistral-7B-Instruct-v0.3",
+    # "base": "mistralai/Mistral-7B-Instruct-v0.3",
     #     "loras": [
     #         "/home/ying/test_lora",
     #         "/home/ying/test_lora_1",
@@ -95,6 +95,11 @@ class TestLoRA(CustomTestCase):
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
+            )
+            srt_outputs_lora_path_none = srt_runner.forward(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                lora_paths=[None] * len(prompts),
             )
 
         with HFRunner(
@@ -169,18 +174,22 @@ class TestLoRA(CustomTestCase):
         print(f"{srt_outputs.output_strs=}")
         print(f"{hf_no_lora_outputs.output_strs=}")
         print(f"{srt_no_lora_outputs.output_strs=}")
+        print(f"{srt_outputs_lora_path_none.output_strs=}")
         for i in range(len(prompts)):
-            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
+            assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[
+                i
+            ].strip(" "), (
                 srt_outputs.output_strs[i].strip(" "),
-                hf_outputs.output_strs[i],
+                hf_outputs.output_strs[i].strip(" "),
             )
-            # assert (
-            #     srt_no_lora_outputs.output_strs[i].strip(" ")
-            #     == hf_no_lora_outputs.output_strs[i]
-            # ), (
-            #     srt_no_lora_outputs.output_strs[i].strip(" "),
-            #     hf_no_lora_outputs.output_strs[i],
-            # )
+            assert (
+                srt_no_lora_outputs.output_strs[i].strip(" ")
+                == hf_no_lora_outputs.output_strs[i]
+            ), (
+                srt_no_lora_outputs.output_strs[i].strip(" "),
+                hf_no_lora_outputs.output_strs[i],
+            )
+            # assert srt_outputs_lora_path_none == srt_no_lora_outputs
 
     def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing serving =======================")
@@ -257,7 +266,7 @@ class TestLoRA(CustomTestCase):
             srt_no_lora_logprobs = torch.Tensor(
                 srt_no_lora_outputs.top_input_logprobs[i]
             )
-            srt_logprobs = torch.uensor(srt_outputs.top_input_logprobs[i])
+            srt_logprobs = torch.Tensor(srt_outputs.top_input_logprobs[i])
             print("max_diff", torch.max(abs(srt_no_lora_logprobs - srt_logprobs)))
 
         print(f"{srt_no_lora_outputs.output_strs=}")
