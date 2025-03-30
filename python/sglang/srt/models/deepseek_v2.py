@@ -1038,6 +1038,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.is_sparse = self._compute_is_sparse(config, layer_id, is_nextn=is_nextn)
+        self.execution_mode = self._compute_execution_mode(is_sparse=self.is_sparse)
+
         if self.is_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
@@ -1079,8 +1081,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _compute_execution_mode():
-        if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
+    def _compute_execution_mode(is_sparse: bool):
+        if global_server_args_dict["enable_deepep_moe"] and is_sparse:
             return _DecoderLayerExecutionMode.MLP_ONE
         else:
             return _DecoderLayerExecutionMode.MLP_ALL
@@ -1092,12 +1094,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        mode = self._compute_execution_mode()
-        if mode == _DecoderLayerExecutionMode.MLP_ONE:
+        if self.execution_mode == _DecoderLayerExecutionMode.MLP_ONE:
             return self.forward_mode_mlp_one(
                 positions, hidden_states, forward_batch, residual
             )
-        elif mode == _DecoderLayerExecutionMode.MLP_ALL:
+        elif self.execution_mode == _DecoderLayerExecutionMode.MLP_ALL:
             return self.forward_mode_mlp_all(
                 positions, hidden_states, forward_batch, residual
             )
