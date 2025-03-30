@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -1043,10 +1044,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        self.is_sparse = self._compute_is_sparse(config, layer_id, is_nextn=is_nextn)
-        self.execution_mode = self._compute_execution_mode(is_sparse=self.is_sparse)
+        self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
 
-        if self.is_sparse:
+        if self.info.is_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
