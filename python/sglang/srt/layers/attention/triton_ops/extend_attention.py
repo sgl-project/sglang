@@ -95,11 +95,7 @@ def _fwd_kernel(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
     offs_m = tl.arange(0, BLOCK_M)
-
-    if IS_CAUSAL:
-        mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
-    else:
-        mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len
+    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
@@ -206,14 +202,14 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
-    cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    cur_block_m_end = (
+        cur_seq_len
+        if not IS_CAUSAL
+        else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    )
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-
-        if IS_CAUSAL:
-            mask_n = (start_n + offs_n) < cur_block_m_end
-        else:
-            mask_n = (start_n + offs_n) < cur_seq_len
+        mask_n = (start_n + offs_n) < cur_block_m_end
 
         # load k in transposed way
         offs_k = (
@@ -264,8 +260,7 @@ def _fwd_kernel(
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
         else:
-            mask_non_causal = (cur_block_m * BLOCK_M + offs_m[:, None]) < cur_seq_len
-            mask_non_causal &= mask_m[:, None] & mask_n[None, :]
+            mask_non_causal = mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_non_causal, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)

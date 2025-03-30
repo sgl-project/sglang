@@ -530,7 +530,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
         self.extend_attention_fwd(
