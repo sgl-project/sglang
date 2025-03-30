@@ -1249,7 +1249,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states, residual
                 )
 
-        if not (self._enable_moe_dense_fully_dp() and hidden_states.shape[0] == 0):
+        if not (self._enable_moe_dense_fully_dp() and (not self.info.is_sparse) and hidden_states.shape[0] == 0):
             hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         if self.is_last_layer and self.attn_tp_size != 1:
