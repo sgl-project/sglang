@@ -1037,7 +1037,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        if is_nextn or self._is_sparse_layer(config, layer_id):
+        if self._is_sparse_layer(config, layer_id, is_nextn=is_nextn):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1061,7 +1061,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.is_sparse = False
 
         self.input_is_scattered = (
-            self._is_sparse_layer(config, layer_id - 1)
+            self._is_sparse_layer(config, layer_id - 1, is_nextn=False)
             and global_server_args_dict["enable_deepep_moe"]
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
@@ -1072,8 +1072,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     @staticmethod
-    def _is_sparse_layer(config: PretrainedConfig, layer_id: int):
-        return (
+    def _is_sparse_layer(config: PretrainedConfig, layer_id: int, is_nextn: bool):
+        return is_nextn or (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
