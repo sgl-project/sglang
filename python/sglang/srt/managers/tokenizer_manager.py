@@ -48,7 +48,7 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.conn import KVBootstrapServer
+from sglang.srt.disaggregation.verbs_conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -452,6 +452,8 @@ class TokenizerManager:
                 top_logprobs_num,
                 token_ids_logprob,
                 obj.stream,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,

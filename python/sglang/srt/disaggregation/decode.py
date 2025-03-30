@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
+from sglang.srt.disaggregation.verbs_conn import KVArgs, KVManager, KVPoll, KVReceiver
 from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
