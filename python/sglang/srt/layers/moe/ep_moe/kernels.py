@@ -5,14 +5,125 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.utils import is_cuda
 
-_is_cuda = torch.cuda.is_available() and torch.version.cuda
+_is_cuda = is_cuda()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def deepep_permute_triton_kernel(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    a1_scales_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+        in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                tl.store(dst_ptr + offset, in_data, mask=mask)
+
+
+@triton.jit
+def deepep_post_reorder_triton_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    InDtype = down_output_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    topk_weights_ptr = topk_weights_ptr + src_idx * topk
+
+    store_ptr = output_ptr + src_idx * hidden_size
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                load_ptr = down_output_ptr + dst_idx * hidden_size
+                in_data = tl.load(load_ptr + offset, mask=mask)
+                sum_vec += in_data * weigh_scale
+        tl.store(store_ptr + offset, sum_vec, mask=mask)
+
+
+@triton.jit
+def compute_src2dst_triton_kernel(
+    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    tl.store(src2dst + src_id, dst_id, mask=mask)
+
+
+@triton.jit
+def deepep_compute_src2dst_triton_kernel(
+    reorder_ids, src2dst, num_toks, num_minus_one, BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = dst_id < num_toks
+    src_id = tl.load(reorder_ids + dst_id, mask=mask)
+    num_invalid = tl.load(num_minus_one)
+    tl.store(src2dst + src_id, dst_id - num_invalid, mask=mask)
+
+
+def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
+
+    # Find offet
+    expert_ids = torch.arange(
+        num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
+    )
+    torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
+    num_minus_one = seg_indptr[0]
+    seg_indptr = seg_indptr - num_minus_one
+
+    BLOCK_SIZE = 512
+    grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+    deepep_compute_src2dst_triton_kernel[grid](
+        reorder_ids, src2dst, topk_ids.numel(), num_minus_one, BLOCK_SIZE
+    )
+    reorder_topk_ids = reorder_topk_ids[num_minus_one:]
+    return reorder_topk_ids, src2dst, seg_indptr
 
 
 @triton.jit
@@ -30,17 +141,6 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
             low = mid + 1
             target_location = mid
     tl.store(seg_indptr + expert + 1, target_location + 1)
-
-
-@triton.jit
-def compute_src2dst_triton_kernel(
-    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = dst_id < num_toks
-    src_id = tl.load(reorder_ids + dst_id, mask=mask)
-    tl.store(src2dst + src_id, dst_id, mask=mask)
 
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):

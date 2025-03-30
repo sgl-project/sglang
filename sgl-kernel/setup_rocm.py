@@ -21,9 +21,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 
-if "bdist_wheel" in sys.argv and "--plat-name" not in sys.argv:
-    sys.argv.extend(["--plat-name", "manylinux2014_x86_64"])
-
 
 def _get_version():
     with open(root / "pyproject.toml") as f:
@@ -41,7 +38,9 @@ include_dirs = [
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/moe/moe_align_kernel.cu",
+    "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/torch_extension_rocm.cc",
+    "csrc/speculative/eagle_utils.cu",
 ]
 
 cxx_flags = ["-O3"]
@@ -79,7 +78,7 @@ ext_modules = [
 setup(
     name="sgl-kernel",
     version=_get_version(),
-    packages=find_packages(),
+    packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},

@@ -132,6 +132,9 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
+        # A reference make this class has the same member as TpModelWorkerClient
+        self.worker = self
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -214,7 +217,7 @@ class TpModelWorker:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors
+                recv_req.serialized_named_tensors[self.tp_rank]
             ),
             load_format=recv_req.load_format,
         )

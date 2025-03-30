@@ -1,15 +1,17 @@
 """Common utilities for testing and benchmarking"""
 
 import argparse
-import asyncio
 import copy
+import logging
 import os
 import random
 import subprocess
 import threading
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
@@ -23,15 +25,24 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree
+from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
-DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
+DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
 )
+DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST = (
+    "nvidia/Llama-3.1-8B-Instruct-FP8"
+)
+# TODO(yundai424): right now specifying to an older revision since the latest one
+#  carries kv cache quantization which doesn't work yet
+DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_REVISION = (
+    "13858565416dbdc0b4e7a4a677fadfbd5b9e5bb9"
+)
+
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -52,7 +63,6 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B"
 
-
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 
@@ -66,11 +76,14 @@ def is_in_ci():
 
 
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 1157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
+DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -423,6 +436,11 @@ def popen_launch_server(
                     return process
             except requests.RequestException:
                 pass
+
+            return_code = process.poll()
+            if return_code is not None:
+                raise Exception(f"Server unexpectedly exits ({return_code=}).")
+
             time.sleep(10)
 
     kill_process_tree(process.pid)
@@ -453,7 +471,13 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: List, timeout_per_file: float):
+@dataclass
+class TestFile:
+    name: str
+    estimated_time: float = 60
+
+
+def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.time()
     success = True
 
@@ -870,7 +894,6 @@ def run_mulit_request_test(
     enable_overlap=False,
     chunked_prefill_size=32,
 ):
-
     def workload_func(base_url, model):
         def run_one(_):
             prompt = """
@@ -905,6 +928,10 @@ def run_mulit_request_test(
 
 
 def write_github_step_summary(content):
+    if not os.environ.get("GITHUB_STEP_SUMMARY"):
+        logging.warning("GITHUB_STEP_SUMMARY environment variable not set")
+        return
+
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
         f.write(content)
 
@@ -982,3 +1009,14 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                                 rank += 1
                             else:
                                 raise
+
+
+class CustomTestCase(unittest.TestCase):
+    def _callTestMethod(self, method):
+        max_retry = int(
+            os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0")
+        )
+        retry(
+            lambda: super(CustomTestCase, self)._callTestMethod(method),
+            max_retry=max_retry,
+        )

@@ -30,13 +30,22 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import ChatGLMConfig, DbrxConfig, ExaoneConfig, Qwen2_5_VLConfig
+from sglang.srt.configs import (
+    ChatGLMConfig,
+    DbrxConfig,
+    DeepseekVL2Config,
+    ExaoneConfig,
+    MultiModalityConfig,
+)
+from sglang.srt.connector import create_remote_connector
+from sglang.srt.utils import is_remote_url
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
     DbrxConfig.model_type: DbrxConfig,
     ExaoneConfig.model_type: ExaoneConfig,
-    Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
+    DeepseekVL2Config.model_type: DeepseekVL2Config,
+    MultiModalityConfig.model_type: MultiModalityConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -66,6 +75,14 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+
+    # FIXME: Pour contents of janus-pro's langauge_config to first-level
+    if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):
+        assert hasattr(config, "language_config")
+        for key, val in config.language_config.__dict__.items():
+            setattr(config, key, val)
+        setattr(config, "architectures", ["MultiModalityCausalLM"])
+
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
@@ -140,6 +157,14 @@ def get_tokenizer(
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
+    if is_remote_url(tokenizer_name):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(tokenizer_name)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        tokenizer_name = client.get_local_dir()
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
@@ -192,11 +217,26 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     **kwargs,
 ):
+    # pop 'revision' from kwargs if present.
+    revision = kwargs.pop("revision", tokenizer_revision)
+
+    config = AutoConfig.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
+
+    # fix: for Qwen2-VL model, inject default 'size' if not provided.
+    if config.model_type in {"qwen2_vl"}:
+        if "size" not in kwargs:
+            kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+
     processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,
         trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
+        revision=revision,
         **kwargs,
     )
 

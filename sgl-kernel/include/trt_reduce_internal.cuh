@@ -39,7 +39,7 @@ limitations under the License.
 
 namespace trt_llm {
 constexpr size_t WARP_SIZE = 32;
-constexpr size_t MAX_ALL_REDUCE_BLOCKS = 36;
+constexpr size_t MAX_ALL_REDUCE_BLOCKS = 32;
 constexpr size_t MAX_RANKS_PER_NODE = 8;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 

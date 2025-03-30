@@ -7,19 +7,32 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
-    prepare_fp8_layer_for_marlin,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     convert_to_channelwise,
+    is_layer_skipped,
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        apply_fp8_marlin_linear,
+        prepare_fp8_layer_for_marlin,
+    )
+
+    MARLIN_FP8_AVAILABLE = True
+except ImportError:
+    MARLIN_FP8_AVAILABLE = False
+
+    def apply_fp8_marlin_linear(*args, **kwargs):
+        raise ImportError("vllm is not installed")
+
+    def prepare_fp8_layer_for_marlin(*args, **kwargs):
+        raise ImportError("vllm is not installed")
+
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -46,6 +59,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_cuda,
     is_hip,
     permute_weight,
     print_warning_once,
@@ -54,11 +68,18 @@ from sglang.srt.utils import (
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
-is_hip_ = is_hip()
+_is_hip = is_hip()
 
-if is_hip_:
+if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe
     from aiter.ops.shuffle import shuffle_weight
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+else:
+    from vllm import _custom_ops as vllm_ops
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +152,6 @@ class Fp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.attention.layer import Attention  # Avoid circular import
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
@@ -141,8 +160,6 @@ class Fp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return Fp8MoEMethod(self)
-        elif isinstance(layer, Attention):
-            return Fp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -173,9 +190,11 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+        self.use_marlin = (
+            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
+        )
         # Disable marlin for ROCm
-        if is_hip_:
+        if _is_hip:
             self.use_marlin = False
 
         self.block_quant = self.quant_config.weight_block_size is not None
@@ -287,7 +306,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip_:
+            if _is_hip:
                 # activation_scheme: dynamic
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.weight,
@@ -347,7 +366,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight = layer.weight
                 weight_scale = layer.weight_scale
                 # If ROCm, normalize the weights and scales to e4m3fnuz
-                if is_hip_:
+                if _is_hip:
                     weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                         weight=weight,
                         weight_scale=weight_scale,
@@ -371,9 +390,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
         if self.use_marlin:
-            prepare_fp8_layer_for_marlin(layer)
-            # Activations not quantized for marlin.
-            del layer.input_scale
+            try:
+                prepare_fp8_layer_for_marlin(layer)
+                # Activations not quantized for marlin.
+                del layer.input_scale
+            except ImportError:
+                self.use_marlin = False
 
     def apply(
         self,
@@ -383,15 +405,18 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.use_marlin:
-            return apply_fp8_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
+            try:
+                return apply_fp8_marlin_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    workspace=layer.workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias,
+                )
+            except ImportError:
+                self.use_marlin = False
 
         if self.block_quant:
             return apply_w8a8_block_fp8_linear(
@@ -563,7 +588,7 @@ class Fp8MoEMethod:
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
             if (
-                is_hip_
+                _is_hip
             ):  # and get_bool_env_var("CK_MOE"): TODO: add check back after triton kernel
                 # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
                 w13_weight_scale1 = torch.nn.Parameter(
@@ -630,7 +655,7 @@ class Fp8MoEMethod:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip_:
+            if _is_hip:
                 # activation_scheme: dynamic
                 w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.w13_weight,
@@ -667,7 +692,7 @@ class Fp8MoEMethod:
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
-            fp8_dtype = torch.float8_e4m3fnuz if is_hip_ else torch.float8_e4m3fn
+            fp8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
@@ -680,16 +705,24 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             for expert in range(layer.num_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                if _is_cuda:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        sgl_scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
+                else:
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        vllm_ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-            if is_hip_:
+            if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
             return
 
@@ -721,7 +754,7 @@ class Fp8MoEMethod:
                 )
 
             # If ROCm, normalize the weights and scales to e4m3fnuz
-            if is_hip_:
+            if _is_hip:
                 # Normalize the weights and scales
                 w13_weight, w13_weight_scale, w13_input_scale = (
                     normalize_e4m3fn_to_e4m3fnuz(
@@ -762,16 +795,25 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                        ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                    )
+                    if _is_cuda:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = sgl_scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                    else:
+                        (
+                            layer.w13_weight[expert_id][start : start + shard_size, :],
+                            _,
+                        ) = vllm_ops.scaled_fp8_quant(
+                            dq_weight, max_w13_scales[expert_id]
+                        )
                     start += shard_size
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
             )
 
-            if is_hip_:
+            if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
             return
 
@@ -882,7 +924,7 @@ class Fp8MoEMethod:
             correction_bias=correction_bias,
         )
 
-        if is_hip_ and get_bool_env_var("USE_INT4_WEIGHT"):
+        if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
             # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
             assert not no_combine, f"{no_combine=} is not supported."
             return asm_moe(
@@ -895,7 +937,7 @@ class Fp8MoEMethod:
                 layer.w2_weight_scale1,
                 activation=activation,
             )
-        if is_hip_ and get_bool_env_var("CK_MOE"):
+        if _is_hip and get_bool_env_var("CK_MOE"):
             # TODO(CK_MOE): FP8 or FP8 block_quant only supports 'silu' for the time-being.
             assert (
                 activation == "silu"

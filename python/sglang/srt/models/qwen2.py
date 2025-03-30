@@ -15,7 +15,6 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
-from readline import add_history
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -361,6 +360,9 @@ class Qwen2ForCausalLM(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
+
+    def get_input_embedding(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(

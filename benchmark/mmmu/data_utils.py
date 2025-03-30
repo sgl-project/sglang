@@ -5,7 +5,6 @@ import os
 import re
 
 import yaml
-from datasets import concatenate_datasets, load_dataset
 
 DOMAIN_CAT2SUB_CAT = {
     "Art and Design": ["Art", "Art_Theory", "Design", "Music"],
@@ -143,6 +142,7 @@ def process_single_sample(data):
 
 # DATA SAVING
 def save_json(filename, ds):
+    print(f"answers saved to: {filename}")
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "w") as f:
         json.dump(ds, f, indent=4)

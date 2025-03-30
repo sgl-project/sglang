@@ -23,7 +23,7 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.backend import BaseLoRABackend, get_backend_from_name
-from sglang.srt.lora.layers import get_lora_layer
+from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
@@ -51,6 +51,8 @@ class LoRAManager:
         load_config: LoadConfig,
         dtype: torch.dtype,
         lora_backend: str = "triton",
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ):
         self.base_model: torch.nn.Module = base_model
         self.lora_paths: Dict[str, str] = lora_paths
@@ -58,6 +60,9 @@ class LoRAManager:
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
+        self.device: torch.device = next(self.base_model.parameters()).device
+        self.tp_size: int = tp_size
+        self.tp_rank: int = tp_rank
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -98,11 +103,14 @@ class LoRAManager:
             self.loras[name] = lora_adapter
 
         # misc lora configs
-        # FIXME remove the restrictions after implementing unified paging
         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
-        self.scaling: float = list(self.loras.values())[0].scaling
-        assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
-        assert all(x.scaling == self.scaling for x in self.loras.values())
+
+        if self.lora_backend == "flashinfer":
+            # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+            max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+            scaling = list(self.loras.values())[0].scaling
+            assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
+            assert all(x.scaling == scaling for x in self.loras.values())
 
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
@@ -110,7 +118,13 @@ class LoRAManager:
     def init_lora_memory_pool(self):
         # Initialize memory pool
         self.memory_pool = LoRAMemoryPool(
-            self.base_hf_config, self.max_loras_per_batch, self.max_lora_dim, self.dtype
+            self.base_hf_config,
+            self.max_loras_per_batch,
+            self.max_lora_dim,
+            self.dtype,
+            self.tp_size,
+            self.tp_rank,
+            self.lora_modules,
         )
 
         # Initialize target lora modules in memory pool
@@ -131,14 +145,24 @@ class LoRAManager:
         seg_lens = (
             forward_batch.extend_seq_lens
             if forward_batch.forward_mode.is_extend()
-            else torch.ones(bs, device="cuda")
+            else torch.ones(bs, device=self.device)
         )
-        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
+        seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
         seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
         max_len = int(torch.max(seg_lens))
-        weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
+        weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+
+        lora_ranks = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+        )
+        scalings = torch.empty(
+            (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+        )
         for i, lora_path in enumerate(forward_batch.lora_paths):
             weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+            lora = self.loras[lora_path]
+            lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+            scalings[weight_indices[i]] = lora.scaling
 
         batch_info = LoRABatchInfo(
             bs=bs,
@@ -146,31 +170,41 @@ class LoRAManager:
             seg_indptr=seg_indptr,
             max_len=max_len,
             weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
         )
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules
-        for module_name, module in self.lora_modules:
-            layer_id = get_layer_id(module_name)
-            if "qkv_proj" not in module_name:
-                weight_name = get_weight_name(
-                    module_name, self.lora_weight_names, LoRAType.LORA_A
-                )
-                module.set_lora_info(
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor(weight_name, layer_id, LoRAType.LORA_B),
-                )
-            else:
-                module.set_lora_info(
-                    self.memory_pool.get_tensor("qkv_proj", layer_id, LoRAType.LORA_A),
-                    self.memory_pool.get_tensor("q_proj", layer_id, LoRAType.LORA_B),
-                    self.memory_pool.get_tensor("kv_proj", layer_id, LoRAType.LORA_B),
-                )
+        for layer_id, modules in self.lora_modules.items():
+            for module_name, module in modules:
+                if "qkv_proj" in module_name:
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            "qkv_proj", layer_id, LoRAType.LORA_A
+                        ),
+                        self.memory_pool.get_tensor(
+                            "q_proj", layer_id, LoRAType.LORA_B
+                        ),
+                        self.memory_pool.get_tensor(
+                            "kv_proj", layer_id, LoRAType.LORA_B
+                        ),
+                    )
+                else:
+                    weight_name = get_weight_name(
+                        module_name, self.lora_weight_names, LoRAType.LORA_A
+                    )
+                    module.set_lora_info(
+                        self.memory_pool.get_tensor(
+                            weight_name, layer_id, LoRAType.LORA_A
+                        ),
+                        self.memory_pool.get_tensor(
+                            weight_name, layer_id, LoRAType.LORA_B
+                        ),
+                    )
 
     def set_lora_module(self, module_name, module):
-        lora_module = get_lora_layer(
-            module, self.max_lora_dim, self.scaling, self.lora_backend
-        )
+        lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -182,10 +216,13 @@ class LoRAManager:
         )
 
         # Monkey patch to use the LoRA version layers
-        self.lora_modules: List[Tuple[str, torch.nn.Module]] = []
+        self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = {
+            i: [] for i in range(self.base_hf_config.num_hidden_layers)
+        }
         for module_name, module in self.base_model.named_modules():
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                self.lora_modules.append(
+                layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id].append(
                     (module_name, self.set_lora_module(module_name, module))
                 )
