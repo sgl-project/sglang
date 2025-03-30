@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Any, Dict, List, Set
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -1119,7 +1119,9 @@ def v1_chat_generate_response(
         if logprobs:
             logprobs = to_openai_style_logprobs(
                 output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-                output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
+                output_top_logprobs=ret_item["meta_info"].get(
+                    "output_top_logprobs", None
+                ),
             )
             token_logprobs = []
             for token_idx, (token, logprob) in enumerate(
@@ -1329,9 +1331,9 @@ async def v1_chat_completions(
                             output_token_logprobs=content["meta_info"][
                                 "output_token_logprobs"
                             ][n_prev_token:],
-                            output_top_logprobs=content["meta_info"][
-                                "output_top_logprobs"
-                            ][n_prev_token:],
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
                         )
 
                         n_prev_token = len(
