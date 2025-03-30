@@ -128,7 +128,7 @@ class ServerArgs:
     # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "xgrammar"
+    grammar_backend: Optional[str] = None
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -193,6 +193,13 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -274,12 +281,9 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
+        # Choose grammar backend
+        if self.grammar_backend is None:
+            self.grammar_backend = "xgrammar"
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -813,7 +817,7 @@ class ServerArgs:
         parser.add_argument(
             "--grammar-backend",
             type=str,
-            choices=["xgrammar", "outlines", "llguidance"],
+            choices=["xgrammar", "outlines", "llguidance", "none"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
