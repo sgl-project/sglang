@@ -33,6 +33,9 @@ CI_LORA_MODELS = [
         ],
         max_loras_per_batch=1,
     ),
+]
+
+ALL_OTHER_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
@@ -43,9 +46,6 @@ CI_LORA_MODELS = [
         ],
         max_loras_per_batch=1,
     ),
-]
-
-ALL_OTHER_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-2-7b-hf",
         adaptors=[LoRAAdaptor(name="winddude/wizardLM-LlaMA-LoRA-7B")],
