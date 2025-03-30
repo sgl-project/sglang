@@ -13,12 +13,14 @@
 # ==============================================================================
 """Radix attention."""
 
+from enum import Enum
+
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class AttentionType:
+class AttentionType(Enum):
     """
     Attention type.
     Use string to be compatible with `torch.compile`.
