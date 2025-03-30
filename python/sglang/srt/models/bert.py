@@ -391,4 +391,8 @@ class BertModel(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [BertModel]
+class Contriever(BertModel):
+    pass
+
+
+EntryClass = [BertModel, Contriever]
