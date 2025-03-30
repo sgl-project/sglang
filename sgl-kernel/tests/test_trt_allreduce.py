@@ -30,6 +30,7 @@ def multi_process_parallel(
     world_size: int,
     test_target: Any,
 ) -> None:
+    mp.set_start_method("spawn", force=True)
     procs = []
     distributed_init_port = get_open_port()
     for i in range(world_size):
