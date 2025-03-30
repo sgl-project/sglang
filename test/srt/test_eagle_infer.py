@@ -298,10 +298,16 @@ class TestEAGLEServer(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        server_info = requests.get(self.base_url + "/get_server_info").json()
+        avg_spec_accept_length = server_info["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 3.5)
+
+        speculative_eagle_topk = server_info["speculative_eagle_topk"]
+
+        if speculative_eagle_topk == 1:
+            self.assertGreater(avg_spec_accept_length, 2.5)
+        else:
+            self.assertGreater(avg_spec_accept_length, 3.5)
 
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
@@ -531,6 +537,37 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "triton",
                 "--max-running-requests",
                 8,
+            ],
+        )
+
+
+class TestEAGLEServerPageSize(TestEAGLEServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                5,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                6,
+                "--mem-fraction-static",
+                0.7,
+                "--chunked-prefill-size",
+                128,
+                "--max-running-requests",
+                8,
+                "--page-size",
+                4,
             ],
         )
 

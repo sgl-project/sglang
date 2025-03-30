@@ -26,7 +26,7 @@ suites = {
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_chunked_prefill.py", 336),
-        TestFile("test_eagle_infer.py", 447),
+        TestFile("test_eagle_infer.py", 500),
         TestFile("test_ebnf_constrained.py"),
         TestFile("test_fp8_kernel.py", 2),
         TestFile("test_embedding_openai_server.py", 36),
