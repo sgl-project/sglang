@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.configs.model_config import ModelConfig
 
 import logging
 
@@ -79,6 +80,11 @@ class Platform:
 
     supported_quantization: list[str] = []
 
+    supported_speculative_algorithm: list[str] = []
+
+    # Use first element as default dtype
+    supported_dtype: list[str] = []
+
     # Use first element as default backend
     supported_attntion_backend: list[str] = []
 
@@ -87,9 +93,6 @@ class Platform:
 
     # Use first element as default backend
     supported_lora_backend: list[str] = []
-
-    # Use first element as default algorithm
-    supported_speculative_algorithm: list[str] = []
 
     def is_cuda(self) -> bool:
         return self._enum == PlatformEnum.CUDA
@@ -220,6 +223,42 @@ class Platform:
         pass
 
     @classmethod
+    def check_and_update_model_dtype(cls, model_config: ModelConfig, dtype: str) -> str:
+        """
+        Check and update the model's dtype for the current platform.
+        """
+        if cls.supported_dtype and dtype not in cls.supported_dtype:
+            logger.warning(
+                f"dtype {dtype} is currently not supported in "
+                f"{cls.device_name}. use {cls.supported_dtype[0]} instead"
+            )
+            return cls.supported_dtype[0]
+        return dtype
+
+    @classmethod
+    def check_and_update_attntion_backend(
+        cls, model_config: ModelConfig, backend: str
+    ) -> str:
+        """
+        Check and update the attntion backend for the current platform.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def check_and_update_sampling_backend(cls, backend: str) -> str:
+        """
+        Check and update the sampling backend for the current platform.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def check_and_update_lora_backend(cls, backend: str) -> str:
+        """
+        Check and update the lora backend for the current platform.
+        """
+        raise NotImplementedError
+
+    @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         """
         Verify whether the current platform supports the specified model
@@ -239,42 +278,6 @@ class Platform:
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
                 f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
-            )
-
-    @classmethod
-    def verify_attntion_backend(cls, backend: str) -> None:
-        """
-        Verify whether the attntion backend is supported by the current platform.
-        """
-        if cls.supported_attntion_backend and backend not in cls.supported_quantization:
-            raise ValueError(
-                f"attention backend {backend} is currently not supported in "
-                f"{cls.device_name}."
-            )
-
-    @classmethod
-    def verify_sampling_backend(cls, backend: str) -> None:
-        """
-        Verify whether the sampling backend is supported by the current platform.
-        """
-        if (
-            cls.supported_sampling_backend
-            and backend not in cls.supported_sampling_backend
-        ):
-            raise ValueError(
-                f"sampling backend {backend} is currently not supported in "
-                f"{cls.device_name}."
-            )
-
-    @classmethod
-    def verify_lora_backend(cls, backend: str) -> None:
-        """
-        Verify whether the lora backend is supported by the current platform.
-        """
-        if cls.supported_lora_backend and backend not in cls.supported_sampling_backend:
-            raise ValueError(
-                f"lora backend {backend} is currently not supported in "
                 f"{cls.device_name}."
             )
 
