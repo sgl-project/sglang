@@ -26,7 +26,6 @@ import tqdm
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
@@ -117,16 +116,18 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+                capture_bs = list(range(1, 33)) + range(40, 161, 16)
             else:
-                capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
             # Since speculative decoding requires more cuda graph memory, we
             # capture less.
-            capture_bs = list(range(1, 9)) + list(range(9, 33, 2)) + [64, 96, 128, 160]
+            capture_bs = (
+                list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
+            )
 
-    if _is_hip:
-        capture_bs += [i * 8 for i in range(21, 33)]
+        if _is_hip:
+            capture_bs += list(range(160, 257, 8))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -175,6 +176,7 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -196,9 +198,6 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
         self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -249,8 +248,8 @@ class CudaGraphRunner:
                 )
             else:
                 self.encoder_lens = None
-
-            if self.enable_dp_attention:
+            if self.enable_dp_attention or self.enable_sp_layernorm:
+                # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
                 self.gathered_buffer = torch.zeros(
                     (
                         self.max_bs * self.dp_size * self.num_tokens_per_bs,
@@ -292,7 +291,7 @@ class CudaGraphRunner:
             self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.enable_sp_layernorm:
             total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
 
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
@@ -373,7 +372,7 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
 
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [
@@ -475,7 +474,7 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.enable_sp_layernorm:
             index = bisect.bisect_left(
                 self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
             )
@@ -501,21 +500,15 @@ class CudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if self.enable_dp_attention:
+        if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
 
-        num_kv_heads = self.num_head
-        if hasattr(forward_batch.token_to_kv_pool, "k_buffer"):
-            if isinstance(forward_batch.token_to_kv_pool.k_buffer, list):
-                num_kv_heads = forward_batch.token_to_kv_pool.k_buffer[0].shape[1]
-
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
-            num_kv_heads,
             self.req_pool_indices,
             self.seq_lens,
             forward_batch.seq_lens_sum + (bs - raw_bs),
