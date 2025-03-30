@@ -45,6 +45,7 @@ class FlashAttentionBackend(AttentionBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
+        draft_worker_id: int = 0,
     ):
         super().__init__()
 
@@ -63,6 +64,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = (
             model_runner.model_config.attention_arch == AttentionArch.MLA
         ) and (not global_server_args_dict["disable_mla"])
+        self.draft_worker_id = draft_worker_id
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata to cache repetitive calculations."""
@@ -70,7 +72,7 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = FlashAttentionMetadata()
 
         # Get sequence information
-        seqlens_in_batch = forward_batch.seq_lens
+        seqlens_in_batch = forward_batch.seq_lens + self.draft_worker_id
         # Precompute int32 version of sequence lengths
         metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
         batch_size = len(seqlens_in_batch)
@@ -168,6 +170,10 @@ class FlashAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            if forward_batch.forward_mode.is_target_verify():
+                max_seqlen_q = forward_batch.spec_info.draft_token_num
+            else:
+                max_seqlen_q = metadata.max_seq_len_q
             o = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -176,7 +182,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
-                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=True,
                 window_size=window_size,
@@ -446,6 +452,7 @@ class FlashAttentionMultiStepBackend:
                 FlashAttentionBackend(
                     model_runner,
                     skip_prefill=True,
+                    draft_worker_id=i,
                 )
             )
 
@@ -480,7 +487,7 @@ class FlashAttentionMultiStepBackend:
                 bs,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
+                seq_lens_sum=-1,
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
