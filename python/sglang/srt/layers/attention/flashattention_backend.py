@@ -159,7 +159,7 @@ class FlashAttentionBackend(AttentionBackend):
         page_table = metadata.page_table
 
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
         # # Use Flash Attention for prefill
@@ -218,7 +218,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
                 max_seqlen_q=metadata.max_seq_len_q,
                 softmax_scale=layer.scaling,
-                causal=True,
+                causal=causal,
                 softcap=layer.logit_cap,
                 k_descale=layer.k_scale,
                 v_descale=layer.v_scale,
