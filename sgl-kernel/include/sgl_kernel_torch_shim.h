@@ -32,13 +32,9 @@ limitations under the License.
  * that the following types are not support by PyTorch libary bindings:
  *  - `int`
  *  - `float`
- *  - `c10::optional<T> &`
- *  - `c10::optional<const at::Tensor> &`
  * So we convert them to (respectively):
  *  - `int64_t`
  *  - `double`
- *  - `const c10::optional<T>&`
- *  - `const c10::optional<at::Tensor>&`
  */
 
 template <typename T>
@@ -56,37 +52,6 @@ template <typename T>
 T convert_from_pytorch_compatible_type(pytorch_library_compatible_type_t<T> arg) {
   return pytorch_library_compatible_type<T>::convert_from_type(arg);
 }
-
-// Map `c10::optional<T> &` -> `const c10::optional<T>&`
-//  (NOTE: this is bit unsafe but non of the ops in flash_attn mutate
-//   the optional container)
-template <typename T>
-struct pytorch_library_compatible_type<c10::optional<T>&> {
-  using type = const c10::optional<T>&;
-  static c10::optional<T>& convert_from_type(const c10::optional<T>& arg) {
-    return const_cast<c10::optional<T>&>(arg);
-  }
-};
-
-// Map `c10::optional<T>` ->
-//          `c10::optional<pytorch_library_compatible_type_t<T>>`
-//  (NOTE: tested for `c10::optional<int>` -> `c10::optional<int64_t>`)
-template <typename T>
-struct pytorch_library_compatible_type<c10::optional<T>> {
-  using type = c10::optional<pytorch_library_compatible_type_t<T>>;
-  static c10::optional<pytorch_library_compatible_type_t<T>> convert_from_type(c10::optional<T> arg) {
-    return arg;
-  }
-};
-
-// Map `c10::optional<const at::Tensor>&` -> `const c10::optional<at::Tensor>&`
-template <>
-struct pytorch_library_compatible_type<c10::optional<const at::Tensor>&> {
-  using type = const c10::optional<at::Tensor>&;
-  static c10::optional<const at::Tensor>& convert_from_type(const c10::optional<at::Tensor>& arg) {
-    return const_cast<c10::optional<const at::Tensor>&>(reinterpret_cast<const c10::optional<const at::Tensor>&>(arg));
-  }
-};
 
 // Map `int` -> `int64_t`
 template <>

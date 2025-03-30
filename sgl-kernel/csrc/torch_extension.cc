@@ -207,7 +207,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "    Tensor   v,"
       "    Tensor?  k_new,"
       "    Tensor?  v_new,"
-      "    Tensor?  q_v_"
+      "    Tensor?  q_v_,"
       "    Tensor!? out,"
       "    Tensor?  cu_seqlens_q,"
       "    Tensor?  cu_seqlens_k,"
@@ -221,7 +221,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "    Tensor?  leftpad_k,"
       "    Tensor?  rotary_cos,"
       "    Tensor?  rotary_sin,"
-      "    Tensor?  seqlens_rotary"
+      "    Tensor?  seqlens_rotary,"
       "    Tensor?  q_descale,"
       "    Tensor?  k_descale,"
       "    Tensor?  v_descale,"
@@ -231,11 +231,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "    int      window_size_right,"
       "    float    softcap,"
       "    bool     is_rotary_interleaved,"
-      "    Tensor?  scheduler_metadata"
+      "    Tensor?  scheduler_metadata,"
       "    int      num_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
-  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+  m.impl("fwd", torch::kCUDA, &mha_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)
