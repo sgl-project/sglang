@@ -129,11 +129,7 @@ def _fwd_kernel(
 
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-
-        if IS_CAUSAL:
-            mask_n = (start_n + offs_n) < cur_seq_len_prefix
-        else:
-            mask_n = (start_n + offs_n) < cur_seq_len
+        mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
@@ -203,7 +199,7 @@ def _fwd_kernel(
     # stage 2: compute the triangle part
 
     cur_block_m_end = (
-        cur_seq_len
+        cur_seq_len_extend
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
