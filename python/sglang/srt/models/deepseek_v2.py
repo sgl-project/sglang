@@ -1102,7 +1102,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
             assert not (
                 self.attn_tp_size != 1 and self.input_is_scattered
-            ), "moe_layer_freq > 1 is not supported"
+            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
 
             # Self Attention
             hidden_states = self.self_attn(
