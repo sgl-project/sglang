@@ -146,6 +146,22 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
+
+    q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
+    v_cache = (
+        v_cache.contiguous()
+        if v_cache.stride(-1) != 1 and v_cache.stride(-3) != 1
+        else v_cache
+    )
+    cu_seqlens_q, cu_seqlens_k_new = [
+        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k_new)
+    ]
+    page_table, cache_batch_idx, cache_leftpad = [
+        maybe_contiguous(x) for x in (page_table, cache_batch_idx, cache_leftpad)
+    ]
+    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
+    rotary_seqlens = maybe_contiguous(rotary_seqlens)
+
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
@@ -171,14 +187,15 @@ def flash_attn_with_kvcache(
         k_descale,
         v_descale,
         softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        softcap=softcap,
-        rotary_interleaved=rotary_interleaved,
-        scheduler_metadata=scheduler_metadata,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_splits,
+        pack_gqa,
+        sm_margin,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out

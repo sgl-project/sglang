@@ -201,6 +201,7 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
     "${FA3_GEN_SRCS}"
@@ -216,6 +217,17 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+
+# Add some flash-attention custom flag for inference
+target_compile_definitions(common_ops PRIVATE
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    # FLASHATTENTION_DISABLE_ALIBI
+    # FLASHATTENTION_DISABLE_SOFTCAP
+    FLASHATTENTION_DISABLE_UNEVEN_K
+    # FLASHATTENTION_DISABLE_LOCAL
+    FLASHATTENTION_VARLEN_ONLY
+)
 
 # JIT Logic
 # DeepGEMM
