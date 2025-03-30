@@ -11,12 +11,9 @@ import requests
 
 from sglang.srt.bootstrap.app import start_bootstrap_server
 
-os.environ["RAPIDS_LIBUCX_PREFER_SYSTEM_LIBRARY"] = "true"
 
-import ucp
 import uuid
 from typing import Dict, Optional
-from dataclasses import dataclass
 import numpy as np
 from sglang.srt.bootstrap.rdma_utils import RdmaQP, RdmaClient
 
@@ -230,7 +227,7 @@ class KVReceiver:
         self.ip_address = "10.246.59.104"
         self.qp = RdmaQP(socket_port=self.rdma_port)
 
-        # Initialize connection 
+        # Initialize connection
         # todo can use other rapid method...
         self.handshake()
         self.mrs_to_receive = []  # Memory regions for receiving data segments
