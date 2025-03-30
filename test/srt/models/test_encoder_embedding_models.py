@@ -16,6 +16,7 @@
 
 import multiprocessing as mp
 import random
+import time
 import unittest
 
 import torch
@@ -66,12 +67,20 @@ class TestEncoderEmbeddingModels(CustomTestCase):
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
+        caculateNum = 10
+
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
             model_type="embedding",
         ) as hf_runner:
+            # warm up
             hf_outputs = hf_runner.forward(truncated_prompts)
+
+            transformer_start_time = time.time()
+            for i in range(caculateNum):
+                hf_outputs = hf_runner.forward(truncated_prompts)
+            transformer_end_time = time.time()
 
         with SRTRunner(
             model_path,
@@ -81,7 +90,16 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             attention_backend=attention_backend,
             disable_radix_cache=True,
         ) as srt_runner:
+            # warm up
             srt_outputs = srt_runner.forward(truncated_prompts)
+
+            sgl_start_time = time.time()
+            for i in range(caculateNum):
+                srt_outputs = srt_runner.forward(truncated_prompts)
+            sgl_end_time = time.time()
+
+        print("transformer: ", (transformer_end_time - transformer_start_time))
+        print("sglang: ", attention_backend, (sgl_end_time - sgl_start_time))
 
         for i in range(len(prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
