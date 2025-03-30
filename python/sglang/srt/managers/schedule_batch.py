@@ -1121,7 +1121,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if page_size == 1:
             return len(self.reqs)
         return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
-    
+
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
             self.new_page_count_next_decode()
