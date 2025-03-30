@@ -1067,6 +1067,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
+        previous_layer_info = self._compute_info(config, layer_id=layer_id - 1, is_nextn=False)
         self.input_is_scattered = (
             self._compute_is_sparse(config, layer_id=layer_id - 1, is_nextn=False)
             and global_server_args_dict["enable_deepep_moe"]
