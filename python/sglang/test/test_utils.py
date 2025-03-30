@@ -76,11 +76,14 @@ def is_in_ci():
 
 
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 1157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
+DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -1009,6 +1012,9 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 
 
 class CustomTestCase(unittest.TestCase):
+    pass
+
+    """
     def _callTestMethod(self, method):
         max_retry = int(
             os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0")
@@ -1017,3 +1023,4 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+    """
