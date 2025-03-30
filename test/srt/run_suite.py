@@ -76,6 +76,16 @@ suites = {
         TestFile("test_hicache.py", 60),
         TestFile("test_hicache_mla.py", 90),
     ],
+    "per-commit-2-gpu": [
+        TestFile("test_data_parallelism.py", 90),
+        TestFile("test_dp_attention.py", 90),
+        TestFile("test_update_weights_from_distributed.py", 100),
+        TestFile("test_verl_engine.py", 100),
+        TestFile("test_patch_torch.py", 30),
+        TestFile("test_moe_ep.py", 220),
+        TestFile("test_mla_tp.py", 420),
+        TestFile("test_lora_tp.py", 300),
+    ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
