@@ -39,7 +39,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -148,6 +147,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Optional seq_lens on cpu
+    seq_lens_cpu: Optional[torch.Tensor] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -161,9 +163,6 @@ class ForwardBatch:
 
     # Position information
     positions: torch.Tensor = None
-
-    # For decode
-    decode_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -293,12 +292,14 @@ class ForwardBatch:
         ):
             ret.positions = ret.spec_info.positions
 
+        # Get seq_lens_cpu if needed
+        if ret.seq_lens_cpu is None:
+            ret.seq_lens_cpu = batch.seq_lens_cpu
+
         # Init position information
         if ret.forward_mode.is_decode():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
-            if ret.decode_seq_lens_cpu is None:
-                ret.decode_seq_lens_cpu = batch.decode_seq_lens
+                ret.positions = torch.clamp((batch.seq_lens - 1), min=0).to(torch.int64)
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -518,8 +519,3 @@ def compute_position_torch(
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
     return positions.to(torch.int64), extend_start_loc
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def clamp_position(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
