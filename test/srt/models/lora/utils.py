@@ -153,13 +153,6 @@ def run_batch_lora_test(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
         )
 
-    with HFRunner(
-        base_path, torch_dtype=torch_dtype, model_type="generation"
-    ) as hf_runner:
-        hf_outputs = hf_runner.forward(
-            prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
-        )
-
     with SRTRunner(
         base_path,
         torch_dtype=torch_dtype,
@@ -170,10 +163,11 @@ def run_batch_lora_test(
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
     with HFRunner(
-        base_path,
-        torch_dtype=torch_dtype,
-        model_type="generation",
+        base_path, torch_dtype=torch_dtype, model_type="generation"
     ) as hf_runner:
+        hf_outputs = hf_runner.forward(
+            prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
+        )
         hf_no_lora_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
     # Compare prefill stage logprobs (HF vs SRTRunner with LoRA)
