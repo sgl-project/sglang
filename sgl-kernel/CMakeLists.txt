@@ -151,24 +151,21 @@ file(GLOB FA3_BF16_GEN_SRCS
 file(GLOB FA3_BF16_GEN_SRCS_
     "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
 list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-file(GLOB FA3_BF16_GEN_SRCS_
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
-list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+
 # FP16 source files
 file(GLOB FA3_FP16_GEN_SRCS
     "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
 file(GLOB FA3_FP16_GEN_SRCS_
     "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
 list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-file(GLOB FA3_FP16_GEN_SRCS_
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
-list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+
 # FP8 source files
 file(GLOB FA3_FP8_GEN_SRCS
     "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
 file(GLOB FA3_FP8_GEN_SRCS_
     "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
 list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+
 set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
 set(SOURCES
@@ -220,6 +217,7 @@ install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
 
 # Add some flash-attention custom flag for inference
 target_compile_definitions(common_ops PRIVATE
+    FLASHATTENTION_DISABLE_SM8x
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     # FLASHATTENTION_DISABLE_ALIBI
