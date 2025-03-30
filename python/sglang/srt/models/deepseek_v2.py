@@ -1037,13 +1037,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        if self._is_sparse_layer(config, layer_id, is_nextn=is_nextn):
+        self.is_sparse = self._is_sparse_layer(config, layer_id, is_nextn=is_nextn)
+        if self.is_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-            self.is_sparse = True
         else:
             if global_server_args_dict["moe_dense_tp_size"] == 1:
                 mlp_tp_rank, mlp_tp_size = 0, 1
@@ -1058,7 +1058,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
-            self.is_sparse = False
 
         self.input_is_scattered = (
             self._is_sparse_layer(config, layer_id=layer_id - 1, is_nextn=False)
