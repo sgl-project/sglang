@@ -30,9 +30,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
@@ -82,6 +79,11 @@ if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
 else:
     from vllm import _custom_ops as ops
+
+if _is_hip:
+    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+        decode_attention_fwd_grouped_rope,
+    )
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
