@@ -28,6 +28,7 @@ from utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 CI_MULTI_LORA_MODELS = [
+    # multi-rank case
     LoRAModelCase(
         base="meta-llama/Llama-2-7b-hf",
         adaptors=[
