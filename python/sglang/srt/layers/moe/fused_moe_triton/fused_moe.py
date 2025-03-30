@@ -640,7 +640,7 @@ def get_moe_configs(
     )
     if int(os.getenv("SHARE_EXPERTS_FUSION_REPLICA", "0")) > 0:
         config_file_path = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "configs/share_experts_fusion", json_file_name
+            os.path.dirname(os.path.realpath(__file__)), "configs/shared_experts_fusion", json_file_name
         )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
