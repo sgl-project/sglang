@@ -1069,7 +1069,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         previous_layer_info = self._compute_info(config, layer_id=layer_id - 1, is_nextn=False)
         self.input_is_scattered = (
-            self._compute_is_sparse(config, layer_id=layer_id - 1, is_nextn=False)
+            previous_layer_info.is_sparse
             and global_server_args_dict["enable_deepep_moe"]
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
