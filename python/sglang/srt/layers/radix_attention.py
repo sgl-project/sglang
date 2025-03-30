@@ -14,6 +14,7 @@
 """Radix attention."""
 
 from typing import Optional
+from enum import Enum
 
 from torch import nn
 
@@ -22,7 +23,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class AttentionType:
+class AttentionType(Enum):
     """
     Attention type.
     Use string to be compatible with `torch.compile`.
