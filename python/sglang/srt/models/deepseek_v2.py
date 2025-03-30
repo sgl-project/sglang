@@ -985,14 +985,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
     ) -> None:
-
-        def is_sparse_layer(l: int):
-            return (
-                config.n_routed_experts is not None
-                and l >= config.first_k_dense_replace
-                and l % config.moe_layer_freq == 0
-            )
-
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -1045,7 +1037,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        if is_nextn or is_sparse_layer(layer_id):
+        if is_nextn or self._is_sparse_layer(config, layer_id):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1069,7 +1061,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.is_sparse = False
 
         self.input_is_scattered = (
-            is_sparse_layer(layer_id - 1)
+            self._is_sparse_layer(config, layer_id - 1)
             and global_server_args_dict["enable_deepep_moe"]
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
@@ -1077,6 +1069,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    @staticmethod
+    def _is_sparse_layer(config: PretrainedConfig, layer_id: int):
+        return (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     @staticmethod
