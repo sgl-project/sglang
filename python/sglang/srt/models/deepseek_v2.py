@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -969,6 +970,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
+class _DecoderLayerForwardMode(Enum):
+    MLP_ONE = auto()
+    MLP_ALL = auto()
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1072,6 +1078,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    @staticmethod
+    def _compute_mode():
+        if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
+            return _DecoderLayerForwardMode.MLP_ONE
+        else:
+            return _DecoderLayerForwardMode.MLP_ALL
 
     def forward(
         self,
