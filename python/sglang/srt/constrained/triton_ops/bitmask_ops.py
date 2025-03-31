@@ -122,9 +122,9 @@ def apply_token_bitmask_inplace_triton(
     if NUM_SMS > 0:
         grid = (NUM_SMS,)
     else:
-        NUM_SMS = 1
         num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
         grid = (num_rows * num_blocks,)
+        NUM_SMS = triton.next_power_of_2(grid[0])
 
     apply_token_bitmask_inplace_kernel[grid](
         logits,
