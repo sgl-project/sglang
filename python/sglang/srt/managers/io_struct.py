@@ -333,7 +333,10 @@ class EmbeddingReqInput:
     # - Single image for a single request
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
-    # See also python/sglang/srt/utils.py:load_image for more details.    image_data: Optional[Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]] = None
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: Optional[
+        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
+    ] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
