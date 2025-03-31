@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
+import os
 import argparse
 import json
 import time

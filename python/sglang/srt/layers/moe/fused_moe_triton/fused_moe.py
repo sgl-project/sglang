@@ -13,7 +13,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import select_experts
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
@@ -510,6 +509,8 @@ def invoke_fused_moe_kernel(
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
 ) -> None:
+    from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+    
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
