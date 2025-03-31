@@ -729,6 +729,73 @@ class TokenizerManager:
             result = (await self.update_weights_from_distributed_communicator(obj))[0]
             return result.success, result.message
 
+    async def _batch_update_weights_from_distributed(
+        self,
+        parameters: List[Dict[str, Any]],
+    ) -> Tuple[bool, str]:
+        """Helper function to update multiple model parameters from distributed source.
+
+        Args:
+            parameters: List of parameter info dictionaries, each containing name, dtype, and shape
+
+        Returns:
+            Tuple of (success_status, message)
+        """
+        all_success = True
+        error_messages = []
+
+        # Process each parameter in the batch
+        for param_info in parameters:
+            # Create a single parameter update request
+            single_update_req = UpdateWeightsFromDistributedReqInput(
+                name=param_info["name"],
+                dtype=param_info["dtype"],
+                shape=param_info["shape"],
+            )
+
+            # Send the update request to the communicator
+            result = (
+                await self.update_weights_from_distributed_communicator(
+                    single_update_req
+                )
+            )[0]
+
+            # Track success/failure
+            if not result.success:
+                all_success = False
+                error_messages.append(
+                    f"Failed to update parameter {param_info['name']}: {result.message}"
+                )
+
+        # Return success only if all parameters were updated successfully
+        if all_success:
+            return True, "All parameters successfully updated."
+        else:
+            return False, "; ".join(error_messages)
+
+    async def update_weights_from_distributed(
+        self,
+        obj: UpdateWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be for update weights from distributed"
+
+        # This means that weight sync
+        # cannot run while requests are in progress.
+        async with self.model_update_lock.writer_lock:
+            # Wrap single parameter in a list for the batch function
+            parameters = [
+                {
+                    "name": obj.name,
+                    "dtype": obj.dtype,
+                    "shape": obj.shape,
+                }
+            ]
+            return await self._batch_update_weights_from_distributed(parameters)
+
     async def batch_update_weights_from_distributed(
         self,
         obj: BatchUpdateWeightsFromDistributedReqInput,
@@ -742,37 +809,7 @@ class TokenizerManager:
 
         # Get a writer lock for the entire batch update operation
         async with self.model_update_lock.writer_lock:
-            all_success = True
-            error_messages = []
-
-            # Process each parameter in the batch
-            for param_info in obj.parameters:
-                # Create a single parameter update request
-                single_update_req = UpdateWeightsFromDistributedReqInput(
-                    name=param_info["name"],
-                    dtype=param_info["dtype"],
-                    shape=param_info["shape"],
-                )
-
-                # Send the update request to the communicator
-                result = (
-                    await self.update_weights_from_distributed_communicator(
-                        single_update_req
-                    )
-                )[0]
-
-                # Track success/failure
-                if not result.success:
-                    all_success = False
-                    error_messages.append(
-                        f"Failed to update parameter {param_info['name']}: {result.message}"
-                    )
-
-            # Return success only if all parameters were updated successfully
-            if all_success:
-                return True, "All parameters successfully updated."
-            else:
-                return False, "; ".join(error_messages)
+            return await self._batch_update_weights_from_distributed(obj.parameters)
 
     async def update_weights_from_tensor(
         self,

@@ -302,14 +302,8 @@ class Engine:
 
     def update_weights_from_distributed(self, name: str, dtype, shape):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
-        )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+        return self.batch_update_weights_from_distributed(
+            [{"name": name, "dtype": dtype, "shape": shape}]
         )
 
     def batch_update_weights_from_distributed(self, parameters: List[Dict]):
