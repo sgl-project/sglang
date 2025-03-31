@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
+from PIL.Image import Image
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -42,9 +43,13 @@ class GenerateReqInput:
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    # See also python/sglang/srt/utils.py:load_image.
-    image_data: Optional[Union[List[str], str]] = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: Optional[Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]] = None
     # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
@@ -162,12 +167,27 @@ class GenerateReqInput:
                 # Expand parallel_sample_num
                 num = self.batch_size * self.parallel_sample_num
 
-            if not self.image_data:
-                self.image_data = [None] * num
+            if self.image_data is None:
+                self.image_data = self.modalities = [None] * num
             elif not isinstance(self.image_data, list):
-                self.image_data = [self.image_data] * num
+                # Single image, convert to list of single-image lists
+                self.image_data = [[self.image_data]] * num
+                self.modalities = ["image"] * num
             elif isinstance(self.image_data, list):
-                pass
+                if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
+                    # Already a list of lists, keep as is
+                    for i in range(len(self.image_data)):
+                        if self.image_data[i][0] is None:
+                            self.modalities.append(None)
+                        elif len(self.image_data[i]) == 1:
+                            self.modalities.append("image")
+                        elif len(self.image_data[i]) > 1:
+                            self.modalities.append("multi-images")
+                elif not self.is_single:
+                    # List of images for a batch, wrap each in a list
+                    assert len(self.image_data) == num
+                    self.image_data = [[img] for img in self.image_data]
+                    self.modalities = ["image"] * num
 
             if self.audio_data is None:
                 self.audio_data = [None] * num
@@ -305,8 +325,12 @@ class TokenizedGenerateReqInput:
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
-    # The image input. It can be a file name, a url, or base64 encoded string.
-    image_data: Optional[Union[List[str], str]] = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.    image_data: Optional[Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
