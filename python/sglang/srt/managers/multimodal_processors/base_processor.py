@@ -230,7 +230,7 @@ class BaseMultimodalProcessor(ABC):
                             continue
 
                     image_sizes += frames[0].size * len(frames)
-                    
+
                     # Generate a hashable value for the image file
                     if isinstance(image_file, Image.Image):
                         # For PIL.Image objects, use the ID as a hashable value
@@ -238,7 +238,7 @@ class BaseMultimodalProcessor(ABC):
                     else:
                         # For other types (strings, etc.), use the regular hash
                         hash_value = hash(image_file)
-                    
+
                     hashes += [hash_value] * len(frames)
                     images += frames
                     image_index += 1

@@ -8,6 +8,8 @@ from PIL import Image
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
     get_global_processor,
 )

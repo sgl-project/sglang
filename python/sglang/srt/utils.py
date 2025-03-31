@@ -537,7 +537,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def load_image(image_file: Union[Image.Image, str, bytes]) -> tuple[Image.Image, tuple[int, int]]:
+def load_image(
+    image_file: Union[Image.Image, str, bytes]
+) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
     if isinstance(image_file, Image.Image):
         image = image_file
