@@ -129,7 +129,7 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
 /*
  * From flash-attention
  */
- m.def("fwd", make_pytorch_shim(mha_fwd));
+ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 ```
 
 ### Build & Install
