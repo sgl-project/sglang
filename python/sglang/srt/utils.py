@@ -568,6 +568,10 @@ def load_image(
 
 
 def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -581,10 +585,6 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
