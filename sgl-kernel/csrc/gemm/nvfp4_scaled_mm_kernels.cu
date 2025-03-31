@@ -38,7 +38,6 @@ limitations under the License.
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
 // Kernel Perf config
 template <typename T>
 struct KernelTraits;
@@ -239,7 +238,6 @@ void runGemm(
       "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "
       "a CUTLASS 3.8 source directory to enable support.");
 }
-#endif  // defined CUDA_VERSION && CUDA_VERSION >= 12080
 #endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
