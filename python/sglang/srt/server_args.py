@@ -373,6 +373,9 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
+            "1" if self.disable_outlines_disk_cache else "0"
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
