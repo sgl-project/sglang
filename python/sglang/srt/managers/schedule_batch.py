@@ -32,7 +32,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union, Literal
 
 import numpy as np
 import torch
@@ -145,10 +145,11 @@ class FINISH_ABORT(BaseFinishReason):
 
 @dataclasses.dataclass
 class MultimodalInputs:
-    """The image related inputs."""
+    """The multi-modal inputs."""
 
     pixel_values: Union[torch.Tensor, np.array]
     data_hashes: Optional[list] = None
+    data_hash_type: Optional[List[Literal["audio", "video", "image"]]] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
     image_pad_len: Optional[list] = None
@@ -166,7 +167,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
     # Qwen2-VL video related
     video_token_id: Optional[int] = None
-    video_grid_thws: List[Tuple[int, int, int]] = None
+    video_grid_thws: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
 
     # deepseek vl2 related
@@ -191,11 +192,15 @@ class MultimodalInputs:
     audio_features: Optional[List[torch.Tensor]] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
 
+    # videos
+    pixel_values_videos: Optional[torch.Tensor] = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(
             pixel_values=obj["pixel_values"],
             data_hashes=obj["data_hashes"],
+            data_hash_type=obj["data_hash_type"],
         )
 
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
@@ -222,6 +227,8 @@ class MultimodalInputs:
             "audio_end_id",
             "audio_features",
             "audio_feature_lens",
+            "pixel_values_videos",
+            "video_grid_thws",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -232,6 +239,9 @@ class MultimodalInputs:
             isinstance(ret.pixel_values, torch.Tensor)
             or isinstance(ret.pixel_values, np.ndarray)
             or isinstance(ret.pixel_values, list)
+            or isinstance(ret.pixel_values_videos, torch.Tensor)
+            or isinstance(ret.pixel_values_videos, np.ndarray)
+            or isinstance(ret.pixel_values_videos, list)
         )
 
         assert ret.audio_features is None or isinstance(ret.audio_features, list)
@@ -241,6 +251,9 @@ class MultimodalInputs:
     def contains_image_inputs(self) -> bool:
         """ """
         return self.pixel_values is not None and self.pixel_values != []
+
+    def contains_video_inputs(self) -> bool:
+        return self.pixel_values_videos is not None and self.pixel_values_videos != []
 
     def contains_audio_inputs(self) -> bool:
         """ """
@@ -285,11 +298,23 @@ class MultimodalInputs:
                 [self.image_grid_thws, other.image_grid_thws]
             )
 
+        if self.video_grid_thws is None:
+            self.video_grid_thws = other.video_grid_thws
+            self.pixel_values_videos = other.pixel_values_videos
+        elif other.video_grid_thws is not None:
+            self.video_grid_thws = torch.concat(
+                [self.video_grid_thws, other.video_grid_thws]
+            )
+            self.pixel_values_videos = torch.concat(
+                [self.pixel_values_videos, other.pixel_values_videos]
+            )
+
         # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
         # Please note that if the `input_ids` is later used in the model forward,
         # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
         # errors in cuda kernels. See also llava.py for example.
         self.data_hashes += other.data_hashes
+        self.data_hash_type += other.data_hash_type
         self.pad_values = [x % (1 << 30) for x in self.data_hashes]
 
         # args needed to be merged

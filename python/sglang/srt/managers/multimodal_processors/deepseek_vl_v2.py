@@ -112,6 +112,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
             "pixel_values": res["images"],
             "im_token_id": res["im_token_id"],
             "data_hashes": base_output.mm_data_hashes,
+            "data_hash_type": base_output.data_hash_type,
             "image_sizes": image_sizes,
             "images_emb_mask": images_seq_mask,
             "image_spatial_crop": batched_images_spatial_crop,

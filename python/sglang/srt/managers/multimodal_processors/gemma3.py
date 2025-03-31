@@ -78,6 +78,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
             "data_hashes": base_output.mm_data_hashes,
+            "data_hash_type": base_output.data_hash_type,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }

@@ -153,6 +153,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             "pixel_values": pixel_values,
             "tgt_sizes": tgt_sizes,
             "data_hashes": base_output.mm_data_hashes,
+            "data_hash_type": base_output.data_hash_type,
             "modalities": request_obj.modalities or ["image"],
             "audio_start_id": audio_start_id,
             "audio_end_id": audio_end_id,

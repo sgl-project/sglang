@@ -47,6 +47,9 @@ class GenerateReqInput:
     image_data: Optional[Union[List[str], str]] = None
     # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[str], str]] = None
+    # The video input. It can be a file name, a url, or a base64 encoded string
+    # See also python/sglang/srt/utils.py:load_video
+    video_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -176,6 +179,13 @@ class GenerateReqInput:
             elif isinstance(self.audio_data, list):
                 pass
 
+            if self.video_data is None:
+                self.video_data = [None] * num
+            elif not isinstance(self.video_data, list):
+                self.video_data = [self.video_data] * num
+            elif isinstance(self.video_data, list):
+                pass
+
             if self.sampling_params is None:
                 self.sampling_params = [{}] * num
             elif not isinstance(self.sampling_params, list):
@@ -241,6 +251,7 @@ class GenerateReqInput:
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             image_data=self.image_data[i],
             audio_data=self.audio_data[i],
+            video_data=self.video_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],

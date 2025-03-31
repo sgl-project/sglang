@@ -22,9 +22,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type
+from typing import Iterable, List, Optional, Tuple, Type, Literal, Callable
 
 import torch
 import torch.nn as nn
@@ -528,10 +529,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         image_embeds = self.visual(pixel_values, grid_thw=image_input.image_grid_thws)
         return image_embeds
 
-    def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
-        pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
+    def get_video_features(self, video_input: MultimodalInputs) -> torch.Tensor:
+        pixel_values_videos = video_input.pixel_values_videos.type(self.visual.dtype)
         video_embeds = self.visual(
-            pixel_values_videos, grid_thw=video_input["video_grid_thw"]
+            pixel_values_videos, grid_thw=video_input.video_grid_thws
         )
         return video_embeds
 
@@ -570,12 +571,76 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        inputs_embeds = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            embed_tokens=self.get_input_embeddings(),
-            mm_data_embedding_func=self.get_image_feature,
-        )
+        def get_modality_pad_values(modality: Literal["audio", "video", "image"]):
+            if forward_batch.mm_inputs is None:
+                return []
+            placeholder_ids = []
+            for mm_input in forward_batch.mm_inputs:
+                print(f"{mm_input.pad_values=} {mm_input.data_hash_type=}")
+                for pad_value, pad_type in zip(
+                    mm_input.pad_values, mm_input.data_hash_type
+                ):
+                    if pad_type == modality:
+                        placeholder_ids.append(pad_value)
+            return placeholder_ids
+
+        def scatter_modal_embeddings(
+            embed_tensor: torch.Tensor,
+            input_ids_original: torch.Tensor,
+            placeholder_ids: List[int],
+            embed_func: Callable[[MultimodalInputs], torch.Tensor],
+        ) -> torch.Tensor:
+            modal_mask = torch.isin(
+                input_ids_original,
+                torch.tensor(placeholder_ids, device=input_ids_original.device),
+            ).unsqueeze(-1)
+
+            if modal_mask.any():
+                mm_inputs = forward_batch.merge_mm_inputs()
+                modal_embeds = embed_func(mm_inputs)
+                modal_mask = modal_mask.expand_as(embed_tensor).to(embed_tensor.device)
+                embed_tensor = embed_tensor.masked_scatter(
+                    modal_mask,
+                    modal_embeds.to(embed_tensor.device, embed_tensor.dtype),
+                )
+
+            return embed_tensor
+
+        input_embeds = self.get_input_embeddings()
+        if (
+            forward_batch.mm_inputs
+            and not forward_batch.forward_mode.is_decode()
+            and forward_batch.contains_mm_inputs()
+        ):
+            image_placeholder_ids = get_modality_pad_values("image")
+            video_placeholder_ids = get_modality_pad_values("video")
+
+            # Clone input_ids before any processing
+            input_ids_copy = input_ids.clone()
+
+            # Create base token embeddings (will be overwritten with modal embeddings)
+            # Ensure input_ids are within vocab bounds first
+            vocab_size = input_embeds.num_embeddings
+            input_ids_safe = input_ids.clone().clamp_(min=0, max=vocab_size - 1)
+            inputs_embeds = input_embeds(input_ids_safe)
+
+            if image_placeholder_ids:
+                inputs_embeds = scatter_modal_embeddings(
+                    inputs_embeds,
+                    input_ids_copy,
+                    image_placeholder_ids,
+                    self.get_image_feature,
+                )
+
+            if video_placeholder_ids:
+                inputs_embeds = scatter_modal_embeddings(
+                    inputs_embeds,
+                    input_ids_copy,
+                    video_placeholder_ids,
+                    self.get_video_features,
+                )
+        else:
+            inputs_embeds = input_embeds(input_ids)
 
         hidden_states = self.model(
             input_ids=None,

@@ -58,6 +58,7 @@ class ClipImageProcessor(BaseMultimodalProcessor):
 
         image_inputs = await self._process_single_image(images, input_text)
         image_inputs["data_hashes"] = [hash(str(image_data))]
+        image_inputs["data_hash_type"] = ["image"]
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
         return image_inputs

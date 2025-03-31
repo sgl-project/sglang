@@ -4,7 +4,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, List, Literal
 
 import numpy as np
 import PIL
@@ -12,7 +12,7 @@ import transformers
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.utils import load_audio, load_image, logger
+from sglang.srt.utils import load_audio, load_image, logger, load_video
 
 global global_processor
 
@@ -28,6 +28,9 @@ class BaseMultiModalProcessorOutput:
     input_text: str
 
     mm_data_hashes: Optional[list[int]]
+    # list containing the media type for each attached hash
+    # this is used to identify which pad values correspond to which media type
+    data_hash_type: Optional[List[Literal["audio", "video", "image"]]]
     # images
     image_sizes: Optional[list[int]]
     # frames loaded from image and video, in given order
@@ -36,8 +39,18 @@ class BaseMultiModalProcessorOutput:
     # audios
     audios: Optional[list[np.ndarray]] = None
 
+    # videos, stored as PIL.Image for easy preprocessing ops
+    videos: Optional[list[list[PIL.Image]]] = None
+
     def normalize(self):
-        for field_name in ["data_hashes", "image_sizes", "images", "audios"]:
+        for field_name in [
+            "data_hashes",
+            "data_hash_type",
+            "image_sizes",
+            "images",
+            "audios",
+            "videos",
+        ]:
             field = getattr(self, field_name, None)
             if field is not None and isinstance(field, list) and len(field) == 0:
                 setattr(self, field_name, None)
@@ -146,6 +159,7 @@ class BaseMultimodalProcessor(ABC):
         max_req_input_len: int,
         image_data: Optional[list] = None,
         audio_data: Optional[list] = None,
+        video_data: Optional[list] = None,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
     ) -> BaseMultiModalProcessorOutput:
@@ -164,8 +178,6 @@ class BaseMultimodalProcessor(ABC):
                     multimodal_tokens.image_token
                 )
             )
-        else:
-            multimodal_tokens.image_token = multimodal_tokens.image_token
 
         if isinstance(input_ids, list) and return_text:
             assert len(input_ids) and isinstance(input_ids[0], int)
@@ -193,8 +205,11 @@ class BaseMultimodalProcessor(ABC):
 
         assert len(image_data) == len(estimated_frames_list)
 
-        image_index, audio_index = 0, 0
-        hashes, image_sizes, images, audios = [], [], [], []
+        image_index, audio_index, video_index = 0, 0, 0
+        hashes, image_sizes, images, audios, videos = [], [], [], [], []
+        # list containing the media type for each attached hash
+        # this is used to identify which pad values correspond to which media type
+        data_hash_type = []
         new_text = ""
         for index, text_part in enumerate(text_parts):
             try:
@@ -231,6 +246,7 @@ class BaseMultimodalProcessor(ABC):
 
                     image_sizes += frames[0].size * len(frames)
                     hashes += [hash(image_file)] * len(frames)
+                    data_hash_type += ["image"] * len(frames)
                     images += frames
                     image_index += 1
                     if frames_to_process != 0:
@@ -241,9 +257,26 @@ class BaseMultimodalProcessor(ABC):
                     audio_file = audio_data[audio_index]
                     audio = load_audio(audio_file)
                     hashes += [hash(audio_file)]
+                    data_hash_type += ["audio"]
                     audios += [audio]
                     audio_index += 1
                     new_text += multimodal_tokens.audio_token
+                elif text_part == multimodal_tokens.video_token:
+                    # load as video
+                    assert (
+                        multimodal_tokens.video_token
+                    ), "Token must not be None to process text_part"
+                    assert (
+                        video_data and len(video_data) > 0
+                    ), "video_Data must not be None and a non zero list to load video"
+                    video_frames, fps, resolution, duration = load_video(
+                        video_data[video_index]
+                    )
+                    hashes += [hash(video_data[video_index])]
+                    data_hash_type += ["video"]
+                    videos.append(video_frames)
+                    video_index += 1
+                    new_text += multimodal_tokens.video_token
                 else:
                     # TODO(mick): handle video
                     # normal text
@@ -255,9 +288,11 @@ class BaseMultimodalProcessor(ABC):
 
         out = BaseMultiModalProcessorOutput(
             mm_data_hashes=hashes,
+            data_hash_type=data_hash_type,
             image_sizes=image_sizes,
             images=images,
             audios=audios,
+            videos=videos,
             input_text=new_text,
         )
         out.normalize()

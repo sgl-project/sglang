@@ -358,6 +358,8 @@ class ForwardBatch:
             merged.pixel_values = torch.from_numpy(merged.pixel_values)
         if isinstance(merged.audio_features, np.ndarray):
             merged.audio_features = torch.from_numpy(merged.audio_features)
+        if isinstance(merged.pixel_values_videos, np.ndarray):
+            merged.pixel_values_videos = torch.from_numpy(merged.pixel_values_videos)
 
         return merged
 
@@ -377,8 +379,20 @@ class ForwardBatch:
             for mm_input in self.mm_inputs
         )
 
+    def contains_video_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_video_inputs()
+            for mm_input in self.mm_inputs
+        )
+
     def contains_mm_inputs(self) -> bool:
-        return self.contains_audio_inputs() or self.contains_image_inputs()
+        return (
+            self.contains_audio_inputs()
+            or self.contains_image_inputs()
+            or self.contains_video_inputs()
+        )
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -436,9 +450,9 @@ class ForwardBatch:
                             tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
-                    batch.multimodal_inputs[i].mrope_position_delta = (
-                        mrope_position_delta
-                    )
+                    batch.multimodal_inputs[
+                        i
+                    ].mrope_position_delta = mrope_position_delta
                 mrope_positions_list[i] = mrope_positions
 
         self.mrope_positions = torch.cat(

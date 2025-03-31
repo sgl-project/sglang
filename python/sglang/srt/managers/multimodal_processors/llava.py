@@ -113,7 +113,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             if "multi-images" in modalities or "video" in modalities:
                 # Multiple images
                 aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                pixel_values, data_hashes, image_sizes = [], [], []
+                pixel_values, data_hashes, data_hash_type, image_sizes = [], [], [], []
                 res = []
                 for img_data in image_data:
                     res.append(
@@ -125,6 +125,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)
+                    data_hash_type.append("image")
                     image_sizes.append(image_s)
 
                 if isinstance(pixel_values[0], np.ndarray):
@@ -135,6 +136,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
                 data_hashes = [image_hash]
+                data_hash_type = ["image"]
                 image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
@@ -142,6 +144,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         return {
             "pixel_values": pixel_values,
             "data_hashes": data_hashes,
+            "data_hash_type": data_hash_type,
             "image_sizes": image_sizes,
             "modalities": request_obj.modalities or ["image"],
         }

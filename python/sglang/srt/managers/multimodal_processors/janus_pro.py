@@ -78,6 +78,7 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
             "pixel_values": res["pixel_values"],
             "images_emb_mask": res["images_emb_mask"],
             "data_hashes": base_out.mm_data_hashes,
+            "data_hash_type": base_out.data_hash_type,
             "im_start_id": res["im_start_id"],
             "im_end_id": res["im_end_id"],
             "im_token_id": res["im_token_id"],

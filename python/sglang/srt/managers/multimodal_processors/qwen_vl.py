@@ -1,7 +1,7 @@
 import asyncio
 import math
 import time
-from typing import List, Union
+from typing import List, Union, Optional
 
 import torch
 from PIL import Image
@@ -24,6 +24,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        self.VIDEO_TOKEN = "<|vision_start|><|video_pad|><|vision_end|>"
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.image_token_id = hf_config.image_token_id
@@ -35,33 +36,43 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MAX_RATIO = 200
 
     @staticmethod
-    def _process_images_task(images, input_text, _hf_config):
+    def _process_images_task(images, videos, input_text, _hf_config):
         if isinstance(images, list) and len(images) == 0:
             images = None
+        if isinstance(videos, list) and len(videos) == 0:
+            videos = None
         result = get_global_processor().__call__(
-            text=[input_text], images=images, padding=True, return_tensors="pt"
+            text=[input_text],
+            images=images,
+            videos=videos,
+            padding=True,
+            return_tensors="pt",
         )
 
         return {
             "input_ids": result.input_ids,
             "pixel_values": getattr(result, "pixel_values", None),
+            "pixel_values_videos": getattr(result, "pixel_values_videos", None),
             "image_grid_thw": getattr(result, "image_grid_thw", None),
             "second_per_grid_ts": getattr(result, "second_per_grid_ts", None),
-            "video_grid_thws": getattr(result, "video_grid_thws", None),
+            "video_grid_thw": getattr(result, "video_grid_thw", None),
         }
 
-    async def _process_single_image(self, images, input_text) -> dict:
+    async def _process_single_image(
+        self, images, input_text, videos: Optional[list[list[Image]]] = None
+    ) -> dict:
         if self.executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.executor,
                 Qwen2_5VLImageProcessor._process_images_task,
                 images,
+                videos,
                 input_text,
                 self.hf_config,
             )
         else:
-            return self._process_images_task(images, input_text, self.hf_config)
+            return self._process_images_task(images, videos, input_text, self.hf_config)
 
     async def process_mm_data_async(
         self,
@@ -73,16 +84,23 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         start = time.time()
-        if not image_data:
+        video_data = request_obj.video_data
+        if not image_data and not video_data:
             return None
         if isinstance(image_data, str):
             image_data = [image_data]
+        if isinstance(video_data, str):
+            video_data = [video_data]
 
         image_token = self.IMAGE_TOKEN
+        video_token = self.VIDEO_TOKEN
         base_output = self.load_mm_data(
             input_ids=input_ids,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            video_data=video_data,
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=image_token, video_token=video_token
+            ),
             max_req_input_len=max_req_input_len,
         )
 
@@ -144,18 +162,31 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
             return math.floor(number / factor) * factor
 
-        images = [resize_image(image) for image in base_output.images]
+        # qwen can have videos or images
+        images = None
+        if base_output.images:
+            images = [resize_image(image) for image in base_output.images]
 
         ret = await self._process_single_image(
-            images=images, input_text=base_output.input_text
+            images=images, videos=base_output.videos, input_text=base_output.input_text
         )
 
-        image_grid_thws = torch.concat([ret["image_grid_thw"]])
-        video_grid_thws = None
+        image_grid_thws = (
+            torch.concat([ret["image_grid_thw"]])
+            if ret["image_grid_thw"] is not None
+            else None
+        )
+        video_grid_thws = (
+            torch.concat([ret["video_grid_thw"]])
+            if ret["video_grid_thw"] is not None
+            else None
+        )
         return {
             "input_ids": ret["input_ids"].flatten().tolist(),
             "pixel_values": ret["pixel_values"],
+            "pixel_values_videos": ret["pixel_values_videos"],
             "data_hashes": base_output.mm_data_hashes,
+            "data_hash_type": base_output.data_hash_type,
             "modalities": request_obj.modalities or ["image"],
             "image_grid_thws": image_grid_thws,
             "video_grid_thws": video_grid_thws,
