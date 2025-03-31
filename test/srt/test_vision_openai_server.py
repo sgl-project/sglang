@@ -500,12 +500,50 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--chat-template",
-                "qwen2-vl",
+                "qwen2.5-vl",
                 "--mem-fraction-static",
                 "0.4",
             ],
         )
         cls.base_url += "/v1"
+
+    def test_video_url_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Using the direct video_url format
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What's in this video?"},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"},
+                    },
+                ],
+            }
+        ]
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=1024,
+            stream=True,
+        )
+
+        print("-" * 30)
+        video_response = ""
+        for chunk in response:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                video_response += content
+                print(content, end="", flush=True)
+        print("-" * 30)
+
+        # Add assertions to validate the response
+        self.assertIsNotNone(video_response)
+        self.assertGreater(len(video_response), 0)
 
 
 class TestVLMContextLengthIssue(CustomTestCase):
