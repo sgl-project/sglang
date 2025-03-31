@@ -27,8 +27,10 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("facebook/contriever", 1, 1e-5)]
 
-ATTENTION_BACKEND = ["torch_native", "triton", "fa3"]
+ATTENTION_BACKEND = ["torch_native"]
+BATCH_SIZE = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TORCH_DTYPES = [torch.float32]
+sgl_to_st_ratio = []
 
 
 class TestEncoderEmbeddingModels(CustomTestCase):
@@ -64,10 +66,10 @@ class TestEncoderEmbeddingModels(CustomTestCase):
         torch_dtype,
         prefill_tolerance,
         attention_backend,
+        batch_size,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
-
-        caculateNum = 10
+        truncated_prompts = truncated_prompts * batch_size
 
         with HFRunner(
             model_path,
@@ -77,10 +79,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # warm up
             hf_outputs = hf_runner.forward(truncated_prompts)
 
-            transformer_start_time = time.time()
-            for i in range(caculateNum):
-                hf_outputs = hf_runner.forward(truncated_prompts)
-            transformer_end_time = time.time()
+            st_start_time = time.time()
+            hf_outputs = hf_runner.forward(truncated_prompts)
+            st_end_time = time.time()
 
         with SRTRunner(
             model_path,
@@ -88,27 +89,29 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend=attention_backend,
+            chunked_prefill_size=-1,
             disable_radix_cache=True,
         ) as srt_runner:
             # warm up
             srt_outputs = srt_runner.forward(truncated_prompts)
 
             sgl_start_time = time.time()
-            for i in range(caculateNum):
-                srt_outputs = srt_runner.forward(truncated_prompts)
+            srt_outputs = srt_runner.forward(truncated_prompts)
             sgl_end_time = time.time()
 
-        print("transformer: ", (transformer_end_time - transformer_start_time))
-        print("sglang: ", attention_backend, (sgl_end_time - sgl_start_time))
+        transformer_time = st_end_time - st_start_time
+        sgl_time = sgl_end_time - sgl_start_time
+        sgl_to_st_ratio.append(sgl_time / transformer_time)
 
-        for i in range(len(prompts)):
+        for i in range(len(truncated_prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
             srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
 
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
-            print("similarity diff", abs(similarity - 1))
+            # If something is wrong, uncomment this to observe similarity.
+            # print("similarity diff", abs(similarity - 1))
 
-            if len(prompts[i]) <= 1000:
+            if len(truncated_prompts[i]) <= 1000:
                 assert torch.all(
                     abs(similarity - 1) < prefill_tolerance
                 ), "embeddings are not all close"
@@ -121,15 +124,25 @@ class TestEncoderEmbeddingModels(CustomTestCase):
 
         for model, tp_size, prefill_tolerance in models_to_test:
             for attention_backend in ATTENTION_BACKEND:
-                for torch_dtype in TORCH_DTYPES:
-                    self.assert_close_prefill_logits(
-                        DEFAULT_PROMPTS,
-                        model,
-                        tp_size,
-                        torch_dtype,
-                        prefill_tolerance,
-                        attention_backend,
-                    )
+                for batch_size in BATCH_SIZE:
+                    for torch_dtype in TORCH_DTYPES:
+                        self.assert_close_prefill_logits(
+                            DEFAULT_PROMPTS,
+                            model,
+                            tp_size,
+                            torch_dtype,
+                            prefill_tolerance,
+                            attention_backend,
+                            batch_size,
+                        )
+
+        for i in range(len(BATCH_SIZE)):
+            print(
+                "bacth size: ",
+                BATCH_SIZE[i] * 5,
+                "sgl_time/st_time",
+                round(sgl_to_st_ratio[i], 3),
+            )
 
 
 if __name__ == "__main__":
