@@ -1344,7 +1344,7 @@ class Scheduler(
                 else set([])
             )
 
-        origin_output_ids = []
+        origin_output_ids = {}
         # Get requests from the waiting queue to a new batch
         for req in self.waiting_queue:
             if (
@@ -1363,7 +1363,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            output_ids = req.output_ids
+            origin_output_ids[req.rid] = req.output_ids
             req.output_ids = [] # clear output_ids
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
@@ -1384,7 +1384,6 @@ class Scheduler(
                     else:
                         self.running_batch.batch_is_full = True
                 break
-            origin_output_ids.append(output_ids)
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:

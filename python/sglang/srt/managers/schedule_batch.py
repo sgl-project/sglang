@@ -995,7 +995,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
-    def recover_for_decode(self, origin_output_ids: List[List[int]]):
+    def recover_for_decode(self, origin_output_ids: dict[str, List[int]]):
         self.forward_mode = ForwardMode.DECODE
 
         bs = len(self.reqs)
@@ -1015,7 +1015,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices[i]
-            req.output_ids = origin_output_ids[i]
+            req.output_ids = origin_output_ids[req.rid]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
             assert seq_len - pre_len == req.extend_input_len
