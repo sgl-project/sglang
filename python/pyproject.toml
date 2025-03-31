@@ -33,6 +33,7 @@ runtime_common = [
     "prometheus-client>=0.20.0",
     "psutil",
     "pydantic",
+    "pynvml",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",

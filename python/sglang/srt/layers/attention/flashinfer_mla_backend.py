@@ -797,7 +797,7 @@ class FlashInferMLAMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.decode_seq_lens_cpu,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
