@@ -450,9 +450,9 @@ class ForwardBatch:
                             tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
-                    batch.multimodal_inputs[
-                        i
-                    ].mrope_position_delta = mrope_position_delta
+                    batch.multimodal_inputs[i].mrope_position_delta = (
+                        mrope_position_delta
+                    )
                 mrope_positions_list[i] = mrope_positions
 
         self.mrope_positions = torch.cat(

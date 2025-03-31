@@ -32,7 +32,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union, Literal
+from typing import TYPE_CHECKING, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch

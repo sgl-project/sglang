@@ -4,7 +4,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional, List, Literal
+from typing import List, Literal, Optional
 
 import numpy as np
 import PIL
@@ -12,7 +12,7 @@ import transformers
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.utils import load_audio, load_image, logger, load_video
+from sglang.srt.utils import load_audio, load_image, load_video, logger
 
 global global_processor
 

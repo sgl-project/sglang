@@ -518,7 +518,9 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
                     {"type": "text", "text": "What's in this video?"},
                     {
                         "type": "video_url",
-                        "video_url": {"url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"},
+                        "video_url": {
+                            "url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"
+                        },
                     },
                 ],
             }

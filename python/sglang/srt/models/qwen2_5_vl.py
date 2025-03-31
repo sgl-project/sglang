@@ -25,7 +25,7 @@
 
 import logging
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type, Literal, Callable
+from typing import Callable, Iterable, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
