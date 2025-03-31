@@ -355,11 +355,6 @@ class ForwardBatch:
         for mm_input in valid_inputs[1:]:
             merged.merge(mm_input)
 
-        if isinstance(merged.pixel_values, np.ndarray):
-            merged.pixel_values = torch.from_numpy(merged.pixel_values)
-        if isinstance(merged.audio_features, np.ndarray):
-            merged.audio_features = torch.from_numpy(merged.audio_features)
-
         return merged
 
     def contains_image_inputs(self) -> bool:
