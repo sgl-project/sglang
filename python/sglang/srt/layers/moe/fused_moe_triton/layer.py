@@ -305,6 +305,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.local_num_experts = num_experts
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -629,8 +630,6 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
-            inplace=self.inplace,
-            no_combine=self.no_combine,
         )
 
         if self.reduce_results and self.tp_size > 1:

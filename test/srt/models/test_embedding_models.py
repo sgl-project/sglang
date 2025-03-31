@@ -20,7 +20,7 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import get_similarities, is_in_ci
+from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
@@ -31,7 +31,7 @@ MODELS = [
 TORCH_DTYPES = [torch.float16]
 
 
-class TestEmbeddingModels(unittest.TestCase):
+class TestEmbeddingModels(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):

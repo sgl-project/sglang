@@ -6,6 +6,7 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.test.test_utils import CustomTestCase
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
@@ -71,7 +72,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     ).sum(dim=1)
 
 
-class TestW8A8Int8FusedMoE(unittest.TestCase):
+class TestW8A8Int8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33]
     N = [128, 1024]

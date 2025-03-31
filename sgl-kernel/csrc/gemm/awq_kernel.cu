@@ -1,6 +1,7 @@
 // Adapted from
 // https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <torch/all.h>
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -79,6 +80,7 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 }
 
 __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
+#if CUDA_VERSION >= 12000
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   uint4 result;
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
@@ -118,6 +120,7 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   assert(false);
   return {};
 #endif
+#endif
 }
 
 template <typename OutputT>
@@ -128,6 +131,7 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     OutputT* __restrict__ output,
     int group_size,
     int qweight_cols) {
+#if CUDA_VERSION >= 12000
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -174,6 +178,7 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     static_assert(sizeof(uint4) == 8 * sizeof(OutputT), "Memory layout mismatch");
     *reinterpret_cast<uint4*>(output_ptr) = weight_raw;
   }
+#endif
 }
 
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros) {
