@@ -5,7 +5,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 # FetchContent_MakeAvailable will build it.
 cmake_policy(SET CMP0169 OLD)
 
-find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
@@ -25,6 +25,7 @@ find_package(Torch REQUIRED)
 
 include(FetchContent)
 
+# cutlass
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
@@ -32,6 +33,7 @@ FetchContent_Declare(
     GIT_SHALLOW    ON
 )
 FetchContent_Populate(repo-cutlass)
+# DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
@@ -39,13 +41,23 @@ FetchContent_Declare(
     GIT_SHALLOW    ON
 )
 FetchContent_Populate(repo-deepgemm)
+# flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer
-    GIT_TAG        79fd1ae90d9b8098ca70dec6071da96f3f6da7b9
+    GIT_REPOSITORY https://github.com/sgl-project/flashinfer
+    GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+# flash-attention
+FetchContent_Declare(
+    repo-flash-attention
+    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+    GIT_TAG sgl-kernel
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-flash-attention)
+
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -54,6 +66,7 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -78,6 +91,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
+    "--use_fast_math"
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 )
@@ -86,6 +100,7 @@ option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
 option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
+option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -118,10 +133,40 @@ if (SGL_KERNEL_ENABLE_FP8)
     )
 endif()
 
+if (SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DENABLE_NVFP4=1"
+    )
+endif()
+
 string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"       "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+
+# set flash-attention sources file
+# BF16 source files
+file(GLOB FA3_BF16_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+file(GLOB FA3_BF16_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
+list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+
+# FP16 source files
+file(GLOB FA3_FP16_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+file(GLOB FA3_FP16_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
+list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+
+# FP8 source files
+file(GLOB FA3_FP8_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+file(GLOB FA3_FP8_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
+list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+
+set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
 set(SOURCES
     "csrc/allreduce/trt_reduce_internal.cu"
@@ -144,6 +189,7 @@ set(SOURCES
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/moe/moe_align_kernel.cu"
+    "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
@@ -152,10 +198,14 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+    "${FA3_GEN_SRCS}"
 )
 
 # Support abi3 for build
-Python_add_library(common_ops MODULE USE_SABI 3.9 WITH_SOABI ${SOURCES})
+Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
@@ -164,3 +214,29 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+
+# Add some flash-attention custom flag for inference
+target_compile_definitions(common_ops PRIVATE
+    FLASHATTENTION_DISABLE_SM8x
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    # FLASHATTENTION_DISABLE_ALIBI
+    # FLASHATTENTION_DISABLE_SOFTCAP
+    FLASHATTENTION_DISABLE_UNEVEN_K
+    # FLASHATTENTION_DISABLE_LOCAL
+    FLASHATTENTION_VARLEN_ONLY
+)
+
+# JIT Logic
+# DeepGEMM
+
+install(DIRECTORY "${repo-deepgemm_SOURCE_DIR}/deep_gemm/"
+        DESTINATION "deep_gemm"
+        PATTERN ".git*" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
+        DESTINATION "deep_gemm/include/cute")
+
+install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
+        DESTINATION "deep_gemm/include/cutlass")
