@@ -320,6 +320,9 @@ class Scheduler(
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
 
+        # Init PrefillAdder
+        self.prefill_adder: Optional[PrefillAdder] = None
+
         # Init session info
         self.sessions: Dict[str, Session] = {}
 
@@ -1002,41 +1005,37 @@ class Scheduler(
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
 
-    def log_prefill_stats(
-        self,
-        adder: PrefillAdder,
-        can_run_list: List[Req],
-        running_bs: int,
-    ):
+    def log_prefill_stats(self):
         gap_latency = time.time() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.time()
         self.last_input_throughput = self.num_prefill_tokens / gap_latency
         self.num_prefill_tokens = 0
 
+        num_running_reqs = len(self.running_batch.reqs)
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
         )
         self._largest_prefill_len = max(
-            self._largest_prefill_len, adder.log_input_tokens
+            self._largest_prefill_len, self.prefill_adder.log_input_tokens
         )
 
         f = (
             f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
-            f"#new-token: {adder.log_input_tokens}, "
-            f"#cached-token: {adder.log_hit_tokens}, "
+            f"#new-seq: {len(self.prefill_adder.can_run_list)}, "
+            f"#new-token: {self.prefill_adder.log_input_tokens}, "
+            f"#cached-token: {self.prefill_adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"#running-req: {running_bs}, "
+            f"#running-req: {num_running_reqs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / (
-                adder.log_input_tokens + adder.log_hit_tokens
+            cache_hit_rate = self.prefill_adder.log_hit_tokens / (
+                self.prefill_adder.log_input_tokens + self.prefill_adder.log_hit_tokens
             )
-            self.stats.num_running_reqs = running_bs
+            self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
@@ -1216,7 +1215,7 @@ class Scheduler(
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
-        adder = PrefillAdder(
+        self.prefill_adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -1228,7 +1227,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = self.prefill_adder.add_chunked_req(self.chunked_req)
 
         if self.lora_paths:
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
@@ -1239,7 +1238,7 @@ class Scheduler(
                 self.lora_paths
                 and len(
                     lora_set
-                    | set([req.lora_path for req in adder.can_run_list])
+                    | set([req.lora_path for req in self.prefill_adder.can_run_list])
                     | set([req.lora_path])
                 )
                 > self.max_loras_per_batch
@@ -1247,7 +1246,10 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
-            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+            if (
+                running_bs + len(self.prefill_adder.can_run_list)
+                >= self.max_running_requests
+            ):
                 self.running_batch.batch_is_full = True
                 break
 
@@ -1256,7 +1258,7 @@ class Scheduler(
                 self.enable_hierarchical_cache,
             )
 
-            res = adder.add_one_req(
+            res = self.prefill_adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
             if res != AddReqResult.CONTINUE:
@@ -1264,7 +1266,7 @@ class Scheduler(
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
-                            adder.can_run_list
+                            self.prefill_adder.can_run_list
                         ) > 0 or (
                             self.running_batch is not None
                             and not self.running_batch.is_empty()
@@ -1274,7 +1276,7 @@ class Scheduler(
                 break
 
         # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
+        can_run_list: List[Req] = self.prefill_adder.can_run_list
         if len(can_run_list) == 0:
             return None
         self.waiting_queue = [
@@ -1284,16 +1286,12 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.read_to_load_cache()
 
-        if adder.new_chunked_req is not None:
+        if self.prefill_adder.new_chunked_req is not None:
             assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+            self.chunked_req = self.prefill_adder.new_chunked_req
 
         if self.chunked_req:
             self.chunked_req.is_chunked += 1
-
-        # Print stats
-        if self.attn_tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
