@@ -102,6 +102,8 @@ option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
 
+# TODO: change `AND` back to `OR` after fixing the build error of
+# nvfp4_scaled_mm_kernels.cu in cuda12.8 environment.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" AND SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
