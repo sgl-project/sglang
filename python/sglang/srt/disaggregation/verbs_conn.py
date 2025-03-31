@@ -15,7 +15,7 @@ from sglang.srt.bootstrap.app import start_bootstrap_server
 import uuid
 from typing import Dict, Optional
 import numpy as np
-from sglang.srt.bootstrap.rdma_utils import RdmaQP, RdmaClient
+from sglang.srt.bootstrap.rdma_utils import RdmaServer, RdmaClient
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,7 @@ class KVReceiver:
 
         # todo get dynamic ip
         self.ip_address = "10.246.59.104"
-        self.qp = RdmaQP(socket_port=self.rdma_port)
+        self.qp = RdmaServer(socket_port=self.rdma_port)
 
         # Initialize connection
         # todo can use other rapid method...

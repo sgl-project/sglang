@@ -59,7 +59,7 @@ class PrefillReadyRequest(BaseModel):
     room_id: int
     ready: bool = True
 
-# Mapping from room_id to ucx_port
+# Mapping from room_id to rdma_port
 room_to_port_mapping = {}
 # Set of room_ids that are ready for prefill
 prefill_ready_rooms = set()
@@ -84,7 +84,7 @@ app.add_middleware(
 async def handshake(request: HandshakeRequest):
     """
     Handle handshake request from the receiver
-    The receiver establishes a RDMA verbs server and sends room_id and ucx_port information
+    The receiver establishes a RDMA verbs server and sends room_id and rdma_port information
     """
     try:
         room_id = request.room_id
@@ -123,7 +123,7 @@ async def get_room_info(room_id: int):
 
 
 
-class RdmaServer:
+class BootstrapServerStarter:
     def __init__(self, app: FastAPI, host: str, port: int, shared_data: dict):
         self.app = app
         self.host = host
@@ -162,7 +162,7 @@ def start_bootstrap_server(bootstrap_host: str, bootstrap_port: int, server_args
     Returns:
         tuple: (UvicornServer instance, shared data dictionary)
     """
-    server = RdmaServer(app, bootstrap_host, bootstrap_port, {})
+    server = BootstrapServerStarter(app, bootstrap_host, bootstrap_port, {})
     server.start()
 
     return server

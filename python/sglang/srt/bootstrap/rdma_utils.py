@@ -53,7 +53,7 @@ logging.basicConfig(
 )
 
 
-class RdmaQP():
+class RdmaServer():
     def __init__(self, ib_device='mlx5_bond_0', host_ip='0.0.0.0', socket_port=17777, debug=True):
         logger.setLevel(logging.DEBUG if debug else logging.INFO)
         self.socket_port: None
