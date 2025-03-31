@@ -546,6 +546,77 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
         # Add assertions to validate the response
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
+        self.assertTrue(
+            any(
+                term in video_response.lower()
+                for term in ["control room", "control", "room"]
+            ),
+            "Response should mention 'Control Room'",
+        )
+
+    def test_video_and_image_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Mixed video_url and image_url format
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an AI that analyzes both video and image inputs.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "https://raw.githubusercontent.com/rzalawad/sglang/qwen2.5vl-video-support/assets/space.mp4"
+                        },
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": "Analyze this video and image together and provide a detailed description of both",
+            },
+        ]
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=1024,
+            # stream=False,
+        )
+
+        print("-" * 30 + " Video and Image Response " + "-" * 30)
+        combined_response = response.choices[0].message.content
+        print(combined_response)
+        print("\n" + "-" * 80)
+
+        # Validate the response contains expected elements
+        self.assertIsNotNone(combined_response)
+        self.assertGreater(len(combined_response), 0)
+
+        # Assert specific content expected in the response
+        self.assertTrue(
+            any(
+                term in combined_response.lower()
+                for term in ["control room", "control", "room"]
+            ),
+            "Response should mention 'Control Room'",
+        )
+        self.assertTrue(
+            "dog" in combined_response.lower(), "Response should mention 'dog'"
+        )
+        self.assertTrue(
+            "beach" in combined_response.lower(), "Response should mention 'beach'"
+        )
 
 
 class TestVLMContextLengthIssue(CustomTestCase):
