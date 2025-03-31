@@ -938,12 +938,14 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.metrics.add_queue_time = time.time()
             self.disagg_prefill_pending_queue.add(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
 
         else:
+            req.metrics.add_queue_time = time.time()
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -1280,6 +1282,9 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+
+        for req in can_run_list:
+            req.metrics.first_scheduled_time = time.time()
 
         if self.enable_hierarchical_cache:
             self.tree_cache.read_to_load_cache()

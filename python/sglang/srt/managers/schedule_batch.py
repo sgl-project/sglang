@@ -310,6 +310,16 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+class ReqMetrics:
+    """Metrics associated with a request. """
+
+    def __init__(self):
+        # The time when the request add to waiting queue.
+        self.add_queue_time = None
+        # The time when the request was first scheduled.
+        self.first_scheduled_time = None
+        # more metrics for req in scheduler
+
 class Req:
     """The input and output status of a request."""
 
@@ -475,6 +485,8 @@ class Req:
         self.metadata_buffer_index: int = -1
         # The first output_id transferred from prefill instance.
         self.transferred_output_id: Optional[int] = None
+        # req metrics
+        self.metrics = ReqMetrics()
 
     @property
     def seqlen(self):

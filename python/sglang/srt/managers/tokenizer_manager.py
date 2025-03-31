@@ -119,10 +119,30 @@ class ReqState:
     event: asyncio.Event
     obj: Any
 
-    # For metrics
+    #  Sometimes, We need to analyze why the time to first token is so long which including
+    #  the following parts:
+
+    #  input_process_time: Tokenize text prompt or multimodal url data download
+    #  time_in_queue: The time the request spent in the queue.
+    #  prefill_time:  The time for prefill
+    #
+    #
+    #   input_process_time   time_in_queue    prefill_time
+    #  |------------------|----------------|----------------|
+    #  ^                  ^                ^                ^
+    # created_time add_queue_time first_scheduled_time first_token_time
+    #
+    # The time when the request arrived
     created_time: float
+    # The time when the request was finished.
     finished_time: float = 0.0
+    # The time when the first token was generated.
     first_token_time: float = 0.0
+    # The time when the request was first scheduled.
+    first_scheduled_time: float = 0.0
+    # The time when the request was added in waiting queue.
+    add_queue_time: float = 0.0
+
     last_time: float = 0.0
     last_completion_tokens: int = 1
 
@@ -982,6 +1002,9 @@ class TokenizerManager:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                meta_info['time_to_first_token'] = state.first_token_time - state.created_time
+                meta_info['time_in_queue'] = state.first_scheduled_time - state.add_queue_time
+                meta_info['time_for_input_process'] = state.add_queue_time - state.created_time
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -1081,11 +1104,19 @@ class TokenizerManager:
             else 0
         )
 
+        if state.add_queue_time == 0.0:
+            state.add_queue_time = recv_obj.metrics[i].add_queue_time
+        if state.first_scheduled_time == 0.0:
+            state.first_scheduled_time = recv_obj.metrics[i].first_scheduled_time
+
         if state.first_token_time == 0.0:
             state.first_token_time = state.last_time = time.time()
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
                 state.first_token_time - state.created_time
+            )
+            self.metrics_collector.observe_time_in_waiting_queue(
+                state.first_scheduled_time - state.add_queue_time
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
