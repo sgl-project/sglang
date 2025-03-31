@@ -1415,6 +1415,7 @@ class Scheduler(
         )
         new_batch.recover_for_decode(origin_output_ids)
         # Recover kv cache from kv_transfer_agent
+        '''
         pt = 0
         for i in range(new_batch.batch_size()):
             req = new_batch.reqs[i]
@@ -1428,6 +1429,33 @@ class Scheduler(
                 kv_cache_pool.set_kv_buffer_by_layer(
                     layer_id,
                     new_batch.out_cache_loc[pt : pt + new_batch.extend_lens[i]],
+                    layer_kv_buffer[len(req.prefix_indices):],
+                    None
+                )
+            req.kv_cache_restored = True
+            pt += new_batch.extend_lens[i]
+        '''
+        pt = 0
+        pt_map = {}
+        try_to_fetch_kv_cache_req_list = []
+        for i in range(new_batch.batch_size()):
+            req = new_batch.reqs[i]
+            if req.kv_cache_restored:
+                pt += new_batch.extend_lens[i]
+                continue
+            try_to_fetch_kv_cache_req_list.append(req)
+            pt_map[req.rid] = pt
+            pt += new_batch.extend_lens[i]
+        
+        kv_bytes_map = self.kv_transfer_agent.get_batch_kv_buffer(try_to_fetch_kv_cache_req_list)
+        for rid, tensor in kv_bytes_map.items():
+            flattened_kv_buffer = tensor.to(self.device)
+            layer_kv_buffers = torch.unbind(flattened_kv_buffer, dim=0)
+            kv_cache_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            for layer_id, layer_kv_buffer in enumerate(layer_kv_buffers):
+                kv_cache_pool.set_kv_buffer_by_layer(
+                    layer_id,
+                    new_batch.out_cache_loc[pt_map[rid] : pt_map[rid] + new_batch.extend_lens[i]],
                     layer_kv_buffer[len(req.prefix_indices):],
                     None
                 )
@@ -1575,7 +1603,7 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
-
+    
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

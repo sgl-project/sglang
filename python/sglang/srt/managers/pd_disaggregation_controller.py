@@ -9,7 +9,8 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
 )
-from sglang.srt.managers.io_struct import PrefilledReqInput, KVTransferFetch, KVTransferAck, AbortReq
+
+from sglang.srt.managers.io_struct import PrefilledReqInput, KVTransferFetch, KVTransferAck, AbortReq, KVTransferFetchBatch
 
 PD_DISAGGREGATION_PORT = 17000
 
@@ -38,6 +39,7 @@ class PDDisaggregationController:
                 (AbortReq, self._handle_abort_req),
                 (PrefilledReqInput, self._handle_prefilled_req),
                 (KVTransferFetch, self._handle_kv_transfer_req),
+                (KVTransferFetchBatch, self._handle_kv_transfer_batch_req),
                 (KVTransferAck, self._handle_kv_transfer_resp),
             ]
         )
@@ -54,6 +56,9 @@ class PDDisaggregationController:
             self._request_dispatcher(recv_obj)
 
     def _handle_kv_transfer_req(self, req: KVTransferFetch):
+        self.send_to_transfer_agent[req.src_rank].send_pyobj(req)
+        
+    def _handle_kv_transfer_batch_req(self, req: KVTransferFetchBatch):
         self.send_to_transfer_agent[req.src_rank].send_pyobj(req)
 
     def _handle_kv_transfer_resp(self, req: KVTransferAck):

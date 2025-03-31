@@ -867,6 +867,21 @@ class KVTransferFetch:
     # the pointer to the buffer of the decode node which needs the kv cache
     dst_ptr: Optional[int] = None
 
+@dataclass
+class KVTransferFetchBatch():
+    fetch_batch_req_hash: Optional[str] = None
+    rids: Optional[List[str]] = None         # request ids
+    fetch_ct: Optional[int] = None
+    # the address of the prefill node which has the kv cache
+    src_addr: Optional[str] = None
+    # the rank of the prefill node which has the kv cache
+    src_rank: Optional[int] = None
+    # the address of the decode node which needs the kv cache
+    dst_addr: Optional[str] = None
+    # the rank of the decode node which needs the kv cache
+    dst_rank: Optional[int] = None
+    # the pointer to the buffer of the decode node which needs the kv cache
+    dst_ptr: Optional[int] = None
 
 @dataclass
 class KVTransferAck:
