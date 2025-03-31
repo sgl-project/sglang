@@ -58,7 +58,7 @@ Steps to add a new kernel:
 2. When creating torch extensions, add the function definition with `m.def`, and device binding with `m.impl`:
 - Using torch.compile need `m.def` with schema, it helps auto capture the custom kernel. Reference: [How to add FakeTensor](https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit?tab=t.0#heading=h.ptttacy8y1u9)
 
-- How to write schema: [Schema reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func) 
+- How to write schema: [Schema reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func)
 
    ```cpp
    // We need def with schema here for torch.compile
