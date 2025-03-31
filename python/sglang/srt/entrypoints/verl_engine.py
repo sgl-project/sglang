@@ -13,9 +13,10 @@
 # ==============================================================================
 import os
 from typing import Dict, List, Optional, Tuple, Union
-from PIL.Image import Image
+
 import torch
 import torch.distributed as dist
+from PIL.Image import Image
 from torch.distributed.tensor import DeviceMesh, DTensor
 
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
@@ -62,7 +63,13 @@ class VerlEngine:
         # - List of images (one per request in a batch)
         # - List of lists of images (multiple images per request)
         # See also python/sglang/srt/utils.py:load_image for more details.
-        image_data: Optional[Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]] = None,
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,

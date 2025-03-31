@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
+
 from PIL.Image import Image
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -49,7 +50,9 @@ class GenerateReqInput:
     # - List of images (one per request in a batch)
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]] = None
+    image_data: Optional[
+        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
+    ] = None
     # The audio input. Like image data, tt can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[str], str]] = None
     # The sampling_params. See descriptions below.
