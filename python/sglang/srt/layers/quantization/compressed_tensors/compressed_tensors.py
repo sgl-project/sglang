@@ -23,7 +23,6 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -123,6 +122,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+        # 使用延迟导入，避免循环导入
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self)
         return None
