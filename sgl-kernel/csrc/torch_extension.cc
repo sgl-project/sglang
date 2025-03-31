@@ -82,12 +82,20 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From FlashInfer
    */
-  m.def("bmm_fp8", bmm_fp8);
+  m.def(
+      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
+      "cublas_handle, int cuda_stream) -> ()");
+  m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
   m.def("min_p_sampling_from_probs", min_p_sampling_from_probs);
   m.def("top_k_renorm_probs", top_k_renorm_probs);
   m.def("top_p_renorm_probs", top_p_renorm_probs);
   m.def("top_k_top_p_sampling_from_probs", top_k_top_p_sampling_from_probs);
   m.def("top_p_sampling_from_probs", top_p_sampling_from_probs);
+
+  /*
+   * From flash-attention
+   */
+  m.def("fwd", make_pytorch_shim(mha_fwd));
 }
 
 REGISTER_EXTENSION(common_ops)
