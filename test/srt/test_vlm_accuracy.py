@@ -1,23 +1,38 @@
 """
 """
 
+import dataclasses
 import unittest
 from io import BytesIO
+from typing import Tuple
+
+import nest_asyncio
+
+nest_asyncio.apply()
 
 import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
+import sglang as sgl
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.conversation import generate_chat_conv
+from sglang.srt.conversation import chat_templates, generate_chat_conv
 from sglang.srt.managers.mm_utils import embed_mm_inputs
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
+
+MiniCPMV = "openbmb/MiniCPM-V-2_6"
+QWEN2VL = "Qwen/Qwen2-VL-7B-Instruct"
 
 
 # Test the logits output between HF and SGLang
@@ -209,6 +224,142 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
             )
 
         self.compare_outputs(sglang_output, hf_output)
+
+
+class TestQWEN2VLLogits(VisionLLMLogitsBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model_path = QWEN2VL
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls.chat_template = "qwen2-vl"
+
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.model = AutoModelForImageTextToText.from_pretrained(
+            cls.model_path,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+            device_map=cls.device,
+            trust_remote_code=True,
+        ).eval()
+        cls.model.to(cls.device)
+        cls.max_new_tokens = 5
+        cls.temperature = 0.4
+        cls.debug_tensor_dump_output_folder = "logits"
+
+    def compare_outputs(
+        self,
+        sgl_logits_output: Tuple[torch.Tensor],
+        hf_logits_output: Tuple[torch.Tensor],
+    ):
+
+        for i, (hf_logits, sgl_logits) in enumerate(
+            zip(hf_logits_output, sgl_logits_output)
+        ):
+
+            hf_logits_np = hf_logits.cpu().numpy()
+            sgl_logits_np = sgl_logits.cpu().numpy()
+            # Compare shapes
+            print(
+                f"Token {i+1} - HF shape: {hf_logits_np.shape}, SGL shape: {sgl_logits_np.shape}"
+            )
+
+            # Compare values with mean absolute difference
+            if hf_logits_np.shape == sgl_logits_np.shape:
+                diff = np.abs(hf_logits_np - sgl_logits_np).mean()
+                print(f"  Mean absolute difference: {diff}")
+
+            try:
+                np.testing.assert_allclose(
+                    hf_logits_np,
+                    sgl_logits_np,
+                    rtol=1e-5,  # Relative tolerance
+                    atol=1e-5,  # Absolute tolerance
+                )
+            except AssertionError as e:
+                print(f"❌ Token {i+1} comparison failed!")
+                raise e
+
+    async def test_decode_logits(self):
+        # Initialize SGLang Engine with logits dumping enabled
+        server_args = ServerArgs(
+            model_path=self.model_path,
+            chat_template=self.chat_template,
+            debug_tensor_dump_output_folder=self.debug_tensor_dump_output_folder,
+            disable_cuda_graph=True,
+        )
+
+        vlm = sgl.Engine(**dataclasses.asdict(server_args))
+
+        # Get conversation template and image token
+        conv = chat_templates[self.chat_template].copy()
+        image_token = conv.image_token
+
+        # Prepare prompt with image
+        prompt = f"What's in this image?\n{image_token}"
+
+        # Generate with same parameters as HF
+        sampling_params = {
+            "temperature": self.temperature,
+            "max_new_tokens": self.max_new_tokens,
+        }
+
+        # Generate output from SGLang used to save the logits
+        _ = vlm.generate(
+            prompt=prompt,
+            image_data=self.image_url,
+            sampling_params=sampling_params,
+        )
+
+        # Get HF output with scores
+        inputs = self.get_processor_output()
+        with torch.no_grad():
+            hf_outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                return_dict_in_generate=True,
+                output_logits=True,
+                temperature=self.temperature,
+            )
+            hf_logits_output = hf_outputs.logits
+
+        # Load SGLang logits
+        data = np.load(
+            f"{self.debug_tensor_dump_output_folder}/pytorch_dump_{self.debug_tensor_dump_output_folder}.npz"
+        )
+        decode_logits = []
+
+        # Get first token's logits from the last position of the prefill
+        prefill_logits = data["prefill"]
+        first_token_logits = prefill_logits[-1]  # Shape (vocab_size,)
+
+        # Convert to tensor and reshape to match HF format (1, vocab_size)
+        first_token_tensor = torch.tensor(first_token_logits).reshape(1, -1)
+
+        # Get all decode step logits
+        decode_logits = []
+        decode_logits.append(first_token_tensor)  # Add first token from prefill
+
+        # Add remaining decode steps
+        for key in sorted(
+            [k for k in data.keys() if k.startswith("decode_")],
+            key=lambda x: int(x.split("_")[1]),
+        ):
+            # Each is shape (1, vocab_size)
+            decode_logits.append(torch.tensor(data[key][0]))
+
+        sgl_logits_output = tuple(decode_logits)
+
+        # Compare logits
+        self.compare_outputs(sgl_logits_output, hf_logits_output)
+
+        # Cleanup
+        vlm.shutdown()
 
 
 if __name__ == "__main__":

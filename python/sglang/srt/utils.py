@@ -916,18 +916,55 @@ def get_zmq_socket(
 
 
 def dump_to_file(dirpath, name, value):
+
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() != 0:
         return
 
     os.makedirs(dirpath, exist_ok=True)
+
     if value.dtype is torch.bfloat16:
         value = value.float()
     value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
+
+    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npz")
+
+    # Check if file exists already
+    if os.path.exists(output_filename):
+        # Load existing arrays
+        existing_data = np.load(output_filename, allow_pickle=True)
+        keys = list(existing_data.keys())
+
+        # Get existing values
+        save_dict = {}
+
+        # First, copy all existing data
+        for key in keys:
+            save_dict[key] = existing_data[key]
+
+        # Then, determine the next decode index
+        next_idx = 0
+        for key in keys:
+            if key.startswith("decode_"):
+                idx = int(key.split("_")[1])
+                next_idx = max(next_idx, idx + 1)
+
+        # Add new decode tensor
+        save_dict[f"decode_{next_idx}"] = value
+
+        logger.info(
+            f"Append decode_{next_idx} tensor logits to {output_filename}. "
+            f"New shape = {value.shape}, Total tensors = {len(save_dict)}"
+        )
+        np.savez(output_filename, **save_dict)
+    else:
+        # First time saving, use prefill as the key
+        logger.info(
+            f"Create Prefill tensor logits at {output_filename}. "
+            f"Shape = {value.shape}, Type = prefill"
+        )
+        np.savez(output_filename, prefill=value)
 
 
 def is_triton_3():
