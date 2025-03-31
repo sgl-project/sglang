@@ -27,10 +27,6 @@ __inline__ __device__ __nv_bfloat16 __half2bfloat16(const half hval) {
   return __nv_bfloat16(__half2float(hval));
 }
 
-// #endif // __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900
-
-// #if __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 900
-
 __inline__ __device__ half2 __bfloat1622half2(const __nv_bfloat162 bf162_val) {
   half2 ret;
   ret.x = __bfloat162half(bf162_val.x);
