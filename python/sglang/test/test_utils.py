@@ -1012,9 +1012,6 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 
 
 class CustomTestCase(unittest.TestCase):
-    pass
-
-    """
     def _callTestMethod(self, method):
         max_retry = int(
             os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0")
@@ -1023,4 +1020,3 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
-    """
