@@ -82,54 +82,58 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = len(seqlens_in_batch)
         device = seqlens_in_batch.device
 
-        if forward_batch.forward_mode == ForwardMode.DECODE:
-            if self.skip_prefill:
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size * self.topk + 1, dtype=torch.int32, device=device
-                )
-                seq_lens_with_decode = seqlens_in_batch + (self.step_id + 1)
-                metadata.cache_seqlens_int32 = (
-                    (seq_lens_with_decode).repeat_interleave(self.topk).to(torch.int32)
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.step_id + 1
-                )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]  # (bsz, max_seq_len)
-                metadata.page_table = metadata.page_table.repeat_interleave(
-                    self.topk, dim=0
-                )
-                cache_loc = forward_batch.out_cache_loc.view(
-                    self.speculative_num_steps, -1
-                ).T
+        if forward_batch.forward_mode == ForwardMode.DECODE and self.skip_prefill:
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size * self.topk + 1, dtype=torch.int32, device=device
+            )
+            seq_lens_with_decode = seqlens_in_batch + (self.step_id + 1)
+            metadata.cache_seqlens_int32 = (
+                (seq_lens_with_decode).repeat_interleave(self.topk).to(torch.int32)
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                self.step_id + 1
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]  # (bsz, max_seq_len)
+            metadata.page_table = metadata.page_table.repeat_interleave(
+                self.topk, dim=0
+            )
+            cache_loc = forward_batch.out_cache_loc.view(
+                self.speculative_num_steps, -1
+            ).T
 
-                # page table indices to update
-                # [bsz, topk]
-                row_indices = torch.arange(batch_size * self.topk, device=device, dtype=torch.int32).view(batch_size, self.topk)
-                # [max_seq_len : max_seq_len + step_id + 1]
-                col_indices = torch.arange(forward_batch.seq_lens_cpu.max().item(), metadata.max_seq_len_k, device=device, dtype=torch.int32)
-                # mask for all valid page table indices
-                valid_mask = (col_indices.view(1, -1) >= seqlens_in_batch.view(-1, 1)) & (col_indices.view(1, -1) < seq_lens_with_decode.view(-1, 1))
+            # page table indices to update
+            # [bsz, topk]
+            row_indices = torch.arange(
+                batch_size * self.topk, device=device, dtype=torch.int32
+            ).view(batch_size, self.topk)
+            # [max_seq_len : max_seq_len + step_id + 1]
+            col_indices = torch.arange(
+                forward_batch.seq_lens_cpu.max().item(),
+                metadata.max_seq_len_k,
+                device=device,
+                dtype=torch.int32,
+            )
+            # mask for all valid page table indices
+            valid_mask = (col_indices.view(1, -1) >= seqlens_in_batch.view(-1, 1)) & (
+                col_indices.view(1, -1) < seq_lens_with_decode.view(-1, 1)
+            )
 
-                # cache indices to read
-                cache_indices = torch.arange(self.step_id + 1, device=device, dtype=torch.int32)
+            # cache indices to read
+            cache_indices = torch.arange(
+                self.step_id + 1, device=device, dtype=torch.int32
+            )
 
-                metadata.page_table[row_indices, col_indices] = torch.where(
-                    valid_mask,
-                    cache_loc[row_indices, cache_indices].to(torch.int32),
-                    metadata.page_table[row_indices, col_indices]
-                )
-            else:
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
+            metadata.page_table[row_indices, col_indices] = torch.where(
+                valid_mask,
+                cache_loc[row_indices, cache_indices].to(torch.int32),
+                metadata.page_table[row_indices, col_indices],
+            )
         elif forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
             draft_token_num = forward_batch.spec_info.draft_token_num
 
@@ -178,7 +182,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
             # Precompute cumulative sequence lengths
-            if (
+            if forward_batch.forward_mode == ForwardMode.DECODE:
+                metadata.cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+            elif (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
