@@ -317,6 +317,7 @@ class DeepseekV2MoE(nn.Module):
                 reorder_topk_ids,
                 seg_indptr,
                 masked_m,
+                expected_m,
             ) = self.deepep_dispatcher.dispatch(
                 hidden_states,
                 topk_idx,
@@ -329,6 +330,7 @@ class DeepseekV2MoE(nn.Module):
                 reorder_topk_ids=reorder_topk_ids,
                 seg_indptr=seg_indptr,
                 masked_m=masked_m,
+                expected_m=expected_m,
             )
             * self.routed_scaling_factor
         )

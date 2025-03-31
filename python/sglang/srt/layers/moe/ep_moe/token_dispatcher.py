@@ -192,6 +192,7 @@ class DeepEPDispatcher:
         masked_m = torch.empty(
             (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
         )
+        expected_m = 0
 
         if self.deepep_low_latency == False:
             (
@@ -206,12 +207,18 @@ class DeepEPDispatcher:
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
         else:
+            expected_m = (
+                hidden_states.shape[0]
+                * self.buffer_low_latency.group_size
+                * topk_idx.shape[1]
+                + num_experts
+            ) // num_experts
             hidden_states, masked_m, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
-                use_fp8=False,
+                use_fp8=True,
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
 
@@ -222,6 +229,7 @@ class DeepEPDispatcher:
             reorder_topk_ids,
             seg_indptr,
             masked_m,
+            expected_m,
         )
 
     def dispatch_normal(
