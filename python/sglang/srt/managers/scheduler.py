@@ -1110,7 +1110,7 @@ class Scheduler(
         )
         if memory_leak:
             msg = (
-                "KV cache pool leak detected! "
+                "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
@@ -1121,7 +1121,7 @@ class Scheduler(
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
-                "Memory pool leak detected!"
+                "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
@@ -1887,7 +1887,7 @@ class Scheduler(
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
-                self.torch_profiler_trace_dir,
+                self.torch_profiler_output_dir,
                 str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
