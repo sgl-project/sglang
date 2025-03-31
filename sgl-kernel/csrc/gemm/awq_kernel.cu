@@ -210,14 +210,14 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_bf16);
     nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale);
 
-#if __CUDA_ARCH__ >= 800  // sm_75 does not defines __hsub2 or __hmul2 for bfloat16 in cu121
+#if __CUDA_ARCH__ >= 800  // sm_80 does not defines __hmul2 for bfloat16 in cu121
 
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
       weight_vec[i] = __hmul2(__hsub2(weight_vec[i], zero_vec[i]), scale_vec[i]);
     }
 
-#elif __CUDA_ARCH__ >= 750
+#elif __CUDA_ARCH__ >= 750  // sm_75 does not defines __hsub2 or __hmul2 for bfloat16 in cu121
 
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // uint4 = 4 * nv_bfloat162
