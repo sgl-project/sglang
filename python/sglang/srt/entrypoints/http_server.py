@@ -832,6 +832,8 @@ def _wait_and_warmup(
 
     model_info = res.json()
 
+    print(f"{model_info=}")
+
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1

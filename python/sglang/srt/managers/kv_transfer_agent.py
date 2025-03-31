@@ -293,7 +293,7 @@ class KVTransferAgent:
         del self.kv_buffer[req.rid]
         
     def _handle_kv_transfer_batch_fetch(self, req: KVTransferFetchBatch):
-        if req.fetch_batch_req_hash not in self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash]:
+        if req.fetch_batch_req_hash not in self.handle_kv_cache_fetch_ct:
             # calculate the total length of the kv cache
             batch_kv_cache_length = sum([len(self.kv_buffer[rid]) for rid in req.rids])
             

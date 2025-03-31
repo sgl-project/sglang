@@ -1460,7 +1460,6 @@ class Scheduler(
                     None
                 )
             req.kv_cache_restored = True
-            pt += new_batch.extend_lens[i]
         return new_batch
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
