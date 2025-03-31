@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
@@ -563,6 +564,10 @@ def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
 
 
 def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -576,10 +581,6 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -1766,3 +1767,32 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+def retry(
+    fn,
+    max_retry: int,
+    initial_delay: float = 2.0,
+    max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
+):
+    for try_index in itertools.count():
+        try:
+            return fn()
+        except Exception as e:
+            if try_index >= max_retry:
+                raise Exception(f"retry() exceed maximum number of retries.")
+
+            if not should_retry(e):
+                raise Exception(f"retry() observe errors that should not be retried.")
+
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
+
+            logger.warning(
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+            )
+            traceback.print_exc()
+
+            time.sleep(delay)

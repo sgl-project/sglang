@@ -1110,7 +1110,7 @@ class Scheduler(
         )
         if memory_leak:
             msg = (
-                "KV cache pool leak detected! "
+                "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
@@ -1121,7 +1121,7 @@ class Scheduler(
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (
-                "Memory pool leak detected!"
+                "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
@@ -1807,7 +1807,11 @@ class Scheduler(
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
-                recv_req.output_dir, recv_req.num_steps, recv_req.activities
+                recv_req.output_dir,
+                recv_req.num_steps,
+                recv_req.activities,
+                recv_req.with_stack,
+                recv_req.record_shapes,
             )
         else:
             return self.stop_profile()
@@ -1817,6 +1821,8 @@ class Scheduler(
         output_dir: Optional[str],
         num_steps: Optional[int],
         activities: Optional[List[str]],
+        with_stack: Optional[bool],
+        record_shapes: Optional[bool],
     ) -> None:
         if self.profiler_activities:
             return ProfileReqOutput(
@@ -1847,7 +1853,8 @@ class Scheduler(
         if torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=True,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
 
@@ -1880,7 +1887,7 @@ class Scheduler(
 
         if "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
-                self.torch_profiler_trace_dir,
+                self.torch_profiler_output_dir,
                 str(time.time()) + f"-TP-{self.tp_rank}-memory" + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
