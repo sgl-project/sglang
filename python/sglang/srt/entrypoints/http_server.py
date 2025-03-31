@@ -417,8 +417,10 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
+
+    obj = BatchUpdateWeightsFromDistributedReqInput(parameters=[obj])
     success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
+        await _global_state.tokenizer_manager.batch_update_weights_from_distributed(
             obj, request
         )
     )

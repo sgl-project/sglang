@@ -322,10 +322,16 @@ class Engine:
         # Convert torch.dtype objects to strings if needed
         processed_parameters = []
         for param in parameters:
-            processed_param = dict(param)
             if not isinstance(param["dtype"], str):
-                processed_param["dtype"] = str(param["dtype"]).split(".")[-1]
-            processed_parameters.append(processed_param)
+                dtype_str = str(param["dtype"]).split(".")[-1]
+            else:
+                dtype_str = param["dtype"]
+
+            processed_parameters.append(
+                UpdateWeightsFromDistributedReqInput(
+                    name=param["name"], dtype=dtype_str, shape=param["shape"]
+                )
+            )
 
         obj = BatchUpdateWeightsFromDistributedReqInput(parameters=processed_parameters)
         loop = asyncio.get_event_loop()

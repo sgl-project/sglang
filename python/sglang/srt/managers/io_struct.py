@@ -544,7 +544,7 @@ class UpdateWeightsFromDistributedReqInput:
 
 @dataclass
 class BatchUpdateWeightsFromDistributedReqInput:
-    parameters: List[Dict[str, Union[str, List[int]]]]
+    parameters: List[UpdateWeightsFromDistributedReqInput]
 
 
 @dataclass
