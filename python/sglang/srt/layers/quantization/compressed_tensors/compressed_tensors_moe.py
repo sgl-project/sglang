@@ -282,7 +282,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
-        # 添加延迟导入
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
 
         topk_weights, topk_ids = select_experts(
