@@ -544,9 +544,44 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
-    load_chat_template_for_openai_api(
-        tokenizer_manager, server_args.chat_template, server_args.model_path
-    )
+
+    should_load_chat_template = False
+    is_multimodal = False
+
+    if server_args.chat_template:
+        should_load_chat_template = True
+        logger.info("User provided chat template, proceeding with loading.")
+    else:
+        if hasattr(tokenizer_manager, "model_config") and hasattr(
+            tokenizer_manager.model_config, "is_multimodal"
+        ):
+            if tokenizer_manager.model_config.is_multimodal:
+                should_load_chat_template = True
+                is_multimodal = True
+                logger.info(
+                    "Model is multimodal and no chat template provided, proceeding with auto-selection."
+                )
+            else:
+                logger.info(
+                    "Model is not multimodal and no chat template provided. Skipping chat template loading."
+                )
+        else:
+            logger.warning(
+                "Could not determine model modality early. Skipping chat template auto-selection."
+            )
+
+    if should_load_chat_template:
+        load_chat_template_for_openai_api(
+            tokenizer_manager, server_args.chat_template, server_args.model_path
+        )
+    else:
+        global chat_template_name
+        from sglang.srt.openai_api.adapter import chat_template_name
+
+        chat_template_name = None
+        logger.info(
+            "Ensuring global chat_template_name is None as loading was skipped."
+        )
 
     if server_args.completion_template:
         load_completion_template_for_openai_api(server_args.completion_template)
