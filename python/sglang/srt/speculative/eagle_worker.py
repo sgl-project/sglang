@@ -186,7 +186,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = True
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionMultiStepBackend
+                FlashAttentionMultiStepBackend,
             )
 
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
