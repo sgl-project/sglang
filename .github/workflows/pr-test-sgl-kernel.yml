@@ -80,17 +80,17 @@ jobs:
 
       - name: Install
         run: |
-          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
+          bash scripts/ci_install_dependency.sh
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.7.2
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
-          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git && cd DeepGEMM && python3 setup.py develop
 
       - name: Run test
         timeout-minutes: 30
         run: |
           cd sgl-kernel
-          find tests -name "test_*.py" | xargs -n 1 python3
+          pytest tests/
 
       - name: Uninstall dependencies
         run: |
@@ -116,7 +116,6 @@ jobs:
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
-          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git && cd DeepGEMM && python3 setup.py develop
 
       - name: Run test
         timeout-minutes: 30
