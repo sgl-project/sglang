@@ -1632,6 +1632,13 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def is_unspecified_address(address: str) -> bool:
+    try:
+        return ipaddress.IPv6Address(address).is_unspecified
+    except ValueError:
+        return ipaddress.IPv4Address(address).is_unspecified
+
+
 def configure_ipv6(dist_init_addr):
     addr = dist_init_addr
     end = addr.find("]")

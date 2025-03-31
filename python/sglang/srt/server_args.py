@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_hip,
     is_port_available,
     is_remote_url,
+    is_unspecified_address,
     is_valid_ipv6_address,
     nullable_str,
 )
@@ -1140,6 +1141,21 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
+
+    def url_or_local(self):
+        """
+        For: https://github.com/sgl-project/sglang/issues/4935#issuecomment-2765008090
+        Some environments may not allow direct access to unspecified addresses.
+        """
+        host = self.host
+        if is_valid_ipv6_address(self.host):
+            if is_unspecified_address(self.host):
+                host = "::1"
+            host = f"[{host}]"
+        else:
+            if is_unspecified_address(self.host):
+                host = "127.0.0.1"
+        return f"http://{host}:{self.port}"
 
     def check_server_args(self):
         assert (
