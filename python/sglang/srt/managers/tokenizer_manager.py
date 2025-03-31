@@ -452,6 +452,8 @@ class TokenizerManager:
                 top_logprobs_num,
                 token_ids_logprob,
                 obj.stream,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,

@@ -1,16 +1,15 @@
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
-from typing import Union
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class MooncakeTransferEngineConfig:
-    localhost_name: str
-    metadata_backend: Union[str, None]
+    local_hostname: str
     metadata_server: str
     protocol: str
     device_name: str
@@ -21,8 +20,7 @@ class MooncakeTransferEngineConfig:
         with open(file_path) as fin:
             config = json.load(fin)
         return MooncakeTransferEngineConfig(
-            localhost_name=config.get("localhost_name", None),
-            metadata_backend=config.get("metadata_backend", None),
+            local_hostname=config.get("local_hostname", None),
             metadata_server=config.get("metadata_server"),
             protocol=config.get("protocol", "rdma"),
             device_name=config.get("device_name", ""),
@@ -65,12 +63,13 @@ class MooncakeTransferEngine:
 
         self.config = MooncakeTransferEngineConfig.load_from_env()
 
+        session_suffix = "_" + str(uuid.uuid4())
+        self.session_id = self.config.local_hostname + session_suffix
         self.initialize(
-            self.config.localhost_name,
+            self.session_id,
             self.config.metadata_server,
             self.config.protocol,
             self.config.device_name,
-            self.config.metadata_backend,
         )
 
     def register(self, ptr, length):
@@ -81,38 +80,22 @@ class MooncakeTransferEngine:
 
     def initialize(
         self,
-        localhost_name: str,
+        local_hostname: str,
         metadata_server: str,
         protocol: str,
         device_name: str,
-        metadata_backend: Union[str, None],
     ) -> None:
         """Initialize the mooncake instance."""
-        if metadata_backend is None:
-            self.engine.initialize(
-                localhost_name, metadata_server, protocol, device_name
-            )
-        else:
-            supported_backend = ["etcd", "redis"]
-            metadata_backend = metadata_backend.lower()
-            if metadata_backend not in supported_backend:
-                raise ValueError(
-                    "Mooncake Configuration error. `metadata_backend`"
-                    f"should be one of {supported_backend}."
-                )
-
-            self.engine.initializeExt(
-                localhost_name, metadata_server, protocol, device_name, metadata_backend
-            )
+        self.engine.initialize(local_hostname, metadata_server, protocol, device_name)
 
     def transfer_sync(
-        self, remote_url: str, buffer: int, peer_buffer_address: int, length: int
+        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
 
         write_op = self.engine.TransferOpcode.WRITE
         ret = self.engine.transferSyncExt(
-            remote_url, buffer, peer_buffer_address, length, write_op
+            session_id, buffer, peer_buffer_address, length, write_op
         )
         if ret < 0:
             logger.error("Transfer Return Error")
@@ -120,4 +103,7 @@ class MooncakeTransferEngine:
         return ret
 
     def get_localhost(self):
-        return self.config.localhost_name
+        return self.config.local_hostname
+
+    def get_session_id(self):
+        return self.session_id

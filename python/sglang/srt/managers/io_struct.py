@@ -83,6 +83,10 @@ class GenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # For disaggregated inference
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
+
     def normalize_batch_and_arguments(self):
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
@@ -299,6 +303,10 @@ class TokenizedGenerateReqInput:
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # For disaggregated inference
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
 
 
 @dataclass
