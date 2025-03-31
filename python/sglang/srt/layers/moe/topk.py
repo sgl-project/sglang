@@ -156,37 +156,29 @@ def biased_grouped_topk_impl(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = gating_output.sigmoid()
-    num_tokens = scores.shape[0]
+    num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    if correction_bias is not None:
-        # Store original scores before applying correction bias. We use biased
-        # scores for expert selection but original scores for routing weights
-        original_scores = scores
-        scores = scores + correction_bias.unsqueeze(0)
-        group_scores = (scores.view(num_tokens, num_expert_group,
-                                    -1).topk(2, dim=-1)[0].sum(dim=-1))
-    else:
-        group_scores = scores.view(num_tokens, num_expert_group,
-                                   -1).max(dim=-1).values  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
-                           sorted=False)[1]  # [n, top_k_group]
+    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    group_scores = (
+        scores_for_choice.view(num_token, num_expert_group, -1)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
+    )  # [n, n_group]
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+        1
+    ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = group_mask.unsqueeze(-1).expand(
-        num_tokens, num_expert_group,
-        scores.shape[-1] // num_expert_group).reshape(num_tokens, -1)  # [n, e]
-    tmp_scores = scores.masked_fill(~score_mask.bool(),
-                                    float("-inf"))  # [n, e]
-
-    if correction_bias is not None:
-        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)[1]
-        # Use original unbiased scores for the routing weights
-        topk_weights = original_scores.gather(1, topk_ids)
-    else:
-        topk_weights, topk_ids = torch.topk(tmp_scores,
-                                            k=topk,
-                                            dim=-1,
-                                            sorted=False)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+        .reshape(num_token, -1)
+    )  # [n, e]
+    tmp_scores = scores_for_choice.masked_fill(
+        ~score_mask.bool(), float("-inf")
+    )  # [n, e]
+    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+    topk_weights = scores.gather(1, topk_ids)
 
     if share_fusion:
         topk_ids[:, -1] = torch.randint(low=num_experts,
