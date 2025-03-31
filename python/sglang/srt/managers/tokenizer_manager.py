@@ -149,6 +149,9 @@ class ReqState:
     # For streaming output
     last_output_offset: int = 0
 
+    # Whether the first token metrics has been collected
+    has_first_token_collected: bool = False
+
 
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
@@ -996,6 +999,8 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
 
+            self.update_prefill_metrics(state, recv_obj, i)
+
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.server_args.speculative_algorithm:
@@ -1014,6 +1019,14 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+
+    def update_prefill_metrics(self, state, recv_obj, i):
+        if state.add_queue_time == 0.0:
+            state.add_queue_time = recv_obj.metrics[i].add_queue_time
+        if state.first_scheduled_time == 0.0:
+            state.first_scheduled_time = recv_obj.metrics[i].first_scheduled_time
+        if state.first_token_time == 0.0:
+            state.first_token_time = state.last_time = time.time()
 
     def convert_logprob_style(
         self,
@@ -1104,13 +1117,7 @@ class TokenizerManager:
             else 0
         )
 
-        if state.add_queue_time == 0.0:
-            state.add_queue_time = recv_obj.metrics[i].add_queue_time
-        if state.first_scheduled_time == 0.0:
-            state.first_scheduled_time = recv_obj.metrics[i].first_scheduled_time
-
-        if state.first_token_time == 0.0:
-            state.first_token_time = state.last_time = time.time()
+        if not state.has_first_token_collected:
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
                 state.first_token_time - state.created_time
@@ -1118,6 +1125,7 @@ class TokenizerManager:
             self.metrics_collector.observe_time_in_waiting_queue(
                 state.first_scheduled_time - state.add_queue_time
             )
+            state.has_first_token_collected = True
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
