@@ -837,8 +837,18 @@ class DeepEPMoE(EPMoE):
         self.deepep_low_latency = deepep_low_latency
         if self.deepep_low_latency:
             assert use_deep_gemm, "DeepEP low latency mode requires deep_gemm"
-        self.w13_weight_fp8 = (self.w13_weight, self.w13_weight_scale_inv)
-        self.w2_weight_fp8 = (self.w2_weight, self.w2_weight_scale_inv)
+        self.w13_weight_fp8 = (
+            self.w13_weight,
+            (
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+        )
+        self.w2_weight_fp8 = (
+            self.w2_weight,
+            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
+        )
 
     def forward(
         self,
@@ -985,7 +995,6 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
@@ -998,7 +1007,7 @@ class DeepEPMoE(EPMoE):
                 gateup_output.shape[2] // 2,
             ),
             device=gateup_output.device,
-            dtype=gateup_output.dtype,
+            dtype=self.fp8_dtype,
         )
         scale_block_size = 128
         down_input_scale = torch.empty(
@@ -1008,26 +1017,25 @@ class DeepEPMoE(EPMoE):
                 gateup_output.shape[2] // 2 // scale_block_size,
             ),
             device=gateup_output.device,
-            dtype=gateup_output.dtype,
+            dtype=torch.float32,
         )
-
         silu_and_mul_masked_post_quant_fwd(
             gateup_output,
             down_input,
             down_input_scale,
             scale_block_size,
-            expected_m,
+            masked_m,
         )
 
         # GroupGemm-1
+        n = self.w2_weight.size(1)
+        down_input_fp8 = (
+            down_input,
+            get_col_major_tma_aligned_tensor(down_input_scale),
+        )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
-        down_input_fp8 = (
-            down_input_fp8[0],
-            get_col_major_tma_aligned_tensor(down_input_fp8[1]),
-        )
-
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
         )
