@@ -215,6 +215,21 @@ class KVTransferAgent:
         return loaded_tensor
     
     def get_batch_kv_buffer(self, req_list: List[Req]) -> dict[str, torch.Tensor]:
+        same_src_req_list = {}
+        res = {}
+        for req in req_list:
+            if req.kv_transfer_src_addr not in same_src_req_list:
+                same_src_req_list[req.kv_transfer_src_addr] = []
+            same_src_req_list[req.kv_transfer_src_addr].append(req)
+        for src_addr, reql in same_src_req_list.items():
+            rid_tensor_map = self.get_batch_kv_buffer_from_same_src(reql)
+            for rid, tensor in rid_tensor_map.items():
+                res[rid] = tensor
+        return res
+    
+    def get_batch_kv_buffer_from_same_src(self, req_list: List[Req]) -> dict[str, torch.Tensor]:
+        if len(req_list) == 0:
+            return {}
         batch_kv_cache_length = 0
         for req in req_list:
             batch_kv_cache_length += req.kv_cache_length
@@ -224,12 +239,12 @@ class KVTransferAgent:
         self.send_to_pd_disagg_controller.send_pyobj(KVTransferFetchBatch(
             fetch_batch_req_hash=hashlib.md5(''.join([req.rid for req in req_list]).encode()).hexdigest(),
             rids=[req.rid for req in req_list],
-            src_addr=req.kv_transfer_src_addr,
-            src_rank=req.kv_transfer_src_rank,
+            src_addr=req_list[0].kv_transfer_src_addr,
+            src_rank=req_list[0].kv_transfer_src_rank,
             dst_addr=self.addr,
             dst_rank=self.tp_rank,
             dst_ptr=dst_ptr,
-            fetch_ct=self.tp_size,
+            fetch_ct=self.attn_tp_size,
         ))
         # recv ack
         recv_obj = self.recv_from_pd_disagg_controller.recv_pyobj()
