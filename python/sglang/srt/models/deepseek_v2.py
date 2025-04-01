@@ -208,7 +208,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=config.topk_group,
                 correction_bias=self.gate.e_score_correction_bias,
                 prefix=add_prefix("experts", prefix),
-                deepep_low_latency=global_server_args_dict["deepep_low_latency"],
+                deepep_mode=global_server_args_dict["deepep_mode"],
             )
 
         if config.n_shared_experts is not None:
@@ -256,7 +256,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_low_latency=global_server_args_dict["deepep_low_latency"],
+                deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,  # TODO
                 return_recv_hook=True,
             )
@@ -318,11 +318,13 @@ class DeepseekV2MoE(nn.Module):
                 seg_indptr,
                 masked_m,
                 expected_m,
+                handle,
             ) = self.deepep_dispatcher.dispatch(
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 self.num_experts,
+                forward_mode,
             )
         final_hidden_states = (
             self.experts(
@@ -331,6 +333,7 @@ class DeepseekV2MoE(nn.Module):
                 seg_indptr=seg_indptr,
                 masked_m=masked_m,
                 expected_m=expected_m,
+                forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
         )
@@ -339,6 +342,8 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
+                forward_mode,
+                handle,
             )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output

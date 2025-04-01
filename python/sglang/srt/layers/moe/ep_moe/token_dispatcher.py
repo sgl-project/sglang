@@ -5,6 +5,7 @@ try:
 except ImportError:
     use_deepep = False
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -16,6 +17,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+logger = logging.getLogger(__name__)
 
 _buffer_normal = None
 _buffer_low_latency = None
@@ -98,7 +101,7 @@ class DeepEPDispatcher:
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_low_latency: bool = False,
+        deepep_mode: str = "auto",
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
@@ -117,16 +120,15 @@ class DeepEPDispatcher:
         self.params_dtype = params_dtype
         self.params_bytes = 2
 
-        self.deepep_low_latency = deepep_low_latency
-        self.handle = None
+        self.deepep_mode = deepep_mode
 
-        if self.deepep_low_latency == False:  # for normal mode
+        if self.deepep_mode in ["normal", "auto"]:  # for normal / auto mode
             self.buffer_normal = get_buffer_normal(
                 self.group, self.hidden_size * self.params_bytes
             )
             self.async_finish = async_finish
             self.src2dst = None
-        else:  # for low latency mode
+        if self.deepep_mode in ["low_latency", "auto"]:  # for low_latency / auto mode
             """
             num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
             https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -181,6 +183,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         num_experts: int,
         num_max_dispatch_tokens_per_rank: int = 128,
+        forward_mode: ForwardMode = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         topk_idx = topk_idx.to(torch.int64)
         reorder_topk_ids = torch.empty(
@@ -194,11 +197,14 @@ class DeepEPDispatcher:
         )
         expected_m = 0
 
-        if self.deepep_low_latency == False:
+        if self.deepep_mode == "normal" or (
+            self.deepep_mode == "auto" and not forward_mode.is_decode()
+        ):
             (
                 hidden_states,
                 topk_idx,
                 topk_weights,
+                handle,
                 event,
             ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
             event.current_stream_wait() if self.async_finish else ()
@@ -206,14 +212,19 @@ class DeepEPDispatcher:
                 reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
-        else:
+        elif self.deepep_mode == "low_latency" or (
+            self.deepep_mode == "auto" and forward_mode.is_decode()
+        ):
             expected_m = (
                 hidden_states.shape[0]
                 * self.buffer_low_latency.group_size
                 * topk_idx.shape[1]
                 + num_experts
             ) // num_experts
-            hidden_states, masked_m, event, hook = self.dispatch_low_latency(
+            logger.info(f">>> hidden_states.shape: {hidden_states.shape}")
+            logger.info(f">>> topk_idx.shape: {topk_idx.shape}")
+            logger.info(f">>> expected_m: {expected_m}")
+            hidden_states, masked_m, handle, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
@@ -221,6 +232,8 @@ class DeepEPDispatcher:
                 use_fp8=True,
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
+        else:
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
         return (
             hidden_states,
@@ -230,6 +243,7 @@ class DeepEPDispatcher:
             seg_indptr,
             masked_m,
             expected_m,
+            handle,
         )
 
     def dispatch_normal(
@@ -260,7 +274,7 @@ class DeepEPDispatcher:
             recv_topk_idx,
             recv_topk_weights,
             _,  # num_recv_tokens_per_expert_list
-            self.handle,
+            handle,
             event,
         ) = self.buffer_normal.dispatch(
             x,
@@ -279,6 +293,7 @@ class DeepEPDispatcher:
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
+            handle,
             event,
         )
 
@@ -323,7 +338,7 @@ class DeepEPDispatcher:
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
 
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
+        packed_recv_hidden, packed_recv_count, handle, event, hook = (
             self.buffer_low_latency.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -334,15 +349,19 @@ class DeepEPDispatcher:
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        return packed_recv_hidden, packed_recv_count, event, hook
+        return packed_recv_hidden, packed_recv_count, handle, event, hook
 
     def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        handle: torch.Tensor,
+        forward_mode: ForwardMode,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if not self.deepep_low_latency:
+        if self.deepep_mode == "normal" or (
+            self.deepep_mode == "auto" and not forward_mode.is_decode()
+        ):
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.empty(
@@ -366,22 +385,26 @@ class DeepEPDispatcher:
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-            hidden_states, event = self.combine_normal(output)
+            hidden_states, event = self.combine_normal(output, handle)
             event.current_stream_wait() if self.async_finish else ()
-        else:
+        elif self.deepep_mode == "low_latency" or (
+            self.deepep_mode == "auto" and forward_mode.is_decode()
+        ):
             hidden_states, event, hook = self.combine_low_latency(
-                hidden_states, topk_idx, topk_weights
+                hidden_states, topk_idx, topk_weights, handle
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
+        else:
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
         return hidden_states
 
-    def combine_normal(self, x: torch.Tensor):
+    def combine_normal(self, x: torch.Tensor, handle: torch.Tensor):
         previous_event = Buffer.capture() if self.async_finish else None
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
-            self.handle,
+            handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
@@ -393,13 +416,14 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
+        handle: torch.Tensor,
     ):
         combined_hidden_states, event, hook = (
             self.buffer_low_latency.low_latency_combine(
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                self.handle,
+                handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )

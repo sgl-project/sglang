@@ -5,7 +5,6 @@ import torch
 
 try:
     from deep_gemm import (
-        ceil_div,
         get_col_major_tma_aligned_tensor,
         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
     )
@@ -815,7 +814,7 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        deepep_low_latency: bool = False,
+        deepep_mode: str = "auto",
     ):
         super().__init__(
             num_experts,
@@ -834,9 +833,9 @@ class DeepEPMoE(EPMoE):
             custom_routing_function,
             activation,
         )
-        self.deepep_low_latency = deepep_low_latency
-        if self.deepep_low_latency:
-            assert use_deep_gemm, "DeepEP low latency mode requires deep_gemm"
+        self.deepep_mode = deepep_mode
+        if self.deepep_mode in ["low_latency", "auto"]:
+            assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -857,11 +856,19 @@ class DeepEPMoE(EPMoE):
         seg_indptr: torch.Tensor,
         masked_m: torch.Tensor,
         expected_m: int,
+        forward_mode: ForwardMode,
     ):
-        if not self.deepep_low_latency:
+        # logger.info(f"reorder_topk_ids: {reorder_topk_ids}")
+        if self.deepep_mode == "normal" or (
+            self.deepep_mode == "auto" and not forward_mode.is_decode()
+        ):
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
-        else:
+        elif self.deepep_mode == "low_latency" or (
+            self.deepep_mode == "auto" and forward_mode.is_decode()
+        ):
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+        else:
+            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
     def forward_normal(
         self,
@@ -987,6 +994,8 @@ class DeepEPMoE(EPMoE):
         assert (
             hidden_states_fp8[0].size(0) % 4 == 0
         ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
+
+        # Todo: this will affect CUDA graph capture, need to fix.
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
