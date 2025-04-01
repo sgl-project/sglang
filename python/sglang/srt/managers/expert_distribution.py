@@ -312,7 +312,7 @@ class ModelExpertMetadata:
                 num_layers=config.num_hidden_layers,
                 num_logical_experts=config.num_experts,
             )
-        return None
+        return ModelExpertMetadata._init_dummy()
 
     @staticmethod
     def _init_new(
@@ -323,4 +323,12 @@ class ModelExpertMetadata:
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
             num_local_physical_experts=TODO,
+        )
+
+    @staticmethod
+    def _init_dummy():
+        return ModelExpertMetadata(
+            num_layers=1,
+            num_local_physical_experts=1,
+            num_logical_experts=1,
         )
