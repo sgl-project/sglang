@@ -199,6 +199,7 @@ class _DetailAccumulator(_Accumulator):
 
     def append(self, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
+            rank=TODO,
             physical_count=single_pass_physical_count.tolist(),
         ))
 
@@ -235,5 +236,6 @@ class _StatAccumulator(_Accumulator):
 
     def dump(self):
         return dict(
+            rank=TODO,
             physical_count=self._physical_count.tolist(),
         )
