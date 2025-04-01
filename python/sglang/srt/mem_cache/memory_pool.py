@@ -185,12 +185,18 @@ class TokenToKVPoolAllocator:
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def backup_state(self):
+        return self.free_slots
+
+    def restore_state(self, free_slots):
+        self.free_slots = free_slots
+
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
-        self.is_in_free_group = False
+        self.is_not_in_free_group = True
         self.free_group = []
 
 
