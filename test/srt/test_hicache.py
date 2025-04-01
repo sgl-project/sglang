@@ -23,8 +23,6 @@ class TestHiCache(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-hierarchical-cache",
-                "--page-size",
-                "32",
             ],
         )
 
