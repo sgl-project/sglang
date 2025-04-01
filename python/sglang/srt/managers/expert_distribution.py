@@ -269,7 +269,7 @@ class _StatAccumulator(_Accumulator):
                     logical_expert_index = expert_location_metadata.physical_to_logical_map[
                         layer_index, global_physical_expert_index]
                     logical_count[layer_index, logical_expert_index] += physical_dump['physical_count'][
-                        layer_index, local_physical_expert_index]
+                        layer_index][local_physical_expert_index]
         return dict(logical_count=logical_count)
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
