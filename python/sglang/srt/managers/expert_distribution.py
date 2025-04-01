@@ -20,16 +20,10 @@ class _ExpertDistributionRecorder:
             list
         )
         self._record = False
-        # TODO
-        # self._current_layer_id = "UNKNOWN"
         self._current_layer_id = Withable()
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_id.with_value(layer_idx)
-
-    # TODO
-    # def set_current_layer(self, layer_idx):
-    #     self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
         if not self._record:
@@ -37,14 +31,14 @@ class _ExpertDistributionRecorder:
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
         for i in topk_ids_list:
-            self._expert_distribution_record[self._current_layer_id].append(tuple(i))
+            self._expert_distribution_record[self._current_layer_id.value].append(tuple(i))
 
     def reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
         self._record = False
         self._expert_distribution_record.clear()
-        self._current_layer_id = "UNKNOWN"
+        assert self._current_layer_id.value is None
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
