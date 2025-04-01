@@ -2,7 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import List, Type
+from typing import List, Type, Any
 
 import torch
 from sglang.srt.server_args import ServerArgs
@@ -81,6 +81,10 @@ class _ExpertDistributionRecorder:
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
+
+
+def convert_dump_to_logical(physical_dumps: List[Any]):
+    return TODO
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
