@@ -300,7 +300,8 @@ class ModelExpertMetadata:
 
     @staticmethod
     def from_model(model):
-        return TDO
+        if hasattr(model, "get_model_expert_metadata"):
+            return model.get_model_expert_metadata()
         return ModelExpertMetadata._init_dummy()
 
     @staticmethod
