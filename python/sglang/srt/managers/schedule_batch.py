@@ -42,6 +42,7 @@ import triton
 import triton.language as tl
 
 from sglang.global_config import global_config
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.conn import KVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
@@ -80,6 +81,7 @@ global_server_args_dict = {
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
 
 logger = logging.getLogger(__name__)
@@ -636,7 +638,6 @@ bid = 0
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
-    from sglang.srt.configs.model_config import ModelConfig
 
     # Request, memory pool, and cache
     reqs: List[Req]

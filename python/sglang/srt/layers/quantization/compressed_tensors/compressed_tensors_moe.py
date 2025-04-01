@@ -17,7 +17,6 @@ if TYPE_CHECKING:
         FusedMoeWeightScaleSupported,
     )
 
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -283,6 +282,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         no_combine: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -631,6 +631,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         activation: str = "silu",
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.moe.topk import select_experts
         
         assert activation == "silu", "Only SiLU activation is supported."
         if not VLLM_AVAILABLE:

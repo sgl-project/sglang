@@ -183,6 +183,7 @@ class ServerArgs:
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 8
+    disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1089,6 +1090,11 @@ class ServerArgs:
             default=ServerArgs.n_share_experts_fusion,
             help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
                  "we use 8 by default. Set it to tp_size is a good practice.",
+        )
+        parser.add_argument(
+            "--disable-shared-experts-fusion",
+            action="store_true",
+            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
         )
 
         # Server warmups
