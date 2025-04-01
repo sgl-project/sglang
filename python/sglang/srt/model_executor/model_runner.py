@@ -47,6 +47,8 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -126,6 +128,8 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
+        self.forward_pass_id = 0
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -181,6 +185,14 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
+        expert_distribution_recorder.initialize(
+            server_args,
+            self.expert_location_metadata,
+            # TODO handle DP!=TP case
+            rank=self.tp_rank,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -984,26 +996,33 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with fine_grained_benchmark.maybe_benchmark(forward_batch, self.tp_rank):
-            if (
-                forward_batch.forward_mode.is_cuda_graph()
-                and self.cuda_graph_runner
-                and self.cuda_graph_runner.can_run(forward_batch)
-            ):
-                return self.cuda_graph_runner.replay(
-                    forward_batch, skip_attn_backend_init=skip_attn_backend_init
-                )
+        self.forward_pass_id += 1
+        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
+       	 	with fine_grained_benchmark.maybe_benchmark(forward_batch, self.tp_rank):
+            	return self._forward_raw(forward_batch, skip_attn_backend_init)
 
-            if forward_batch.forward_mode.is_decode():
-                return self.forward_decode(forward_batch)
-            elif forward_batch.forward_mode.is_extend():
-                return self.forward_extend(
-                    forward_batch, skip_attn_backend_init=skip_attn_backend_init
-                )
-            elif forward_batch.forward_mode.is_idle():
-                return self.forward_idle(forward_batch)
-            else:
-                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+    def _forward_raw(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
+    ) -> LogitsProcessorOutput:
+        if (
+            forward_batch.forward_mode.is_cuda_graph()
+            and self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run(forward_batch)
+        ):
+            return self.cuda_graph_runner.replay(
+                forward_batch, skip_attn_backend_init=skip_attn_backend_init
+            )
+
+        if forward_batch.forward_mode.is_decode():
+            return self.forward_decode(forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            return self.forward_extend(
+                forward_batch, skip_attn_backend_init=skip_attn_backend_init
+            )
+        elif forward_batch.forward_mode.is_idle():
+            return self.forward_idle(forward_batch)
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

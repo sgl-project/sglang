@@ -1,3 +1,4 @@
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 try:
@@ -223,6 +224,9 @@ class DeepEPDispatcher:
             event,
         ) = self.dispatch_normal(
             hidden_states, topk_idx, topk_weights, num_experts, previous_event
+        )
+        expert_distribution_recorder.on_deepep_dispatch_normal(
+            num_recv_tokens_per_expert_list
         )
 
         if self.enable_async:

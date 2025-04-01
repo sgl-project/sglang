@@ -51,6 +51,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers import expert_distribution
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -233,6 +234,7 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.expert_location_metadata = None
 
         # Metrics
         if self.enable_metrics:
@@ -667,7 +669,15 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        raw_outputs: List[ExpertDistributionReqOutput] = (
+            await self.expert_distribution_communicator(
+                ExpertDistributionReq.DUMP_RECORD
+            )
+        )
+        return expert_distribution.postprocess_dumps(
+            [output.dump_output for output in raw_outputs],
+            expert_location_metadata=self.expert_location_metadata,
+        )
 
     async def update_weights_from_disk(
         self,

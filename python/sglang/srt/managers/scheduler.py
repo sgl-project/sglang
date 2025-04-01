@@ -55,7 +55,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -134,8 +134,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +281,7 @@ class Scheduler(
             self.random_seed,
             self.device,
             worker_global_server_args_dict,
+            self.expert_location_metadata,
             _,
             _,
             _,
@@ -1971,15 +1970,16 @@ class Scheduler(
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             expert_distribution_recorder.start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             expert_distribution_recorder.stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            expert_distribution_recorder.dump_record()
+            dump_output = expert_distribution_recorder.dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput()
+        return ExpertDistributionReqOutput(dump_output=dump_output)
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -2067,6 +2067,7 @@ def run_scheduler_process(
                 "status": "ready",
                 "max_total_num_tokens": scheduler.max_total_num_tokens,
                 "max_req_input_len": scheduler.max_req_input_len,
+                "expert_location_metadata": scheduler.expert_location_metadata,
             }
         )
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

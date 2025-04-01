@@ -17,14 +17,11 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 def fused_topk_native(
@@ -255,6 +252,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    expert_distribution_recorder.record_new_token(topk_ids)
+    expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids
