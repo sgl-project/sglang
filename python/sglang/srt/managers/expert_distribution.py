@@ -113,7 +113,12 @@ class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
 
         num_recv_tokens_per_expert_list = TODO
         for i in topk_ids_list:
-            self._expert_distribution_record[layer_idx].append(tuple(i))
+            expert_distribution_record[layer_idx].append(tuple(i))
+        for layer_idx, layer_record in expert_distribution_record.items():
+            results[layer_idx] = defaultdict(int)
+            for token_record in layer_record:
+                for expert_idx in token_record:
+                    results[layer_idx][expert_idx] += 1
 
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
