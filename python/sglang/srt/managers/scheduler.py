@@ -1061,7 +1061,7 @@ class Scheduler(
 
         if self.spec_algorithm.is_none():
             msg = (
-                f"Decode batch. "
+                f"Decode batch (filtered). "
                 f"#running-req: {num_running_reqs}, "
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -1077,7 +1077,7 @@ class Scheduler(
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
             msg = (
-                f"Decode batch. "
+                f"Decode batch (filtered). "
                 f"#running-req: {num_running_reqs}, "
                 f"#token: {num_used}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
