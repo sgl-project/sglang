@@ -655,7 +655,8 @@ class TokenizerManager:
     async def dump_expert_distribution_record(self):
         raw_outputs: List[ExpertDistributionReqOutput] = await self.expert_distribution_communicator(
             ExpertDistributionReq.DUMP_RECORD)
-        return expert_distribution.postprocess_dumps([output.dump_output for output in raw_outputs])
+        return expert_distribution.postprocess_dumps([output.dump_output for output in raw_outputs],
+                                                     physical_to_logical_map=TODO)
 
     async def update_weights_from_disk(
         self,
