@@ -216,10 +216,10 @@ class _StatAccumulator(_Accumulator):
         # Most naive implementation, can optimize if it is bottleneck
         for physical_dump in physical_dumps:
             for layer_index in range(num_layers):
-                for physical_expert_index in range(num_local_physical_experts):
+                for local_physical_expert_index in range(num_local_physical_experts):
                     logical_expert_index = TODO
                     logical_count[layer_index, logical_expert_index] += physical_dump[
-                        layer_index, physical_expert_index]
+                        layer_index, local_physical_expert_index]
         return dict(logical_count=logical_count)
 
     def __init__(self):
