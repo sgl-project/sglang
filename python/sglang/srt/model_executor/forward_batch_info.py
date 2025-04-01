@@ -29,15 +29,20 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt import two_batch_overlap
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend
 
@@ -210,6 +215,7 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
+    tbo_split_seq_index: Optional[int] = None
     can_run_dp_cuda_graph: bool = False
 
     # Speculative decoding
@@ -222,6 +228,9 @@ class ForwardBatch:
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+
+    tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     @classmethod
     def init_new(
@@ -251,6 +260,7 @@ class ForwardBatch:
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
+            tbo_split_seq_index=batch.tbo_split_seq_index,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
@@ -331,6 +341,8 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        ret.prepare_tbo()
 
         return ret
 
@@ -443,6 +455,153 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
+    def prepare_tbo(self):
+        if self.tbo_split_seq_index is None:
+            return
+
+        tbo_split_token_index = two_batch_overlap.compute_split_token_index(
+            split_seq_index=self.tbo_split_seq_index,
+            forward_mode=self.forward_mode,
+            extend_seq_lens=self.extend_seq_lens,
+        )
+
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        assert isinstance(self.attn_backend, TboAttnBackend)
+        attn_backend_child_a, attn_backend_child_b = self.attn_backend.children
+
+        child_a = self.filter_batch(
+            start_token_index=0,
+            end_token_index=tbo_split_token_index,
+            start_seq_index=0,
+            end_seq_index=self.tbo_split_seq_index,
+            output_attn_backend=attn_backend_child_a,
+        )
+        child_b = self.filter_batch(
+            start_token_index=tbo_split_token_index,
+            end_token_index=self.input_ids.shape[0],
+            start_seq_index=self.tbo_split_seq_index,
+            end_seq_index=self.batch_size,
+            output_attn_backend=attn_backend_child_b,
+        )
+
+        assert self.tbo_children is None
+        self.tbo_children = [child_a, child_b]
+
+    def filter_batch(
+        self,
+        *,
+        start_token_index: int,
+        end_token_index: int,
+        start_seq_index: int,
+        end_seq_index: int,
+        output_attn_backend: AttentionBackend,
+    ):
+        num_tokens = self.input_ids.shape[0]
+        num_seqs = self.batch_size
+
+        output_dict = dict()
+
+        for key in [
+            "input_ids",
+            "positions",
+            "out_cache_loc",
+        ]:
+            old_value = getattr(self, key)
+            assert (
+                old_value.shape[0] == num_tokens
+            ), f"{key=} {old_value=} {num_tokens=} {self=}"
+            output_dict[key] = old_value[start_token_index:end_token_index]
+
+        for key in [
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+            "extend_prefix_lens_cpu",
+            "extend_seq_lens_cpu",
+            "extend_logprob_start_lens_cpu",
+            "lora_paths",
+        ]:
+            old_value = getattr(self, key)
+            if old_value is None:
+                continue
+            assert (
+                len(old_value) == num_seqs
+            ), f"{key=} {old_value=} {num_seqs=} {self=}"
+            output_dict[key] = old_value[start_seq_index:end_seq_index]
+
+        for key in [
+            "forward_mode",
+            "return_logprob",
+            "req_to_token_pool",
+            "token_to_kv_pool",
+            "can_run_dp_cuda_graph",
+            "spec_info",
+            "spec_algorithm",
+            "capture_hidden_mode",
+            "padded_static_len",
+            "mrope_positions",  # only used by qwen2-vl, thus not care
+        ]:
+            output_dict[key] = getattr(self, key)
+
+        assert (
+            _compute_extend_num_tokens(self.input_ids, self.forward_mode)
+            == self.extend_num_tokens
+        ), f"{self=}"
+        extend_num_tokens = _compute_extend_num_tokens(
+            output_dict["input_ids"], output_dict["forward_mode"]
+        )
+
+        output_dict.update(
+            dict(
+                batch_size=end_seq_index - start_seq_index,
+                seq_lens_sum=output_dict["seq_lens"].sum().item(),
+                extend_num_tokens=extend_num_tokens,
+                attn_backend=output_attn_backend,
+                tbo_split_seq_index=None,
+                tbo_parent_token_range=(start_token_index, end_token_index),
+                tbo_children=None,
+                global_num_tokens_gpu=None,
+                global_num_tokens_cpu=None,
+                gathered_buffer=None,
+                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_for_logprob_cpu=None,
+                sampling_info=None,
+                # For logits and logprobs post processing, thus we do not care
+                temp_scaled_logprobs=False,
+                temperature=None,
+                top_p_normalized_logprobs=False,
+                top_p=None,
+                mm_inputs=None,
+            )
+        )
+
+        errors = []
+        for field in dataclasses.fields(ForwardBatch):
+            if getattr(self, field.name) is not None and field.name not in output_dict:
+                errors.append(
+                    f"Field {field.name} has value, but is not yet supported (value={getattr(self, field.name)} self={self})"
+                )
+        if len(errors) > 0:
+            raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
+
+        return ForwardBatch(**output_dict)
+
+    @property
+    def can_run_tbo(self):
+        return self.tbo_split_seq_index is not None
+
+
+def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
+    if forward_mode.is_extend():
+        return input_ids.shape[0]
+    elif forward_mode.is_decode():
+        return None
+    raise NotImplementedError
+
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
@@ -520,3 +679,4 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
