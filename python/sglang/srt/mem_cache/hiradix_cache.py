@@ -335,13 +335,11 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
-                self.inc_hit_count(child)
                 if not child.evicted:
                     value.append(child.value)
                 node = child
@@ -387,7 +385,6 @@ class HiRadixCache(RadixCache):
             node = node.children[child_key]
             node.last_access_time = time.time()
             prefix_len = self.key_match_fn(node.key, key)
-            total_prefix_length += prefix_len
 
             if prefix_len == len(node.key):
                 if node.evicted:
@@ -398,7 +395,9 @@ class HiRadixCache(RadixCache):
                     self.evictable_size_ += len(node.value)
                 else:
                     self.inc_hit_count(node)
+                    total_prefix_length += prefix_len
             else:
+                # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
@@ -406,6 +405,7 @@ class HiRadixCache(RadixCache):
                     self.evictable_size_ += len(new_node.value)
                 else:
                     self.inc_hit_count(new_node)
+                    total_prefix_length += prefix_len
                 node = new_node
 
             key = key[prefix_len:]
@@ -424,7 +424,7 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy == "write_through":
                 self.write_backup(new_node)
-        return 0
+        return total_prefix_length
 
     def _collect_leaves_device(self):
         def is_leaf(node):
