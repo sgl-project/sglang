@@ -32,8 +32,8 @@ class _ExpertDistributionRecorder:
             self._on_forward_pass_end()
 
     def _on_forward_pass_end(self):
-        forward_pass_data = self._single_pass_gatherer.collect()
-        self._accumulator.append(forward_pass_data)
+        single_pass_count = self._single_pass_gatherer.collect()
+        self._accumulator.append(single_pass_count)
         self._single_pass_gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -160,7 +160,7 @@ class _Accumulator(ABC):
     def get_class() -> Type["_Accumulator"]:
         return TODO
 
-    def append(self, forward_pass_data: torch.Tensor):
+    def append(self, single_pass_count: torch.Tensor):
         raise NotImplementedError
 
     def reset(self):
@@ -174,9 +174,9 @@ class _DetailAccumulator(_Accumulator):
     def __init__(self):
         self._records = []
 
-    def append(self, forward_pass_data: torch.Tensor):
+    def append(self, single_pass_count: torch.Tensor):
         self._records.append(dict(
-            forward_pass_data=forward_pass_data.tolist(),
+            single_pass_count=single_pass_count.tolist(),
         ))
 
     def reset(self):
@@ -190,7 +190,7 @@ class _StatAccumulator(_Accumulator):
     def __init__(self):
         self._TODO = TODO
 
-    def append(self, forward_pass_data: torch.Tensor):
+    def append(self, single_pass_count: torch.Tensor):
         TODO
 
     def reset(self):
