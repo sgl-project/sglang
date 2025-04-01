@@ -295,3 +295,11 @@ class ModelExpertMetadata:
     num_layers: int
     num_local_physical_experts: int
     num_logical_experts: int
+
+    @staticmethod
+    def from_model(model):
+        return ModelExpertMetadata(
+            num_layers=TODO,
+            num_local_physical_experts=TODO,
+            num_logical_experts=TODO,
+        )

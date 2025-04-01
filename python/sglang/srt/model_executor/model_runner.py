@@ -216,11 +216,7 @@ class ModelRunner:
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
 
-        model_expert_metadata = ModelExpertMetadata(
-            num_layers=TODO,
-            num_local_physical_experts=TODO,
-            num_logical_experts=TODO,
-        )
+        model_expert_metadata = ModelExpertMetadata.from_model(self.model)
         self.expert_distribution_recorder = ExpertDistributionRecorder(
             server_args, model_expert_metadata,
             # TODO handle DP!=TP case
