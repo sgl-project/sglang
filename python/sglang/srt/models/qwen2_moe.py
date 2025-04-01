@@ -41,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
@@ -366,7 +366,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
-            with expert_distribution_recorder.with_current_layer(i):
+            with global_expert_distribution_recorder.with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
