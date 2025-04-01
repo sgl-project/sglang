@@ -1,3 +1,5 @@
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+
 try:
     from deep_ep import Buffer
 
@@ -196,6 +198,7 @@ class DeepEPDispatcher:
                 handle,
                 event,
             ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+            expert_distribution_recorder.on_deepep_dispatch_normal(num_recv_tokens_per_expert_list)
             self.tokens_per_expert = torch.tensor(
                 num_recv_tokens_per_expert_list,
                 device=hidden_states.device,

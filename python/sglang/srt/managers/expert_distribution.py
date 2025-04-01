@@ -29,10 +29,15 @@ class _ExpertDistributionRecorder:
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
 
-    def on_select_experts(self, topk_ids):
+    def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
             return
         self._forward_gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
+
+    def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
+        if not self._recording:
+            return
+        self._forward_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
     def reset(self):
         """Reset the expert distribution recorder."""
@@ -79,6 +84,9 @@ class _ExpertDistributionRecorder:
 
 class _ForwardGatherer(ABC):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        pass
+
+    def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         pass
 
 
