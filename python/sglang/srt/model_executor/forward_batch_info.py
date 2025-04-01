@@ -211,6 +211,10 @@ class ForwardBatch:
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+    gathered_buffer_tp2dp: Optional[torch.Tensor] = None
+    gathered_buffer_dp2tp: Optional[torch.Tensor] = None
+    dp_mla_tp2dp_plan_meta: Optional[torch.Tensor] = None
+    dp_mla_dp2tp_plan_meta: Optional[torch.Tensor] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -282,6 +286,31 @@ class ForwardBatch:
                 dtype=model_runner.dtype,
                 device=device,
             )
+            if model_runner.server_args.enable_dp_mla:
+                dp_mla_tp_size = (
+                    model_runner.server_args.tp_size // model_runner.server_args.dp_size
+                )
+                kv_lora_rank = model_runner.model_config.kv_lora_rank
+                qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+                num_key_value_heads = model_runner.model_config.num_key_value_heads
+                ret.gathered_buffer_tp2dp = torch.zeros(
+                    (
+                        batch.input_ids.shape[0],
+                        num_key_value_heads // dp_mla_tp_size,
+                        kv_lora_rank + qk_rope_head_dim,
+                    ),
+                    dtype=model_runner.dtype,
+                    device=device,
+                )
+                ret.gathered_buffer_dp2tp = torch.zeros(
+                    (
+                        sum_len,
+                        num_key_value_heads // model_runner.server_args.tp_size,
+                        kv_lora_rank,
+                    ),
+                    dtype=model_runner.dtype,
+                    device=device,
+                )
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             return ret

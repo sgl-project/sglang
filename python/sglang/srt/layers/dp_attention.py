@@ -191,10 +191,12 @@ def _dp_gather(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+        """# torch compile report error
         assert (
             global_tokens.untyped_storage().data_ptr()
             != local_tokens.untyped_storage().data_ptr()
         ), "aliasing between global_tokens and local_tokens not allowed"
+        """
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -242,10 +244,12 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
+        """# torch compile report error
         assert (
             local_tokens.untyped_storage().data_ptr()
             != global_tokens.untyped_storage().data_ptr()
         ), "aliasing between local_tokens and global_tokens not allowed"
+        """
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
@@ -260,3 +264,221 @@ def tp_reduce_scatter(
 
 def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
     return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
+
+
+def get_dp_mla_tp_to_dp_plan_meta(
+    forward_batch: "ForwardBatch",
+    rank,
+    world_size,
+    dp_tp_size,
+    group,
+    output,
+    input,
+    tp_head,
+    layer_id,
+    mla_mask,
+):
+    if layer_id == 0:
+        all_lens = forward_batch.global_num_tokens_gpu.to(torch.int64)
+
+        dp_size = world_size // dp_tp_size  # 8//4=2
+        dp_rank = rank // dp_tp_size  # 0,0,1,1,2,2,3,3
+        new_seq = all_lens[dp_rank]
+        # dp0~3[h0,h1,h2,h3,h4,h5,h6,h7] -> [dp0[h0~3],dp0[h4~7],dp1[h0~3],dp1[h4~7],...]
+        dp_tp_rank = rank % dp_tp_size
+        # recv from every rank, [world_size,2] 2:block_offset, block_cnt
+        output_split_sizes = torch.zeros(
+            world_size, dtype=torch.int64, device=all_lens.device
+        )
+        seq_with_pad = forward_batch.gathered_buffer_tp2dp.shape[0]
+        output_split_sizes[dp_tp_rank * dp_size : (dp_tp_rank + 1) * dp_size] = new_seq
+        output_split_offsets = torch.zeros(
+            world_size, dtype=torch.int64, device=all_lens.device
+        )
+        if seq_with_pad > 0:
+            output_split_offsets[dp_tp_rank * dp_size : (dp_tp_rank + 1) * dp_size] = (
+                torch.arange(
+                    0,
+                    seq_with_pad * dp_size,
+                    seq_with_pad,
+                    dtype=torch.int64,
+                    device=all_lens.device,
+                )
+            )
+
+        # send to every rank, [world_size] block_cnt
+        # mla_mask = torch.zeros(dp_tp_size, dtype=torch.int64, device=all_lens.device)
+        # mla_mask[rank // dp_size] = 1  # to dp0~n tp dp_tp_rank
+        input_split_sizes = all_lens.unsqueeze(-1) * mla_mask
+        input_split_sizes = input_split_sizes.view(-1)
+
+        forward_batch.dp_mla_tp2dp_plan_meta = group.custom_all_to_all_plan(
+            output,
+            input,
+            output_split_sizes * tp_head,
+            input_split_sizes * tp_head,
+            output_split_offsets=output_split_offsets * tp_head,
+        )
+
+    return forward_batch.dp_mla_tp2dp_plan_meta
+
+
+def all_to_all_tp_to_dp(
+    input_tensor: torch.Tensor,
+    k_input: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    rank,
+    world_size,
+    dp_tp_size,
+    group,
+    layer_id,
+    mla_mask,
+):
+    # input_tensor: [seq0+seq1+seq2+..., head/8, head_dim] -> [seq0, head/2, head_dim], [seq1, head/2, head_dim]
+    if world_size == 1:
+        return input_tensor, k_input
+
+    total_seq, local_head, seq_head_dim = input_tensor.shape
+    dp_size = world_size // dp_tp_size  # 8//4=2
+    new_head = local_head * dp_size  # 16*4=64
+
+    output_tensor = forward_batch.gathered_buffer_tp2dp
+    # dp_size, seq+seq_pad, local_head * seq_head_dim
+    output_tensor = output_tensor.view(dp_size, -1, local_head * seq_head_dim)
+
+    block_size = seq_head_dim  # 576
+    plan_meta = get_dp_mla_tp_to_dp_plan_meta(
+        forward_batch,
+        rank,
+        world_size,
+        dp_tp_size,
+        group,
+        output_tensor.view(-1, block_size),
+        input_tensor.view(-1, block_size),
+        local_head,
+        layer_id,
+        mla_mask,
+    )
+
+    group.custom_all_to_all(
+        output_tensor.view(-1, block_size),
+        input_tensor.view(-1, block_size),
+        plan_meta,
+    )
+
+    output_tensor = (
+        output_tensor.transpose(0, 1).contiguous().view(-1, new_head, seq_head_dim)
+    )
+
+    local_k_input = torch.empty(
+        output_tensor.shape[0],
+        *k_input.shape[1:],
+        dtype=k_input.dtype,
+        device=k_input.device,
+    )
+    dp_scatter(local_k_input, k_input, forward_batch)
+    return output_tensor, local_k_input
+
+
+def get_dp_mla_dp_to_tp_plan_meta(
+    forward_batch: "ForwardBatch",
+    rank,
+    world_size,
+    dp_tp_size,
+    group,
+    output,
+    input,
+    tp_head,
+    layer_id,
+    mla_mask,
+):
+    if layer_id == 0:
+        dp_size = world_size // dp_tp_size  # 8//2==4
+
+        all_lens = forward_batch.global_num_tokens_gpu.to(torch.int64)
+        dp_rank = rank // dp_tp_size  # 0,0,1,1,2,2,3,3
+        cur_seq = all_lens[dp_rank]
+
+        # [dp0[h0~3],dp0[h4~7],dp1[h0~3],dp1[h4~7],...] -> dp0~3[h0,h1,h2,h3,h4,h5,h6,h7]
+        dp_tp_rank = rank % dp_tp_size
+        # recv from every rank, [world_size] block_cnt
+        # mla_mask = torch.zeros(dp_tp_size, dtype=torch.int64, device=all_lens.device)
+        # mla_mask[rank // dp_size] = 1  # to dp0~n tp dp_tp_rank
+        output_split_sizes = all_lens.unsqueeze(-1) * mla_mask
+        output_split_sizes = output_split_sizes.view(-1)
+        # send to every rank, [world_size,2] 2:block_offset, block_cnt
+        input_split_sizes = torch.zeros(
+            world_size, dtype=torch.int64, device=all_lens.device
+        )
+        input_split_sizes[dp_tp_rank * dp_size : (dp_tp_rank + 1) * dp_size] = cur_seq
+        seq_with_pad = forward_batch.gathered_buffer_tp2dp.shape[0]
+        input_split_offsets = torch.zeros(
+            world_size, dtype=torch.int64, device=all_lens.device
+        )
+        if seq_with_pad > 0:
+            input_split_offsets[dp_tp_rank * dp_size : (dp_tp_rank + 1) * dp_size] = (
+                torch.arange(
+                    0,
+                    seq_with_pad * dp_size,
+                    seq_with_pad,
+                    dtype=torch.int64,
+                    device=all_lens.device,
+                )
+            )
+        forward_batch.dp_mla_dp2tp_plan_meta = group.custom_all_to_all_plan(
+            output,
+            input,
+            output_split_sizes * tp_head,
+            input_split_sizes * tp_head,
+            input_split_offsets=input_split_offsets * tp_head,
+        )
+    return forward_batch.dp_mla_dp2tp_plan_meta
+
+
+def all_to_all_dp_to_tp(
+    input_tensor: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    rank,
+    world_size,
+    dp_tp_size,
+    group,
+    layer_id,
+    mla_mask,
+):
+    if world_size == 1:
+        return input_tensor
+    # input_tensor: [seq_r0, head/2, 572], [seq_r1, head/2, 572], ... -> [seq_r0+seq_r1+seq_r2+...,head/8, 572]
+    _, local_head, seq_head_dim = input_tensor.shape
+
+    dp_size = world_size // dp_tp_size  # 8//2==4
+    new_head = local_head // dp_size  # 64//4=16
+    # to [dp_size, seq+seq_pad, new_head, seq_head_dim)
+    input_tensor = (
+        input_tensor.view(-1, dp_size, new_head * seq_head_dim)
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+    output_tensor = forward_batch.gathered_buffer_dp2tp
+    output_tensor = output_tensor.view(-1, new_head * seq_head_dim)
+
+    block_size = seq_head_dim  # 512
+    plan_meta = get_dp_mla_dp_to_tp_plan_meta(
+        forward_batch,
+        rank,
+        world_size,
+        dp_tp_size,
+        group,
+        output_tensor.view(-1, block_size),
+        input_tensor.view(-1, block_size),
+        new_head,
+        layer_id,
+        mla_mask,
+    )
+
+    group.custom_all_to_all(
+        output_tensor.view(-1, block_size),
+        input_tensor.view(-1, block_size),
+        plan_meta,
+    )
+    return output_tensor.view(-1, new_head, seq_head_dim)

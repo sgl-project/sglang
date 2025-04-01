@@ -70,6 +70,7 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_dp_mla": ServerArgs.enable_dp_mla,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "deepep_mode": ServerArgs.deepep_mode,

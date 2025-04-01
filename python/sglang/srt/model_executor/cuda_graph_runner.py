@@ -129,6 +129,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if _is_hip:
             capture_bs += list(range(160, 257, 8))
 
+        if model_runner.server_args.enable_dp_mla:
+            capture_bs += [i * 8 for i in range(21, 33)]
+
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -143,6 +146,10 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if bs <= model_runner.req_to_token_pool.size
         and bs <= server_args.cuda_graph_max_bs
     ]
+    if model_runner.server_args.enable_dp_mla:
+        # reduce cuda graph number when occupy too much gpu memory
+        capture_bs = [bs for bs in capture_bs if bs <= 64 or bs % 32 == 0]
+
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -176,6 +183,7 @@ class CudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_dp_mla = model_runner.server_args.enable_dp_mla
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
@@ -260,7 +268,30 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
-
+            if self.enable_dp_mla:
+                dp_mla_tp_size = self.tp_size // self.dp_size
+                kv_lora_rank = self.model_runner.model_config.kv_lora_rank
+                qk_rope_head_dim = self.model_runner.model_config.qk_rope_head_dim
+                num_kv_heads = self.model_runner.model_config.num_key_value_heads
+                self.gathered_buffer_tp2dp = torch.zeros(
+                    (
+                        self.max_bs * self.num_tokens_per_bs,
+                        num_kv_heads // dp_mla_tp_size,
+                        kv_lora_rank + qk_rope_head_dim,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+                self.gathered_buffer_dp2tp = self.gathered_buffer_tp2dp.view(-1)[
+                    : self.max_bs
+                    * self.num_tokens_per_bs
+                    * num_kv_heads
+                    // self.tp_size
+                    * kv_lora_rank
+                ].view(
+                    self.max_bs * self.num_tokens_per_bs,
+                    num_kv_heads // self.tp_size,
+                    kv_lora_rank,
+                )
         # Capture
         try:
             with self.model_capture_mode():
@@ -389,6 +420,13 @@ class CudaGraphRunner:
             global_num_tokens = None
             gathered_buffer = None
 
+        if self.enable_dp_mla:
+            gathered_buffer_tp2dp = self.gathered_buffer_tp2dp[:num_tokens]
+            gathered_buffer_dp2tp = self.gathered_buffer_dp2tp[:num_tokens]
+        else:
+            gathered_buffer_tp2dp = None
+            gathered_buffer_dp2tp = None
+
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
@@ -411,6 +449,8 @@ class CudaGraphRunner:
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
             gathered_buffer=gathered_buffer,
+            gathered_buffer_tp2dp=gathered_buffer_tp2dp,
+            gathered_buffer_dp2tp=gathered_buffer_dp2tp,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
