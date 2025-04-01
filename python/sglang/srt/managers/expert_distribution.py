@@ -302,16 +302,25 @@ class ModelExpertMetadata:
     def from_model(model):
         config = model.config
         if isinstance(config, DeepseekV2Config):
-            return ModelExpertMetadata(
+            return ModelExpertMetadata._init_new(
                 num_layers=config.num_hidden_layers,
-                num_local_physical_experts=TODO,
                 num_logical_experts=config.n_routed_experts,
             )
         # TODO is it this class?
         if isinstance(config, Qwen2MoeConfig):
-            return ModelExpertMetadata(
+            return ModelExpertMetadata._init_new(
                 num_layers=config.num_hidden_layers,
-                num_local_physical_experts=TODO,
                 num_logical_experts=config.num_experts,
             )
         return None
+
+    @staticmethod
+    def _init_new(
+        num_layers: int,
+        num_logical_experts: int,
+    ):
+        return ModelExpertMetadata(
+            num_layers=num_layers,
+            num_logical_experts=num_logical_experts,
+            num_local_physical_experts=TODO,
+        )
