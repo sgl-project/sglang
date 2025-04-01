@@ -35,6 +35,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -50,10 +51,11 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -101,6 +103,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -121,6 +124,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    enable_colocated_batch_gen,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -1490,12 +1494,25 @@ class Scheduler(
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+
+        if local_batch is not None:
+            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=local_batch.forward_mode,
+                num_tokens=local_batch.input_ids.shape[0],
+                extend_lens=local_batch.extend_lens,
+            )
+        else:
+            local_tbo_split_seq_index = None
+        local_can_run_tbo = local_tbo_split_seq_index is not None
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
+                local_can_run_tbo,
+                local_batch.forward_mode.value if local_batch is not None else -1,
             ],
             dtype=torch.int64,
         )
@@ -1512,6 +1529,14 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+
+        can_run_tbo = (
+            enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_same
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = self.get_idle_batch()
@@ -1519,6 +1544,9 @@ class Scheduler(
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+            local_batch.tbo_split_seq_index = (
+                local_tbo_split_seq_index if can_run_tbo else None
+            )
 
             # Check forward mode for cuda graph
             if not self.server_args.disable_cuda_graph:
@@ -1962,6 +1990,10 @@ def _import_static_state(model, static_params):
         self_named_buffers[name][...] = tensor
 
 
+def _is_all_same(x):
+    return all(value == x[0] for value in x)
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2020,3 +2052,4 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
