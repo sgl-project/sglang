@@ -24,7 +24,6 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -69,7 +68,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -201,6 +200,10 @@ def run_one_case(
             fout.write(json.dumps(res) + "\n")
 
 
+def _process_expert_distribution_record(response):
+    TODO
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -259,7 +262,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             # requests.post(base_url + "/stop_profile").raise_for_status()
         if bench_args.enable_expert_distribution_recorder:
             requests.post(base_url + "/stop_expert_distribution_record").raise_for_status()
-            data = requests.post(base_url + "/dump_expert_distribution_record")
+            _process_expert_distribution_record(requests.post(base_url + "/dump_expert_distribution_record"))
     finally:
         if proc:
             kill_process_tree(proc.pid)
