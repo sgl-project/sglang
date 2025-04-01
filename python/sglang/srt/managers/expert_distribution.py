@@ -39,8 +39,8 @@ class _ExpertDistributionRecorder:
             self._on_forward_pass_end()
 
     def _on_forward_pass_end(self):
-        data = self._forward_gatherer.collect()
-        TODO_use_data
+        forward_pass_data = self._forward_gatherer.collect()
+        self._accumulator.append(forward_pass_data)
         self._forward_gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -160,15 +160,18 @@ class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
 
 
 class _Accumulator(ABC):
-    pass
+    def append(self, forward_pass_data: torch.Tensor):
+        raise NotImplementedError
 
 
 class _DetailAccumulator(_Accumulator):
-    pass
+    def append(self, forward_pass_data: torch.Tensor):
+        TODO
 
 
 class _StatAccumulator(_Accumulator):
-    pass
+    def append(self, forward_pass_data: torch.Tensor):
+        TODO
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
