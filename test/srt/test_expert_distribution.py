@@ -25,15 +25,17 @@ class TestExpertDistribution(CustomTestCase):
             os.remove(f)
 
     def test_expert_distribution_record(self):
-        for model_path in [
-            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-            "Qwen/Qwen1.5-MoE-A2.7B",
+        for info in [
+            dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", mode_detail=False),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode_detail=False),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode_detail=True),
         ]:
-            with self.subTest(model_path=model_path):
-                self._execute_core(model_path=model_path)
+            with self.subTest(info=info):
+                self._execute_core(**info)
 
-    def _execute_core(self, model_path: str):
+    def _execute_core(self, model_path: str, mode_detail: bool):
         """Test expert distribution record endpoints"""
+        os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"] = "1" if mode_detail else "0"
         process = popen_launch_server(
             model_path,
             DEFAULT_URL_FOR_TEST,
