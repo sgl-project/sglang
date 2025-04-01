@@ -227,9 +227,10 @@ class _Accumulator(ABC):
             return _DetailAccumulator
         return _StatAccumulator
 
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int, server_args: ServerArgs):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._server_args = server_args
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -275,12 +276,12 @@ class _DetailAccumulator(_Accumulator):
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
-        if server_args.enable_two_batch_overlap:
+        if self._server_args.enable_two_batch_overlap:
             return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
         return super().get_single_pass_gatherer_keys()
 
     def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        if server_args.enable_two_batch_overlap:
+        if self._server_args.enable_two_batch_overlap:
             return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
         return super().get_single_pass_gatherer_key(debug_name)
 
