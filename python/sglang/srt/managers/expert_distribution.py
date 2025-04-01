@@ -98,4 +98,10 @@ class _SelectExpertsGatherer(_ForwardGatherer):
             self._expert_distribution_record[layer_idx].append(tuple(i))
 
 
+# TODO Will have a `_DeepepLowLatencyGatherer` after low-latency DeepEP is ready
+class _DeepepNormalGatherer(_ForwardGatherer):
+    def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
+        TODO
+
+
 expert_distribution_recorder = _ExpertDistributionRecorder()
