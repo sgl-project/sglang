@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata", rank: int):
+    def __init__(self, server_args: ServerArgs, metadata: Optional["ModelExpertMetadata"], rank: int):
         self._recording = False
         self._current_layer_idx = Withable()
         self._metadata = metadata
