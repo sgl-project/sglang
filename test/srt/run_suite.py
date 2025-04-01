@@ -85,7 +85,7 @@ suites = {
         TestFile("test_patch_torch.py", 30),
         TestFile("test_update_weights_from_distributed.py", 100),
         TestFile("test_verl_engine.py", 100),
-        TestFile("test_enable_two_batch_overlap.py", 100),
+        TestFile("test_two_batch_overlap.py", 100),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
