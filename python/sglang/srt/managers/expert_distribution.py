@@ -101,11 +101,14 @@ def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.
 
 class _SinglePassGatherer(ABC):
     @staticmethod
-    def init_new(server_args: ServerArgs) -> "_SinglePassGatherer":
+    def init_new(server_args: ServerArgs, metadata: "ModelExpertMetadata") -> "_SinglePassGatherer":
         if server_args.enable_deepep_moe:
             # TODO DeepEP low latency
-            return _DeepepNormalSinglePassGatherer()
-        return _LayerBasedSinglePassGatherer()
+            return _DeepepNormalSinglePassGatherer(metadata)
+        return _LayerBasedSinglePassGatherer(metadata)
+
+    def __init__(self, metadata: "ModelExpertMetadata"):
+        self._metadata = metadata
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
@@ -121,7 +124,8 @@ class _SinglePassGatherer(ABC):
 
 
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
-    def __init__(self):
+    def __init__(self, metadata: "ModelExpertMetadata"):
+        super().__init__(metadata)
         self._num_recv_tokens_per_expert_list_of_layer = {}
 
     def _on_layer_data(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
