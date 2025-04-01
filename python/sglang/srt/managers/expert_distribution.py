@@ -116,6 +116,7 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
     def _on_layer_data(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         # TODO for TBO, we may need to relax this restriction
         assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
+        assert 0 <= layer_idx < num_layers
         self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = num_recv_tokens_per_expert_list
 
     def reset(self):
@@ -123,7 +124,7 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
 
     def collect(self) -> torch.Tensor:
         data = [
-            TODO
+            self._num_recv_tokens_per_expert_list_of_layer.get(layer_index) or ([0] * num_local_physical_experts)
             for layer_index in range(num_layers)
         ]
         return torch.tensor(data)
