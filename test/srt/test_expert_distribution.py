@@ -1,4 +1,3 @@
-import glob
 import os
 import unittest
 
@@ -15,16 +14,6 @@ from sglang.test.test_utils import (
 
 
 class TestExpertDistribution(CustomTestCase):
-    def setUp(self):
-        # Clean up any existing expert distribution files before each test
-        for f in glob.glob("expert_distribution_*.csv"):
-            os.remove(f)
-
-    def tearDown(self):
-        # Clean up any expert distribution files after each test
-        for f in glob.glob("expert_distribution_*.csv"):
-            os.remove(f)
-
     def test_expert_distribution_record(self):
         # TODO: Add tests for DeepEP gatherer (currently our CI cannot run that)
         for info in [
