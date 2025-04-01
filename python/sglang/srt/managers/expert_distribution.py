@@ -46,13 +46,13 @@ class ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
             return
-        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key()]
+        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key(debug_name)]
         gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
         if not self._recording:
             return
-        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key()]
+        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key(debug_name)]
         gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
     def _reset(self):
@@ -94,7 +94,7 @@ global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
                       metadata: "ModelExpertMetadata"):
-    return _Accumulator.get_class().postprocess_dumps(physical_dumps, physical_to_logical_map)
+    return _Accumulator.get_class().postprocess_dumps(physical_dumps, physical_to_logical_map, metadata)
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -226,8 +226,8 @@ class _DetailAccumulator(_Accumulator):
             for record in physical_dump
         ]
 
-    def __init__(self, metadata: "ModelExpertMetadata"):
-        super().__init__(metadata)
+    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
+        super().__init__(metadata, rank)
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
@@ -271,8 +271,8 @@ class _StatAccumulator(_Accumulator):
                         layer_index, local_physical_expert_index]
         return dict(logical_count=logical_count)
 
-    def __init__(self, metadata: "ModelExpertMetadata"):
-        super().__init__(metadata)
+    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
+        super().__init__(metadata, rank)
         self._physical_count = torch.zeros((self._metadata.num_layers, self._metadata.num_local_physical_experts))
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
