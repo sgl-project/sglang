@@ -1,5 +1,6 @@
 import logging
 import time
+from abc import ABC
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -74,6 +75,14 @@ class _ExpertDistributionRecorder:
                 for expert_idx, count in layer_results.items():
                     fd.write(f"{layer_idx},{expert_idx},{count}\n")
         self.reset()
+
+
+class _ForwardGatherer(ABC):
+    pass
+
+
+class _SelectExpertsGatherer(_ForwardGatherer):
+    pass
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
