@@ -88,7 +88,7 @@ def _warmup_raw(model_name: str):
 
 
 def _compute_sources(model) -> Optional[List[Dict[str, Any]]]:
-    if model in ["DeepseekV3ForCausalLM"]:
+    if model == "DeepseekV3ForCausalLM":
         return _compute_sources_deepseek_v3()
     return None
 
