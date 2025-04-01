@@ -26,6 +26,7 @@ class TestExpertDistribution(CustomTestCase):
             os.remove(f)
 
     def test_expert_distribution_record(self):
+        # TODO: Add tests for DeepEP gatherer (currently our CI cannot run that)
         for info in [
             dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", mode_detail=False),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode_detail=False),
