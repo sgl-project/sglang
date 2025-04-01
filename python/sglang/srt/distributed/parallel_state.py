@@ -42,6 +42,7 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda_alike,
+    is_npu,
     supports_custom_op,
 )
 
@@ -297,7 +298,7 @@ class GroupCoordinator:
             NpuCommunicator,
         )
 
-        self.npu_communicator: Optional[NpuCommunicator]
+        self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
@@ -509,6 +510,11 @@ class GroupCoordinator:
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
             return hpu_comm.all_gather(input_, dim)
+
+        # For NPUs, use NPU communicator.
+        npu_comm = self.npu_communicator
+        if npu_comm is not None and not npu_comm.disabled:
+            return npu_comm.all_gather(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -973,7 +979,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=True,
+        use_pynccl=not is_npu(),
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
