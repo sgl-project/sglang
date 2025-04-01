@@ -1354,6 +1354,10 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
 
+    # compatible with SimpleNamespace
+    if not hasattr(args, "flush_cache"):
+        args.flush_cache = False
+
     return asyncio.run(
         benchmark(
             backend=backend,
