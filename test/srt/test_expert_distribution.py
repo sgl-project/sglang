@@ -76,7 +76,7 @@ class TestExpertDistribution(CustomTestCase):
             self.assertEqual(response.status_code, 200)
 
             # Check data rows
-            rows = list(csv_reader)
+            data = response.json()
             self.assertGreater(len(rows), 0, "CSV file should contain data rows")
 
             for row in rows:
