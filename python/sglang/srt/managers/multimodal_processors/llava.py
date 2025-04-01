@@ -3,10 +3,10 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from sglang.srt.managers.image_processor import BaseImageProcessor
-from sglang.srt.managers.image_processors.base_image_processor import (
-    get_global_processor,
+from sglang.srt.managers.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor,
 )
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.models.llava import LlavaMistralForCausalLM, LlavaQwenForCausalLM
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
@@ -14,7 +14,7 @@ from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
 
-class LlavaImageProcessor(BaseImageProcessor):
+class LlavaImageProcessor(BaseMultimodalProcessor):
     models = [LlavaVidForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -25,11 +25,10 @@ class LlavaImageProcessor(BaseImageProcessor):
         image_data: Union[str, bytes],
         image_aspect_ratio: Optional[str] = None,
         image_grid_pinpoints: Optional[str] = None,
-        image_processor=None,
+        processor=None,
     ):
-        processor = get_global_processor()
 
-        image_processor = image_processor or processor.image_processor
+        image_processor = processor.image_processor
 
         try:
             image, image_size = load_image(image_data)
@@ -72,21 +71,25 @@ class LlavaImageProcessor(BaseImageProcessor):
     async def _process_single_image(
         self, image_data: Union[bytes, str], aspect_ratio: str, grid_pinpoints: str
     ):
-        if self.executor is not None:
+        if self.cpu_executor is not None:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
-                self.executor,
+                self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
                 aspect_ratio,
                 grid_pinpoints,
+                self._processor,
             )
         else:
             return self._process_single_image_task(
-                image_data, aspect_ratio, grid_pinpoints
+                image_data,
+                aspect_ratio,
+                grid_pinpoints,
+                self._processor.image_processor,
             )
 
-    async def process_images_async(
+    async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
@@ -113,7 +116,7 @@ class LlavaImageProcessor(BaseImageProcessor):
             if "multi-images" in modalities or "video" in modalities:
                 # Multiple images
                 aspect_ratio = "pad"  # LLaVA OneVision Handling: more than one image --> interleaved image mode or video mode. We do not use anyres
-                pixel_values, image_hashes, image_sizes = [], [], []
+                pixel_values, data_hashes, image_sizes = [], [], []
                 res = []
                 for img_data in image_data:
                     res.append(
@@ -124,7 +127,7 @@ class LlavaImageProcessor(BaseImageProcessor):
                 res = await asyncio.gather(*res)
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
-                    image_hashes.append(image_h)
+                    data_hashes.append(image_h)
                     image_sizes.append(image_s)
 
                 if isinstance(pixel_values[0], np.ndarray):
@@ -134,14 +137,22 @@ class LlavaImageProcessor(BaseImageProcessor):
                 pixel_values, image_hash, image_size = await self._process_single_image(
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
-                image_hashes = [image_hash]
                 image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
+        modality = Modality.IMAGE
+        if isinstance(request_obj.modalities, list):
+            if request_obj.modalities[0] == "multi-images":
+                modality = Modality.MULTI_IMAGES
+            elif request_obj.modalities[0] == "video":
+                modality = Modality.VIDEO
 
         return {
-            "pixel_values": pixel_values,
-            "image_hashes": image_hashes,
-            "image_sizes": image_sizes,
-            "modalities": request_obj.modalities or ["image"],
+            "mm_items": [
+                MultimodalDataItem(
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    modality=modality,
+                )
+            ],
         }
