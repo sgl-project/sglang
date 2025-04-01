@@ -79,7 +79,10 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int)
 
 
 def _write_output(data, tp_rank):
-    path = Path(_dir_output) / f"TP{tp_rank}.jsonl"
+    directory = Path(_dir_output)
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"TP{tp_rank}.jsonl"
     with path.open("a") as fp:
         fp.write(f"{json.dumps(data)}\n")
 
