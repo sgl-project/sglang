@@ -570,6 +570,20 @@ class GroupCoordinator:
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
+
+        if input_.is_cpu:
+            # TODO: fix the binding of device_group
+            if False:
+                # if cpu_has_amx_support():
+                return torch.ops.sgl_kernel.shm_allgather(
+                    input_, get_tp_group().device_group, dim
+                )
+            else:
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor, input_, group=self.device_group
+                )
+                return output_tensor
+
         # All-gather.
         self.all_gather_into_tensor(output_tensor, input_)
         # Reshape
