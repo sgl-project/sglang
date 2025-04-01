@@ -217,7 +217,8 @@ class _StatAccumulator(_Accumulator):
         for physical_dump in physical_dumps:
             for layer_index in range(num_layers):
                 for local_physical_expert_index in range(num_local_physical_experts):
-                    logical_expert_index = TODO
+                    global_physical_expert_index = TODO + local_physical_expert_index
+                    logical_expert_index = physical_to_logical_map[layer_index, global_physical_expert_index]
                     logical_count[layer_index, logical_expert_index] += physical_dump[
                         layer_index, local_physical_expert_index]
         return dict(logical_count=logical_count)
