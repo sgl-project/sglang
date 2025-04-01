@@ -52,6 +52,7 @@ from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     input_to_float8,
@@ -77,6 +78,10 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
+
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
 else:
     from vllm import _custom_ops as ops
 
@@ -301,10 +306,13 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
+
         if self.tp_size > 1:
+            x = sglang_per_token_group_quant_fp8(hidden_states, 128)
+
             recv_hidden_states, reorder_topk_ids, seg_indptr = (
                 self.deepep_dispatcher.dispatch(
-                    hidden_states,
+                    x,
                     topk_idx,
                     topk_weights,
                     self.num_experts,

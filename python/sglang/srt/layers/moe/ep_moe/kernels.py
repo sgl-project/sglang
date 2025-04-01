@@ -7,6 +7,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -20,7 +21,9 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def deepep_permute_triton_kernel(
     input_ptr,
-    gateup_input_ptr,
+    scales_ptr,
+    gateup_input_ptr,  # output
+    input_scales_ptr,  # output
     src2dst_ptr,
     topk_ids_ptr,
     a1_scales_ptr,
@@ -29,12 +32,13 @@ def deepep_permute_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
-
+    scales_size = hidden_size // 128
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
 
     src_ptr = input_ptr + src_idx * hidden_size
+    src_scales_ptr = scales_ptr + src_idx * scales_size
 
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
@@ -46,6 +50,17 @@ def deepep_permute_triton_kernel(
             if dst_idx >= 0:
                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
                 tl.store(dst_ptr + offset, in_data, mask=mask)
+
+    for start_offset in tl.range(0, scales_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < scales_size
+        scales_data = tl.load(src_scales_ptr + offset, mask=mask)
+
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                dst_scales_ptr = input_scales_ptr + dst_idx * scales_size
+                tl.store(dst_scales_ptr + offset, scales_data, mask=mask)
 
 
 @triton.jit
@@ -504,22 +519,24 @@ def grouped_gemm_triton(
     scale_a: torch.Tensor = None,
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
+    is_w13: bool = False,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
         assert scale_a is not None and scale_b is not None
 
     if block_shape is not None:
-        assert len(block_shape) == 2
-        block_n, block_k = block_shape[0], block_shape[1]
-        if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
-        else:
-            a, scale_a = per_token_group_quant_fp8(a, block_k)
+        if global_server_args_dict["enable_deepep_moe"] and not is_w13:
+            assert len(block_shape) == 2
+            block_n, block_k = block_shape[0], block_shape[1]
+            if _is_cuda:
+                a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+            else:
+                a, scale_a = per_token_group_quant_fp8(a, block_k)
 
-        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
-        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
-        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+            assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+            assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+            assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
