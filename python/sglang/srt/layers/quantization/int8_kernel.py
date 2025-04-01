@@ -8,7 +8,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name
+from sglang.srt.utils import get_device_name, is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import sgl_per_token_group_quant_int8
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +165,33 @@ def per_token_group_quant_int8(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+
+    return x_q, x_s
+
+
+def sglang_per_token_group_quant_int8(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype = torch.int8,
+):
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    iinfo = torch.iinfo(dtype)
+    int8_max = iinfo.max
+    int8_min = iinfo.min
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_s = torch.empty(
+        x.shape[:-1] + (x.shape[-1] // group_size,),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
 
     return x_q, x_s
 
