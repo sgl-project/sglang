@@ -19,6 +19,7 @@ class ExpertLocationMetadata:
     def init_new(num_layers: int, num_logical_experts: int):
         # TODO handle more complex cases like duplicating experts on different GPUs
         num_local_physical_experts = num_logical_experts // get_tensor_model_parallel_world_size()
+
         return ExpertLocationMetadata(
             num_layers=num_layers,
             num_logical_experts=num_local_physical_experts,
