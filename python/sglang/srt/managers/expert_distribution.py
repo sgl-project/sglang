@@ -131,7 +131,7 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def _on_layer_data(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         # TODO for TBO, we may need to relax this restriction
         assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
-        assert 0 <= layer_idx < num_layers
+        assert 0 <= layer_idx < self._metadata.num_layers
         self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = num_recv_tokens_per_expert_list
 
     def reset(self):
@@ -139,8 +139,9 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> torch.Tensor:
         data = [
-            self._num_recv_tokens_per_expert_list_of_layer.get(layer_index) or ([0] * num_local_physical_experts)
-            for layer_index in range(num_layers)
+            self._num_recv_tokens_per_expert_list_of_layer.get(layer_index) or (
+                [0] * self._metadata.num_local_physical_experts)
+            for layer_index in range(self._metadata.num_layers)
         ]
         return torch.tensor(data)
 
@@ -151,7 +152,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
 
-        num_recv_tokens_per_expert_list = [0] * num_local_physical_experts
+        num_recv_tokens_per_expert_list = [0] * self._metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for expert_idx in token_record:
                 num_recv_tokens_per_expert_list[expert_idx] += 1
@@ -253,12 +254,12 @@ class _DetailAccumulator(_Accumulator):
 class _StatAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
-        logical_count = torch.zeros((num_layers, num_logical_experts))
+        logical_count = torch.zeros((metadata.num_layers, metadata.num_logical_experts))
         # Most naive implementation, can optimize if it is bottleneck
         for physical_dump in physical_dumps:
-            for layer_index in range(num_layers):
-                for local_physical_expert_index in range(num_local_physical_experts):
-                    global_physical_expert_index = num_local_physical_experts * physical_dump[
+            for layer_index in range(metadata.num_layers):
+                for local_physical_expert_index in range(metadata.num_local_physical_experts):
+                    global_physical_expert_index = metadata.num_local_physical_experts * physical_dump[
                         'rank'] + local_physical_expert_index
                     logical_expert_index = physical_to_logical_map[layer_index, global_physical_expert_index]
                     logical_count[layer_index, logical_expert_index] += physical_dump['physical_count'][
@@ -267,7 +268,7 @@ class _StatAccumulator(_Accumulator):
 
     def __init__(self, metadata: "ModelExpertMetadata"):
         super().__init__(metadata)
-        self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
+        self._physical_count = torch.zeros((self._metadata.num_layers, self._metadata.num_local_physical_experts))
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         self._physical_count += single_pass_physical_count
