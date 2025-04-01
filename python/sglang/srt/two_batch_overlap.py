@@ -129,8 +129,8 @@ class ExecutionOperation:
     fn: Callable
 
 
-Operation = Union[YieldOperation, Callable]
-Stage = List[Callable]
+Operation = Union[YieldOperation, ExecutionOperation, Callable]
+Stage = List[ExecutionOperation]
 
 
 def model_forward_execute_two_batch(
@@ -180,10 +180,8 @@ class _StageExecutor:
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
-                with _annotate_region(
-                    debug_name=op.__name__.replace("_forward_tbo_op_", "")
-                ):
-                    self._stage_output = op(
+                with _annotate_region(debug_name=op.debug_name):
+                    self._stage_output = op.fn(
                         state=self._stage_state, **(self._stage_output or {})
                     )
 
@@ -266,4 +264,7 @@ def decorate_operations(operations: List[Operation], debug_name_prefix: str):
 def _decorate_operation(operation: Operation, debug_name_prefix: str):
     if isinstance(operation, YieldOperation):
         return operation
-    return ExecutionOperation(debug_name=TODO, fn=operation)
+    return ExecutionOperation(
+        debug_name=debug_name_prefix + operation.__name__.replace("_forward_tbo_op_", ""),
+        fn=operation,
+    )
