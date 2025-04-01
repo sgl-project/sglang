@@ -36,9 +36,10 @@ class ExpertDistributionRecorder:
             self._on_forward_pass_end(forward_pass_id)
 
     def _on_forward_pass_end(self, forward_pass_id: int):
-        single_pass_physical_count = self._single_pass_gatherer.collect()
-        self._accumulator.append(forward_pass_id, single_pass_physical_count)
-        self._single_pass_gatherer.reset()
+        for gatherer_key, gatherer in self._single_pass_gatherers.items():
+            single_pass_physical_count = gatherer.collect()
+            self._accumulator.append(forward_pass_id, gatherer_key, single_pass_physical_count)
+            gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
@@ -190,7 +191,7 @@ class _Accumulator(ABC):
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
         raise NotImplementedError
 
-    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         raise NotImplementedError
 
     def reset(self):
@@ -223,7 +224,7 @@ class _DetailAccumulator(_Accumulator):
             return debug_name
         return super().get_single_pass_gatherer_key(debug_name)
 
-    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
             forward_pass_id=forward_pass_id,
             rank=TODO,
@@ -255,7 +256,7 @@ class _StatAccumulator(_Accumulator):
     def __init__(self):
         self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
 
-    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         self._physical_count += single_pass_physical_count
 
     def reset(self):
