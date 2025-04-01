@@ -168,32 +168,6 @@ class TokenizerMetricsCollector:
             ],
         )
 
-        self.histogram_time_in_waiting_queue = Histogram(
-            name="sglang:time_in_waiting_queue",
-            documentation="Histogram of time waiting in queue",
-            labelnames=labels.keys(),
-            buckets=[
-                0.1,
-                0.2,
-                0.4,
-                0.6,
-                0.8,
-                1,
-                2,
-                4,
-                6,
-                8,
-                10,
-                20,
-                40,
-                60,
-                80,
-                100,
-                200,
-                400,
-            ],
-        )
-
         self.histogram_inter_token_latency_seconds = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
@@ -271,9 +245,6 @@ class TokenizerMetricsCollector:
 
     def observe_time_to_first_token(self, value: float):
         self.histogram_time_to_first_token.labels(**self.labels).observe(value)
-
-    def observe_time_in_waiting_queue(self, value: float):
-        self.histogram_time_in_waiting_queue.labels(**self.labels).observe(value)
 
     def observe_inter_token_latency(self, internval: float, num_new_tokens: int):
         adjusted_interval = internval / num_new_tokens

@@ -424,10 +424,6 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
-        # Latency Breakdown
-        self.queue_time_start = None
-        self.queue_time_end = None
-
         # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None

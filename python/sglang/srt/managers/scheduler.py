@@ -828,8 +828,7 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
-            req.queue_time_start = time.time()
-
+            req.metrics.add_queue_time = time.time()
             if (
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
@@ -843,7 +842,7 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
-            req.queue_time_start = time.time()
+            req.metrics.add_queue_time = time.time()
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -940,14 +939,12 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req.metrics.add_queue_time = time.time()
             self.disagg_prefill_pending_queue.add(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
 
         else:
-            req.metrics.add_queue_time = time.time()
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
@@ -989,7 +986,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
-                req.queue_time_start = time.time()
+                req.metrics.add_queue_time = time.time()
                 self.waiting_queue.append(req)
                 return
 
@@ -1050,8 +1047,8 @@ class Scheduler(
 
             total_queue_latency = 0
             for req in can_run_list:
-                if req.queue_time_start is not None and req.queue_time_end is not None:
-                    total_queue_latency += req.queue_time_end - req.queue_time_start
+                if req.metrics.add_queue_time is not None and req.metrics.first_scheduled_time is not None:
+                    total_queue_latency += req.metrics.first_scheduled_time - req.metrics.add_queue_time
             if total_queue_latency > 0:
                 self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
@@ -1249,7 +1246,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            req.queue_time_end = time.time()
+            req.metrics.first_scheduled_time = time.time()
             if (
                 self.lora_paths
                 and len(
@@ -1295,9 +1292,6 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
-
-        for req in can_run_list:
-            req.metrics.first_scheduled_time = time.time()
 
         if self.enable_hierarchical_cache:
             self.tree_cache.read_to_load_cache()
