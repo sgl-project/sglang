@@ -1,7 +1,7 @@
 import logging
 from abc import ABC
 from contextlib import contextmanager
-from typing import List
+from typing import List, Type
 
 import torch
 from sglang.srt.utils import Withable
@@ -17,8 +17,8 @@ class _ExpertDistributionRecorder:
     def __init__(self):
         self._recording = False
         self._current_layer_idx = Withable()
-        self._forward_gatherer: _ForwardGatherer = TODO
-        self._accumulator: _Accumulator = TODO
+        self._forward_gatherer = _ForwardGatherer.init_new()
+        self._accumulator = _Accumulator.init_new()
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -83,6 +83,10 @@ expert_distribution_recorder = _ExpertDistributionRecorder()
 # --------------------------------------- ForwardGatherer -----------------------------------------
 
 class _ForwardGatherer(ABC):
+    @staticmethod
+    def init_new() -> "_ForwardGatherer":
+        return TODO
+
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
 
@@ -146,6 +150,14 @@ class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
 # --------------------------------------- Accumulator -----------------------------------------
 
 class _Accumulator(ABC):
+    @staticmethod
+    def init_new() -> "_Accumulator":
+        return _Accumulator.get_class()()
+
+    @staticmethod
+    def get_class() -> Type["_Accumulator"]:
+        return TODO
+
     def append(self, forward_pass_data: torch.Tensor):
         raise NotImplementedError
 
