@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import List, Type
 
 import torch
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,11 @@ expert_distribution_recorder = _ExpertDistributionRecorder()
 
 class _SinglePassGatherer(ABC):
     @staticmethod
-    def init_new() -> "_SinglePassGatherer":
-        return TODO
+    def init_new(server_args: ServerArgs) -> "_SinglePassGatherer":
+        if server_args.enable_deepep_moe:
+            # TODO DeepEP low latency
+            return _DeepepNormalSinglePassGatherer()
+        return _LayerBasedSinglePassGatherer()
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
