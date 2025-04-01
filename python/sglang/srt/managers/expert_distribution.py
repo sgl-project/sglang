@@ -43,9 +43,7 @@ class _ExpertDistributionRecorder:
             return
         self._forward_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
-    # -------------------------------- TODO ---------------------------------------
-
-    def reset(self):
+    def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
         self._recording = False
@@ -59,7 +57,7 @@ class _ExpertDistributionRecorder:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
-        self.reset()
+        self._reset()
         self._recording = True
 
     def stop_record(self):
@@ -72,7 +70,7 @@ class _ExpertDistributionRecorder:
 
     def dump_record(self):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        self.reset()
+        self._reset()
         return TODO
 
 
