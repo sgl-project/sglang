@@ -454,6 +454,48 @@ class ForwardBatch:
                         else torch.cat(second_per_grid_ts_list, dim=0)
                     )
 
+                    feature_attention_mask_list = [
+                        item.feature_attention_mask
+                        for item in mm_input.mm_items
+                        if item.feature_attention_mask is not None
+                    ]
+
+                    mm_items_index_with_audio = [
+                        index
+                        for index, item in enumerate(mm_input.mm_items)
+                        if item.is_audio()
+                    ]
+
+                    feature_attention_mask = (
+                        None
+                        if len(feature_attention_mask_list) == 0
+                        else torch.cat(feature_attention_mask_list, dim=0)
+                    )
+                    if feature_attention_mask is not None:
+                        assert len(mm_items_index_with_audio) == 1
+                        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+                        assert len(feature_attention_mask_list) <= 1
+                        audio_feature_list = [
+                            item.audio_feature
+                            for item in mm_input.mm_items
+                            if item.audio_feature is not None
+                        ]
+                        audio_feature = (
+                            None
+                            if len(audio_feature_list) == 0
+                            else torch.cat(audio_feature_list, dim=0)
+                        )
+                        print(f"{mm_items_index_with_audio=}")
+                        mm_item_index_with_audio = mm_items_index_with_audio[0]
+                        mm_input.mm_items[mm_item_index_with_audio].audio_feature = (
+                            audio_feature.permute(0, 2, 1)[
+                                feature_attention_mask.bool()
+                            ].permute(1, 0)
+                        )
+                    else:
+                        audio_feature_lengths = None
+
+                    audio_feature_lens = audio_feature_lengths
                     if is_omni:
                         mrope_positions, mrope_position_delta = (
                             MRotaryEmbedding.get_rope_index(
@@ -462,6 +504,7 @@ class ForwardBatch:
                                 ].unsqueeze(0),
                                 image_grid_thw=image_grid_thw,
                                 video_grid_thw=video_grid_thw,
+                                audio_seqlens=audio_feature_lens,
                                 config=hf_config,
                                 second_per_grids=second_per_grid_ts,
                             )

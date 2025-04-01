@@ -1,3 +1,5 @@
+# Copied and adapted from: https://github.com/huggingface/transformers/blob/5efaed689114030ffaf51c02f6f82adcbfc72389/src/transformers/models/qwen2_5_omni/modeling_qwen2_5_omni.py
+
 import math
 import operator
 from itertools import accumulate
@@ -26,19 +28,21 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
-    general_mm_embed_routine,
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Attention, Qwen2MLP
 from sglang.srt.utils import add_prefix
 from sglang.utils import logger
-
-# Copied and adapted from: https://github.com/huggingface/transformers/blob/5efaed689114030ffaf51c02f6f82adcbfc72389/src/transformers/models/qwen2_5_omni/modeling_qwen2_5_omni.py
 
 
 ############################
@@ -405,8 +409,6 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
                 padded_mask_after_cnn.sum(1).cumsum(0),
             )
         ).to(torch.int32)
-        encoder_states = None
-        all_attentions = None
 
         tmp_hidden_states = []
         # check if head_mask has a correct number of layers specified if desired
@@ -831,9 +833,10 @@ class Qwen2_5OmniThinkerModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.config = config
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
         )
+
         self.layers = nn.ModuleList(
             [
                 Qwen2_5OmniDecoderLayer(config, layer_idx, quant_config=quant_config)
@@ -923,10 +926,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
             .type(self.visual.dtype)
             .to("cuda")
         )
+
         image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thws.dim() == 2, image_grid_thws.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)
+
         return image_embeds
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -941,9 +946,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         )
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
+            # input_features = input_features.permute(0, 2, 1)[
+            #     feature_attention_mask.bool()
+            # ].permute(1, 0)
         else:
             audio_feature_lengths = None
 
@@ -967,6 +972,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
             aftercnn_lens=audio_feat_lengths,
         )
         audio_features = audio_outputs
+
         return audio_features
 
     def forward(
@@ -988,6 +994,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(nn.Module):
             language_model=self.model,
             image_data_embedding_func=self.get_image_feature,
             audio_data_embedding_func=self.get_audio_feature,
+            placeholder_tokens={
+                Modality.AUDIO: self.config.audio_token_index,
+                Modality.IMAGE: self.config.image_token_index,
+            },
             positions=positions,
         )
         return self.logits_processor(input_ids, hs, self.lm_head, forward_batch)
@@ -1028,13 +1038,14 @@ class Qwen2_5OmniModel(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        media_token_pairs = [
-            (mm_inputs.im_start_id, mm_inputs.im_end_id),
-            (mm_inputs.audio_start_id, mm_inputs.audio_end_id),
-        ]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        # media_token_pairs = [
+        #     (mm_inputs.im_start_id, mm_inputs.im_end_id),
+        #     (mm_inputs.audio_start_id, mm_inputs.audio_end_id),
+        # ]
+        # pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        #
+        # return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return input_ids
 
     def load_speakers(self, path):
         for key, value in torch.load(path).items():

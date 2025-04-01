@@ -207,6 +207,10 @@ class MultimodalDataItem:
                 return hash(arr_bytes)
             return hash(f)
 
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
+        # errors in cuda kernels. See also llava.py for example.
         if self.is_audio():
             self.hash = hash_feature(self.audio_feature)
         else:
@@ -251,7 +255,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[int] = None
 
     # image
-    im_token_id: Optional[torch.Tensor] = None
+    im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
@@ -314,17 +318,10 @@ class MultimodalInputs:
         merge image inputs when requests are being merged
         """
 
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
-
         # args needed to be merged
         optional_args = [
-            "items",
-            "image_offsets",
+            "mm_items",
             "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)

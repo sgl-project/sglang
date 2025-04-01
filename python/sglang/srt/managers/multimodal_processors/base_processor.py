@@ -173,7 +173,7 @@ class BaseMultimodalProcessor(ABC):
         assert len(image_data) == len(estimated_frames_list)
 
         image_index, audio_index = 0, 0
-        hashes, image_sizes, images, audios = [], [], [], []
+        image_sizes, images, audios = [], [], [], []
         new_text = ""
         for index, text_part in enumerate(text_parts):
             try:
@@ -210,15 +210,6 @@ class BaseMultimodalProcessor(ABC):
 
                     image_sizes += frames[0].size * len(frames)
 
-                    # Generate a hashable value for the image file
-                    if isinstance(image_file, Image.Image):
-                        # For PIL.Image objects, use the ID as a hashable value
-                        hash_value = hash(id(image_file))
-                    else:
-                        # For other types (strings, etc.), use the regular hash
-                        hash_value = hash(image_file)
-
-                    hashes += [hash_value] * len(frames)
                     images += frames
                     image_index += 1
                     if frames_to_process != 0:
@@ -228,7 +219,6 @@ class BaseMultimodalProcessor(ABC):
                     # load as audio
                     audio_file = audio_data[audio_index]
                     audio = load_audio(audio_file)
-                    hashes += [hash(audio_file)]
                     audios += [audio]
                     audio_index += 1
                     new_text += multimodal_tokens.audio_token
