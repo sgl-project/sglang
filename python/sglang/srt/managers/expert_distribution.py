@@ -83,8 +83,8 @@ class _ExpertDistributionRecorder:
 expert_distribution_recorder = _ExpertDistributionRecorder()
 
 
-def convert_dump_to_logical(physical_dumps: List[Any]):
-    return TODO
+def convert_dumps_to_logical(physical_dumps: List[Any]):
+    return _Accumulator.get_class().convert_dumps_to_logical(physical_dumps)
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -170,6 +170,9 @@ class _Accumulator(ABC):
             return _DetailAccumulator
         return _StatAccumulator
 
+    @classmethod
+    def convert_dumps_to_logical(cls, physical_dumps: List[Any]):
+        raise NotImplementedError
     def append(self, single_pass_physical_count: torch.Tensor):
         raise NotImplementedError
 
@@ -181,9 +184,12 @@ class _Accumulator(ABC):
 
 
 class _DetailAccumulator(_Accumulator):
+    @classmethod
+    def convert_dumps_to_logical(cls, physical_dumps: List[Any]):
+        TODO
+
     def __init__(self):
         self._records = []
-
     def append(self, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
             physical_count=single_pass_physical_count.tolist(),
@@ -197,6 +203,9 @@ class _DetailAccumulator(_Accumulator):
 
 
 class _StatAccumulator(_Accumulator):
+    @classmethod
+    def convert_dumps_to_logical(cls, physical_dumps: List[Any]):
+        TODO
     def __init__(self):
         self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
 
