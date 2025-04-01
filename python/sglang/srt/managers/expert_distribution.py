@@ -97,6 +97,11 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
     def __init__(self):
         self._num_recv_tokens_per_expert_list_of_layer = {}
 
+    def _on_layer_data(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
+        # TODO for TBO, we may need to relax this restriction
+        assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
+        self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = num_recv_tokens_per_expert_list
+
     def collect(self):
         return TODO
 
