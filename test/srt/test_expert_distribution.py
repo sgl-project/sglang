@@ -1,10 +1,8 @@
-import csv
 import glob
 import os
 import unittest
 
 import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -27,13 +25,17 @@ class TestExpertDistribution(CustomTestCase):
             os.remove(f)
 
     def test_expert_distribution_record(self):
-        self._execute_core()
+        for model_path in [
+            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+            "Qwen/Qwen1.5-MoE-A2.7B",
+        ]:
+            with self.subTest(model_path=model_path):
+                self._execute_core(model_path=model_path)
 
-    def _execute_core(self):
+    def _execute_core(self, model_path: str):
         """Test expert distribution record endpoints"""
         process = popen_launch_server(
-            # The feature is only implemented in deepseek_v2.py
-            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+            model_path,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
