@@ -241,6 +241,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 #         "record_shapes": bench_args.profile_record_shapes,
                 #     },
                 # ).raise_for_status()
+            if bench_args.enable_expert_distribution_recorder and index == bench_args.profile_skip_cases:
+                requests.post(base_url + "/start_expert_distribution_record").raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -255,6 +257,9 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             torch.cuda.cudart().cudaProfilerStop()
             # print("Execute stop_profile")
             # requests.post(base_url + "/stop_profile").raise_for_status()
+        if bench_args.enable_expert_distribution_recorder:
+            requests.post(base_url + "/stop_expert_distribution_record").raise_for_status()
+            data = requests.post(base_url + "/dump_expert_distribution_record")
     finally:
         if proc:
             kill_process_tree(proc.pid)
