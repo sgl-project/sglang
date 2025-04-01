@@ -211,7 +211,23 @@ def _process_expert_distribution_record(bench_args, response):
     path = Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
     print(f"Write expert_distribution_recorder information to {path}")
     path.write_text(json.dumps(data))
-    # TODO more
+
+    import polars as pl
+    df = pl.read_json("/tmp/expert_distribution.json")
+    df = df.with_row_index('temp_index')
+    df = df.explode('physical_count')
+    df = df.with_columns(layer_id=(pl.col('physical_count').cum_count() - 1).over('temp_index'))
+    df = df.drop('temp_index')
+    df = df.with_columns(
+        total_num_tokens=pl.col('physical_count').list.sum(),
+        max_expert_num_tokens=pl.col('physical_count').list.max(),
+        min_expert_num_tokens=pl.col('physical_count').list.min())
+    df = df.filter(pl.col('total_num_tokens') > 0)
+    df = df.sort('forward_pass_id', 'layer_id', 'gatherer_key', 'rank')
+    df = df.select('forward_pass_id', 'layer_id', 'gatherer_key', 'rank', 'total_num_tokens', 'max_expert_num_tokens',
+                   'min_expert_num_tokens', 'physical_count')
+    with pl.Config(fmt_str_lengths=1000, tbl_cols=-1, tbl_rows=-1, fmt_table_cell_list_len=1000, tbl_width_chars=-1):
+        print(df)
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
