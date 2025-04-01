@@ -79,13 +79,12 @@ class TestExpertDistribution(CustomTestCase):
 
             # Check data rows
             data = response.json()
+            print(f"{data=}")
 
             if mode_detail:
-                TODO
+                self.assertGreater(len(data), 0, "Should contain data rows")
             else:
                 TODO
-
-            self.assertGreater(len(rows), 0, "CSV file should contain data rows")
 
             for row in rows:
                 # Verify each row has 3 columns
