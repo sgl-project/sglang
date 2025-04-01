@@ -187,7 +187,12 @@ class _Accumulator(ABC):
 class _DetailAccumulator(_Accumulator):
     @classmethod
     def convert_dumps_to_logical(cls, physical_dumps: List[Any]):
-        TODO
+        # Do not convert to logical since we want all details
+        return [
+            record
+            for physical_dump in physical_dumps
+            for record in physical_dump
+        ]
 
     def __init__(self):
         self._records = []
