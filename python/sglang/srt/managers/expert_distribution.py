@@ -19,15 +19,17 @@ logger = logging.getLogger(__name__)
 class _ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
+    def __init__(self):
+        self._recording = False
+        self._current_layer_idx = Withable()
+        self._current_debug_name = Withable()
+
     def initialize(
         self,
         server_args: ServerArgs,
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ):
-        self._recording = False
-        self._current_layer_idx = Withable()
-        self._current_debug_name = Withable()
         self._expert_location_metadata = expert_location_metadata
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
