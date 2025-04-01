@@ -20,6 +20,9 @@ enum coll_state {
   coll_alt1_allreduce_naive__copy_in_done,
   coll_alt2_allreduce_naive__copy_in_done,
   coll_alt1_allreduce_naive__reduce_done,
+  coll_allgather_naive__copy_in_done,
+  coll_alt1_allgather_naive__copy_in_done,
+  coll_alt2_allgather_naive__copy_in_done,
 };
 
 // SHM building blocks
@@ -675,4 +678,71 @@ void all_reduce_outer_loop(torch::Tensor& data, size_t numel, int data_size) {
           data_ptr, data.scalar_type(), chunk_size, chunk_el);
     }
   }
+}
+
+void naive_all_gather(
+    char* result_ptr,
+    char* data_ptr,
+    size_t res_stride,
+    size_t chunk_size,
+    size_t chunk_el) {
+  const int state_group = 1;
+  static int current_buffer = 0;
+  static int state_idx = 0;
+
+  enum coll_state copy_current, copy_next;
+
+  switch (state_idx) {
+    case 0:
+      copy_current = coll_allgather_naive__copy_in_done;
+      copy_next = coll_alt1_allgather_naive__copy_in_done;
+      break;
+    case 1:
+      copy_current = coll_alt1_allgather_naive__copy_in_done;
+      copy_next = coll_alt2_allgather_naive__copy_in_done;
+      break;
+    case 2:
+      copy_current = coll_alt2_allgather_naive__copy_in_done;
+      copy_next = coll_allgather_naive__copy_in_done;
+      break;
+    default:
+      assert(!"Should not get here.");
+  }
+  state_idx = (state_idx + 1) % 3;
+
+  int data_size = chunk_size / chunk_el;
+  parallel_memcpy(distributed_buffer[current_buffer][world_rank], data_ptr, chunk_size);
+  std::atomic_thread_fence(std::memory_order_release);
+  workspace[world_rank]->states[state_group] = copy_current;
+
+  for (int i = 0; i < world_size; i++) {
+    // wait until all the other ranks copy the buffer
+    if (i != world_rank) wait_buffer_state_until_2(i, copy_current, copy_next, state_group);
+  }
+  for (int i = 0; i < world_size; i++) {
+    parallel_memcpy(result_ptr + i * res_stride, distributed_buffer[current_buffer][i], chunk_size);
+  }
+  current_buffer = 1 - current_buffer;
+}
+
+torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, size_t numel, int data_size) {
+  size_t dim_el = data.stride(dim) * data.size(dim);
+  int dtype_size = data_size / numel;
+  size_t dim_size = dim_el * dtype_size;
+  int dim_count = data_size / dim_size;
+  auto data_ptr = (char*)(data.data_ptr());
+  auto result_ptr = (char*)(result.data_ptr());
+  for (int i = 0; i < dim_count; i++) {
+    for (int offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
+      size_t chunk_size = dim_size - offset > MAX_BUF_SIZE ? MAX_BUF_SIZE : dim_size - offset;
+      size_t chunk_el = chunk_size / dtype_size;
+      naive_all_gather(
+        result_ptr + i * dim_size * world_size + offset,
+        data_ptr + i * dim_size + offset,
+        dim_size,
+        chunk_size,
+        chunk_el);
+    }
+  }
+  return result;
 }

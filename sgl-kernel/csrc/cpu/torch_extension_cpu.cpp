@@ -97,6 +97,9 @@ void initialize(int size, int rank);
 // shared mmeory all_reduce
 void shm_allreduce(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, py::object op);
 
+// shared memory all_gather
+at::Tensor shm_allgather(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int dim);
+
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_position_embedding_cpu(at::Tensor& t_pos, at::Tensor& q_pe,
     at::Tensor& k_pe, at::Tensor& t_emb_pos);
@@ -151,6 +154,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // all reduce
   m.def("initialize", &initialize, "shared memory initialization for CPU");
   m.def("shm_allreduce", &shm_allreduce, "low latency all_reduce implementation for CPU");
+  m.def("shm_allgather", &shm_allgather, "low latency all_gather implementation for CPU");
 
   // rope
   m.def("rotary_position_embedding_cpu", &rotary_position_embedding_cpu, "rotary position embedding for CPU");

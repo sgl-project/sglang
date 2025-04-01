@@ -87,3 +87,41 @@ void shm_allreduce(
 
   return;
 }
+
+torch::Tensor shm_allgather(torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int dim) {
+  RECORD_FUNCTION("sgl-kernel::shm_allgather", std::vector<c10::IValue>({data}));
+
+  auto numel = data.numel();
+
+  int data_size = 0;
+  bool data_type_fallback = false;
+
+  switch (data.scalar_type()) {
+    case c10::ScalarType::BFloat16:
+      data_size = numel * 2;
+      break;
+    case c10::ScalarType::Float:
+      data_size = numel * 4;
+      break;
+    default:
+      data_type_fallback = true;
+  }
+  if (dim < 0) {
+    dim += data.dim();
+  }
+  if (data_type_fallback || !all_ranks_local_p) {
+    // Fallback to torch distributed allreduce
+    std::vector<std::vector<torch::Tensor>> output_tensors(1);
+    auto world_size = process_group->getSize();
+    for (int i = 0; i < world_size; i++) {
+      output_tensors[0].push_back(torch::empty_like(data));
+    }
+    std::vector<torch::Tensor> input_tensors = {data};
+    process_group->allgather(output_tensors, input_tensors)->wait();
+    return torch::cat(output_tensors[0], dim).contiguous();
+  }
+  std::vector<int64_t> result_shape = data.sizes().vec();
+  result_shape[dim] *= world_size;
+  torch::Tensor result_tensor = torch::empty(result_shape, data.options());
+  return all_gather(result_tensor, data, dim, numel, data_size);
+}
