@@ -18,7 +18,7 @@ class _ExpertDistributionRecorder:
     def __init__(self):
         self._recording = False
         self._current_layer_idx = Withable()
-        self._forward_gatherer = _ForwardGatherer.init_new()
+        self._single_pass_gatherer = _SinglePassGatherer.init_new()
         self._accumulator = _Accumulator.init_new()
 
     def with_current_layer(self, layer_idx):
@@ -32,26 +32,27 @@ class _ExpertDistributionRecorder:
             self._on_forward_pass_end()
 
     def _on_forward_pass_end(self):
-        forward_pass_data = self._forward_gatherer.collect()
+        forward_pass_data = self._single_pass_gatherer.collect()
         self._accumulator.append(forward_pass_data)
-        self._forward_gatherer.reset()
+        self._single_pass_gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
             return
-        self._forward_gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
+        self._single_pass_gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
         if not self._recording:
             return
-        self._forward_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
+        self._single_pass_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value,
+                                                             num_recv_tokens_per_expert_list)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
         self._recording = False
         assert self._current_layer_idx.value is None
-        self._forward_gatherer.reset()
+        self._single_pass_gatherer.reset()
         self._accumulator.reset()
 
     def start_record(self):
@@ -81,11 +82,11 @@ class _ExpertDistributionRecorder:
 expert_distribution_recorder = _ExpertDistributionRecorder()
 
 
-# --------------------------------------- ForwardGatherer -----------------------------------------
+# --------------------------------------- SinglePassGatherer -----------------------------------------
 
-class _ForwardGatherer(ABC):
+class _SinglePassGatherer(ABC):
     @staticmethod
-    def init_new() -> "_ForwardGatherer":
+    def init_new() -> "_SinglePassGatherer":
         return TODO
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
@@ -101,7 +102,7 @@ class _ForwardGatherer(ABC):
         raise NotImplementedError
 
 
-class _LayerBasedForwardGatherer(_ForwardGatherer):
+class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def __init__(self):
         self._num_recv_tokens_per_expert_list_of_layer = {}
 
@@ -122,7 +123,7 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
         return torch.tensor(data)
 
 
-class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
+class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
     # pretty slow, but we will use the DeepEP Gatherer in production
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
@@ -136,7 +137,7 @@ class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
 
-class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
+class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
     def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         assert isinstance(num_recv_tokens_per_expert_list, list)
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
@@ -144,7 +145,7 @@ class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
 
 # TODO Wait for LowLatency DeepEP merging
 # e.g. use naive tensor copying
-class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
+class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
     pass
 
 
