@@ -1484,7 +1484,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
 
-
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -1821,4 +1820,3 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
-
