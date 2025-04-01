@@ -1,10 +1,10 @@
 import logging
 import time
 from collections import defaultdict
-from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
+from sglang.srt.utils import Withable
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +20,12 @@ class _ExpertDistributionRecorder:
             list
         )
         self._record = False
-        self._current_layer_id = "UNKNOWN"
+        # TODO
+        # self._current_layer_id = "UNKNOWN"
+        self._current_layer_id = Withable()
 
-    @contextmanager
     def with_current_layer(self, layer_idx):
-        TODO
+        return self._current_layer_id.with_value(layer_idx)
 
     # TODO
     # def set_current_layer(self, layer_idx):
