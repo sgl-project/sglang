@@ -23,6 +23,7 @@ class LoadFormat(str, enum.Enum):
     LAYERED = "layered"
     JAX = "jax"
     REMOTE = "remote"
+    RUNAI_STREAMER = "runai_streamer"
 
 
 @dataclass
