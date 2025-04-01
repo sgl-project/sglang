@@ -308,7 +308,7 @@ class HiRadixCache(RadixCache):
 
         return last_node, prefix_indices
 
-    def read_to_load_cache(self):
+    def ready_to_load_cache(self):
         self.load_cache_event.set()
 
     def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
