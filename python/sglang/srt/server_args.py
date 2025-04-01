@@ -182,6 +182,7 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    n_share_experts_fusion: int = 8
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1081,6 +1082,13 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--n-share-experts-fusion",
+            type=int,
+            default=ServerArgs.n_share_experts_fusion,
+            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
+                 "we use 8 by default. Set it to tp_size is a good practice.",
         )
 
         # Server warmups

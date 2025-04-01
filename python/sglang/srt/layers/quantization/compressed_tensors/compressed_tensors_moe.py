@@ -317,7 +317,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
-        # 添加延迟导入
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase, FusedMoeWeightScaleSupported
         
         self.quant_config = quant_config
@@ -631,7 +630,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
-        # 添加延迟导入
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         
         assert activation == "silu", "Only SiLU activation is supported."
