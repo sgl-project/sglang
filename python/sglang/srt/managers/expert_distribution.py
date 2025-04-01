@@ -305,18 +305,6 @@ class ModelExpertMetadata:
         return ModelExpertMetadata._init_dummy()
 
     @staticmethod
-    def init_new(
-        num_layers: int,
-        num_logical_experts: int,
-    ):
-        return ModelExpertMetadata(
-            num_layers=num_layers,
-            num_logical_experts=num_logical_experts,
-            # TODO handle more complex cases, e.g. duplicate some experts
-            num_local_physical_experts=num_logical_experts // get_tensor_model_parallel_world_size(),
-        )
-
-    @staticmethod
     def _init_dummy():
         return ModelExpertMetadata(
             num_layers=1,

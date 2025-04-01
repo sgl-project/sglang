@@ -485,9 +485,10 @@ class Qwen2MoeForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
     def get_model_expert_metadata(self):
-        return ModelExpertMetadata.init_new(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
+        return ModelExpertMetadata(
+            num_layers=self.config.num_hidden_layers,
+            num_logical_experts=self.config.num_experts,
+            num_local_physical_experts=TODO,
         )
 
 EntryClass = Qwen2MoeForCausalLM
