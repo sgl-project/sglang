@@ -9,6 +9,8 @@ from sglang.srt.utils import Withable
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------- Entrypoint -----------------------------------------
+
 class _ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
@@ -75,6 +77,8 @@ class _ExpertDistributionRecorder:
         return output
 
 
+# --------------------------------------- ForwardGatherer -----------------------------------------
+
 class _ForwardGatherer(ABC):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
@@ -135,6 +139,8 @@ class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
 class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
     pass
 
+
+# --------------------------------------- Accumulator -----------------------------------------
 
 class _Accumulator(ABC):
     def append(self, forward_pass_data: torch.Tensor):
