@@ -43,13 +43,14 @@ class ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
             return
-        self._single_pass_gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
+        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key()]
+        gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
         if not self._recording:
             return
-        self._single_pass_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value,
-                                                             num_recv_tokens_per_expert_list)
+        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key()]
+        gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
