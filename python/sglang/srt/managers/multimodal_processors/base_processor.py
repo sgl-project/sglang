@@ -139,8 +139,6 @@ class BaseMultimodalProcessor(ABC):
         else:
             multimodal_tokens.image_token = multimodal_tokens.image_token
 
-        assert isinstance(prompt, str)
-
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
