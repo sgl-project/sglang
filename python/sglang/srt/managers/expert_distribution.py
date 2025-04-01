@@ -107,6 +107,7 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
 
 
 class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
+    # pretty slow, but we will use the DeepEP Gatherer in production
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
