@@ -229,6 +229,7 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.expert_location_metadata = None
 
         # Metrics
         if self.enable_metrics:
@@ -656,7 +657,7 @@ class TokenizerManager:
         raw_outputs: List[ExpertDistributionReqOutput] = await self.expert_distribution_communicator(
             ExpertDistributionReq.DUMP_RECORD)
         return expert_distribution.postprocess_dumps([output.dump_output for output in raw_outputs],
-                                                     expert_location_metadata=TODO)
+                                                     expert_location_metadata=self.expert_location_metadata)
 
     async def update_weights_from_disk(
         self,
