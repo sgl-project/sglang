@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.4.post2"
+version = "0.4.4.post3"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -17,6 +17,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
+    "compressed-tensors",
     "datasets",
     "decord",
     "fastapi",
@@ -32,6 +33,7 @@ runtime_common = [
     "prometheus-client>=0.20.0",
     "psutil",
     "pydantic",
+    "pynvml",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
@@ -45,7 +47,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.0.5.post3",
+    "sgl-kernel==0.0.6",
     "flashinfer_python==0.2.3",
     "torch==2.5.1",
     "cuda-python",
@@ -56,7 +58,12 @@ srt = [
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
-srt_hip = ["sglang[runtime_common]", "torch", "vllm==0.6.7.dev2", "outlines==0.1.11"]
+srt_hip = [
+    "sglang[runtime_common]",
+    "torch",
+    "vllm==0.6.7.dev2",
+    "outlines==0.1.11"
+]
 
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
@@ -74,7 +81,7 @@ srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "torch"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver>=0.0.3"]
+torch_memory_saver = ["torch_memory_saver>=0.0.4"]
 test = [
     "jsonlines",
     "matplotlib",

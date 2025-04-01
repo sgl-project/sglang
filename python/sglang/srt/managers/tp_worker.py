@@ -53,8 +53,6 @@ class TpModelWorker:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
-        self.worker = self
-
         # Parse args
         self.tp_rank = tp_rank
 
@@ -133,6 +131,9 @@ class TpModelWorker:
             self.model_runner.tp_group.cpu_group,
         )[0]
         set_random_seed(self.random_seed)
+
+        # A reference make this class has the same member as TpModelWorkerClient
+        self.worker = self
 
     def get_worker_info(self):
         return (

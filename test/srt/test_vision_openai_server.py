@@ -155,9 +155,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
-                            },
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
                             "modalities": "multi-images",
                         },
                         {
@@ -400,12 +398,12 @@ class TestOpenAIVisionServer(CustomTestCase):
                 "role": "user",
                 "content": [
                     {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                    {
                         "type": "audio_url",
                         "audio_url": {"url": f"{audio_file_name}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
                     },
                 ],
             }
@@ -699,6 +697,8 @@ class TestGemma3itServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--chat-template",
                 "gemma-it",
+                "--mem-fraction-static",
+                "0.75",
             ],
         )
         cls.base_url += "/v1"

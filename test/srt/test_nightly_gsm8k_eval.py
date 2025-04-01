@@ -128,7 +128,8 @@ def check_model_scores(results):
         raise AssertionError("\n".join(failed_models))
 
 
-class TestNightlyGsm8KEval(CustomTestCase):
+# Do not use `CustomTestCase` since `test_mgsm_en_all_models` does not want retry
+class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
