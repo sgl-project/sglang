@@ -270,8 +270,8 @@ class _DetailAccumulator(_Accumulator):
         # Do not convert to logical since we want all details
         return [record for physical_dump in physical_dumps for record in physical_dump]
 
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
-        super().__init__(expert_location_metadata, rank)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
