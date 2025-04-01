@@ -69,6 +69,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -1388,10 +1390,11 @@ class DeepseekV2Model(nn.Module):
             else len(self.layers)
         )
         for i in range(normal_num_layers):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with expert_distribution_recorder.with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
 
         hidden_states, residual = self._forward_tbo_layers(
             positions=positions,
@@ -1649,6 +1652,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def get_expert_location_metadata(self):
+        return ExpertLocationMetadata.init_new(
+            num_layers=self.config.num_hidden_layers,
+            num_logical_experts=self.config.n_routed_experts,
+        )
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
