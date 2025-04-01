@@ -80,3 +80,5 @@ class ExpertDistributionRecorder:
                 for expert_idx, count in layer_results.items():
                     fd.write(f"{layer_idx},{expert_idx},{count}\n")
         self.reset()
+
+expert_distribution_recorder = ExpertDistributionRecorder()
