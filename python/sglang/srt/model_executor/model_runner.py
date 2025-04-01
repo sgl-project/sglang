@@ -982,7 +982,7 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
-        with global_expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
+        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
             return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool) -> LogitsProcessorOutput:
