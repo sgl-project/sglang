@@ -92,7 +92,8 @@ class ExpertDistributionRecorder:
 global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 
-def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
+def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
+                      metadata: "ModelExpertMetadata"):
     return _Accumulator.get_class().postprocess_dumps(physical_dumps, physical_to_logical_map)
 
 
@@ -199,7 +200,8 @@ class _Accumulator(ABC):
         return _SINGLE_PASS_GATHERER_KEY_PRIMARY
 
     @classmethod
-    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
+    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
+                          metadata: "ModelExpertMetadata"):
         raise NotImplementedError
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
@@ -214,7 +216,8 @@ class _Accumulator(ABC):
 
 class _DetailAccumulator(_Accumulator):
     @classmethod
-    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
+    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
+                          metadata: "ModelExpertMetadata"):
         # Do not convert to logical since we want all details
         return [
             record
@@ -253,7 +256,8 @@ class _DetailAccumulator(_Accumulator):
 
 class _StatAccumulator(_Accumulator):
     @classmethod
-    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
+    def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
+                          metadata: "ModelExpertMetadata"):
         logical_count = torch.zeros((metadata.num_layers, metadata.num_logical_experts))
         # Most naive implementation, can optimize if it is bottleneck
         for physical_dump in physical_dumps:
