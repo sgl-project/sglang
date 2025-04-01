@@ -48,11 +48,11 @@ class _ExpertDistributionRecorder:
 
     def reset(self):
         """Reset the expert distribution recorder."""
-        logger.info("Resetting expert distribution record...")
+        logger.info("Resetting ExpertDistributionRecorder...")
         self._recording = False
+        assert self._current_layer_idx.value is None
         self._forward_gatherer.reset()
         self._accumulator.reset()
-        assert self._current_layer_idx.value is None
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
