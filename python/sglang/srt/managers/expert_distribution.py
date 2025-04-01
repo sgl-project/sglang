@@ -158,4 +158,16 @@ class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
     pass
 
 
+class _Accumulator(ABC):
+    pass
+
+
+class _DetailAccumulator(_Accumulator):
+    pass
+
+
+class _StatAccumulator(_Accumulator):
+    pass
+
+
 expert_distribution_recorder = _ExpertDistributionRecorder()
