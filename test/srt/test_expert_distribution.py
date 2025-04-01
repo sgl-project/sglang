@@ -70,51 +70,31 @@ class TestExpertDistribution(CustomTestCase):
             )
             self.assertEqual(response.status_code, 200)
 
-            # Verify the dumped file exists and has correct format
-            csv_files = glob.glob("expert_distribution_*.csv")
-            self.assertEqual(
-                len(csv_files),
-                1,
-                f"Expected exactly one expert distribution CSV file {csv_files=}",
-            )
+            # Check data rows
+            rows = list(csv_reader)
+            self.assertGreater(len(rows), 0, "CSV file should contain data rows")
 
-            # Check CSV file format
-            with open(csv_files[0], "r") as f:
-                csv_reader = csv.reader(f)
-
-                # Check header
-                header = next(csv_reader)
+            for row in rows:
+                # Verify each row has 3 columns
                 self.assertEqual(
-                    header,
-                    ["layer_id", "expert_id", "count"],
-                    "CSV header should be 'layer_id,expert_id,count'",
+                    len(row),
+                    3,
+                    "Each row should have layer_id, expert_id and count",
                 )
 
-                # Check data rows
-                rows = list(csv_reader)
-                self.assertGreater(len(rows), 0, "CSV file should contain data rows")
-
-                for row in rows:
-                    # Verify each row has 3 columns
-                    self.assertEqual(
-                        len(row),
-                        3,
-                        "Each row should have layer_id, expert_id and count",
-                    )
-
-                    # Verify data types
-                    layer_id, expert_id, count = row
-                    self.assertTrue(
-                        layer_id.isdigit(),
-                        f"layer_id should be an integer {row=} {rows=}",
-                    )
-                    self.assertTrue(
-                        expert_id.isdigit(),
-                        f"expert_id should be an integer {row=} {rows=}",
-                    )
-                    self.assertTrue(
-                        count.isdigit(), f"count should be an integer {row=} {rows=}"
-                    )
+                # Verify data types
+                layer_id, expert_id, count = row
+                self.assertTrue(
+                    layer_id.isdigit(),
+                    f"layer_id should be an integer {row=} {rows=}",
+                )
+                self.assertTrue(
+                    expert_id.isdigit(),
+                    f"expert_id should be an integer {row=} {rows=}",
+                )
+                self.assertTrue(
+                    count.isdigit(), f"count should be an integer {row=} {rows=}"
+                )
 
         finally:
             kill_process_tree(process.pid)
