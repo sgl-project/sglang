@@ -654,6 +654,7 @@ class TokenizerManager:
 
     async def dump_expert_distribution_record(self):
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        return TODO
 
     async def update_weights_from_disk(
         self,
