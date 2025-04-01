@@ -394,23 +394,23 @@ class DeepseekV2MoE(nn.Module):
             state.seg_indptr_from_dispatch,
         )
 
-    def _forward_tbo_op_dispatch_a(self, state, tbo_child_index: int):
+    def _forward_tbo_op_dispatch_a(self, state):
+        self._forward_deepep_dispatch_a(
+            self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
+            state.forward_batch.forward_mode,
+            state.hidden_states_after_post_attn_ln,
+            state.router_logits,
+        )
+
+    def _forward_tbo_op_dispatch_b(self, state, tbo_child_index: int):
+        dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
         with expert_distribution_recorder.with_current_layer(
             self.layer_id), expert_distribution_recorder.with_debug_name(["child_a", "child_b"][tbo_child_index]):
-            self._forward_deepep_dispatch_a(
-                self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
-                state.forward_batch.forward_mode,
-                state.hidden_states_after_post_attn_ln,
-                state.router_logits,
-            )
-
-    def _forward_tbo_op_dispatch_b(self, state):
-        dispatcher = self.tbo_deepep_dispatchers[state.tbo_subbatch_index]
-        (
-            state.recv_hidden_states_from_dispatch,
-            state.reorder_topk_ids_from_dispatch,
-            state.seg_indptr_from_dispatch,
-        ) = dispatcher.dispatch_b()
+            (
+                state.recv_hidden_states_from_dispatch,
+                state.reorder_topk_ids_from_dispatch,
+                state.seg_indptr_from_dispatch,
+            ) = dispatcher.dispatch_b()
 
     def _forward_tbo_op_combine_a(self, state):
         self.tbo_deepep_dispatchers[state.tbo_subbatch_index].combine_a(
@@ -1399,9 +1399,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_prefill_attn,
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
-                partial(self.mlp._forward_tbo_op_dispatch_a, tbo_child_index=tbo_child_index),
+                self.mlp._forward_tbo_op_dispatch_a,
                 two_batch_overlap.YieldOperation(),
-                self.mlp._forward_tbo_op_dispatch_b,
+                partial(self.mlp._forward_tbo_op_dispatch_b, tbo_child_index=tbo_child_index),
                 self.mlp._forward_tbo_op_mlp,
                 self.mlp._forward_tbo_op_combine_a,
                 two_batch_overlap.YieldOperation(),
@@ -1418,10 +1418,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
                 two_batch_overlap.YieldOperation(),
-                partial(self.mlp._forward_tbo_op_dispatch_a, tbo_child_index=tbo_child_index),
+                self.mlp._forward_tbo_op_dispatch_a,
                 self.mlp._forward_tbo_op_shared,
                 two_batch_overlap.YieldOperation(),
-                self.mlp._forward_tbo_op_dispatch_b,
+                partial(self.mlp._forward_tbo_op_dispatch_b, tbo_child_index=tbo_child_index),
                 self.mlp._forward_tbo_op_mlp,
                 self.mlp._forward_tbo_op_combine_a,
                 two_batch_overlap.YieldOperation(),
