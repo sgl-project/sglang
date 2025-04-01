@@ -286,6 +286,13 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -301,6 +308,10 @@ class ServerArgs:
         self.enable_sp_layernorm = False
         # DeepEP MoE
         if self.enable_deepep_moe:
+            if self.deepep_mode == "auto":
+                assert (
+                    not self.enable_dp_attention
+                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True

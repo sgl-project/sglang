@@ -246,7 +246,8 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if global_server_args_dict["enable_deepep_moe"]:
-            self.dp_size = get_attention_dp_size()
+            # self.dp_size = get_attention_dp_size()
+            self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -323,7 +324,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        if self.dp_size > 1:
+        if self.ep_size > 1:
             (
                 hidden_states,
                 topk_idx,
@@ -350,7 +351,7 @@ class DeepseekV2MoE(nn.Module):
             )
             * self.routed_scaling_factor
         )
-        if self.dp_size > 1:
+        if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
                 topk_idx,
