@@ -268,6 +268,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-                   + (getattr(operation, "__name__").replace("_forward_tbo_op_", "") or "unknown"),
+                   + (getattr(operation, "__name__", "").replace("_forward_tbo_op_", "") or "unknown"),
         fn=operation,
     )
