@@ -2,6 +2,7 @@
 Multi-modality utils
 """
 
+import dataclasses
 import logging
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
@@ -46,8 +47,21 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
     """
 
-    def __init__(self, data_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
+    def __init__(
+        self,
+        data_token_pairs: Optional[List[Tuple[int, int]]],
+        data_start_token_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+
+        Args:
+            data_start_token_ids marks the start of a single multimodal data
+            See Minicpmo's slice_start_id for example
+        """
         self.data_token_id_pairs = data_token_pairs
+        self.data_start_token_ids = data_start_token_ids or [
+            s for s, _e in data_token_pairs
+        ]
 
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
@@ -81,7 +95,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
-            if input_ids[start_idx] in start_token_ids:
+            if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
                 mm_inputs.data_offsets += [start_idx]
 
@@ -178,7 +192,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
 def get_embedding_and_mask(
     data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
-    appearing_items: List[MultimodalDataItem],
+    embedding_items: List[MultimodalDataItem],
     placeholder_tensor: torch.Tensor,
     input_ids: torch.Tensor,
 ):
@@ -187,7 +201,7 @@ def get_embedding_and_mask(
 
     """
     # 1. Get the embedding
-    embedding = data_embedding_func(appearing_items)
+    embedding = data_embedding_func(embedding_items)
 
     # 2. Check the embedding
     if embedding.dim() == 2:
@@ -204,7 +218,7 @@ def get_embedding_and_mask(
     num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text."
+            f"Number of tokens in multimodal embedding does not match those in the input text. "
             f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
             "tokens from multimodal embeddings."
         )
@@ -229,6 +243,12 @@ def get_embedding_and_mask(
             )
 
     return embedding, special_multimodal_mask
+
+
+@dataclasses.dataclass
+class Modality2Token:
+    modality: Modality
+    token_id: int
 
 
 def embed_mm_inputs(
@@ -256,7 +276,6 @@ def embed_mm_inputs(
 
     if mm_inputs is None:
         return None
-
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
     # See `pad_input_ids` for more detail
@@ -310,7 +329,7 @@ def embed_mm_inputs(
             items = [item for item in appearing_items if item.is_image()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=image_data_embedding_func,
-                appearing_items=items,
+                embedding_items=items,
                 placeholder_tensor=(
                     # use the specified modality token to identify the location to embed
                     placeholder_tokens[Modality.IMAGE]
@@ -333,7 +352,7 @@ def embed_mm_inputs(
             items = [item for item in appearing_items if item.is_audio()]
             embedding, mask = get_embedding_and_mask(
                 data_embedding_func=audio_data_embedding_func,
-                appearing_items=items,
+                embedding_items=items,
                 placeholder_tensor=(
                     placeholder_tokens[Modality.AUDIO]
                     if using_all_items

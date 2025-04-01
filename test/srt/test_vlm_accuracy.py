@@ -236,8 +236,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
                 },
             )
 
-        self.compare_outputs(sglang_output, hf_output)
+            self.compare_outputs(sglang_output, hf_output)
 
-
-if __name__ == "__main__":
-    unittest.main()
+            if __name__ == "__main__":
+                unittest.main()

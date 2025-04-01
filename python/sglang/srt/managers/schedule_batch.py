@@ -247,6 +247,10 @@ class MultimodalDataItem:
                 return tensor_hash([f])
             return data_hash(f)
 
+        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
+        # Please note that if the `input_ids` is later used in the model forward,
+        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
+        # errors in cuda kernels. See also llava.py for example.
         if self.is_audio():
             self.hash = hash_feature(self.audio_feature)
         else:

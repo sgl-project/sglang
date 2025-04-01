@@ -493,6 +493,16 @@ class EmbeddingReqInput:
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
 
+    def contains_mm_input(self) -> bool:
+        def has_valid_data(data) -> bool:
+            if data is None:
+                return False
+            if isinstance(data, list):
+                return any(has_valid_data(item) for item in flatten_nested_list(data))
+            return True
+
+        return has_valid_data(self.image_data)
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:

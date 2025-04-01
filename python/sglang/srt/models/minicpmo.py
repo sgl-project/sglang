@@ -1520,12 +1520,15 @@ class MiniCPMO(MiniCPMBaseModel):
         slice_start_id: int = mm_input.slice_start_id
         slice_end_id: int = mm_input.slice_end_id
 
-        media_token_pairs = [
+        data_token_pairs = [
             (im_start_id, im_end_id),
             (slice_start_id, slice_end_id),
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        data_start_token_ids = [im_start_id, mm_input.audio_start_id]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
+        )
 
         return pattern.pad_input_tokens(input_ids, mm_input)
 
@@ -1824,10 +1827,8 @@ class MiniCPMO(MiniCPMBaseModel):
     ) -> torch.Tensor:
 
         mm_input = forward_batch.merge_mm_inputs()
-        placeholder_token_ids = (
-            ([mm_input.im_token_id] + [item.pad_value for item in mm_input.mm_items])
-            if forward_batch.contains_mm_inputs()
-            else []
+        placeholder_token_id = (
+            mm_input.im_token_id if forward_batch.contains_mm_inputs() else None
         )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

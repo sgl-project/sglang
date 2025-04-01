@@ -1651,7 +1651,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                 return position_ids, mrope_position_deltas
         except Exception as e:
-            logger.info("Please consider disabling chunked_prefill")
+            logger.info(f"Please consider disabling chunked_prefill: {e}")
             raise
 
     @staticmethod

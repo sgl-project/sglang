@@ -54,29 +54,7 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_single_image_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe this image in a very short sentence.",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-        )
-
+    def verify_single_image_response(self, response):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
@@ -100,6 +78,31 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.prompt_tokens > 0
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a very short sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        self.verify_single_image_response(response=response)
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -723,7 +726,7 @@ class TestKimiVLServer(TestOpenAIVisionServer):
 class TestOpenAIOmniServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
+        cls.model = "Qwen/Qwen2.5-Omni-7B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -733,9 +736,9 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--chat-template",
-                "minicpmo",
+                "qwen2-5-o",
                 "--mem-fraction-static",
-                "0.7",
+                "0.5",
                 "--tp=2",
             ],
         )
@@ -787,6 +790,14 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
 
         return audio_response
 
+    def verify_speech_recognition_response(self, text):
+        text = text.lower()
+        assert "thank you" in text
+        assert "it's a privilege to be here" in text
+        assert "leader" in text
+        assert "science" in text
+        assert "art" in text
+
     def _test_audio_speech_completion(self):
         # a fragment of Trump's speech
         audio_response = self.get_audio_response(
@@ -795,11 +806,7 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
             "Repeat what does the person say in the audio",
             category="speech",
         )
-        assert "thank you" in audio_response
-        assert "it's a privilege to be here" in audio_response
-        assert "leader" in audio_response
-        assert "science" in audio_response
-        assert "art" in audio_response
+        self.verify_speech_recognition_response(audio_response)
 
     def _test_audio_ambient_completion(self):
         # bird song
@@ -814,11 +821,49 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
         self._test_audio_speech_completion()
         self._test_audio_ambient_completion()
 
+    def test_mixed_modality_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Here is an image and audio. Please first describe the image in a very short sentence, and then repeat the exact words from the audio",
+                    },
+                ],
+            },
+        ]
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
 
-class TestQwen2_5_oServer(TestOpenAIOmniServer):
+        text = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"Mixed modality response:\n{text}")
+        print("-" * 30)
+
+        self.verify_single_image_response(response=response)
+        self.verify_speech_recognition_response(text=text)
+
+
+class TestMinicpmoServer(TestOpenAIOmniServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-Omni-7B"
+        cls.model = "openbmb/MiniCPM-o-2_6"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -828,13 +873,50 @@ class TestQwen2_5_oServer(TestOpenAIOmniServer):
             other_args=[
                 "--trust-remote-code",
                 "--chat-template",
-                "qwen2-5-o",
+                "minicpmo",
                 "--mem-fraction-static",
-                "0.5",
-                "--tp=2",
+                "0.7",
+                # "--tp=2",
             ],
         )
         cls.base_url += "/v1"
+
+    def test_mixed_modality_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    },
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Here is an image and audio. Please first describe the image in a very short sentence, and then repeat exactly the person says in the audio",
+                    },
+                ],
+            },
+        ]
+        response = client.chat.completions.create(
+            model="default",
+            messages=messages,
+            temperature=0,
+            max_tokens=128,
+            stream=False,
+        )
+
+        text = response.choices[0].message.content
+
+        print("-" * 30)
+        print(f"Mixed modality response:\n{text}")
+        print("-" * 30)
+
+        self.verify_single_image_response(response=response)
 
 
 if __name__ == "__main__":

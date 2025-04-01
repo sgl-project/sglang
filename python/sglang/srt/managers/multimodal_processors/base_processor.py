@@ -265,6 +265,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
         )
         # Process results
+        image_index, audio_index = 0, 0
         image_sizes, images, audios = [], [], []
         new_text = ""
         task_ptr = 0
@@ -282,8 +283,11 @@ class BaseMultimodalProcessor(ABC):
                         images += frames
                         new_text += multimodal_tokens.image_token * len(frames)
                 elif task_type == Modality.AUDIO:
-                    # audio
-                    audios.append(result)
+                    # load as audio
+                    audio_file = audio_data[audio_index]
+                    audio = load_audio(audio_file)
+                    audios += [audio]
+                    audio_index += 1
                     new_text += multimodal_tokens.audio_token
                 # TODO: handle video
             else:
