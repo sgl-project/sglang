@@ -488,7 +488,8 @@ class Qwen2MoeForCausalLM(nn.Module):
         return ModelExpertMetadata(
             num_layers=self.config.num_hidden_layers,
             num_logical_experts=self.config.num_experts,
-            num_local_physical_experts=TODO,
+            # TODO handle more complex cases like duplicating experts on different GPUs
+            num_local_physical_experts=self.config.num_experts // get_tensor_model_parallel_world_size(),
         )
 
 EntryClass = Qwen2MoeForCausalLM
