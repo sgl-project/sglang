@@ -112,6 +112,7 @@ class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
         torch.cuda.synchronize()
         for i in topk_ids_list:
             self._expert_distribution_record[layer_idx].append(tuple(i))
+        self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
 
 # TODO Will have a `_DeepepLowLatencyGatherer` after low-latency DeepEP is ready
