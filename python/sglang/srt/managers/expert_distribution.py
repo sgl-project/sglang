@@ -2,7 +2,7 @@ import logging
 from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Dict, List, Tuple
+from typing import List
 
 import torch
 from sglang.srt.utils import Withable
@@ -18,14 +18,6 @@ class _ExpertDistributionRecorder:
         self._current_layer_idx = Withable()
         self._forward_gatherer: _ForwardGatherer = TODO
         self._accumulator: _Accumulator = TODO
-
-        # TODO
-        # the length of the dictionary is the number of layers
-        # the length of the list is the number of tokens
-        # the length of the tuple is topk's k value
-        self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(
-            list
-        )
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -58,7 +50,8 @@ class _ExpertDistributionRecorder:
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
         self._recording = False
-        self._expert_distribution_record.clear()
+        self._forward_gatherer.reset()
+        self._accumulator.reset()
         assert self._current_layer_idx.value is None
 
     def start_record(self):
@@ -154,14 +147,23 @@ class _Accumulator(ABC):
     def append(self, forward_pass_data: torch.Tensor):
         raise NotImplementedError
 
+    def reset(self):
+        raise NotImplementedError
+
 
 class _DetailAccumulator(_Accumulator):
     def append(self, forward_pass_data: torch.Tensor):
         TODO
 
+    def reset(self):
+        TODO
+
 
 class _StatAccumulator(_Accumulator):
     def append(self, forward_pass_data: torch.Tensor):
+        TODO
+
+    def reset(self):
         TODO
 
 
