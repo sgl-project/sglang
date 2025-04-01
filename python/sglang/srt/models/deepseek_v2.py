@@ -1245,6 +1245,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     def get_forward_tbo_operations(self, forward_mode: ForwardMode):
         if forward_mode == ForwardMode.EXTEND:
             return [
+                two_batch_overlap.AnnotationOperation(debug_name=f"L{self.layer_id}"),
                 self._forward_tbo_op_input_layernorm,
                 self._forward_tbo_op_prefill_attn,
                 self._forward_tbo_op_post_attn_layernorm,
@@ -1261,6 +1262,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             ]
         elif forward_mode == ForwardMode.DECODE:
             return [
+                two_batch_overlap.AnnotationOperation(debug_name=f"L{self.layer_id}"),
                 self._forward_tbo_op_input_layernorm,
                 self._forward_tbo_op_decode_attn_0,
                 two_batch_overlap.YieldOperation(),
