@@ -228,6 +228,7 @@ class _DetailAccumulator(_Accumulator):
         self._records.append(dict(
             forward_pass_id=forward_pass_id,
             rank=TODO,
+            gatherer_key=gatherer_key,
             physical_count=single_pass_physical_count.tolist(),
         ))
 
