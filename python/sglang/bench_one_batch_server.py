@@ -25,7 +25,6 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
-
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -47,6 +46,7 @@ class BenchArgs:
     profile_record_shapes: bool = False
     profile_skip_cases: int = 0
     enable_expert_distribution_recorder: bool = False
+    expert_distribution_recorder_dir: str = "/tmp"
     seed: int = 1
 
     @staticmethod
@@ -70,7 +70,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -88,6 +88,8 @@ class BenchArgs:
             type=int,
             default=BenchArgs.enable_expert_distribution_recorder,
         )
+        parser.add_argument("--expert-distribution-recorder-dir", type=str,
+                            default=BenchArgs.expert_distribution_recorder_dir)
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
@@ -204,11 +206,11 @@ def run_one_case(
             fout.write(json.dumps(res) + "\n")
 
 
-def _process_expert_distribution_record(response):
+def _process_expert_distribution_record(bench_args, response):
     response.raise_for_status()
     data = response.json()
     (
-        Path(os.environ["SGLANG_TORCH_PROFILER_DIR"]) / "expert_distribution.json"
+        Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
     ).write_text(json.dumps(data))
     # TODO more
 
@@ -279,6 +281,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 base_url + "/stop_expert_distribution_record"
             ).raise_for_status()
             _process_expert_distribution_record(
+                bench_args,
                 requests.post(base_url + "/dump_expert_distribution_record")
             )
     finally:
