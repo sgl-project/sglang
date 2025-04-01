@@ -248,6 +248,23 @@ void int8_scaled_mm_kernel_impl(
 
 } // anonymous namespace
 
+// tinygemm interface
+template <typename scalar_t>
+void tinygemm_kernel(const uint8_t* __restrict__ A, const int8_t* __restrict__ B, scalar_t* __restrict__ C,
+    int32_t* __restrict__ Ctmp,  const float* __restrict__ As, const float* __restrict__ Bs,
+    int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, bool brg) {
+  tinygemm_kernel<scalar_t, false>(A, B, C, Ctmp, As, Bs, nullptr, M, N, K, lda, ldb, ldc, brg);
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)                                                     \
+    template void tinygemm_kernel<TYPE>(                                                        \
+        const uint8_t* __restrict__ A, const int8_t* __restrict__ B, TYPE* __restrict__ C,      \
+        int32_t* __restrict__ Ctmp, const float* __restrict__ As, const float* __restrict__ Bs, \
+        int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, bool brg)
+
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
+
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A) {
   RECORD_FUNCTION("sgl-kernel::per_token_quant_int8_cpu", std::vector<c10::IValue>({A}));
 
