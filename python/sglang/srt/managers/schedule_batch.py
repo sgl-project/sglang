@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum, auto
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 # Copyright 2023-2024 SGLang Team

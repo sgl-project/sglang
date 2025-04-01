@@ -998,7 +998,9 @@ class ModelRunner:
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
         with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
-            with fine_grained_benchmark.maybe_benchmark(forward_batch, self.tp_rank, self.forward_pass_id):
+            with fine_grained_benchmark.maybe_benchmark(
+                forward_batch, self.tp_rank, self.forward_pass_id
+            ):
                 return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(

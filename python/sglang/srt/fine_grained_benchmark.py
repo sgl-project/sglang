@@ -27,7 +27,11 @@ def is_enabled():
 
 
 def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int):
-    return benchmark(forward_batch, tp_rank, forward_pass_id) if is_enabled() else nullcontext()
+    return (
+        benchmark(forward_batch, tp_rank, forward_pass_id)
+        if is_enabled()
+        else nullcontext()
+    )
 
 
 @contextmanager

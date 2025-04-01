@@ -1,5 +1,5 @@
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 
 try:
     from deep_ep import Buffer

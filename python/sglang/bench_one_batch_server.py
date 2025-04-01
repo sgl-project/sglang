@@ -25,6 +25,7 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -69,7 +70,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -83,7 +84,9 @@ class BenchArgs:
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
         )
         parser.add_argument(
-            "--enable-expert-distribution-recorder", type=int, default=BenchArgs.enable_expert_distribution_recorder
+            "--enable-expert-distribution-recorder",
+            type=int,
+            default=BenchArgs.enable_expert_distribution_recorder,
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
@@ -204,7 +207,9 @@ def run_one_case(
 def _process_expert_distribution_record(response):
     response.raise_for_status()
     data = response.json()
-    (Path(os.environ["SGLANG_TORCH_PROFILER_DIR"]) / 'expert_distribution.json').write_text(json.dumps(data))
+    (
+        Path(os.environ["SGLANG_TORCH_PROFILER_DIR"]) / "expert_distribution.json"
+    ).write_text(json.dumps(data))
     # TODO more
 
 
@@ -248,8 +253,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 #         "record_shapes": bench_args.profile_record_shapes,
                 #     },
                 # ).raise_for_status()
-            if bench_args.enable_expert_distribution_recorder and index == bench_args.profile_skip_cases:
-                requests.post(base_url + "/start_expert_distribution_record").raise_for_status()
+            if (
+                bench_args.enable_expert_distribution_recorder
+                and index == bench_args.profile_skip_cases
+            ):
+                requests.post(
+                    base_url + "/start_expert_distribution_record"
+                ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -265,8 +275,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             # print("Execute stop_profile")
             # requests.post(base_url + "/stop_profile").raise_for_status()
         if bench_args.enable_expert_distribution_recorder:
-            requests.post(base_url + "/stop_expert_distribution_record").raise_for_status()
-            _process_expert_distribution_record(requests.post(base_url + "/dump_expert_distribution_record"))
+            requests.post(
+                base_url + "/stop_expert_distribution_record"
+            ).raise_for_status()
+            _process_expert_distribution_record(
+                requests.post(base_url + "/dump_expert_distribution_record")
+            )
     finally:
         if proc:
             kill_process_tree(proc.pid)
