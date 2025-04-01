@@ -217,8 +217,8 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 class _Accumulator(ABC):
     @staticmethod
-    def init_new(**kwargs) -> "_Accumulator":
-        return _Accumulator.get_class()(**kwargs)
+    def init_new(*args, **kwargs) -> "_Accumulator":
+        return _Accumulator.get_class()(*args, **kwargs)
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
