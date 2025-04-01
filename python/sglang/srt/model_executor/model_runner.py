@@ -44,8 +44,7 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ExpertDistributionRecorder, \
-    ModelExpertMetadata
+from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ExpertDistributionRecorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
@@ -985,7 +984,7 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
-        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
+        with global_expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
             return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool) -> LogitsProcessorOutput:
