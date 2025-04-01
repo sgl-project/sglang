@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import List, Optional, Union
+from typing import List, Union
 
 import torch
 from PIL import Image
@@ -62,15 +62,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+
+        print(f"{request_obj=}")
+
         if isinstance(image_data, str):
             image_data = [image_data]
         audio_data = request_obj.audio_data
-        is_omni = self.arch == Qwen2_5OmniModel.__name__
-        if audio_data and is_omni:
-            # refer to https://github.com/huggingface/transformers/blob/5efaed689114030ffaf51c02f6f82adcbfc72389/src/transformers/models/qwen2_5_omni/processing_qwen2_5_omni.py#L289
-            prompt = prompt.replace(
-                QWEN_DEFAULT_SYSTEM_PROMPT, QWEN_AUDIO_SYSTEM_PROMPT, 1
-            )
+
         base_output = self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
@@ -82,6 +80,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             max_req_input_len=max_req_input_len,
         )
+        print(f"11 {base_output=}")
 
         def smart_resize(
             height: int,
@@ -148,12 +147,14 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if base_output.images:
             resize_tasks = [resize_image_async(image) for image in resized_images]
             resized_images = await asyncio.gather(*resize_tasks)
-
+        print(f"{base_output=}")
         res = self.process_mm_data(
             input_text=base_output.input_text,
             images=resized_images,
             audios=base_output.audios,
         )
+
+        print(f"{res=}")
 
         items = []
 
@@ -174,7 +175,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 modality=Modality.AUDIO,
             )
             items += [item]
-
         return {
             "input_ids": res["input_ids"].flatten().tolist(),
             "mm_items": items,
