@@ -27,6 +27,9 @@ class TestExpertDistribution(CustomTestCase):
             os.remove(f)
 
     def test_expert_distribution_record(self):
+        self._execute_core()
+
+    def _execute_core(self):
         """Test expert distribution record endpoints"""
         process = popen_launch_server(
             # The feature is only implemented in deepseek_v2.py
