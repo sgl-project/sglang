@@ -999,8 +999,9 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
 
-            if state.obj.log_metrics:
-                self.update_prefill_metrics(state, recv_obj, i)
+            if self.enable_metrics or self.log_requests:
+                if state.first_token_time == 0.0:
+                    self.update_prefill_metrics(state, recv_obj, i)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
@@ -1008,7 +1009,7 @@ class TokenizerManager:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
-                if state.obj.log_metrics:
+                if self.log_requests:
                     meta_info['time_to_first_token'] = state.first_token_time - state.created_time
                     meta_info['time_in_queue'] = state.first_scheduled_time - state.add_queue_time
                     meta_info['time_for_input_process'] = state.add_queue_time - state.created_time
