@@ -6,7 +6,7 @@ from typing import List, Type
 
 import torch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable
+from sglang.srt.utils import Withable, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class _Accumulator(ABC):
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
-        if TODO:
+        if get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"):
             return _DetailAccumulator
         return _StatAccumulator
 
