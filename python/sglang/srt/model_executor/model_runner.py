@@ -181,6 +181,13 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
+        self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
+        expert_distribution_recorder.initialize(
+            server_args, self.expert_location_metadata,
+            # TODO handle DP!=TP case
+            rank=self.tp_rank,
+        )
+
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
@@ -215,13 +222,6 @@ class ModelRunner:
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
-
-        self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
-        expert_distribution_recorder.initialize(
-            server_args, self.expert_location_metadata,
-            # TODO handle DP!=TP case
-            rank=self.tp_rank,
-        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
