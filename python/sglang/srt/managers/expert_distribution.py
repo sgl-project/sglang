@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata"):
+    def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata", rank: int):
         self._recording = False
         self._current_layer_idx = Withable()
         self._metadata = metadata
-        self._accumulator = _Accumulator.init_new(metadata)
+        self._accumulator = _Accumulator.init_new(metadata, rank)
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, metadata)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -181,8 +181,8 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 class _Accumulator(ABC):
     @staticmethod
-    def init_new(metadata: "ModelExpertMetadata") -> "_Accumulator":
-        return _Accumulator.get_class()(metadata)
+    def init_new(metadata: "ModelExpertMetadata", rank: int) -> "_Accumulator":
+        return _Accumulator.get_class()(metadata, rank)
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
@@ -190,8 +190,9 @@ class _Accumulator(ABC):
             return _DetailAccumulator
         return _StatAccumulator
 
-    def __init__(self, metadata: "ModelExpertMetadata"):
+    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
         self._metadata = metadata
+        self._rank = rank
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -242,7 +243,7 @@ class _DetailAccumulator(_Accumulator):
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
             forward_pass_id=forward_pass_id,
-            rank=TODO,
+            rank=self._rank,
             gatherer_key=gatherer_key,
             physical_count=single_pass_physical_count.tolist(),
         ))
@@ -282,7 +283,7 @@ class _StatAccumulator(_Accumulator):
 
     def dump(self):
         return dict(
-            rank=TODO,
+            rank=self._rank,
             physical_count=self._physical_count.tolist(),
         )
 
