@@ -9,8 +9,9 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# global expert distribution recording
 class ExpertDistributionRecorder:
+    """Global expert distribution recording"""
+
     # This class is a singleton class
     def __new__(cls):
         if not hasattr(cls, "instance"):
