@@ -131,6 +131,7 @@ class DeepEPDispatcher:
             num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
             https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
             """
+            # TODO(ch-wan): allow users to set this value
             self.num_max_dispatch_tokens_per_rank = 128
             self.buffer_low_latency = get_buffer_low_latency(
                 self.group,
@@ -262,6 +263,9 @@ class DeepEPDispatcher:
             allocate_on_comm_stream=previous_event is not None,
         )
 
+        # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
+        # However, doing this would incur an unknown synchronization error, but keeping
+        # `handle` as a member variable works.
         (
             recv_x,
             recv_topk_idx,
