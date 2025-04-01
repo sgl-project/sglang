@@ -28,12 +28,13 @@ class ExpertLocationMetadata:
             num_layers=num_layers,
             num_logical_experts=num_local_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
+            physical_to_logical_map=_create_vanilla_physical_to_logical_map(),
         )
 
     @staticmethod
     def _init_dummy():
-        return ExpertLocationMetadata(
-            num_layers=1,
-            num_local_physical_experts=1,
-            num_logical_experts=1,
-        )
+        return ExpertLocationMetadata.init_new(num_layers=1, num_logical_experts=1)
+
+
+def _create_vanilla_physical_to_logical_map():
+    return TODO
