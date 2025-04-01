@@ -57,7 +57,8 @@ class ExpertDistributionRecorder:
         logger.info("Resetting ExpertDistributionRecorder...")
         self._recording = False
         assert self._current_layer_idx.value is None
-        self._single_pass_gatherer.reset()
+        for gatherer in self._single_pass_gatherers.values():
+            gatherer.reset()
         self._accumulator.reset()
 
     def start_record(self):
