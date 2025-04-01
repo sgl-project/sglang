@@ -124,6 +124,8 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
+        self.forward_pass_id = 0
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -971,7 +973,8 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
-        with expert_distribution_recorder.with_forward_pass(forward_pass_id):
+        self.forward_pass_id += 1
+        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
             return self._forward_raw(forward_batch, skip_attn_backend_init)
 
     def _forward_raw(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool) -> LogitsProcessorOutput:
