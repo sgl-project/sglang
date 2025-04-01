@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
-class ExpertDistributionRecorder:
+class _ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
     def initialize(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
@@ -42,6 +42,8 @@ class ExpertDistributionRecorder:
             self._on_forward_pass_end(forward_pass_id)
 
     def _on_forward_pass_end(self, forward_pass_id: int):
+        if not self._recording:
+            return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_physical_count = gatherer.collect()
             self._accumulator.append(forward_pass_id, gatherer_key, single_pass_physical_count)
@@ -93,7 +95,7 @@ class ExpertDistributionRecorder:
         return output
 
 
-expert_distribution_recorder = ExpertDistributionRecorder()
+expert_distribution_recorder = _ExpertDistributionRecorder()
 
 
 def postprocess_dumps(physical_dumps: List[Any], expert_location_metadata: "ExpertLocationMetadata"):
