@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -163,7 +164,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -183,7 +184,8 @@ class ModelRunner:
 
         self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
         expert_distribution_recorder.initialize(
-            server_args, self.expert_location_metadata,
+            server_args,
+            self.expert_location_metadata,
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )
@@ -904,7 +906,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -985,7 +987,9 @@ class ModelRunner:
         with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
             return self._forward_raw(forward_batch, skip_attn_backend_init)
 
-    def _forward_raw(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool) -> LogitsProcessorOutput:
+    def _forward_raw(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
+    ) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner

@@ -24,7 +24,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 
-
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 
@@ -21,7 +22,9 @@ class ExpertLocationMetadata:
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
         # TODO handle more complex cases like duplicating experts on different GPUs
-        num_local_physical_experts = num_logical_experts // get_tensor_model_parallel_world_size()
+        num_local_physical_experts = (
+            num_logical_experts // get_tensor_model_parallel_world_size()
+        )
         num_physical_experts = num_logical_experts
 
         return ExpertLocationMetadata(

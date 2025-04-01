@@ -43,7 +43,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union, TypeVar, Generic
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -1835,7 +1847,8 @@ def flatten_nested_list(nested_list):
     else:
         return [nested_list]
 
-T = TypeVar('T')
+
+T = TypeVar("T")
 
 
 class Withable(Generic[T]):
@@ -1855,4 +1868,3 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
-

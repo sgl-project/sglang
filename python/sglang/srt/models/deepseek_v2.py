@@ -1498,6 +1498,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_logical_experts=self.config.n_routed_experts,
         )
 
+
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
