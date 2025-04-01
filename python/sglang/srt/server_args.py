@@ -225,6 +225,9 @@ class ServerArgs:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
 
+        if is_hip():
+            self.disable_shared_experts_fusion = True
+
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
