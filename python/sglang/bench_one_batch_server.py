@@ -209,7 +209,7 @@ def _process_expert_distribution_record(bench_args, response):
     response.raise_for_status()
     data = response.json()
     path = Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
-    print(f"Write expert_distribution_recorder information to {path}")
+    print(f"Write expert_distribution_recorder information to {path}", flush=True)
     path.write_text(json.dumps(data))
 
     import polars as pl
@@ -227,7 +227,7 @@ def _process_expert_distribution_record(bench_args, response):
     df = df.select('forward_pass_id', 'layer_id', 'gatherer_key', 'rank', 'total_num_tokens', 'max_expert_num_tokens',
                    'min_expert_num_tokens', 'physical_count')
     with pl.Config(fmt_str_lengths=1000, tbl_cols=-1, tbl_rows=-1, fmt_table_cell_list_len=1000, tbl_width_chars=-1):
-        print(df)
+        print(df, flush=True)
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
