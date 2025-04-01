@@ -523,7 +523,6 @@ class ForwardBatch:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
-            "image_inputs",
             "lora_paths",
         ]:
             old_value = getattr(self, key)
