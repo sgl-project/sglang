@@ -45,6 +45,7 @@ class BenchArgs:
     profile_with_stack: bool = False
     profile_record_shapes: bool = False
     profile_skip_cases: int = 0
+    enable_expert_distribution_recorder: bool = False
     seed: int = 1
 
     @staticmethod
@@ -80,6 +81,9 @@ class BenchArgs:
         parser.add_argument("--profile-record-shapes", action="store_true")
         parser.add_argument(
             "--profile-skip-cases", type=int, default=BenchArgs.profile_skip_cases
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-recorder", type=int, default=BenchArgs.enable_expert_distribution_recorder
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
