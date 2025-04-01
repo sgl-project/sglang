@@ -18,6 +18,7 @@ class _ExpertDistributionRecorder:
         self._recording = False
         self._current_layer_idx = Withable()
         self._forward_gatherer: _ForwardGatherer = TODO
+        self._accumulator: _Accumulator = TODO
 
         # TODO
         # the length of the dictionary is the number of layers
