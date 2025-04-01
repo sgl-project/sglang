@@ -15,7 +15,7 @@ class _ExpertDistributionRecorder:
 
     def __init__(self):
         self._recording = False
-        self._current_layer_id = Withable()
+        self._current_layer_idx = Withable()
         self._forward_gatherer: _ForwardGatherer = TODO
 
         # TODO
@@ -27,19 +27,19 @@ class _ExpertDistributionRecorder:
         )
 
     def with_current_layer(self, layer_idx):
-        return self._current_layer_id.with_value(layer_idx)
+        return self._current_layer_idx.with_value(layer_idx)
 
     def on_select_experts(self, topk_ids):
         if not self._recording:
             return
-        self._forward_gatherer.on_select_experts(topk_ids)
+        self._forward_gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
 
     def reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
         self._recording = False
         self._expert_distribution_record.clear()
-        assert self._current_layer_id.value is None
+        assert self._current_layer_idx.value is None
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
@@ -78,16 +78,16 @@ class _ExpertDistributionRecorder:
 
 
 class _ForwardGatherer(ABC):
-    def on_select_experts(self, topk_ids):
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
 
 
 class _SelectExpertsGatherer(_ForwardGatherer):
-    def on_select_experts(self, topk_ids):
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
         for i in topk_ids_list:
-            self._expert_distribution_record[self._current_layer_id.value].append(tuple(i))
+            self._expert_distribution_record[layer_idx].append(tuple(i))
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
