@@ -1366,7 +1366,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                             f".{suffix}", weights_dict[
                                 f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"]
                             .clone()))
-                        weights_dict.pop(f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}")
             weights = weights_list
         
         # Params for weights, fp8 weight scales, fp8 activation scales
