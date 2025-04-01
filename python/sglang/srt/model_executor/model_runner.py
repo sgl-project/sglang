@@ -44,7 +44,7 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder, ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -214,6 +214,10 @@ class ModelRunner:
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
+
+        self.expert_distribution_recorder = ExpertDistributionRecorder()
+        global global_expert_distribution_recorder
+        global_expert_distribution_recorder = self.expert_distribution_recorder
 
     def model_specific_adjustment(self):
         server_args = self.server_args

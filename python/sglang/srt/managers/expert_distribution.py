@@ -2,7 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import List, Type, Any
+from typing import List, Type, Any, Optional
 
 import torch
 from sglang.srt.server_args import ServerArgs
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
-class _ExpertDistributionRecorder:
+class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
     def __init__(self):
@@ -80,7 +80,7 @@ class _ExpertDistributionRecorder:
         return output
 
 
-expert_distribution_recorder = _ExpertDistributionRecorder()
+global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 
 def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
