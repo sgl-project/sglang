@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import random
 import time
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -201,7 +202,10 @@ def run_one_case(
 
 
 def _process_expert_distribution_record(response):
-    TODO
+    response.raise_for_status()
+    data = response.json()
+    (Path(os.environ["SGLANG_TORCH_PROFILER_DIR"]) / 'expert_distribution.json').write_text(json.dumps(data))
+    # TODO more
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
