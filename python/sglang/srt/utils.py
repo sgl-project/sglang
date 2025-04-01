@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import builtins
 import ctypes
@@ -35,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
@@ -53,6 +53,7 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from decord import VideoReader, cpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -512,13 +513,18 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     import soundfile as sf
     from scipy.signal import resample
 
-    # print(f"loading {audio_file}")
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
         audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -534,6 +540,30 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
         audio = np.mean(audio, axis=1)
 
     return audio
+
+
+def encode_video(video_path, frame_count_limit=None):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
 
 
 def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
@@ -563,6 +593,10 @@ def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
 
 
 def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -576,10 +610,6 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -1602,6 +1632,7 @@ def get_ip() -> str:
 def get_open_port() -> int:
     port = os.getenv("SGLANG_PORT")
     if port is not None:
+        port = int(port)
         while True:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1628,6 +1659,38 @@ def is_valid_ipv6_address(address: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def configure_ipv6(dist_init_addr):
+    addr = dist_init_addr
+    end = addr.find("]")
+    if end == -1:
+        raise ValueError("invalid IPv6 address format: missing ']'")
+
+    host = addr[: end + 1]
+
+    # this only validates the address without brackets: we still need the below checks.
+    # if it's invalid, immediately raise an error so we know it's not formatting issues.
+    if not is_valid_ipv6_address(host[1:end]):
+        raise ValueError(f"invalid IPv6 address: {host}")
+
+    port_str = None
+    if len(addr) > end + 1:
+        if addr[end + 1] == ":":
+            port_str = addr[end + 2 :]
+        else:
+            raise ValueError("received IPv6 address format: expected ':' after ']'")
+
+    if not port_str:
+        raise ValueError(
+            "a port must be specified in IPv6 address (format: [ipv6]:port)"
+        )
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
+    return port, host
 
 
 def rank0_print(msg: str):
@@ -1733,3 +1796,41 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+def retry(
+    fn,
+    max_retry: int,
+    initial_delay: float = 2.0,
+    max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
+):
+    for try_index in itertools.count():
+        try:
+            return fn()
+        except Exception as e:
+            if try_index >= max_retry:
+                raise Exception(f"retry() exceed maximum number of retries.")
+
+            if not should_retry(e):
+                raise Exception(f"retry() observe errors that should not be retried.")
+
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
+
+            logger.warning(
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+            )
+            traceback.print_exc()
+
+            time.sleep(delay)
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
