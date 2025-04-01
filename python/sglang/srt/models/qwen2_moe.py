@@ -41,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder
+from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ModelExpertMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
@@ -484,5 +484,10 @@ class Qwen2MoeForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
+    def get_model_expert_metadata(self):
+        return ModelExpertMetadata.init_new(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+        )
 
 EntryClass = Qwen2MoeForCausalLM

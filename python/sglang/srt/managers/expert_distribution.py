@@ -10,7 +10,6 @@ from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
-from transformers import Qwen2MoeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -301,22 +300,11 @@ class ModelExpertMetadata:
 
     @staticmethod
     def from_model(model):
-        config = model.config
-        if isinstance(config, DeepseekV2Config):
-            return ModelExpertMetadata._init_new(
-                num_layers=config.num_hidden_layers,
-                num_logical_experts=config.n_routed_experts,
-            )
-        # TODO is it this class?
-        if isinstance(config, Qwen2MoeConfig):
-            return ModelExpertMetadata._init_new(
-                num_layers=config.num_hidden_layers,
-                num_logical_experts=config.num_experts,
-            )
+        return TDO
         return ModelExpertMetadata._init_dummy()
 
     @staticmethod
-    def _init_new(
+    def init_new(
         num_layers: int,
         num_logical_experts: int,
     ):
