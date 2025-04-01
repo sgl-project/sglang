@@ -162,7 +162,9 @@ class _Accumulator(ABC):
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
-        return TODO
+        if TODO:
+            return _DetailAccumulator
+        return _StatAccumulator
 
     def append(self, single_pass_physical_count: torch.Tensor):
         raise NotImplementedError
