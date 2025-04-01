@@ -163,7 +163,7 @@ class HiPAttentionBackend(AttentionBackend):
             offloading_metadata=offloading_metadata,
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -258,4 +258,4 @@ class HiPAttentionBackend(AttentionBackend):
         if self.is_kv_cache_offload_enabled:
             offload_cache.handle_cache_miss(metadata)
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
