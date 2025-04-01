@@ -219,7 +219,7 @@ class ModelRunner:
 
         self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
         self.expert_distribution_recorder = ExpertDistributionRecorder(
-            server_args, expert_location_metadata,
+            server_args, self.expert_location_metadata,
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )
