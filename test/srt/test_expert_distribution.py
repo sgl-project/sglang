@@ -79,6 +79,12 @@ class TestExpertDistribution(CustomTestCase):
 
             # Check data rows
             data = response.json()
+
+            if mode_detail:
+                TODO
+            else:
+                TODO
+
             self.assertGreater(len(rows), 0, "CSV file should contain data rows")
 
             for row in rows:
