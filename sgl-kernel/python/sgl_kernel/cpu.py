@@ -31,6 +31,9 @@ def decode_attention(
     k_buffer,
     v_buffer,
     o,
+    key,
+    value,
+    loc,
     kv_indptr,
     kv_indices,
     seq_lens,
@@ -40,9 +43,12 @@ def decode_attention(
 ):
     sgl_kernel.common_ops.decode_attention_cpu(
         q,
-        o,
         k_buffer,
         v_buffer,
+        o,
+        key,
+        value,
+        loc,
         attn_logits,
         kv_indptr,
         kv_indices,
