@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import List, Type, Any, Optional
 
 import torch
+from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
+from transformers import Qwen2MoeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -298,8 +300,18 @@ class ModelExpertMetadata:
 
     @staticmethod
     def from_model(model):
-        return ModelExpertMetadata(
-            num_layers=TODO,
-            num_local_physical_experts=TODO,
-            num_logical_experts=TODO,
-        )
+        config = model.config
+        if isinstance(config, DeepseekV2Config):
+            return ModelExpertMetadata(
+                num_layers=TODO,
+                num_local_physical_experts=TODO,
+                num_logical_experts=TODO,
+            )
+        # TODO is it this class?
+        if isinstance(config, Qwen2MoeConfig):
+            return ModelExpertMetadata(
+                num_layers=TODO,
+                num_local_physical_experts=TODO,
+                num_logical_experts=TODO,
+            )
+        return None
