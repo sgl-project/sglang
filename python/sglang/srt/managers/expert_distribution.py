@@ -20,6 +20,7 @@ class ExpertDistributionRecorder:
     def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata", rank: int):
         self._recording = False
         self._current_layer_idx = Withable()
+        self._current_debug_name = Withable()
         self._metadata = metadata
         self._accumulator = _Accumulator.init_new(metadata, rank)
         self._single_pass_gatherers = {
@@ -29,6 +30,9 @@ class ExpertDistributionRecorder:
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
+
+    def with_debug_name(self, debug_name):
+        return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int):
@@ -46,13 +50,15 @@ class ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
             return
-        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key(debug_name)]
+        gatherer = self._single_pass_gatherers[
+            self._accumulator.get_single_pass_gatherer_key(self._current_debug_name.value)]
         gatherer.on_select_experts(layer_idx=self._current_layer_idx.value, topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(self, num_recv_tokens_per_expert_list: List[int]):
         if not self._recording:
             return
-        gatherer = self._single_pass_gatherers[self._accumulator.get_single_pass_gatherer_key(debug_name)]
+        gatherer = self._single_pass_gatherers[
+            self._accumulator.get_single_pass_gatherer_key(self._current_debug_name.value)]
         gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
     def _reset(self):
@@ -197,7 +203,7 @@ class _Accumulator(ABC):
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
 
-    def get_single_pass_gatherer_key(self, debug_name: str):
+    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
         return _SINGLE_PASS_GATHERER_KEY_PRIMARY
 
     @classmethod
@@ -235,9 +241,9 @@ class _DetailAccumulator(_Accumulator):
             return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
         return super().get_single_pass_gatherer_keys()
 
-    def get_single_pass_gatherer_key(self, debug_name: str):
+    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
         if False:  # TODO `server_args.enable_two_batch_overlap`
-            return debug_name
+            return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
         return super().get_single_pass_gatherer_key(debug_name)
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
