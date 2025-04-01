@@ -7,6 +7,7 @@ from typing import List, Type, Any, Optional
 
 import torch
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
 from transformers import Qwen2MoeConfig
@@ -322,7 +323,8 @@ class ModelExpertMetadata:
         return ModelExpertMetadata(
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
-            num_local_physical_experts=TODO,
+            # TODO handle more complex cases, e.g. duplicate some experts
+            num_local_physical_experts=num_logical_experts // get_tensor_model_parallel_world_size(),
         )
 
     @staticmethod
