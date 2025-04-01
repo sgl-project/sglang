@@ -19,7 +19,7 @@ class _ExpertDistributionRecorder:
     def __init__(self):
         self._recording = False
         self._current_layer_idx = Withable()
-        self._single_pass_gatherer = _SinglePassGatherer.init_new()
+        self._single_pass_gatherer = _SinglePassGatherer.init_new(server_args)
         self._accumulator = _Accumulator.init_new()
 
     def with_current_layer(self, layer_idx):
