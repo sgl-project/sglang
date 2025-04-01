@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ModelExpertMetadata
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -1491,8 +1492,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def get_model_expert_metadata(self):
-        return ModelExpertMetadata(
+    def get_expert_location_metadata(self):
+        return ExpertLocationMetadata.init_new(
             num_layers=self.config.num_hidden_layers,
             num_logical_experts=self.config.n_routed_experts,
             # TODO handle more complex cases like duplicating experts on different GPUs

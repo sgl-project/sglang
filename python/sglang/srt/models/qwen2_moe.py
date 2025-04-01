@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ModelExpertMetadata
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
@@ -484,8 +485,8 @@ class Qwen2MoeForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-    def get_model_expert_metadata(self):
-        return ModelExpertMetadata(
+    def get_expert_location_metadata(self):
+        return ExpertLocationMetadata.init_new(
             num_layers=self.config.num_hidden_layers,
             num_logical_experts=self.config.num_experts,
             # TODO handle more complex cases like duplicating experts on different GPUs

@@ -9,9 +9,13 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def from_model(model):
-        if hasattr(model, "get_model_expert_metadata"):
-            return model.get_model_expert_metadata()
+        if hasattr(model, "get_expert_location_metadata"):
+            return model.get_expert_location_metadata()
         return ExpertLocationMetadata._init_dummy()
+
+    @staticmethod
+    def init_new(**kwargs):
+        return ExpertLocationMetadata(**kwargs)
 
     @staticmethod
     def _init_dummy():
