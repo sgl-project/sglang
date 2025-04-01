@@ -26,7 +26,7 @@ def is_enabled():
     return _dir_output is not None
 
 
-def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int):
+def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int):
     return benchmark(forward_batch, tp_rank) if is_enabled() else nullcontext()
 
 
