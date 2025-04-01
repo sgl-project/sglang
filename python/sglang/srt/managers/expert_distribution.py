@@ -112,13 +112,10 @@ class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
 
-        num_recv_tokens_per_expert_list = TODO
-        for i in topk_ids_list:
-            layer_record.append(tuple(i))
-        results[layer_idx] = defaultdict(int)
-        for token_record in layer_record:
+        num_recv_tokens_per_expert_list = [0] * num_local_physical_experts
+        for token_record in topk_ids_list:
             for expert_idx in token_record:
-                results[layer_idx][expert_idx] += 1
+                num_recv_tokens_per_expert_list[expert_idx] += 1
 
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
