@@ -285,12 +285,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.run_name,
                 bench_args.result_filename,
             )
-        if bench_args.profile:
-            # TODO extract to PR
-            print("bench script call cudaProfilerStop")
-            torch.cuda.cudart().cudaProfilerStop()
-            # print("Execute stop_profile")
-            # requests.post(base_url + "/stop_profile").raise_for_status()
         if bench_args.enable_expert_distribution_recorder:
             requests.post(
                 base_url + "/stop_expert_distribution_record"
@@ -299,6 +293,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args,
                 requests.post(base_url + "/dump_expert_distribution_record")
             )
+        if bench_args.profile:
+            # TODO extract to PR
+            print("bench script call cudaProfilerStop")
+            torch.cuda.cudart().cudaProfilerStop()
+            # print("Execute stop_profile")
+            # requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
