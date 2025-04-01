@@ -85,8 +85,7 @@ class BenchArgs:
         )
         parser.add_argument(
             "--enable-expert-distribution-recorder",
-            type=int,
-            default=BenchArgs.enable_expert_distribution_recorder,
+            action="store_true",
         )
         parser.add_argument("--expert-distribution-recorder-dir", type=str,
                             default=BenchArgs.expert_distribution_recorder_dir)
