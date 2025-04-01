@@ -80,6 +80,7 @@ class ExpertDistributionRecorder:
         return output
 
 
+# Put global args for easy access, just like `global_server_args_dict`
 global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 
