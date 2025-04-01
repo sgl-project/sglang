@@ -1,5 +1,4 @@
 import logging
-import time
 from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
@@ -87,14 +86,6 @@ class _ExpertDistributionRecorder:
             for token_record in layer_record:
                 for expert_idx in token_record:
                     results[layer_idx][expert_idx] += 1
-        with open(
-            f"expert_distribution_rank{torch.distributed.get_rank()}_timestamp{time.time()}.csv",
-            "w",
-        ) as fd:
-            fd.write("layer_id,expert_id,count\n")
-            for layer_idx, layer_results in results.items():
-                for expert_idx, count in layer_results.items():
-                    fd.write(f"{layer_idx},{expert_idx},{count}\n")
         self.reset()
 
 
