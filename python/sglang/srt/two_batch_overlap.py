@@ -134,7 +134,7 @@ class ExecutableOperation:
     fn: Callable
 
 
-Operation = Union[YieldOperation, AnnotationOperation, ExecutableOperation, Callable]
+Operation = Union[YieldOperation, AnnotationOperation, Callable]
 Stage = List[Callable]
 
 
@@ -243,16 +243,11 @@ class _StateDict:
 
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
-    operations = [_prepare_operation(op) for op in operations]
     operation_chunks = list(
         _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
     )
     assert all(len(chunk) > 0 for chunk in operation_chunks)
     return operation_chunks
-
-
-def _prepare_operation(op: Operation):
-    if iscal
 
 
 def _chunk_by_separator(
