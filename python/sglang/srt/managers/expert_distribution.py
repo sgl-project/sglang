@@ -20,40 +20,40 @@ class _ExpertDistributionRecorder:
         self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(
             list
         )
-        self._record = False
+        self._recording = False
         self._current_layer_id = Withable()
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_id.with_value(layer_idx)
 
     def on_select_experts(self, topk_ids):
-        if not self._record:
+        if not self._recording:
             return
         TODO
 
     def reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
-        self._record = False
+        self._recording = False
         self._expert_distribution_record.clear()
         assert self._current_layer_id.value is None
 
     def start_record(self):
         """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
-        if self._record:
+        if self._recording:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
         self.reset()
-        self._record = True
+        self._recording = True
 
     def stop_record(self):
         """Stop recording the expert distribution. Set the recording flag to False."""
-        if not self._record:
+        if not self._recording:
             logger.warning(
                 "SGLang server has not been recording expert ids. Did you forget to start recording by sending request to the `/start_expert_distribution_record` endpoint?"
             )
-        self._record = False
+        self._recording = False
 
     def dump_record(self):
         """Dump the expert distribution record to a file. Reset the recorder after dumping."""
