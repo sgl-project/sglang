@@ -75,3 +75,43 @@ else:
 
     def register_graph_buffers(fa, handles, offsets):
         torch.ops.sgl_kernel.register_graph_buffers.default(fa, handles, offsets)
+
+    def custom_all_to_all(fa, output, input, plan_meta, block_size):
+        torch.ops.sgl_kernel.all_to_all.default(
+            fa,
+            output,
+            input,
+            plan_meta,
+            block_size,
+        )
+
+    def custom_all_to_all_plan(
+        fa,
+        output,
+        input,
+        output_split_sizes,
+        input_split_sizes,
+        output_split_offsets,
+        input_split_offsets,
+        plan_meta,
+        block_size,
+    ):
+        if output_split_offsets is None:
+            output_split_offsets = torch.zeros(
+                (0,), dtype=torch.int64, device=input.device
+            )
+        if input_split_offsets is None:
+            input_split_offsets = torch.zeros(
+                (0,), dtype=torch.int64, device=input.device
+            )
+        return torch.ops.sgl_kernel.all_to_all_plan.default(
+            fa,
+            output,
+            input,
+            output_split_sizes,
+            input_split_sizes,
+            output_split_offsets,
+            input_split_offsets,
+            plan_meta,
+            block_size,
+        )

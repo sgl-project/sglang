@@ -35,6 +35,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+  m.def("all_to_all(int fa, Tensor! out, Tensor inp, Tensor plan_meta, int block_size) -> ()");
+  m.impl("all_to_all", torch::kCUDA, &all_to_all);
+
+  m.def(
+      "all_to_all_plan(int fa, Tensor out, Tensor inp, Tensor output_split_sizes, "
+      "Tensor input_split_sizes, Tensor output_split_offsets, Tensor input_split_offsets, "
+      "Tensor !plan_meta, int block_size) -> ()");
+  m.impl("all_to_all_plan", torch::kCUDA, &all_to_all_plan);
   /*
    * From csrc/attention
    */
