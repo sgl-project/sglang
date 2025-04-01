@@ -394,7 +394,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def _forward_tbo_op_dispatch_a(self, state):
-        with expert_distribution_recorder.with_current_layer(TODO), expert_distribution_recorder.with_debug_name(TODO):
+        with expert_distribution_recorder.with_current_layer(
+            self.layer_id), expert_distribution_recorder.with_debug_name(TODO):
             self._forward_deepep_dispatch_a(
                 self.tbo_deepep_dispatchers[state.tbo_subbatch_index],
                 state.forward_batch.forward_mode,
