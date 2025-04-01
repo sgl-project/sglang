@@ -170,7 +170,13 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        if global_server_args_dict.get("disable_shared_experts_fusion", False):
+        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        if (
+            global_server_args_dict.get("disable_shared_experts_fusion", False)
+            or self.config.architectures[0] != "DeepseekV3ForCausalLM"
+            or self.config.n_routed_experts != 256
+            or self.config.routed_scaling_factor != 2.5
+        ):
             self.n_share_experts_fusion = 0
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -1303,7 +1309,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        if global_server_args_dict.get("disable_shared_experts_fusion", False):
+        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        if (
+            global_server_args_dict.get("disable_shared_experts_fusion", False)
+            or self.config.architectures[0] != "DeepseekV3ForCausalLM"
+            or self.config.n_routed_experts != 256
+            or self.config.routed_scaling_factor != 2.5
+        ):
             self.n_share_experts_fusion = 0
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
