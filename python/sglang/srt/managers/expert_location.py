@@ -9,9 +9,8 @@ class ExpertLocationMetadata:
     num_layers: int
     num_local_physical_experts: int
     num_logical_experts: int
+    # will have a `logical_to_physical_map` later
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
-
-    # will have a `logical_to_physical_map` as well
 
     @staticmethod
     def from_model(model):
