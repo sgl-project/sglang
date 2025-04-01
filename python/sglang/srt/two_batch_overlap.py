@@ -14,7 +14,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -83,8 +82,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-                forward_batch.tbo_children
-            )
+            forward_batch.tbo_children
+        )
         ]
     )
 
@@ -251,3 +250,7 @@ def _chunk_by_separator(
             pending_items.append(item)
     if len(pending_items) > 0:
         yield pending_items
+
+
+def decorate_operations(operations: List[Operation], debug_name_prefix: str):
+    return TODO
