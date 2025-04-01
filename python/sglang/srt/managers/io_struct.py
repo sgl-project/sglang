@@ -186,10 +186,15 @@ class GenerateReqInput:
                             self.modalities.append("image")
                         elif len(self.image_data[i]) > 1:
                             self.modalities.append("multi-images")
-                elif not self.is_single:
-                    # List of images for a batch, wrap each in a list
-                    assert len(self.image_data) == num
-                    self.image_data = [[img] for img in self.image_data]
+                    # Expand parallel_sample_num
+                    self.image_data = self.image_data * self.parallel_sample_num
+                    self.modalities = self.modalities * self.parallel_sample_num
+                else:
+                    # List of images for a batch, wrap each in a list, and expand
+                    # parallel_sample_num
+                    self.image_data = [
+                        [img] for img in self.image_data
+                    ] * self.parallel_sample_num
                     self.modalities = ["image"] * num
 
             if self.audio_data is None:
