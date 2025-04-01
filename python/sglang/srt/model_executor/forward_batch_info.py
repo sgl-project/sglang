@@ -515,6 +515,7 @@ class ForwardBatch:
         for key in [
             "req_pool_indices",
             "seq_lens",
+            "seq_lens_cpu",
             "extend_seq_lens",
             "extend_prefix_lens",
             "extend_start_loc",
