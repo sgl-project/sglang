@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Any, Dict, List, Set
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -897,6 +897,7 @@ def v1_chat_generate_request(
     request_ids: List[str] = None,
 ):
     input_ids = []
+    prompts = []
     sampling_params_list = []
     image_data_list = []
     audio_data_list = []
@@ -916,6 +917,7 @@ def v1_chat_generate_request(
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
+        prompt = ""
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -1005,11 +1007,13 @@ def v1_chat_generate_request(
             image_data = None
             audio_data = None
             modalities = []
+            prompt = request.messages
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
+        prompts.append(prompt)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -1063,10 +1067,14 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids[0]}
+        if tokenizer_manager.model_config.is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts[0]}
         else:
-            prompt_kwargs = {"input_ids": input_ids[0]}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids[0]}
+            else:
+                prompt_kwargs = {"input_ids": input_ids[0]}
         sampling_params_list = sampling_params_list[0]
         image_data_list = image_data_list[0]
         audio_data_list = audio_data_list[0]
@@ -1076,10 +1084,14 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
     else:
-        if isinstance(input_ids[0], str):
-            prompt_kwargs = {"text": input_ids}
+        if tokenizer_manager.model_config.is_multimodal:
+            # processor will need text input
+            prompt_kwargs = {"text": prompts}
         else:
-            prompt_kwargs = {"input_ids": input_ids}
+            if isinstance(input_ids[0], str):
+                prompt_kwargs = {"text": input_ids}
+            else:
+                prompt_kwargs = {"input_ids": input_ids}
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
@@ -1119,7 +1131,9 @@ def v1_chat_generate_response(
         if logprobs:
             logprobs = to_openai_style_logprobs(
                 output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-                output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
+                output_top_logprobs=ret_item["meta_info"].get(
+                    "output_top_logprobs", None
+                ),
             )
             token_logprobs = []
             for token_idx, (token, logprob) in enumerate(
@@ -1329,9 +1343,9 @@ async def v1_chat_completions(
                             output_token_logprobs=content["meta_info"][
                                 "output_token_logprobs"
                             ][n_prev_token:],
-                            output_top_logprobs=content["meta_info"][
-                                "output_top_logprobs"
-                            ][n_prev_token:],
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
                         )
 
                         n_prev_token = len(
