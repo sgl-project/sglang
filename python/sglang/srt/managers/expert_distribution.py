@@ -2,6 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import List, Type, Any, Optional
 
 import torch
@@ -269,3 +270,12 @@ class _StatAccumulator(_Accumulator):
             rank=TODO,
             physical_count=self._physical_count.tolist(),
         )
+
+
+# --------------------------------------- Misc -----------------------------------------
+
+@dataclass
+class ModelExpertInfo:
+    num_layers: int
+    num_local_physical_experts: int
+    num_logical_experts: int
