@@ -20,8 +20,10 @@ class ExpertDistributionRecorder:
         self._recording = False
         self._current_layer_idx = Withable()
         self._accumulator = _Accumulator.init_new()
-        self._single_pass_gatherers = {k: _SinglePassGatherer.init_new(server_args) for k in
-                                       self._accumulator.get_single_pass_gatherer_keys()}
+        self._single_pass_gatherers = {
+            k: _SinglePassGatherer.init_new(server_args)
+            for k in self._accumulator.get_single_pass_gatherer_keys()
+        }
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
