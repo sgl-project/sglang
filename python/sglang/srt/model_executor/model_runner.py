@@ -217,13 +217,11 @@ class ModelRunner:
             self.model.set_eagle3_layers_to_capture()
 
         self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
-        self.expert_distribution_recorder = ExpertDistributionRecorder(
+        expert_distribution_recorder.initialize(
             server_args, self.expert_location_metadata,
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )
-        global global_expert_distribution_recorder
-        global_expert_distribution_recorder = self.expert_distribution_recorder
 
     def model_specific_adjustment(self):
         server_args = self.server_args

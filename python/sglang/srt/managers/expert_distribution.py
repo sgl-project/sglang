@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def initialize(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         self._recording = False
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
@@ -93,7 +93,7 @@ class ExpertDistributionRecorder:
         return output
 
 
-expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
+expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 def postprocess_dumps(physical_dumps: List[Any], expert_location_metadata: "ExpertLocationMetadata"):
