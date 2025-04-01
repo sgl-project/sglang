@@ -128,16 +128,14 @@ class AnnotationOperation:
     debug_name: str
 
 
-Operation = Union[YieldOperation, AnnotationOperation, Callable]
-
-
 @dataclass
-class _Substage:
+class ExecutableOperation:
     debug_name: Optional[str]
     fn: Callable
 
 
-Stage = List[_Substage]
+Operation = Union[YieldOperation, AnnotationOperation, Callable]
+Stage = List[Callable]
 
 
 def model_forward_execute_two_batch(
@@ -249,10 +247,7 @@ def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
         _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
     )
     assert all(len(chunk) > 0 for chunk in operation_chunks)
-    return [
-        [_Substage(debug_name=TODO, fn=op) for op in operation_chunk]
-        for operation_chunk in operation_chunks
-    ]
+    return operation_chunks
 
 
 def _chunk_by_separator(
