@@ -17,12 +17,12 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -129,8 +129,7 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def biased_grouped_topk(
+def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -169,6 +168,34 @@ def biased_grouped_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def biased_grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    compiled: bool = True,
+):
+    biased_grouped_topk_fn = (
+        torch.compile(
+            biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+        )
+        if compiled
+        else biased_grouped_topk_impl
+    )
+    return biased_grouped_topk_fn(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+    )
 
 
 def select_experts(

@@ -12,8 +12,9 @@ def _sgemm_lora_a_kernel(
     weights,
     output,
     # Matrix dimensions
-    N,  # r
+    N,  # stack_num * r
     K,  # input_dim
+    stack_num,
     # Strides
     x_stride_0,
     x_stride_1,
@@ -22,10 +23,11 @@ def _sgemm_lora_a_kernel(
     w_stride_2,
     output_stride_0,
     output_stride_1,
-    # Information on sequence lengths and weight id
+    # Information on sequence lengths,ranks and weight id
     seg_lens,
     seg_indptr,
     weight_indices,
+    lora_ranks,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -43,6 +45,9 @@ def _sgemm_lora_a_kernel(
     seg_len = tl.load(seg_lens + batch_id)
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+    # Adjust N (stack_num * max_rank) according to the specific LoRA adapter
+    N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -91,11 +96,15 @@ def _sgemm_lora_a_kernel(
 
 
 def sgemm_lora_a_fwd(
-    x: torch.Tensor, weights: torch.Tensor, batch_info: LoRABatchInfo
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    stack_num: int = 1,
 ) -> torch.Tensor:
     # x: (s, input_dim)
-    # weights: (num_lora, r, input_dim)
-    # output: (s, r)
+    # weights: (num_lora, stack_num * r, input_dim)
+    # output: (s, stack_num * r)
+    # stack_num: run_qkv_lora: 3, run_gate_up_lora: 2
     # when called by run_qkv_lora, the weights.shape[-2] will be 3 * r
     # input_dim is much larger than r
 
@@ -126,6 +135,7 @@ def sgemm_lora_a_fwd(
         output,
         R,
         K,
+        stack_num,
         x.stride(0),
         x.stride(1),
         weights.stride(0),
@@ -136,6 +146,7 @@ def sgemm_lora_a_fwd(
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
+        batch_info.lora_ranks,
         BLOCK_S,
         BLOCK_R,
         BLOCK_K,
