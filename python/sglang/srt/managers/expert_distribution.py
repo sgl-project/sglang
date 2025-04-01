@@ -29,10 +29,7 @@ class _ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids):
         if not self._record:
             return
-        topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
-        torch.cuda.synchronize()
-        for i in topk_ids_list:
-            self._expert_distribution_record[self._current_layer_id.value].append(tuple(i))
+        TODO
 
     def reset(self):
         """Reset the expert distribution recorder."""
@@ -82,7 +79,11 @@ class _ForwardGatherer(ABC):
 
 
 class _SelectExpertsGatherer(_ForwardGatherer):
-    pass
+    def on_select_experts(self, topk_ids):
+        topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
+        torch.cuda.synchronize()
+        for i in topk_ids_list:
+            self._expert_distribution_record[self._current_layer_id.value].append(tuple(i))
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
