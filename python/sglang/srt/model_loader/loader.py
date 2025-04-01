@@ -51,9 +51,9 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    runai_safetensors_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
-    runai_safetensors_weights_iterator,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
