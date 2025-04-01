@@ -253,6 +253,6 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    expert_distribution_recorder.record_new_token(topk_ids)
+    expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids

@@ -26,7 +26,7 @@ class _ExpertDistributionRecorder:
     def with_current_layer(self, layer_idx):
         return self._current_layer_id.with_value(layer_idx)
 
-    def record_new_token(self, topk_ids):
+    def on_select_experts(self, topk_ids):
         if not self._record:
             return
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
