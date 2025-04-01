@@ -105,7 +105,7 @@ class _ForwardGatherer(ABC):
     def reset(self):
         raise NotImplementedError
 
-    def collect(self):
+    def collect(self) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -121,8 +121,12 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
     def reset(self):
         self._num_recv_tokens_per_expert_list_of_layer.clear()
 
-    def collect(self):
-        return TODO
+    def collect(self) -> torch.Tensor:
+        data = [
+            TODO
+            for layer_index in range(num_layers)
+        ]
+        return torch.tensor(data)
 
 
 class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
