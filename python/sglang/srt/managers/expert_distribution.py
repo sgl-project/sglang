@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from typing import List, Type, Any, Optional
 
 import torch
-from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
 
