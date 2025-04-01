@@ -27,11 +27,11 @@ def is_enabled():
 
 
 def maybe_benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int):
-    return benchmark(forward_batch, tp_rank) if is_enabled() else nullcontext()
+    return benchmark(forward_batch, tp_rank, forward_pass_id) if is_enabled() else nullcontext()
 
 
 @contextmanager
-def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
+def benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int):
     import nvtx
 
     num_tokens = forward_batch.input_ids.shape[0]
@@ -42,6 +42,7 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int):
     )
     debug_name = (
         f"forward"
+        f"-id{forward_pass_id}"
         f"-{forward_batch.forward_mode.name}"
         f"-bs{forward_batch.batch_size}"
         f"-tok{num_tokens}"
