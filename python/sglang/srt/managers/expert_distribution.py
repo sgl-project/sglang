@@ -70,8 +70,9 @@ class _ExpertDistributionRecorder:
 
     def dump_record(self):
         """Dump the expert distribution record and reset the recorder after dumping."""
+        output = self._accumulator.dump()
         self._reset()
-        return TODO
+        return output
 
 
 class _ForwardGatherer(ABC):
@@ -142,6 +143,9 @@ class _Accumulator(ABC):
     def reset(self):
         raise NotImplementedError
 
+    def dump(self):
+        raise NotImplementedError
+
 
 class _DetailAccumulator(_Accumulator):
     def append(self, forward_pass_data: torch.Tensor):
@@ -150,12 +154,18 @@ class _DetailAccumulator(_Accumulator):
     def reset(self):
         TODO
 
+    def dump(self):
+        TODO
+
 
 class _StatAccumulator(_Accumulator):
     def append(self, forward_pass_data: torch.Tensor):
         TODO
 
     def reset(self):
+        TODO
+
+    def dump(self):
         TODO
 
 
