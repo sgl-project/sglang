@@ -77,6 +77,9 @@ class _ExpertDistributionRecorder:
         return output
 
 
+expert_distribution_recorder = _ExpertDistributionRecorder()
+
+
 # --------------------------------------- ForwardGatherer -----------------------------------------
 
 class _ForwardGatherer(ABC):
@@ -173,6 +176,3 @@ class _StatAccumulator(_Accumulator):
 
     def dump(self):
         TODO
-
-
-expert_distribution_recorder = _ExpertDistributionRecorder()
