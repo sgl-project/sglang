@@ -161,6 +161,7 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
 
 # TODO Wait for LowLatency DeepEP merging
 # e.g. use naive tensor copying
+# need to consider CUDA graph, e.g. add initialization and after-end
 class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
     pass
 
