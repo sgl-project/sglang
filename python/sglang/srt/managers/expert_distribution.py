@@ -213,6 +213,11 @@ class _StatAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any]):
         logical_count = torch.zeros((num_layers, num_logical_experts))
+        # Most naive implementation, can optimize if it is bottleneck
+        for physical_dump in physical_dumps:
+            for layer_index in range(num_layers):
+                for physical_expert_index in range(num_local_physical_experts):
+                    TODO
         return dict(logical_count=logical_count)
 
     def __init__(self):
