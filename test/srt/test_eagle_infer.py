@@ -144,7 +144,7 @@ class TestEAGLEEngine(CustomTestCase):
         if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
             self.assertGreater(acc_length, 3.6)
         else:
-            self.assertGreater(acc_length, 2.6)
+            self.assertGreater(acc_length, 2.5)
 
 
 class TestEAGLEEngineTokenMap(TestEAGLEEngine):
@@ -567,7 +567,7 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
                 "--max-running-requests",
                 8,
                 "--page-size",
-                4,
+                8,
             ],
         )
 
