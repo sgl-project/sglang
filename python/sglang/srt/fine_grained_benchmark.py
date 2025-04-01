@@ -60,6 +60,7 @@ def benchmark(forward_batch: "ForwardBatch", tp_rank: int, forward_pass_id: int)
                 torch.cuda.synchronize()
                 latency = time.time() - start_time
                 debug_info = dict(
+                    forward_pass_id=forward_pass_id,
                     forward_mode=forward_batch.forward_mode.name,
                     throughput=num_tokens / latency,
                     latency=latency,
