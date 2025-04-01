@@ -120,11 +120,15 @@ class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
 
-# TODO Will have a `_DeepepLowLatencyGatherer` after low-latency DeepEP is ready
 class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
     def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         assert isinstance(num_recv_tokens_per_expert_list, list)
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
+
+
+# TODO Wait for LowLatency DeepEP merging
+class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
+    pass
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
