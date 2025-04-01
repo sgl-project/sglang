@@ -52,6 +52,8 @@ class _ExpertDistributionRecorder:
             return
         self._forward_gatherer.on_deepep_dispatch_normal(self._current_layer_idx.value, num_recv_tokens_per_expert_list)
 
+    # -------------------------------- TODO ---------------------------------------
+
     def reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting expert distribution record...")
