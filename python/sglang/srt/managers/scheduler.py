@@ -135,6 +135,8 @@ from sglang.srt.utils import (
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+expert_distribution_recorder = ExpertDistributionRecorder()
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
