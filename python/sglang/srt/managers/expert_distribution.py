@@ -2,10 +2,10 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import List, Type, Any, Optional
 
 import torch
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
 
@@ -17,14 +17,14 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata", rank: int):
+    def __init__(self, server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         self._recording = False
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._metadata = metadata
-        self._accumulator = _Accumulator.init_new(metadata, rank)
+        self._expert_location_metadata = expert_location_metadata
+        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, metadata)
+            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -98,8 +98,8 @@ global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = None
 
 
 def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
-                      metadata: "ModelExpertMetadata"):
-    return _Accumulator.get_class().postprocess_dumps(physical_dumps, physical_to_logical_map, metadata)
+                      expert_location_metadata: "ExpertLocationMetadata"):
+    return _Accumulator.get_class().postprocess_dumps(physical_dumps, physical_to_logical_map, expert_location_metadata)
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -107,14 +107,14 @@ def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.
 
 class _SinglePassGatherer(ABC):
     @staticmethod
-    def init_new(server_args: ServerArgs, metadata: "ModelExpertMetadata") -> "_SinglePassGatherer":
+    def init_new(server_args: ServerArgs, expert_location_metadata: "ExpertLocationMetadata") -> "_SinglePassGatherer":
         if server_args.enable_deepep_moe:
             # TODO DeepEP low latency
-            return _DeepepNormalSinglePassGatherer(metadata)
-        return _LayerBasedSinglePassGatherer(metadata)
+            return _DeepepNormalSinglePassGatherer(expert_location_metadata)
+        return _LayerBasedSinglePassGatherer(expert_location_metadata)
 
-    def __init__(self, metadata: "ModelExpertMetadata"):
-        self._metadata = metadata
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
+        self._expert_location_metadata = expert_location_metadata
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         pass
@@ -130,14 +130,14 @@ class _SinglePassGatherer(ABC):
 
 
 class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, metadata: "ModelExpertMetadata"):
-        super().__init__(metadata)
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
+        super().__init__(expert_location_metadata)
         self._num_recv_tokens_per_expert_list_of_layer = {}
 
     def _on_layer_data(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         # TODO for TBO, we may need to relax this restriction
         assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
-        assert 0 <= layer_idx < self._metadata.num_layers
+        assert 0 <= layer_idx < self._expert_location_metadata.num_layers
         self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = num_recv_tokens_per_expert_list
 
     def reset(self):
@@ -146,8 +146,8 @@ class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
     def collect(self) -> torch.Tensor:
         data = [
             self._num_recv_tokens_per_expert_list_of_layer.get(layer_index) or (
-                [0] * self._metadata.num_local_physical_experts)
-            for layer_index in range(self._metadata.num_layers)
+                [0] * self._expert_location_metadata.num_local_physical_experts)
+            for layer_index in range(self._expert_location_metadata.num_layers)
         ]
         return torch.tensor(data)
 
@@ -158,7 +158,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
 
-        num_recv_tokens_per_expert_list = [0] * self._metadata.num_local_physical_experts
+        num_recv_tokens_per_expert_list = [0] * self._expert_location_metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for expert_idx in token_record:
                 num_recv_tokens_per_expert_list[expert_idx] += 1
@@ -186,8 +186,8 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 class _Accumulator(ABC):
     @staticmethod
-    def init_new(metadata: "ModelExpertMetadata", rank: int) -> "_Accumulator":
-        return _Accumulator.get_class()(metadata, rank)
+    def init_new(expert_location_metadata: "ExpertLocationMetadata", rank: int) -> "_Accumulator":
+        return _Accumulator.get_class()(expert_location_metadata, rank)
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
@@ -195,8 +195,8 @@ class _Accumulator(ABC):
             return _DetailAccumulator
         return _StatAccumulator
 
-    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
-        self._metadata = metadata
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+        self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
     def get_single_pass_gatherer_keys(self):
@@ -207,7 +207,7 @@ class _Accumulator(ABC):
 
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
-                          metadata: "ModelExpertMetadata"):
+                          expert_location_metadata: "ExpertLocationMetadata"):
         raise NotImplementedError
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
@@ -223,7 +223,7 @@ class _Accumulator(ABC):
 class _DetailAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
-                          metadata: "ModelExpertMetadata"):
+                          expert_location_metadata: "ExpertLocationMetadata"):
         # Do not convert to logical since we want all details
         return [
             record
@@ -231,8 +231,8 @@ class _DetailAccumulator(_Accumulator):
             for record in physical_dump
         ]
 
-    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
-        super().__init__(metadata, rank)
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+        super().__init__(expert_location_metadata, rank)
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
@@ -263,22 +263,23 @@ class _DetailAccumulator(_Accumulator):
 class _StatAccumulator(_Accumulator):
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor,
-                          metadata: "ModelExpertMetadata"):
-        logical_count = torch.zeros((metadata.num_layers, metadata.num_logical_experts))
+                          expert_location_metadata: "ExpertLocationMetadata"):
+        logical_count = torch.zeros((expert_location_metadata.num_layers, expert_location_metadata.num_logical_experts))
         # Most naive implementation, can optimize if it is bottleneck
         for physical_dump in physical_dumps:
-            for layer_index in range(metadata.num_layers):
-                for local_physical_expert_index in range(metadata.num_local_physical_experts):
-                    global_physical_expert_index = metadata.num_local_physical_experts * physical_dump[
+            for layer_index in range(expert_location_metadata.num_layers):
+                for local_physical_expert_index in range(expert_location_metadata.num_local_physical_experts):
+                    global_physical_expert_index = expert_location_metadata.num_local_physical_experts * physical_dump[
                         'rank'] + local_physical_expert_index
                     logical_expert_index = physical_to_logical_map[layer_index, global_physical_expert_index]
                     logical_count[layer_index, logical_expert_index] += physical_dump['physical_count'][
                         layer_index, local_physical_expert_index]
         return dict(logical_count=logical_count)
 
-    def __init__(self, metadata: "ModelExpertMetadata", rank: int):
-        super().__init__(metadata, rank)
-        self._physical_count = torch.zeros((self._metadata.num_layers, self._metadata.num_local_physical_experts))
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+        super().__init__(expert_location_metadata, rank)
+        self._physical_count = torch.zeros(
+            (self._expert_location_metadata.num_layers, self._expert_location_metadata.num_local_physical_experts))
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
         self._physical_count += single_pass_physical_count
@@ -290,27 +291,4 @@ class _StatAccumulator(_Accumulator):
         return dict(
             rank=self._rank,
             physical_count=self._physical_count.tolist(),
-        )
-
-
-# --------------------------------------- Misc -----------------------------------------
-
-@dataclass
-class ModelExpertMetadata:
-    num_layers: int
-    num_local_physical_experts: int
-    num_logical_experts: int
-
-    @staticmethod
-    def from_model(model):
-        if hasattr(model, "get_model_expert_metadata"):
-            return model.get_model_expert_metadata()
-        return ModelExpertMetadata._init_dummy()
-
-    @staticmethod
-    def _init_dummy():
-        return ModelExpertMetadata(
-            num_layers=1,
-            num_local_physical_experts=1,
-            num_logical_experts=1,
         )
