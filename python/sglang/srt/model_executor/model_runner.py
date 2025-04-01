@@ -221,7 +221,11 @@ class ModelRunner:
             num_local_physical_experts=TODO,
             num_logical_experts=TODO,
         )
-        self.expert_distribution_recorder = ExpertDistributionRecorder(server_args, model_expert_metadata, TODO)
+        self.expert_distribution_recorder = ExpertDistributionRecorder(
+            server_args, model_expert_metadata,
+            # TODO handle DP!=TP case
+            rank=self.tp_rank,
+        )
         global global_expert_distribution_recorder
         global_expert_distribution_recorder = self.expert_distribution_recorder
 
