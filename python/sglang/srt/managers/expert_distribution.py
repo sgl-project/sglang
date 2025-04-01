@@ -106,7 +106,7 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
         return TODO
 
 
-class _SelectExpertsForwardGatherer(_ForwardGatherer):
+class _SelectExpertsForwardGatherer(_LayerBasedForwardGatherer):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
@@ -115,9 +115,9 @@ class _SelectExpertsForwardGatherer(_ForwardGatherer):
 
 
 # TODO Will have a `_DeepepLowLatencyGatherer` after low-latency DeepEP is ready
-class _DeepepNormalForwardGatherer(_ForwardGatherer):
+class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
     def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
-        TODO
+        self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
 
 
 expert_distribution_recorder = _ExpertDistributionRecorder()
