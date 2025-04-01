@@ -46,6 +46,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import global_expert_distribution_recorder, ExpertDistributionRecorder, \
     ModelExpertMetadata
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -216,9 +217,9 @@ class ModelRunner:
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
 
-        model_expert_metadata = ModelExpertMetadata.from_model(self.model)
+        self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
         self.expert_distribution_recorder = ExpertDistributionRecorder(
-            server_args, model_expert_metadata,
+            server_args, expert_location_metadata,
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )

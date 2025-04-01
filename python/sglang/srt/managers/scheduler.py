@@ -276,6 +276,7 @@ class Scheduler(
             self.random_seed,
             self.device,
             worker_global_server_args_dict,
+            self.expert_location_metadata,
             _,
             _,
             _,
