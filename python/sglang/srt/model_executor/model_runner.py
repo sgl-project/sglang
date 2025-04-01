@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -971,6 +972,10 @@ class ModelRunner:
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
+        with expert_distribution_recorder.with_forward_pass():
+            return self._forward_raw(forward_batch, skip_attn_backend_init)
+
+    def _forward_raw(self, forward_batch: ForwardBatch, skip_attn_backend_init: bool) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
