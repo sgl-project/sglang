@@ -19,6 +19,7 @@
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -393,7 +394,7 @@ class DeepseekV2MoE(nn.Module):
             state.seg_indptr_from_dispatch,
         )
 
-    def _forward_tbo_op_dispatch_a(self, state):
+    def _forward_tbo_op_dispatch_a(self, state, tbo_child_index: int):
         with expert_distribution_recorder.with_current_layer(
             self.layer_id), expert_distribution_recorder.with_debug_name(TODO):
             self._forward_deepep_dispatch_a(
@@ -1391,14 +1392,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     # ----------------------------------------- TBO-related --------------------------------------------
 
-    def get_forward_tbo_operations(self, forward_mode: ForwardMode):
+    def get_forward_tbo_operations(self, forward_mode: ForwardMode, tbo_child_index: int):
         if forward_mode == ForwardMode.EXTEND:
             operations = [
                 self._forward_tbo_op_input_layernorm,
                 self._forward_tbo_op_prefill_attn,
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
-                self.mlp._forward_tbo_op_dispatch_a,
+                partial(self.mlp._forward_tbo_op_dispatch_a, tbo_child_index=tbo_child_index),
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_dispatch_b,
                 self.mlp._forward_tbo_op_mlp,
@@ -1417,7 +1418,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self._forward_tbo_op_post_attn_layernorm,
                 self.mlp._forward_tbo_op_gate,
                 two_batch_overlap.YieldOperation(),
-                self.mlp._forward_tbo_op_dispatch_a,
+                partial(self.mlp._forward_tbo_op_dispatch_a, tbo_child_index=tbo_child_index),
                 self.mlp._forward_tbo_op_shared,
                 two_batch_overlap.YieldOperation(),
                 self.mlp._forward_tbo_op_dispatch_b,
