@@ -173,9 +173,9 @@ class DeepseekV2MoE(nn.Module):
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         if (
             global_server_args_dict.get("disable_shared_experts_fusion", False)
-            or self.config.architectures[0] != "DeepseekV3ForCausalLM"
-            or self.config.n_routed_experts != 256
-            or self.config.routed_scaling_factor != 2.5
+            or config.architectures[0] != "DeepseekV3ForCausalLM"
+            or config.n_routed_experts != 256
+            or config.routed_scaling_factor != 2.5
         ):
             self.n_share_experts_fusion = 0
         self.routed_scaling_factor = config.routed_scaling_factor
