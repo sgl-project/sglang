@@ -76,7 +76,7 @@ if _is_hip:
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
@@ -705,7 +705,7 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             for expert in range(layer.num_experts):
-                if _is_cuda:
+                if _is_cuda or _is_hip:
                     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
                         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                     )
@@ -795,7 +795,7 @@ class Fp8MoEMethod:
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
                     )
-                    if _is_cuda:
+                    if _is_cuda or _is_hip:
                         (
                             layer.w13_weight[expert_id][start : start + shard_size, :],
                             _,

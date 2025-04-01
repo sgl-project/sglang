@@ -41,7 +41,6 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
-    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
@@ -50,6 +49,8 @@ else:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 
 
 @triton.jit
@@ -519,7 +520,7 @@ def invoke_fused_moe_kernel(
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
-            if _is_cuda:
+            if _is_cuda or is_hip:
                 A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
             else:
                 A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)

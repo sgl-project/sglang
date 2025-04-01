@@ -28,8 +28,11 @@ except ImportError:
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
 _is_hip = is_hip()
-if _is_hip and get_bool_env_var("CK_MOE"):
-    from aiter import gemm_a8w8_blockscale
+if _is_hip:
+    from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
+
+    if get_bool_env_var("CK_MOE"):
+        from aiter import gemm_a8w8_blockscale
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -453,7 +456,7 @@ class Fp8LinearOp:
         # so fallback to naive if per channel or per token
         else:
             # Maybe apply padding to output, see comment in __init__
-            if _is_cuda:
+            if _is_cuda or is_hip:
                 qinput, x_scale = sgl_scaled_fp8_quant(
                     input_2d,
                     input_scale,
