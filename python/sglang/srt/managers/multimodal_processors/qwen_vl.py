@@ -33,35 +33,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
 
-    @staticmethod
-    def _process_images_task(images, input_text, _hf_config):
-        if isinstance(images, list) and len(images) == 0:
-            images = None
-        result = get_global_processor().__call__(
-            text=[input_text], images=images, padding=True, return_tensors="pt"
-        )
-
-        return {
-            "input_ids": result.input_ids,
-            "pixel_values": getattr(result, "pixel_values", None),
-            "image_grid_thw": getattr(result, "image_grid_thw", None),
-            "second_per_grid_ts": getattr(result, "second_per_grid_ts", None),
-            "video_grid_thws": getattr(result, "video_grid_thws", None),
-        }
-
-    async def _process_single_image(self, images, input_text) -> dict:
-        if self.executor is not None:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                self.executor,
-                Qwen2_5VLImageProcessor._process_images_task,
-                images,
-                input_text,
-                self.hf_config,
-            )
-        else:
-            return self._process_images_task(images, input_text, self.hf_config)
-
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
