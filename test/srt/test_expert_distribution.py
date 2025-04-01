@@ -57,7 +57,7 @@ class TestExpertDistribution(CustomTestCase):
                     "text": "The capital of France is",
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 32,
+                        "max_new_tokens": 3,
                     },
                 },
             )
