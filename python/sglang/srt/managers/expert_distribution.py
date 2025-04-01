@@ -1,6 +1,5 @@
 import logging
 from abc import ABC
-from collections import defaultdict
 from contextlib import contextmanager
 from typing import List
 
@@ -55,7 +54,7 @@ class _ExpertDistributionRecorder:
         self._accumulator.reset()
 
     def start_record(self):
-        """Start recording the expert distribution. Reset the recorder and set the recording flag to True."""
+        """Start recording the expert distribution."""
         if self._recording:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
@@ -64,7 +63,7 @@ class _ExpertDistributionRecorder:
         self._recording = True
 
     def stop_record(self):
-        """Stop recording the expert distribution. Set the recording flag to False."""
+        """Stop recording the expert distribution."""
         if not self._recording:
             logger.warning(
                 "SGLang server has not been recording expert ids. Did you forget to start recording by sending request to the `/start_expert_distribution_record` endpoint?"
@@ -72,14 +71,9 @@ class _ExpertDistributionRecorder:
         self._recording = False
 
     def dump_record(self):
-        """Dump the expert distribution record to a file. Reset the recorder after dumping."""
-        results = {}
-        for layer_idx, layer_record in self._expert_distribution_record.items():
-            results[layer_idx] = defaultdict(int)
-            for token_record in layer_record:
-                for expert_idx in token_record:
-                    results[layer_idx][expert_idx] += 1
+        """Dump the expert distribution record and reset the recorder after dumping."""
         self.reset()
+        return TODO
 
 
 class _ForwardGatherer(ABC):
