@@ -194,7 +194,9 @@ class _StatAccumulator(_Accumulator):
         self._physical_count += single_pass_physical_count
 
     def reset(self):
-        TODO
+        self._physical_count[...] = 0
 
     def dump(self):
-        TODO
+        return dict(
+            physical_count=self._physical_count.tolist(),
+        )
