@@ -34,6 +34,19 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
+template <typename scalar_t>
+inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  int64_t d = 0;
+  for (; d <= size - bVec::size(); d += bVec::size()) {
+    bVec out_bvec = bVec::loadu(src + d);
+    out_bvec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = src[d];
+  }
+}
+
 // GEMM handles query @ key (indexed) x scale
 //   A : [M, K]
 //   B : [N, K] indexed
@@ -611,8 +624,11 @@ void decode_attention_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    scalar_t* __restrict__ k_buffer,
+    scalar_t* __restrict__ v_buffer,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const int32_t* __restrict__ loc,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -630,6 +646,14 @@ void decode_attention_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
+  int64_t loc_val = loc[0];
+  for (int64_t i = 0; i < num_heads; i++) {
+    scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + i * k_strideH;
+    scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + i * v_strideH;
+    copy_stub<scalar_t>(k_buffer_ptr, key + i * head_size, head_size);
+    copy_stub<scalar_t>(v_buffer_ptr, value + i * head_size_v, head_size_v);
+  }
+
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
@@ -791,8 +815,11 @@ void decode_attention_grouped_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    scalar_t* __restrict__ k_buffer,
+    scalar_t* __restrict__ v_buffer,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const int32_t* __restrict__ loc,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -811,6 +838,14 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
+  int64_t loc_val = loc[0];
+  for (int64_t i = 0; i < num_heads_kv; i++) {
+    scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + i * k_strideH;
+    scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + i * v_strideH;
+    copy_stub<scalar_t>(k_buffer_ptr, key + i * head_size, head_size);
+    copy_stub<scalar_t>(v_buffer_ptr, value + i * head_size_v, head_size_v);
+  }
+
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
@@ -1004,9 +1039,12 @@ void decode_attention_grouped_kernel_impl(
 //
 void decode_attention_cpu(
     at::Tensor& query,
-    at::Tensor& output,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    at::Tensor& output,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
@@ -1024,6 +1062,12 @@ void decode_attention_cpu(
   CHECK_DIM(3, query);
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
+  CHECK_INPUT(key);
+  CHECK_INPUT(value);
+  CHECK_DIM(3, key);
+  CHECK_DIM(3, value);
+  CHECK_DIM(1, loc);
+  TORCH_CHECK(loc.numel() == 1, "decode_attention_cpu: expect loc to be a scalar, got ", loc.numel());
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1070,6 +1114,9 @@ void decode_attention_cpu(
             query.data_ptr<scalar_t>(),
             k_buffer.data_ptr<scalar_t>(),
             v_buffer.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int32_t>(),
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
@@ -1095,6 +1142,9 @@ void decode_attention_cpu(
             query.data_ptr<scalar_t>(),
             k_buffer.data_ptr<scalar_t>(),
             v_buffer.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int32_t>(),
             req_to_token.data_ptr<index_t>(),
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
