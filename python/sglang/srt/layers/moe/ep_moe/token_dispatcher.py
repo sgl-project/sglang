@@ -121,6 +121,7 @@ class DeepEPDispatcher:
         self.params_bytes = 2
 
         self.deepep_mode = deepep_mode
+        self.handle = None
 
         if self.deepep_mode in ["normal", "auto"]:  # for normal / auto mode
             self.buffer_normal = get_buffer_normal(
@@ -184,7 +185,7 @@ class DeepEPDispatcher:
         num_experts: int,
         num_max_dispatch_tokens_per_rank: int = 128,
         forward_mode: ForwardMode = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple:
         topk_idx = topk_idx.to(torch.int64)
         reorder_topk_ids = torch.empty(
             (0,), device=hidden_states.device, dtype=torch.int64
@@ -200,11 +201,11 @@ class DeepEPDispatcher:
         if self.deepep_mode == "normal" or (
             self.deepep_mode == "auto" and not forward_mode.is_decode()
         ):
+            # logger.info(f">>> dispatch_normal")
             (
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                handle,
                 event,
             ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
             event.current_stream_wait() if self.async_finish else ()
@@ -215,16 +216,18 @@ class DeepEPDispatcher:
         elif self.deepep_mode == "low_latency" or (
             self.deepep_mode == "auto" and forward_mode.is_decode()
         ):
+            # logger.info(f">>> dispatch_low_latency")
             expected_m = (
                 hidden_states.shape[0]
                 * self.buffer_low_latency.group_size
                 * topk_idx.shape[1]
                 + num_experts
             ) // num_experts
-            logger.info(f">>> hidden_states.shape: {hidden_states.shape}")
-            logger.info(f">>> topk_idx.shape: {topk_idx.shape}")
-            logger.info(f">>> expected_m: {expected_m}")
-            hidden_states, masked_m, handle, event, hook = self.dispatch_low_latency(
+            # logger.info(f">>> hidden_states.shape: {hidden_states.shape}")
+            # logger.info(f">>> topk_idx.shape: {topk_idx.shape}")
+            # logger.info(f">>> expected_m: {expected_m}")
+            # logger.info(f">>> num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}")
+            hidden_states, masked_m, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
@@ -243,7 +246,6 @@ class DeepEPDispatcher:
             seg_indptr,
             masked_m,
             expected_m,
-            handle,
         )
 
     def dispatch_normal(
@@ -274,7 +276,7 @@ class DeepEPDispatcher:
             recv_topk_idx,
             recv_topk_weights,
             _,  # num_recv_tokens_per_expert_list
-            handle,
+            self.handle,
             event,
         ) = self.buffer_normal.dispatch(
             x,
@@ -293,7 +295,6 @@ class DeepEPDispatcher:
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            handle,
             event,
         )
 
@@ -338,7 +339,7 @@ class DeepEPDispatcher:
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
 
-        packed_recv_hidden, packed_recv_count, handle, event, hook = (
+        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             self.buffer_low_latency.low_latency_dispatch(
                 hidden_states,
                 topk_idx,
@@ -349,16 +350,15 @@ class DeepEPDispatcher:
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        return packed_recv_hidden, packed_recv_count, handle, event, hook
+        return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        handle: torch.Tensor,
         forward_mode: ForwardMode,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         if self.deepep_mode == "normal" or (
             self.deepep_mode == "auto" and not forward_mode.is_decode()
         ):
@@ -385,13 +385,17 @@ class DeepEPDispatcher:
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-            hidden_states, event = self.combine_normal(output, handle)
+            hidden_states, event = self.combine_normal(
+                output,
+            )
             event.current_stream_wait() if self.async_finish else ()
         elif self.deepep_mode == "low_latency" or (
             self.deepep_mode == "auto" and forward_mode.is_decode()
         ):
             hidden_states, event, hook = self.combine_low_latency(
-                hidden_states, topk_idx, topk_weights, handle
+                hidden_states,
+                topk_idx,
+                topk_weights,
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
         else:
@@ -399,12 +403,12 @@ class DeepEPDispatcher:
 
         return hidden_states
 
-    def combine_normal(self, x: torch.Tensor, handle: torch.Tensor):
+    def combine_normal(self, x: torch.Tensor):
         previous_event = Buffer.capture() if self.async_finish else None
 
         combined_x, _, event = self.buffer_normal.combine(
             x,
-            handle,
+            self.handle,
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
@@ -416,14 +420,13 @@ class DeepEPDispatcher:
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        handle: torch.Tensor,
     ):
         combined_hidden_states, event, hook = (
             self.buffer_low_latency.low_latency_combine(
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                handle,
+                self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )

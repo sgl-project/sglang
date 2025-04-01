@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import logging
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -71,6 +72,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -318,13 +321,12 @@ class DeepseekV2MoE(nn.Module):
                 seg_indptr,
                 masked_m,
                 expected_m,
-                handle,
             ) = self.deepep_dispatcher.dispatch(
                 hidden_states,
                 topk_idx,
                 topk_weights,
                 self.num_experts,
-                forward_mode,
+                forward_mode=forward_mode,
             )
         final_hidden_states = (
             self.experts(
@@ -343,7 +345,6 @@ class DeepseekV2MoE(nn.Module):
                 topk_idx,
                 topk_weights,
                 forward_mode,
-                handle,
             )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1193,6 +1194,7 @@ class DeepseekV2Model(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            # logger.info(f"layer {i} forward")
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
