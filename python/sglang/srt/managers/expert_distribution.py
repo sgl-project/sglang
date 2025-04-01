@@ -14,14 +14,17 @@ class _ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
     def __init__(self):
+        self._recording = False
+        self._current_layer_id = Withable()
+        self._forward_gatherer: _ForwardGatherer = TODO
+
+        # TODO
         # the length of the dictionary is the number of layers
         # the length of the list is the number of tokens
         # the length of the tuple is topk's k value
         self._expert_distribution_record: Dict[int, List[Tuple[int]]] = defaultdict(
             list
         )
-        self._recording = False
-        self._current_layer_id = Withable()
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_id.with_value(layer_idx)
@@ -29,7 +32,7 @@ class _ExpertDistributionRecorder:
     def on_select_experts(self, topk_ids):
         if not self._recording:
             return
-        TODO
+        self._forward_gatherer.on_select_experts(topk_ids)
 
     def reset(self):
         """Reset the expert distribution recorder."""
@@ -75,7 +78,8 @@ class _ExpertDistributionRecorder:
 
 
 class _ForwardGatherer(ABC):
-    pass
+    def on_select_experts(self, topk_ids):
+        pass
 
 
 class _SelectExpertsGatherer(_ForwardGatherer):
