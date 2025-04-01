@@ -1625,4 +1625,3 @@ def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
-

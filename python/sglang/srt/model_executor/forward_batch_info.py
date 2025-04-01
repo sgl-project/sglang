@@ -679,4 +679,3 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-

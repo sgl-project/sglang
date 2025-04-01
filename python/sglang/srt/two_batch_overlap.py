@@ -1,8 +1,4 @@
-from typing import (
-    TYPE_CHECKING,
-    Optional,
-    Sequence,
-)
+from typing import TYPE_CHECKING, Optional, Sequence
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
