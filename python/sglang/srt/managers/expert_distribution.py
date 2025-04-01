@@ -2,6 +2,7 @@ import logging
 import time
 from abc import ABC
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
@@ -28,6 +29,18 @@ class _ExpertDistributionRecorder:
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
+
+    @contextmanager
+    def with_forward_pass(self):
+        try:
+            yield
+        finally:
+            self._on_forward_pass_end()
+
+    def _on_forward_pass_end(self):
+        data = self._forward_gatherer.collect()
+        TODO_use_data
+        self._forward_gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         if not self._recording:
@@ -89,6 +102,9 @@ class _ForwardGatherer(ABC):
     def on_deepep_dispatch_normal(self, layer_idx: int, num_recv_tokens_per_expert_list: List[int]):
         pass
 
+    def reset(self):
+        raise NotImplementedError
+
     def collect(self):
         raise NotImplementedError
 
@@ -101,6 +117,9 @@ class _LayerBasedForwardGatherer(_ForwardGatherer):
         # TODO for TBO, we may need to relax this restriction
         assert layer_idx not in self._num_recv_tokens_per_expert_list_of_layer
         self._num_recv_tokens_per_expert_list_of_layer[layer_idx] = num_recv_tokens_per_expert_list
+
+    def reset(self):
+        self._num_recv_tokens_per_expert_list_of_layer.clear()
 
     def collect(self):
         return TODO
