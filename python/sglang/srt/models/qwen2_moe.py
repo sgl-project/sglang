@@ -51,13 +51,13 @@ from transformers import PretrainedConfig
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
-            self,
-            hidden_size: int,
-            intermediate_size: int,
-            hidden_act: str,
-            quant_config: Optional[QuantizationConfig] = None,
-            reduce_results: bool = True,
-            prefix: str = "",
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -91,10 +91,10 @@ class Qwen2MoeMLP(nn.Module):
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -144,7 +144,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
 
         # router_logits: (num_tokens, n_experts)
@@ -162,17 +162,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
 class Qwen2MoeAttention(nn.Module):
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            layer_id: int = 0,
-            rope_theta: float = 10000,
-            rope_scaling: Optional[Dict[str, Any]] = None,
-            max_position_embeddings: int = 8192,
-            qkv_bias: int = True,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        qkv_bias: int = True,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -232,10 +232,10 @@ class Qwen2MoeAttention(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -247,11 +247,11 @@ class Qwen2MoeAttention(nn.Module):
 
 class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
-            self,
-            config: PretrainedConfig,
-            layer_id: int,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -279,7 +279,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
         if (layer_id not in mlp_only_layers) and (
-                config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
+            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 config=config,
@@ -300,11 +300,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
-            residual: Optional[torch.Tensor],
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -326,10 +326,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 class Qwen2MoeModel(nn.Module):
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -354,11 +354,11 @@ class Qwen2MoeModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -366,11 +366,11 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
-            expert_distribution_recorder.set_current_layer(i)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with expert_distribution_recorder.with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -379,10 +379,10 @@ class Qwen2MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
-            self,
-            config: PretrainedConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -400,11 +400,11 @@ class Qwen2MoeForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(

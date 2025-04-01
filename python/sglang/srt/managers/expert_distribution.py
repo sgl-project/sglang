@@ -1,6 +1,7 @@
 import logging
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
@@ -21,8 +22,13 @@ class _ExpertDistributionRecorder:
         self._record = False
         self._current_layer_id = "UNKNOWN"
 
-    def set_current_layer(self, layer_idx):
-        self._current_layer_id = layer_idx
+    @contextmanager
+    def with_current_layer(self, layer_idx):
+        TODO
+
+    # TODO
+    # def set_current_layer(self, layer_idx):
+    #     self._current_layer_id = layer_idx
 
     def record_new_token(self, topk_ids):
         if not self._record:
