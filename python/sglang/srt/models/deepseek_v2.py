@@ -16,7 +16,6 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
-import logging
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -72,8 +71,6 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
-
-logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -246,7 +243,6 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if global_server_args_dict["enable_deepep_moe"]:
-            # self.dp_size = get_attention_dp_size()
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
@@ -1308,7 +1304,6 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
-            # logger.info(f"layer {i} forward")
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )

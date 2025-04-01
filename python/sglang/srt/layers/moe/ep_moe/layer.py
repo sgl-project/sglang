@@ -858,7 +858,6 @@ class DeepEPMoE(EPMoE):
         expected_m: int,
         forward_mode: ForwardMode,
     ):
-        # logger.info(f"reorder_topk_ids: {reorder_topk_ids}")
         if self.deepep_mode == "normal" or (
             self.deepep_mode == "auto" and not forward_mode.is_decode()
         ):
@@ -994,8 +993,6 @@ class DeepEPMoE(EPMoE):
         assert (
             hidden_states_fp8[0].size(0) % 4 == 0
         ), f"TMA alignment error: {hidden_states_fp8[0].size(0)}"
-
-        # Todo: this will affect CUDA graph capture, need to fix.
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()

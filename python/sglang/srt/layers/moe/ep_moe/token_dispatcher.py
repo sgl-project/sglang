@@ -5,7 +5,6 @@ try:
 except ImportError:
     use_deepep = False
 
-import logging
 from typing import Optional, Tuple
 
 import torch
@@ -17,8 +16,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_run_moe_deep_preprocess,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-logger = logging.getLogger(__name__)
 
 _buffer_normal = None
 _buffer_low_latency = None
@@ -201,7 +198,6 @@ class DeepEPDispatcher:
         if self.deepep_mode == "normal" or (
             self.deepep_mode == "auto" and not forward_mode.is_decode()
         ):
-            # logger.info(f">>> dispatch_normal")
             (
                 hidden_states,
                 topk_idx,
@@ -216,17 +212,12 @@ class DeepEPDispatcher:
         elif self.deepep_mode == "low_latency" or (
             self.deepep_mode == "auto" and forward_mode.is_decode()
         ):
-            # logger.info(f">>> dispatch_low_latency")
             expected_m = (
                 hidden_states.shape[0]
                 * self.buffer_low_latency.group_size
                 * topk_idx.shape[1]
                 + num_experts
             ) // num_experts
-            # logger.info(f">>> hidden_states.shape: {hidden_states.shape}")
-            # logger.info(f">>> topk_idx.shape: {topk_idx.shape}")
-            # logger.info(f">>> expected_m: {expected_m}")
-            # logger.info(f">>> num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}")
             hidden_states, masked_m, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
