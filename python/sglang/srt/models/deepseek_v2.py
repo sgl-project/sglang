@@ -17,6 +17,7 @@
 """Inference-only DeepseekV2 model."""
 
 import os
+from tqdm import tqdm
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -1348,15 +1349,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         ]
         if self.n_share_experts_fusion != 0:
             weights_list = list(weights)
-            weights_dict = {k: v for (k, v) in weights_list}
+            weights_dict = dict(weights_list)
             suffix_list = [
                 'down_proj.weight', 'down_proj.weight_scale_inv',
                 'gate_proj.weight', 'gate_proj.weight_scale_inv',
                 'up_proj.weight', 'up_proj.weight_scale_inv'
             ]
-            for moe_layer in range(self.config.num_hidden_layers):
-                if moe_layer < self.config.first_k_dense_replace:
-                    continue
+            for moe_layer in tqdm(range(self.config.first_k_dense_replace, self.config.num_hidden_layers, self.config.moe_layer_freq), desc=f"Cloning {self.n_share_experts_fusion} "
+                                  "replicas of the shared expert into MoE",):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
                         weights_list.append((
@@ -1366,6 +1366,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             f".{suffix}", weights_dict[
                                 f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"]
                             .clone()))
+                        weights_dict.pop(f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}")
             weights = weights_list
         
         # Params for weights, fp8 weight scales, fp8 activation scales

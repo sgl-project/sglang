@@ -132,7 +132,7 @@ def grouped_topk(
                                         size=(topk_ids.size(0), ),
                                         dtype=topk_ids.dtype,
                                         device=topk_ids.device)
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) * 1.0 / 2.5
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / 2.5 # 2.5 is the routed_scaling_factor.
 
     if renormalize:
         topk_weights_sum = topk_weights.sum(
@@ -187,7 +187,7 @@ def biased_grouped_topk_impl(
                                         size=(topk_ids.size(0), ),
                                         dtype=topk_ids.dtype,
                                         device=topk_ids.device)
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) * 1.0 / 2.5
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / 2.5 # 2.5 is the routed_scaling_factor.
 
     if renormalize:
         topk_weights_sum = topk_weights.sum(
