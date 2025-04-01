@@ -10,7 +10,6 @@ python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --
 python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 """
 
-import torch
 import argparse
 import dataclasses
 import itertools
@@ -23,7 +22,9 @@ from typing import Tuple
 
 import numpy as np
 import requests
+import torch
 import torch.multiprocessing as mp
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -67,7 +68,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -224,7 +225,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             )
         ):
             if bench_args.profile and index == bench_args.profile_skip_cases:
-                print('bench script call cudaProfilerStart')
+                print("bench script call cudaProfilerStart")
                 torch.cuda.cudart().cudaProfilerStart()
                 # print("Execute start_profile")
                 # requests.post(
@@ -244,7 +245,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.result_filename,
             )
         if bench_args.profile:
-            print('bench script call cudaProfilerStop')
+            print("bench script call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
             # print("Execute stop_profile")
             # requests.post(base_url + "/stop_profile").raise_for_status()

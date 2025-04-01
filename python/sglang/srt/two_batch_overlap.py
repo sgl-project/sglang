@@ -1,8 +1,20 @@
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Generator, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -71,8 +83,8 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
-        )
+                forward_batch.tbo_children
+            )
         ]
     )
 
@@ -162,7 +174,9 @@ class _StageExecutor:
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
             for op in stage:
-                with _annotate_region(debug_name=op.__name__.replace("_forward_tbo_op_", "")):
+                with _annotate_region(
+                    debug_name=op.__name__.replace("_forward_tbo_op_", "")
+                ):
                     self._stage_output = op(
                         state=self._stage_state, **(self._stage_output or {})
                     )
@@ -218,12 +232,16 @@ class _StateDict:
 
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
-    operation_chunks = list(_chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation)))
+    operation_chunks = list(
+        _chunk_by_separator(operations, lambda op: isinstance(op, YieldOperation))
+    )
     assert all(len(chunk) > 0 for chunk in operation_chunks)
     return operation_chunks
 
 
-def _chunk_by_separator(items: List[Any], is_separator: Callable[[Any], bool]) -> Generator[List[Any], None, None]:
+def _chunk_by_separator(
+    items: List[Any], is_separator: Callable[[Any], bool]
+) -> Generator[List[Any], None, None]:
     pending_items = []
     for item in items:
         if is_separator(item):

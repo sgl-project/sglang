@@ -200,10 +200,18 @@ class DeepEPDispatcher:
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.enable_async else None
-        self.dispatch_intermediate_state = hidden_states, topk_idx, topk_weights, num_experts, previous_event
+        self.dispatch_intermediate_state = (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            num_experts,
+            previous_event,
+        )
 
     def dispatch_b(self):
-        hidden_states, topk_idx, topk_weights, num_experts, previous_event = self.dispatch_intermediate_state
+        hidden_states, topk_idx, topk_weights, num_experts, previous_event = (
+            self.dispatch_intermediate_state
+        )
         del self.dispatch_intermediate_state
 
         (
@@ -213,7 +221,9 @@ class DeepEPDispatcher:
             num_recv_tokens_per_expert_list,
             handle,
             event,
-        ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts, previous_event)
+        ) = self.dispatch_normal(
+            hidden_states, topk_idx, topk_weights, num_experts, previous_event
+        )
 
         if self.enable_async:
             event.current_stream_wait()
@@ -291,9 +301,7 @@ class DeepEPDispatcher:
             event,
         )
 
-    def combine_a(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
-    ):
+    def combine_a(self, hidden_states: torch.Tensor, forward_mode: ForwardMode):
         if hidden_states.shape[0] > 0:
             num_tokens = self.src2dst.shape[0] // self.router_topk
             output = torch.empty(
