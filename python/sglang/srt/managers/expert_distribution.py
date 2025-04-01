@@ -186,6 +186,9 @@ class _DetailAccumulator(_Accumulator):
 
 
 class _StatAccumulator(_Accumulator):
+    def __init__(self):
+        self._TODO = TODO
+
     def append(self, forward_pass_data: torch.Tensor):
         TODO
 
