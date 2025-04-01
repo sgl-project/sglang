@@ -41,7 +41,7 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-r
 
 Add [performance optimization options](#performance-optimization-options) as needed.
 
-<a id="option_args"></a>
+`<a id="option_args"></a>`
 
 ### Performance Optimization Options
 
@@ -175,15 +175,13 @@ python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
 ```
 
-
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
-AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+Add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
 
 ```bash
 python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
 ```
-
 
 ### Example: Serving with 16 A100/A800 with int8 Quantization
 
@@ -193,6 +191,7 @@ There are block-wise and per-channel quantization methods, and the quantization 
 - [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
 
 Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
+
 ```bash
 #master
 python3 -m sglang.launch_server \
