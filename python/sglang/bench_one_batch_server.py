@@ -257,6 +257,13 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 bench_args.batch_size, bench_args.input_len, bench_args.output_len
             )
         ):
+            if (
+                bench_args.enable_expert_distribution_recorder
+                and index == bench_args.profile_skip_cases
+            ):
+                requests.post(
+                    base_url + "/start_expert_distribution_record"
+                ).raise_for_status()
             if bench_args.profile and index == bench_args.profile_skip_cases:
                 # TODO extract to PR
                 print("bench script call cudaProfilerStart")
@@ -270,13 +277,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 #         "record_shapes": bench_args.profile_record_shapes,
                 #     },
                 # ).raise_for_status()
-            if (
-                bench_args.enable_expert_distribution_recorder
-                and index == bench_args.profile_skip_cases
-            ):
-                requests.post(
-                    base_url + "/start_expert_distribution_record"
-                ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
