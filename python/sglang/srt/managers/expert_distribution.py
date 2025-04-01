@@ -1,4 +1,3 @@
-import json
 import logging
 import time
 from collections import defaultdict
@@ -9,14 +8,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-class ExpertDistributionRecorder:
+class _ExpertDistributionRecorder:
     """Global expert distribution recording"""
-
-    # This class is a singleton class
-    def __new__(cls):
-        if not hasattr(cls, "instance"):
-            cls.instance = super(ExpertDistributionRecorder, cls).__new__(cls)
-        return cls.instance
 
     def __init__(self):
         # the length of the dictionary is the number of layers
@@ -81,4 +74,5 @@ class ExpertDistributionRecorder:
                     fd.write(f"{layer_idx},{expert_idx},{count}\n")
         self.reset()
 
-expert_distribution_recorder = ExpertDistributionRecorder()
+
+expert_distribution_recorder = _ExpertDistributionRecorder()
