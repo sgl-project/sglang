@@ -186,11 +186,9 @@ class _StageExecutor:
         stage = self._stages[self._index]
 
         with _annotate_region(debug_name=f"{self._debug_name}{self._index}"):
-            for op in stage:
-                with _annotate_region(
-                    debug_name=op.__name__.replace("_forward_tbo_op_", "")
-                ):
-                    self._stage_output = op(
+            for substage in stage:
+                with _annotate_region(debug_name=substage.debug_name):
+                    self._stage_output = substage.fn(
                         state=self._stage_state, **(self._stage_output or {})
                     )
 
