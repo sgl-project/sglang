@@ -1089,7 +1089,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.n_share_experts_fusion,
             help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
-                 "we use 8 by default. Set it to tp_size is a good practice.",
+            "we use 8 by default. Set it to tp_size is a good practice.",
         )
         parser.add_argument(
             "--disable-shared-experts-fusion",

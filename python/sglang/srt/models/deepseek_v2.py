@@ -17,12 +17,12 @@
 """Inference-only DeepseekV2 model."""
 
 import os
-from tqdm import tqdm
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -1345,23 +1345,37 @@ class DeepseekV2ForCausalLM(nn.Module):
             weights_list = list(weights)
             weights_dict = dict(weights_list)
             suffix_list = [
-                'down_proj.weight', 'down_proj.weight_scale_inv',
-                'gate_proj.weight', 'gate_proj.weight_scale_inv',
-                'up_proj.weight', 'up_proj.weight_scale_inv'
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+                "gate_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight",
+                "up_proj.weight_scale_inv",
             ]
-            for moe_layer in tqdm(range(self.config.first_k_dense_replace, self.config.num_hidden_layers, self.config.moe_layer_freq), desc=f"Cloning {self.n_share_experts_fusion} "
-                                  "replicas of the shared expert into MoE",):
+            for moe_layer in tqdm(
+                range(
+                    self.config.first_k_dense_replace,
+                    self.config.num_hidden_layers,
+                    self.config.moe_layer_freq,
+                ),
+                desc=f"Cloning {self.n_share_experts_fusion} "
+                "replicas of the shared expert into MoE",
+            ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
-                        weights_list.append((
-                            f"model.layers.{moe_layer}."
-                            f"mlp.experts."
-                            f"{self.config.n_routed_experts + num_repeat}"
-                            f".{suffix}", weights_dict[
-                                f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"]
-                            .clone()))
+                        weights_list.append(
+                            (
+                                f"model.layers.{moe_layer}."
+                                f"mlp.experts."
+                                f"{self.config.n_routed_experts + num_repeat}"
+                                f".{suffix}",
+                                weights_dict[
+                                    f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                                ].clone(),
+                            )
+                        )
             weights = weights_list
-        
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         MoEImpl = (

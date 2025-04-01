@@ -123,6 +123,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self)
         return None

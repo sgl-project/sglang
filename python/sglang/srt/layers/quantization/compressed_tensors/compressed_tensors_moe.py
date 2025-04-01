@@ -4,7 +4,7 @@
 import enum
 import logging
 from enum import Enum
-from typing import Callable, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -59,6 +59,7 @@ __all__ = [
 class CompressedTensorsMoEMethod:
     def __new__(cls, *args, **kwargs):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
         if cls is CompressedTensorsMoEMethod:
             return super().__new__(cls)
         return super().__new__(cls)
@@ -91,7 +92,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase, FusedMoeWeightScaleSupported
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoEMethodBase,
+            FusedMoeWeightScaleSupported,
+        )
+
         self.quant_config = quant_config
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
@@ -317,8 +322,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def __init__(
         self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase, FusedMoeWeightScaleSupported
-        
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoEMethodBase,
+            FusedMoeWeightScaleSupported,
+        )
+
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -632,7 +640,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.moe.topk import select_experts
-        
+
         assert activation == "silu", "Only SiLU activation is supported."
         if not VLLM_AVAILABLE:
             raise ImportError(

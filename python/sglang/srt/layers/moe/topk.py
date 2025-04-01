@@ -19,8 +19,8 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -127,18 +127,23 @@ def grouped_topk(
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     if n_share_experts_fusion:
-        topk_ids[:, -1] = torch.randint(low=num_experts,
-                                        high=num_experts + n_share_experts_fusion,
-                                        size=(topk_ids.size(0), ),
-                                        dtype=topk_ids.dtype,
-                                        device=topk_ids.device)
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / 2.5 # 2.5 is the routed_scaling_factor.
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + n_share_experts_fusion,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = (
+            topk_weights[:, :-1].sum(dim=-1) / 2.5
+        )  # 2.5 is the routed_scaling_factor.
 
     if renormalize:
-        topk_weights_sum = topk_weights.sum(
-            dim=-1,
-            keepdim=True) if n_share_experts_fusion == 0 else topk_weights[:, :-1].sum(
-                dim=-1, keepdim=True)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if n_share_experts_fusion == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
         topk_weights = topk_weights / topk_weights_sum
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
@@ -182,18 +187,23 @@ def biased_grouped_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if n_share_experts_fusion:
-        topk_ids[:, -1] = torch.randint(low=num_experts,
-                                        high=num_experts + n_share_experts_fusion,
-                                        size=(topk_ids.size(0), ),
-                                        dtype=topk_ids.dtype,
-                                        device=topk_ids.device)
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / 2.5 # 2.5 is the routed_scaling_factor.
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + n_share_experts_fusion,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = (
+            topk_weights[:, :-1].sum(dim=-1) / 2.5
+        )  # 2.5 is the routed_scaling_factor.
 
     if renormalize:
-        topk_weights_sum = topk_weights.sum(
-            dim=-1,
-            keepdim=True) if n_share_experts_fusion == 0 else topk_weights[:, :-1].sum(
-                dim=-1, keepdim=True)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if n_share_experts_fusion == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
         topk_weights = topk_weights / topk_weights_sum
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)

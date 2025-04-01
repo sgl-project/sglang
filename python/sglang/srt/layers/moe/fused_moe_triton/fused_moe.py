@@ -506,11 +506,12 @@ def invoke_fused_moe_kernel(
         per_token_group_quant_int8,
         per_token_quant_int8,
     )
+
     if _is_cuda:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
-    
+
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 

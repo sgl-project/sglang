@@ -201,6 +201,7 @@ def get_linear_quant_method(
 
 def gptq_get_quant_method(self, layer, prefix):
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
 
