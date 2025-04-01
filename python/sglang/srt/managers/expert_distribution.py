@@ -26,15 +26,15 @@ class _ExpertDistributionRecorder:
         return self._current_layer_idx.with_value(layer_idx)
 
     @contextmanager
-    def with_forward_pass(self):
+    def with_forward_pass(self, forward_pass_id: int):
         try:
             yield
         finally:
-            self._on_forward_pass_end()
+            self._on_forward_pass_end(forward_pass_id)
 
-    def _on_forward_pass_end(self):
+    def _on_forward_pass_end(self, forward_pass_id: int):
         single_pass_physical_count = self._single_pass_gatherer.collect()
-        self._accumulator.append(single_pass_physical_count)
+        self._accumulator.append(forward_pass_id, single_pass_physical_count)
         self._single_pass_gatherer.reset()
 
     def on_select_experts(self, topk_ids: torch.Tensor):
@@ -174,7 +174,7 @@ class _Accumulator(ABC):
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
         raise NotImplementedError
 
-    def append(self, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
         raise NotImplementedError
 
     def reset(self):
@@ -197,8 +197,9 @@ class _DetailAccumulator(_Accumulator):
     def __init__(self):
         self._records = []
 
-    def append(self, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
+            forward_pass_id=forward_pass_id,
             rank=TODO,
             physical_count=single_pass_physical_count.tolist(),
         ))
@@ -228,7 +229,7 @@ class _StatAccumulator(_Accumulator):
     def __init__(self):
         self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
 
-    def append(self, single_pass_physical_count: torch.Tensor):
+    def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
         self._physical_count += single_pass_physical_count
 
     def reset(self):
