@@ -111,7 +111,7 @@ class _SinglePassGatherer(ABC):
         if server_args.enable_deepep_moe:
             # TODO DeepEP low latency
             return _DeepepNormalSinglePassGatherer(expert_location_metadata)
-        return _LayerBasedSinglePassGatherer(expert_location_metadata)
+        return _SelectExpertsSinglePassGatherer(expert_location_metadata)
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata"):
         self._expert_location_metadata = expert_location_metadata
