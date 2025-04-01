@@ -191,7 +191,7 @@ class _StatAccumulator(_Accumulator):
         self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
 
     def append(self, single_pass_physical_count: torch.Tensor):
-        TODO
+        self._physical_count += single_pass_physical_count
 
     def reset(self):
         TODO
