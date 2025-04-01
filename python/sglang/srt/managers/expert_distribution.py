@@ -1,6 +1,7 @@
 import logging
 from abc import ABC
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import List, Type
 
 import torch
@@ -169,14 +170,19 @@ class _Accumulator(ABC):
 
 
 class _DetailAccumulator(_Accumulator):
+    def __init__(self):
+        self._records = []
+
     def append(self, forward_pass_data: torch.Tensor):
-        TODO
+        self._records.append(dict(
+            forward_pass_data=forward_pass_data.tolist(),
+        ))
 
     def reset(self):
-        TODO
+        self._records.clear()
 
     def dump(self):
-        TODO
+        return deepcopy(self._records)
 
 
 class _StatAccumulator(_Accumulator):
