@@ -180,7 +180,10 @@ class _Accumulator(ABC):
         return _StatAccumulator
 
     def get_single_pass_gatherer_keys(self):
-        return ["primary"]
+        return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
+
+    def get_single_pass_gatherer_key(self, debug_name: str):
+        return _SINGLE_PASS_GATHERER_KEY_PRIMARY
 
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
@@ -213,6 +216,11 @@ class _DetailAccumulator(_Accumulator):
         if False:  # TODO `server_args.enable_two_batch_overlap`
             return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
         return super().get_single_pass_gatherer_keys()
+
+    def get_single_pass_gatherer_key(self, debug_name: str):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return debug_name
+        return super().get_single_pass_gatherer_key(debug_name)
 
     def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
