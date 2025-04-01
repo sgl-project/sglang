@@ -128,12 +128,6 @@ class AnnotationOperation:
     debug_name: str
 
 
-@dataclass
-class ExecutableOperation:
-    debug_name: Optional[str]
-    fn: Callable
-
-
 Operation = Union[YieldOperation, AnnotationOperation, Callable]
 Stage = List[Callable]
 
