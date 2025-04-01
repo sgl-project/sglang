@@ -3,7 +3,9 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-from sgl_kernel import awq_dequantize
+from sglang.srt.utils import is_npu
+if not is_npu():
+    from sgl_kernel import awq_dequantize
 
 from sglang.srt.layers.linear import (
     LinearBase,
