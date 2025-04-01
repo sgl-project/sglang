@@ -213,7 +213,7 @@ def _process_expert_distribution_record(bench_args, response):
     path.write_text(json.dumps(data))
 
     import polars as pl
-    df = pl.read_json("/tmp/expert_distribution.json")
+    df = pl.read_json("/tmp/expert_distribution.json", infer_schema_length=1000000)
     df = df.with_row_index('temp_index')
     df = df.explode('physical_count')
     df = df.with_columns(layer_id=(pl.col('physical_count').cum_count() - 1).over('temp_index'))
