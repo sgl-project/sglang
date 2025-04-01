@@ -226,6 +226,8 @@ class RdmaClient:
         self.qp_s = []  # Only one QP in first phase
         self.completed_wrs = 0
         self.completed_meta_wrs = 0
+        self.wrs_to_send = []
+
 
     def init(self, meta_buff_addr, meta_buff_len, rcq_num=100, scq_num=100, max_send_wr=100, max_recv_wr=10,
              max_send_sge=10,
@@ -310,26 +312,27 @@ class RdmaClient:
         self.qp.post_send(wr)
         logger.debug(f"Sending metadata sent ...")
 
-    def send_wrs(self, mrs, mrs_info):
-        remote_mrs_info = self.remote_info['mrs_info']
-        wrs = self.get_wrs(mrs, mrs_info, remote_mrs_info)
-        for wr in wrs:
+    def send_wrs(self,  groups_mrs_info):
+        remote_groups_mrs_info = self.remote_info['groups_mrs_info']
+        self.add_to_sending_wrs(groups_mrs_info, remote_groups_mrs_info)
+        for wr in self.wrs_to_send:
             self.qp.post_send(wr)
         logger.debug("Sending Request posted ...")
 
-    def get_wrs(self, mrs, mrs_info, remote_mrs_info):
+    def add_to_sending_wrs(self, mrs_info, group_remote_mrs_info):
         wrs = []
-        for layer_id, item in enumerate(remote_mrs_info):
-            self.initial_wr_index += 1
-            local_sge = SGE(addr=mrs_info[layer_id]["address"],
-                            length=mrs_info[layer_id]["length"],
-                            lkey=mrs[layer_id].lkey)
-            wr = SendWR(wr_id=self.initial_wr_index, sg=[local_sge], num_sge=1, opcode=IBV_WR_RDMA_WRITE,
-                        send_flags=IBV_SEND_SIGNALED)
-            wr.set_wr_rdma(addr=item['address'],
-                           rkey=item['rkey'])
-            wrs.append(wr)
-        return wrs
+        for group_id, remote_mrs_info in enumerate(group_remote_mrs_info):
+            for layer_id, item in enumerate(remote_mrs_info):
+                # 以下是连续的
+                self.initial_wr_index += 1
+                local_sge = SGE(addr=mrs_info[group_id][layer_id]["address"],
+                                length=mrs_info[group_id][layer_id]["length"],
+                                lkey=mrs_info[group_id][layer_id]['lkey'])
+                wr = SendWR(wr_id=self.initial_wr_index, sg=[local_sge], num_sge=1, opcode=IBV_WR_RDMA_WRITE,
+                            send_flags=IBV_SEND_SIGNALED)
+                wr.set_wr_rdma(addr=item['address'],
+                               rkey=item['rkey'])
+                self.wrs_to_send.append(wr)
 
     def create_mr(self, address, length, access=0b111):
         """
@@ -370,7 +373,6 @@ class RdmaClient:
                     logger.error(wc)
                 else:
                     self.completed_wrs += 1
-                    logger.debug(f"Send completed! Bytes: {wc.byte_len}, wr_id: {wc.wr_id}")
 
     def check_recv_complete(self):
         npolled, wc_list = self.recv_cq.poll()

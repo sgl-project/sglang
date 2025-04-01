@@ -17,6 +17,8 @@ from typing import Dict, Optional
 import numpy as np
 from sglang.srt.bootstrap.rdma_utils import RdmaServer, RdmaClient
 
+from python.sglang.srt.disaggregation.group_indics import groups_by_continuity_numpy
+
 logger = logging.getLogger(__name__)
 
 from sglang.srt.utils import get_open_port
@@ -124,6 +126,7 @@ class KVSender:
         return None
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+
         """Initialize sender with metadata only
 
         Args:
@@ -133,6 +136,8 @@ class KVSender:
         Returns:
             bool: True if metadata sent successfully
         """
+        self.num_tokens = num_kv_indices
+        self.aux_idx = aux_index
         metadata_ptr = self.mgr.aux_data_ptrs[0] + (aux_index * self.mgr.aux_item_lens[0])
         metadata_ptr_length = self.mgr.aux_item_lens[0]
 
@@ -146,7 +151,7 @@ class KVSender:
             self.state = KVPoll.Bootstrapping
 
     def poll(self) -> KVPoll:
-        """Poll transfer status and handle state transitions"""
+        """Poll transfer status"""
         if self.state == KVPoll.Bootstrapping:
             data = self.handshake()
             if not data:
@@ -155,6 +160,7 @@ class KVSender:
                 logger.debug(data)
                 self.target_ip = data.get(str(self.mgr.engine_rank))['ip']
                 self.target_port = data.get(str(self.mgr.engine_rank))['port']
+
                 self.state = KVPoll.WaitingForInput
         if self.state == KVPoll.Failed:
             return KVPoll.Failed
@@ -162,10 +168,12 @@ class KVSender:
         if self.state == KVPoll.Transferring:
             self.qp.check_send_complete()
 
-            # Check completion of all work requests including metadata
+            '''
+            completed wrs + metadata wrs
+            '''
             if self.qp.completed_wrs == len(self.mrs_to_send) + 1 and self.meta_has_sent:
                 print("Transferring complete")
-                # Write remote metadata //todo
+                # 写入远端 metadata //todo
                 self.state = KVPoll.Success
             elif self.qp.completed_wrs == len(self.mrs_to_send) and not self.meta_has_sent:
                 self.qp.send_metadata_wrs()
@@ -174,28 +182,30 @@ class KVSender:
         return self.state
 
     def send(self, kv_indices: np.ndarray[np.int32]):
-        """Send actual data synchronously
+        """Send actual data synchronously"""
+        # 收集要传输的数据
+        groups_mrs_info = []
+        continous_indices = groups_by_continuity_numpy(kv_indices)
+        for group_id, continue_kv_indices in enumerate(continous_indices):
+            mrs_info = []
+            address_lengths = self.mgr.caculate_layer_kv_addresses(continue_kv_indices)
+            for layer_id, (address, length) in enumerate(address_lengths):
+                mr = self.qp.create_mr(address, length)
+                self.mrs_to_send.append(mr)
+                mrs_info.append({
+                    "address": address,
+                    "length": length,
+                    "rkey": mr.rkey,
+                    'lkey': mr.lkey
+                })
+            groups_mrs_info.append(mrs_info)
+        self.qp.send_wrs(groups_mrs_info)
 
-        Args:
-            kv_indices: Array of KV indices to send
-        """
-        # Calculate addresses and prepare memory regions for transfer
-        address_lengths = self.mgr.caculate_layer_kv_addresses(kv_indices)
-        mrs_info = []
-        for layer_id, (address, length) in enumerate(address_lengths):
-            mr = self.qp.create_mr(address, length)
-            self.mrs_to_send.append(mr)
-            mrs_info.append({
-                "address": address,
-                "length": length,
-                "rkey": mr.rkey
-            })
-
-        self.qp.send_wrs(self.mrs_to_send, mrs_info)
 
 
 class KVReceiver:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None):
+        self.kv_layers_mrs = []
         self.mgr = mgr
         self.bootstrap_addr = bootstrap_addr
         self.bootstrap_room = bootstrap_room
@@ -256,30 +266,39 @@ class KVReceiver:
         Returns:
             bool: True if initialization successful
         """
+
         metadata_ptr = self.mgr.aux_data_ptrs[0] + (aux_index * self.mgr.aux_item_lens[0])
         metadata_length = self.mgr.aux_item_lens[0]
+        # 创建每一岑layer的mr 得到对应的key 传给客户端
+        rkeys= []
 
-        # Initialize RDMA server and register memory regions
-        address_lengths = self.mgr.caculate_layer_kv_addresses(kv_indices)
-        mrs_info = []
-
-        # Create memory regions for each layer
-        for layer_id, (address, length) in enumerate(address_lengths):
-            mr = self.qp.create_mr(address, length)
-            self.mrs_to_receive.append(mr)
-            mrs_info.append({
-                "address": address,
-                "length": length,
-                "rkey": mr.rkey
-            })
+        for layer_id, base_addr in enumerate(self.mgr.kv_data_ptrs):
+            layer_mr = self.qp.create_mr(base_addr, self.mgr.kv_data_lens[layer_id])
+            rkeys.append(layer_mr.rkey)
+            self.kv_layers_mrs.append(layer_mr)
+        # todo 根据kv_indics的连续性 来判断 地址连续性，借此可以动态创建 较大的 MR
+        groups_mrs_info = []
+        continous_indices = groups_by_continuity_numpy(kv_indices)
+        for group_id, continue_kv_indices in enumerate(continous_indices):
+            mrs_info = []
+            address_lengths = self.mgr.caculate_layer_kv_addresses(continue_kv_indices)
+            for layer_id, (address, length) in enumerate(address_lengths):
+                mrs_info.append({
+                    "address": address,
+                    "length": length,
+                    "rkey": rkeys[layer_id]
+                })
+            groups_mrs_info.append(mrs_info)
 
         try:
-            self.qp.init(self.mrs_to_receive, mrs_info, metadata_ptr, metadata_length)
+            self.qp.init( groups_mrs_info, metadata_ptr, metadata_length)
             self.state = KVPoll.Transferring
             self.qp.recv_metadata_mr()
+
         except Exception as e:
             self.state = KVPoll.Bootstrapping
             return
+
 
     def poll(self) -> KVPoll:
         """Poll receive status and handle state transitions"""
