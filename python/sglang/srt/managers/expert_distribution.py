@@ -19,8 +19,9 @@ class ExpertDistributionRecorder:
     def __init__(self, server_args: ServerArgs):
         self._recording = False
         self._current_layer_idx = Withable()
-        self._single_pass_gatherer = _SinglePassGatherer.init_new(server_args)
         self._accumulator = _Accumulator.init_new()
+        self._single_pass_gatherers = {k: _SinglePassGatherer.init_new(server_args) for k in
+                                       self._accumulator.get_single_pass_gatherer_keys()}
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -89,6 +90,7 @@ def postprocess_dumps(physical_dumps: List[Any], physical_to_logical_map: torch.
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
+
 
 class _SinglePassGatherer(ABC):
     @staticmethod
@@ -160,6 +162,9 @@ class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
 
 # --------------------------------------- Accumulator -----------------------------------------
 
+_SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
+
+
 class _Accumulator(ABC):
     @staticmethod
     def init_new() -> "_Accumulator":
@@ -170,6 +175,9 @@ class _Accumulator(ABC):
         if get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"):
             return _DetailAccumulator
         return _StatAccumulator
+
+    def get_single_pass_gatherer_keys(self):
+        return ["primary"]
 
     @classmethod
     def postprocess_dumps(cls, physical_dumps: List[Any], physical_to_logical_map: torch.Tensor):
@@ -197,6 +205,11 @@ class _DetailAccumulator(_Accumulator):
 
     def __init__(self):
         self._records = []
+
+    def get_single_pass_gatherer_keys(self):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
+        return super().get_single_pass_gatherer_keys()
 
     def append(self, forward_pass_id: int, single_pass_physical_count: torch.Tensor):
         self._records.append(dict(
