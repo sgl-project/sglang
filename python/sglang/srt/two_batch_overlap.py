@@ -1,5 +1,6 @@
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -120,6 +121,12 @@ if _ENABLE_PROFILE:
 
 class YieldOperation:
     pass
+
+
+@dataclass
+class ExecutionOperation:
+    debug_name: str
+    fn: Callable
 
 
 Operation = Union[YieldOperation, Callable]
@@ -253,4 +260,10 @@ def _chunk_by_separator(
 
 
 def decorate_operations(operations: List[Operation], debug_name_prefix: str):
-    return TODO
+    return [_decorate_operation(op, debug_name_prefix) for op in operations]
+
+
+def _decorate_operation(operation: Operation, debug_name_prefix: str):
+    if isinstance(operation, YieldOperation):
+        return operation
+    return ExecutionOperation(debug_name=TODO, fn=operation)
