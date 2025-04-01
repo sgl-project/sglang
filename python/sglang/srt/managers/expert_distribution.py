@@ -127,6 +127,7 @@ class _DeepepNormalForwardGatherer(_LayerBasedForwardGatherer):
 
 
 # TODO Wait for LowLatency DeepEP merging
+# e.g. use naive tensor copying
 class _DeepepLowLatencyForwardGatherer(_ForwardGatherer):
     pass
 
