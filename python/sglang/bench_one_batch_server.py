@@ -209,9 +209,9 @@ def run_one_case(
 def _process_expert_distribution_record(bench_args, response):
     response.raise_for_status()
     data = response.json()
-    (
-        Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
-    ).write_text(json.dumps(data))
+    path = Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
+    print(f"Write expert_distribution_recorder information to {path}")
+    path.write_text(json.dumps(data))
     # TODO more
 
 
