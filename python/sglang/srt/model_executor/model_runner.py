@@ -215,7 +215,7 @@ class ModelRunner:
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture()
 
-        self.expert_distribution_recorder = ExpertDistributionRecorder()
+        self.expert_distribution_recorder = ExpertDistributionRecorder(server_args)
         global global_expert_distribution_recorder
         global_expert_distribution_recorder = self.expert_distribution_recorder
 

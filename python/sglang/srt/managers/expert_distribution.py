@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self):
+    def __init__(self, server_args: ServerArgs):
         self._recording = False
         self._current_layer_idx = Withable()
         self._single_pass_gatherer = _SinglePassGatherer.init_new(server_args)
