@@ -17,12 +17,13 @@ logger = logging.getLogger(__name__)
 class ExpertDistributionRecorder:
     """Global expert distribution recording"""
 
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, server_args: ServerArgs, metadata: "ModelExpertMetadata"):
         self._recording = False
         self._current_layer_idx = Withable()
-        self._accumulator = _Accumulator.init_new()
+        self._metadata = metadata
+        self._accumulator = _Accumulator.init_new(metadata)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args)
+            k: _SinglePassGatherer.init_new(server_args, metadata)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -174,14 +175,17 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 class _Accumulator(ABC):
     @staticmethod
-    def init_new() -> "_Accumulator":
-        return _Accumulator.get_class()()
+    def init_new(metadata: "ModelExpertMetadata") -> "_Accumulator":
+        return _Accumulator.get_class()(metadata)
 
     @staticmethod
     def get_class() -> Type["_Accumulator"]:
         if get_bool_env_var("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"):
             return _DetailAccumulator
         return _StatAccumulator
+
+    def __init__(self, metadata: "ModelExpertMetadata"):
+        self._metadata = metadata
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -213,7 +217,8 @@ class _DetailAccumulator(_Accumulator):
             for record in physical_dump
         ]
 
-    def __init__(self):
+    def __init__(self, metadata: "ModelExpertMetadata"):
+        super().__init__(metadata)
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
@@ -256,7 +261,8 @@ class _StatAccumulator(_Accumulator):
                         layer_index, local_physical_expert_index]
         return dict(logical_count=logical_count)
 
-    def __init__(self):
+    def __init__(self, metadata: "ModelExpertMetadata"):
+        super().__init__(metadata)
         self._physical_count = torch.zeros((num_layers, num_local_physical_experts))
 
     def append(self, forward_pass_id: int, gatherer_key: str, single_pass_physical_count: torch.Tensor):
@@ -275,7 +281,7 @@ class _StatAccumulator(_Accumulator):
 # --------------------------------------- Misc -----------------------------------------
 
 @dataclass
-class ModelExpertInfo:
+class ModelExpertMetadata:
     num_layers: int
     num_local_physical_experts: int
     num_logical_experts: int
