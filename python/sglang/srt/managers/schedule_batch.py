@@ -72,6 +72,7 @@ global_server_args_dict = {
     "enable_dp_attention": ServerArgs.enable_dp_attention,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+    "deepep_mode": ServerArgs.deepep_mode,
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
@@ -1219,10 +1220,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = (
-                    (len(req.prefix_indices) + server_args.page_size - 1)
-                    // server_args.page_size
-                    * server_args.page_size
-                )
+                    len(req.prefix_indices) // server_args.page_size
+                ) * server_args.page_size
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
