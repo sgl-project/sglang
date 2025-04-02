@@ -852,9 +852,6 @@ def match_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if "qwen" in model_path and "vl" in model_path:
         return "qwen2-vl"
-    if "qwen" in model_path:
-        if "vl" in model_path:
-            return "qwen2-vl"
     if (
         "llava-v1.6-34b" in model_path
         or "llava-v1.6-yi-34b" in model_path
