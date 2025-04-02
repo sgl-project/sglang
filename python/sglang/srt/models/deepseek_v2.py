@@ -178,6 +178,8 @@ class DeepseekV2MoE(nn.Module):
             or config.routed_scaling_factor != 2.5
         ):
             self.n_share_experts_fusion = 0
+            global_server_args_dict["disable_shared_experts_fusion"] = True
+
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -1349,6 +1351,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.routed_scaling_factor != 2.5
         ):
             self.n_share_experts_fusion = 0
+            global_server_args_dict["disable_shared_experts_fusion"] = True
+
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
