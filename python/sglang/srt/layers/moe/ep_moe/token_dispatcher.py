@@ -1,3 +1,5 @@
+from sglang.srt.utils import DeepEPMode
+
 try:
     from deep_ep import Buffer
 
@@ -98,7 +100,7 @@ class DeepEPDispatcher:
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_mode: str = "auto",
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
