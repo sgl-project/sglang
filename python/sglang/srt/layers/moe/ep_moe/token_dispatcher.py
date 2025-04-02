@@ -552,7 +552,7 @@ class DeepEPDispatcher:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
-    ) -> torch.Tensor:
+    ):
         inner_state = self._get_dispatcher(forward_mode).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
