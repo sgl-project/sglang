@@ -384,10 +384,12 @@ class DeepEPDispatcher:
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
 
-            masked_m = torch.empty(
-                (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
-            )
-            expected_m = 0
+            # TODO
+            # masked_m = torch.empty(
+            #     (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
+            # )
+            # expected_m = 0
+            masked_m = expected_m = None
         elif resolved_deepep_mode == DeepEPMode.low_latency:
             expected_m = (
                              hidden_states.shape[0]
@@ -404,13 +406,14 @@ class DeepEPDispatcher:
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
 
-            # TODO make it none
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
-            )
-            seg_indptr = torch.zeros(
-                (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-            )
+            # TODO
+            # reorder_topk_ids = torch.empty(
+            #     (0,), device=hidden_states.device, dtype=torch.int64
+            # )
+            # seg_indptr = torch.zeros(
+            #     (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            # )
+            reorder_topk_ids = seg_indptr = None
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
