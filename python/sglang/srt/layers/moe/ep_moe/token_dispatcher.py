@@ -353,9 +353,8 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ) -> torch.Tensor:
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.empty(
@@ -383,9 +382,7 @@ class DeepEPDispatcher:
                 output,
             )
             event.current_stream_wait() if self.async_finish else ()
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states,
                 topk_idx,
