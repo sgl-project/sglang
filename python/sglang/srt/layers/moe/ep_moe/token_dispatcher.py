@@ -369,10 +369,6 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode = None,
     ) -> Tuple:
         topk_idx = topk_idx.to(torch.int64)
-        masked_m = torch.empty(
-            (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
-        )
-        expected_m = 0
 
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
@@ -387,6 +383,11 @@ class DeepEPDispatcher:
                 reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
+
+            masked_m = torch.empty(
+                (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
+            )
+            expected_m = 0
         elif resolved_deepep_mode == DeepEPMode.low_latency:
             expected_m = (
                              hidden_states.shape[0]
