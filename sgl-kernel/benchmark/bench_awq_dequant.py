@@ -92,9 +92,7 @@ configs = list(
         args={},
     )
 )
-def benchmark(
-    kernel_name, dtype, qweight_row, qweight_col, provider
-):
+def benchmark(kernel_name, dtype, qweight_row, qweight_col, provider):
     device = torch.device("cuda")
     qweight = torch.randint(
         0,
