@@ -139,8 +139,6 @@ class BaseMultimodalProcessor(ABC):
         else:
             multimodal_tokens.image_token = multimodal_tokens.image_token
 
-        assert isinstance(prompt, str)
-
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
@@ -204,7 +202,16 @@ class BaseMultimodalProcessor(ABC):
                             continue
 
                     image_sizes += frames[0].size * len(frames)
-                    hashes += [hash(image_file)] * len(frames)
+
+                    # Generate a hashable value for the image file
+                    if isinstance(image_file, Image.Image):
+                        # For PIL.Image objects, use the ID as a hashable value
+                        hash_value = hash(id(image_file))
+                    else:
+                        # For other types (strings, etc.), use the regular hash
+                        hash_value = hash(image_file)
+
+                    hashes += [hash_value] * len(frames)
                     images += frames
                     image_index += 1
                     if frames_to_process != 0:
