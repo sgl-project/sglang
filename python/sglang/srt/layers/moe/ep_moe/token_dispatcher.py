@@ -98,6 +98,10 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
 
 
 class DeepEPDispatcher:
+    TODO
+
+
+class DeepEPDispatcher:
     """
     Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
     https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
