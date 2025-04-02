@@ -90,14 +90,14 @@ class _DeepEPDispatcherBase:
         self,
         group: torch.distributed.ProcessGroup,
         router_topk: int,
-        permute_fusion: bool = False,
-        num_experts: int = None,
-        num_local_experts: int = None,
-        hidden_size: int = None,
-        params_dtype: torch.dtype = None,
-        deepep_mode: DeepEPMode = DeepEPMode.auto,
-        async_finish: bool = False,
-        return_recv_hook: bool = False,
+        permute_fusion: bool,
+        num_experts: int,
+        num_local_experts: int,
+        hidden_size: int,
+        params_dtype: torch.dtype,
+        deepep_mode: DeepEPMode,
+        async_finish: bool,
+        return_recv_hook: bool,
     ):
         if not use_deepep:
             raise ImportError(
@@ -150,7 +150,20 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
 
 
 class DeepEPDispatcher:
-    TODO
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
+    ):
+        TODO
 
 
 class DeepEPDispatcher:
