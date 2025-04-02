@@ -205,9 +205,9 @@ class HiRadixCache(RadixCache):
             # only evict the host value of evicted nodes
             if not x.evicted:
                 continue
-            assert x.lock_ref == 0 and x.host_value is not None
 
-            assert self.cache_controller.evict_host(x.host_value) > 0
+            num_evicted += self.cache_controller.evict_host(x.host_value)
+
             for k, v in x.parent.children.items():
                 if v == x:
                     break
