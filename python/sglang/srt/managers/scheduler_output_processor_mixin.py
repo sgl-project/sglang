@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    BaseFinishReason,
+    Req,
+    ScheduleBatch,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -58,23 +63,44 @@ class SchedulerOutputProcessorMixin:
                         )
 
             hidden_state_offset = 0
-
-            # Check finish conditions
             logprob_pt = 0
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            out_cache_loc_offset = 0
+            result_idx = 0
+
+            for req in batch.reqs:
+                current_req_extend_len = 0
+                if not req.is_retracted and extend_input_len_per_req is not None:
+                    current_req_extend_len = extend_input_len_per_req[result_idx]
+
                 if req.is_retracted:
+                    out_cache_loc_offset += current_req_extend_len
                     continue
 
+                next_token_id = next_token_ids[result_idx]
+
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    out_cache_loc_offset += current_req_extend_len
+                    result_idx += 1
                     continue
 
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
+
+                    is_finished_zero_tokens = (
+                        isinstance(req.finished_reason, FINISH_LENGTH)
+                        and req.finished_reason.length == 0
+                    )
+                    if is_finished_zero_tokens:
+                        if current_req_extend_len > 0:
+                            token_slot_to_free = batch.out_cache_loc[
+                                out_cache_loc_offset
+                                + current_req_extend_len
+                                - 1 : out_cache_loc_offset
+                                + current_req_extend_len
+                            ]
+                            self.token_to_kv_pool_allocator.free(token_slot_to_free)
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
@@ -84,12 +110,14 @@ class SchedulerOutputProcessorMixin:
 
                     if req.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[
+                            result_idx
+                        ]
+                        num_input_logprobs = (
+                            current_req_extend_len - extend_logprob_start_len
+                        )
                         self.add_logprob_return_values(
-                            i,
+                            result_idx,
                             req,
                             logprob_pt,
                             next_token_ids,
@@ -104,38 +132,32 @@ class SchedulerOutputProcessorMixin:
                     ):
                         req.hidden_states.append(
                             logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
+                                hidden_state_offset : hidden_state_offset
+                                + len(req.origin_input_ids)
                             ]
                             .cpu()
                             .clone()
                             .tolist()
                         )
+                        hidden_state_offset += len(req.origin_input_ids)
 
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
                         req.grammar.finished = req.finished()
-                else:
-                    # being chunked reqs' prefill is not finished
+                else:  # Handle chunked requests
                     req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
-
-                    # Incrementally update input logprobs.
                     if req.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
+                        assert extend_logprob_start_len_per_req is not None
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[
+                            result_idx
+                        ]
+                        if extend_logprob_start_len < current_req_extend_len:
                             num_input_logprobs = (
-                                extend_input_len - extend_logprob_start_len
+                                current_req_extend_len - extend_logprob_start_len
                             )
                             self.add_input_logprob_return_values(
-                                i,
+                                result_idx,
                                 req,
                                 logits_output,
                                 logprob_pt,
@@ -143,6 +165,9 @@ class SchedulerOutputProcessorMixin:
                                 last_prefill_chunk=False,
                             )
                             logprob_pt += num_input_logprobs
+
+                out_cache_loc_offset += current_req_extend_len
+                result_idx += 1
 
             if batch.next_batch_sampling_info:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
@@ -272,7 +297,7 @@ class SchedulerOutputProcessorMixin:
 
     def add_input_logprob_return_values(
         self,
-        i: int,
+        result_idx: int,
         req: Req,
         output: LogitsProcessorOutput,
         logprob_pt: int,
@@ -319,15 +344,19 @@ class SchedulerOutputProcessorMixin:
         req.input_token_logprobs.extend(input_token_logprobs)
 
         if req.top_logprobs_num > 0:
-            req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
-            req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
+            req.temp_input_top_logprobs_val.append(
+                output.input_top_logprobs_val[result_idx]
+            )
+            req.temp_input_top_logprobs_idx.append(
+                output.input_top_logprobs_idx[result_idx]
+            )
 
         if req.token_ids_logprob is not None:
             req.temp_input_token_ids_logprobs_val.append(
-                output.input_token_ids_logprobs_val[i]
+                output.input_token_ids_logprobs_val[result_idx]
             )
             req.temp_input_token_ids_logprobs_idx.append(
-                output.input_token_ids_logprobs_idx[i]
+                output.input_token_ids_logprobs_idx[result_idx]
             )
 
         if last_prefill_chunk:
@@ -406,7 +435,7 @@ class SchedulerOutputProcessorMixin:
 
     def add_logprob_return_values(
         self,
-        i: int,
+        result_idx: int,
         req: Req,
         pt: int,
         next_token_ids: List[int],
@@ -414,23 +443,27 @@ class SchedulerOutputProcessorMixin:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        req.output_token_logprobs_val.append(output.next_token_logprobs[result_idx])
+        req.output_token_logprobs_idx.append(next_token_ids[result_idx])
 
         self.add_input_logprob_return_values(
-            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+            result_idx, req, output, pt, num_input_logprobs, last_prefill_chunk=True
         )
 
         if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+            req.output_top_logprobs_val.append(
+                output.next_token_top_logprobs_val[result_idx]
+            )
+            req.output_top_logprobs_idx.append(
+                output.next_token_top_logprobs_idx[result_idx]
+            )
 
         if req.token_ids_logprob is not None:
             req.output_token_ids_logprobs_val.append(
-                output.next_token_token_ids_logprobs_val[i]
+                output.next_token_token_ids_logprobs_val[result_idx]
             )
             req.output_token_ids_logprobs_idx.append(
-                output.next_token_token_ids_logprobs_idx[i]
+                output.next_token_token_ids_logprobs_idx[result_idx]
             )
 
         return num_input_logprobs
@@ -525,7 +558,16 @@ class SchedulerOutputProcessorMixin:
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+
+                current_completion_tokens = len(req.output_ids)
+                finish_reason_obj = req.finished_reason
+                if (
+                    isinstance(finish_reason_obj, FINISH_LENGTH)
+                    and finish_reason_obj.length == 0
+                ):
+                    current_completion_tokens = 0
+                completion_tokens.append(current_completion_tokens)
+
                 cached_tokens.append(req.cached_tokens)
 
                 if not self.spec_algorithm.is_none():

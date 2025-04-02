@@ -568,6 +568,13 @@ class Req:
         if self.finished():
             return
 
+        if self.sampling_params.max_new_tokens == 0 and len(self.output_ids) <= 1:
+            self.finished_reason = FINISH_LENGTH(length=0)
+            # If a token was just added, remove it to reflect 0 completion tokens accurately.
+            if len(self.output_ids) == 1:
+                self.output_ids.pop()
+            return
+
         if self.to_abort:
             self.finished_reason = FINISH_ABORT(
                 message=self.to_abort_message,
