@@ -157,12 +157,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         num_max_dispatch_tokens_per_rank: int,
     ):
         topk_idx = topk_idx.to(torch.int64)
+        previous_event = Buffer.capture() if self.async_finish else None
         (
             hidden_states,
             topk_idx,
             topk_weights,
             event,
-        ) = self._dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+        ) = self._dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         if hidden_states.shape[0] > 0:
             reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
@@ -192,9 +193,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         num_experts: int,
+        previous_event,
     ):
-        previous_event = Buffer.capture() if self.async_finish else None
-
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
