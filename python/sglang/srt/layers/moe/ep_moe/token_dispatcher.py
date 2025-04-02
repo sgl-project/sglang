@@ -85,7 +85,7 @@ def get_buffer_low_latency(
     return _buffer_low_latency
 
 
-class _DeepEPDispatcherBase:
+class _DeepEPDispatcherImplBase:
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -132,7 +132,7 @@ class _DeepEPDispatcherBase:
         raise NotImplementedError
 
 
-class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
+class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -321,7 +321,7 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
         return combined_x, event
 
 
-class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
+class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -497,12 +497,12 @@ class DeepEPDispatcher:
         )
 
         if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherNormal(
+            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherLowLatency(
+            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
@@ -537,7 +537,7 @@ class DeepEPDispatcher:
             topk_weights=topk_weights,
         )
 
-    def _get_dispatcher(self, forward_mode: ForwardMode) -> '_DeepEPDispatcherBase':
+    def _get_dispatcher(self, forward_mode: ForwardMode) -> '_DeepEPDispatcherImplBase':
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
