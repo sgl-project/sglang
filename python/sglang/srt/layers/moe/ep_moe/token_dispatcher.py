@@ -310,16 +310,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
-        hidden_states, event = self._combine_normal(
-            output,
-        )
+        previous_event = Buffer.capture() if self.async_finish else None
+
+        hidden_states, event = self._combine_normal(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
 
         return hidden_states
 
-    def _combine_normal(self, x: torch.Tensor):
-        previous_event = Buffer.capture() if self.async_finish else None
-
+    def _combine_normal(self, x: torch.Tensor, previous_event):
         combined_x, _, event = self.buffer_normal.combine(
             x,
             self.handle,
