@@ -112,15 +112,17 @@ class FlashAttentionBackend(AttentionBackend):
                     self.speculative_num_steps, -1
                 ).T
 
-                for idx, single_seq_len in enumerate(seq_lens_with_decode):
-                    real_bsz_start_idx = idx * self.topk
-                    real_bsz_end_idx = (idx + 1) * self.topk
-                    metadata.page_table[
-                        real_bsz_start_idx:real_bsz_end_idx,
-                        (single_seq_len - (self.step_id + 1)) : single_seq_len,
-                    ] = cache_loc[
-                        real_bsz_start_idx:real_bsz_end_idx, : (self.step_id + 1)
-                    ]
+                # Calculate page table indices and cache location indices to update the page table.
+                batch_indices = torch.arange(batch_size, device=device).repeat_interleave(self.topk * (self.step_id + 1))
+                topk_indices = torch.arange(self.topk, device=device).repeat(batch_size * (self.step_id + 1))
+                row_indices = batch_indices * self.topk + topk_indices
+
+                page_table_col_base_indices = seqlens_in_batch.unsqueeze(1) + torch.arange(self.step_id + 1, device=device)
+                page_table_col_indices = page_table_col_base_indices.view(-1).repeat(self.topk)
+
+                cache_loc_col_indices = torch.arange(self.step_id + 1, device=device, dtype=torch.int32).repeat(batch_size * self.topk)
+
+                metadata.page_table[row_indices, page_table_col_indices] = cache_loc[row_indices, cache_loc_col_indices].to(torch.int32)
             else:
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
