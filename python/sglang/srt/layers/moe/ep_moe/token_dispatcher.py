@@ -159,10 +159,27 @@ class DeepEPDispatcher:
         return_recv_hook: bool = False,
     ):
         self.deepep_mode = deepep_mode
+
+        common_kwargs = dict(
+            group=group,
+            router_topk=router_topk,
+            permute_fusion=permute_fusion,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            params_dtype=params_dtype,
+        )
+
         if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherNormal()
+            self._normal_dispatcher = _DeepEPDispatcherNormal(
+                async_finish=async_finish,
+                **common_kwargs,
+            )
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherLowLatency()
+            self._low_latency_dispatcher = _DeepEPDispatcherLowLatency(
+                return_recv_hook=return_recv_hook,
+                **common_kwargs,
+            )
 
 
 class DeepEPDispatcher:
