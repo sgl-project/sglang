@@ -86,27 +86,6 @@ def get_buffer_low_latency(
 
 
 class _DeepEPDispatcherBase:
-    TODO
-
-
-class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
-    TODO
-
-
-class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
-    TODO
-
-
-class DeepEPDispatcher:
-    TODO
-
-
-class DeepEPDispatcher:
-    """
-    Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
-    """
-
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -158,6 +137,27 @@ class DeepEPDispatcher:
                 self.num_experts,
             )
             self.return_recv_hook = return_recv_hook
+
+
+class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+class DeepEPDispatcher:
+    TODO
+
+
+class DeepEPDispatcher:
+    """
+    Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
+    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
+    """
 
     def deepep_permute(
         self,
