@@ -652,6 +652,14 @@ class ProfileReqInput:
     num_steps: Optional[int] = None
     activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
 
+    def __post_init__(self):
+        if "CUDA_PROFILER" in self.activities and len(self.activities) > 1:
+            raise ValueError(
+                "CUDA_PROFILER is for nsys profiling. "
+                "CPU, GPU, and MEM are for torch profiler. "
+                "Therefore, CUDA_PROFILER cannot be used with other activities."
+            )
+
 
 class ProfileReqType(Enum):
     START_PROFILE = 1
