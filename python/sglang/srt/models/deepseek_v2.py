@@ -22,7 +22,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from scipy.stats import loggamma
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
