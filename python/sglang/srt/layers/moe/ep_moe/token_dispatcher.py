@@ -281,12 +281,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         )
         return reorder_topk_ids, seg_indptr, gateup_input
 
-    def combine(
+    def combine_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
+    ):
         if hidden_states.shape[0] > 0:
             num_tokens = self.src2dst.shape[0] // self.router_topk
             output = torch.empty(
@@ -311,10 +311,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 dtype=hidden_states.dtype,
             )
         previous_event = Buffer.capture() if self.async_finish else None
+        return output, previous_event
 
+    def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_normal(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-
         return hidden_states
 
     def _combine_normal(self, x: torch.Tensor, previous_event):
