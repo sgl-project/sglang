@@ -225,7 +225,7 @@ class DeepseekV2MoE(nn.Module):
                 deepep_mode=global_server_args_dict["deepep_mode"],
             )
 
-        if config.n_shared_experts is not None:
+        if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             if not global_server_args_dict["enable_deepep_moe"]:
@@ -1403,6 +1403,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "up_proj.weight",
                 "up_proj.weight_scale_inv",
             ]
+            names_to_remove = []
             for moe_layer in tqdm(
                 range(
                     self.config.first_k_dense_replace,
@@ -1425,7 +1426,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 ].clone(),
                             )
                         )
-            weights = weights_list
+                    names_to_remove += [
+                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                        for suffix in suffix_list
+                    ]
+            weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
