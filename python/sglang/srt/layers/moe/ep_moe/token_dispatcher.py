@@ -122,13 +122,13 @@ class DeepEPDispatcher:
         self.deepep_mode = deepep_mode
         self.handle = None
 
-        if self.deepep_mode in ["normal", "auto"]:  # for normal / auto mode
+        if self.deepep_mode.enable_normal():
             self.buffer_normal = get_buffer_normal(
                 self.group, self.hidden_size * self.params_bytes
             )
             self.async_finish = async_finish
             self.src2dst = None
-        if self.deepep_mode in ["low_latency", "auto"]:  # for low_latency / auto mode
+        if self.deepep_mode.enable_low_latency():
             """
             num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
             https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -216,11 +216,11 @@ class DeepEPDispatcher:
             self.deepep_mode == "auto" and forward_mode.is_decode()
         ):
             expected_m = (
-                hidden_states.shape[0]
-                * self.buffer_low_latency.group_size
-                * topk_idx.shape[1]
-                + num_experts
-            ) // num_experts
+                             hidden_states.shape[0]
+                             * self.buffer_low_latency.group_size
+                             * topk_idx.shape[1]
+                             + num_experts
+                         ) // num_experts
             hidden_states, masked_m, event, hook = self.dispatch_low_latency(
                 hidden_states,
                 topk_idx,
