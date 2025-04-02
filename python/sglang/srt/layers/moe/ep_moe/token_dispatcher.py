@@ -369,12 +369,6 @@ class DeepEPDispatcher:
         forward_mode: ForwardMode = None,
     ) -> Tuple:
         topk_idx = topk_idx.to(torch.int64)
-        reorder_topk_ids = torch.empty(
-            (0,), device=hidden_states.device, dtype=torch.int64
-        )
-        seg_indptr = torch.zeros(
-            (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-        )
         masked_m = torch.empty(
             (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
         )
@@ -408,6 +402,14 @@ class DeepEPDispatcher:
                 use_fp8=True,
             )
             hook() if self.return_recv_hook else event.current_stream_wait()
+
+            # TODO make it none
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            )
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
