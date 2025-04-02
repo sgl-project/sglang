@@ -113,6 +113,24 @@ class _DeepEPDispatcherBase:
 
         self.handle = None
 
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int,
+    ):
+        raise NotImplementedError
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
 
 class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
     def __init__(self, async_finish: bool, **kwargs):
