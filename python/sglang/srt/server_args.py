@@ -1100,6 +1100,13 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
+            "--deepep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+
+        parser.add_argument(
             "--n-share-experts-fusion",
             type=int,
             default=ServerArgs.n_share_experts_fusion,
