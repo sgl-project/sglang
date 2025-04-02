@@ -428,6 +428,9 @@ class LlamaForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
@@ -610,6 +613,12 @@ class LlamaForCausalLM(nn.Module):
         return self.model.embed_tokens.weight
 
     def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()

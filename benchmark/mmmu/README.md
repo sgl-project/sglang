@@ -2,9 +2,13 @@
 
 ### Evaluate sglang
 
+Host the VLM:
+
 ```
 python -m sglang.launch_server --model-path Qwen/Qwen2-VL-7B-Instruct --chat-template qwen2-vl --port 30000
 ```
+
+Benchmark:
 
 ```
 python benchmark/mmmu/bench_sglang.py --port 30000
