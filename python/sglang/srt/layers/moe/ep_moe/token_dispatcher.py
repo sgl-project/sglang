@@ -259,7 +259,6 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             num_tokens = self.src2dst.shape[0] // self.router_topk
@@ -424,7 +423,6 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
     ) -> torch.Tensor:
         hidden_states, event, hook = self._combine_low_latency(
             hidden_states,
