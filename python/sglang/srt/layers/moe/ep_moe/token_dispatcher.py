@@ -349,11 +349,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0]
-            * self.buffer_low_latency.group_size
-            * topk_idx.shape[1]
-            + num_experts
-        ) // num_experts
+                         hidden_states.shape[0]
+                         * self.buffer_low_latency.group_size
+                         * topk_idx.shape[1]
+                         + num_experts
+                     ) // num_experts
         hidden_states, masked_m, event, hook = self._dispatch_low_latency(
             hidden_states,
             topk_idx,
@@ -523,6 +523,29 @@ class DeepEPDispatcher:
             num_experts=num_experts,
             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
         )
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int = 128,
+        forward_mode: ForwardMode = None,
+    ):
+        inner_state = self._get_dispatcher(forward_mode).dispatch_a(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_experts=num_experts,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+        )
+        self._dispatch_intermediate_state = forward_mode, inner_state
+
+    def dispatch_b(self):
+        forward_mode, inner_state = self._dispatch_intermediate_state
+        del self._dispatch_intermediate_state
+        return self._get_dispatcher(forward_mode).dispatch_b()
 
     def combine(
         self,
