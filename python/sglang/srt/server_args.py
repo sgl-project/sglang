@@ -161,6 +161,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    deepep_mode: Optional[str] = "auto"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -291,6 +292,13 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -306,6 +314,10 @@ class ServerArgs:
         self.enable_sp_layernorm = False
         # DeepEP MoE
         if self.enable_deepep_moe:
+            if self.deepep_mode == "auto":
+                assert (
+                    not self.enable_dp_attention
+                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
@@ -1093,6 +1105,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="tp_size for MoE dense MLP layers",
+        )
+        parser.add_argument(
+            "--deepep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
         # Server warmups
