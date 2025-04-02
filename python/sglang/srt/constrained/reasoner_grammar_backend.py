@@ -13,17 +13,16 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
-from abc import ABC
 from concurrent.futures import Future
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
-class ReasonerGrammarObject(ABC):
-    def __init__(self, grammar: Optional[BaseGrammarObject] = None, think_end_id=0):
+class ReasonerGrammarObject(BaseGrammarObject):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id):
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.is_in_reasoning = True
@@ -59,11 +58,25 @@ class ReasonerGrammarObject(ABC):
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
 
+    def try_jump_forward(self, tokenizer):
+        return self.grammar.try_jump_forward(tokenizer)
 
-class ReasonerGrammarBackend(ABC):
-    def __init__(
-        self, grammar_backend: Optional[BaseGrammarBackend] = None, think_end_id=0
+    def jump_forward_str_state(self, helper):
+        return self.grammar.jump_forward_str_state(helper)
+
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
+        return self.grammar.jump_and_retokenize(
+            old_output_ids, new_output_ids, next_state
+        )
+
+    def copy(self) -> BaseGrammarObject:
+        return ReasonerGrammarObject(self.grammar.copy(), self.think_end_id)
+
+
+class ReasonerGrammarBackend(BaseGrammarBackend):
+    def __init__(self, grammar_backend: BaseGrammarBackend, think_end_id):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
@@ -73,11 +86,14 @@ class ReasonerGrammarBackend(ABC):
 
     def get_future_value(self, key: Tuple[str, str]) -> Future:
         grammar = Future()
-        self.grammar_backend.get_future_value(key).add_done_callback(
-            lambda f: grammar.set_result(
-                ReasonerGrammarObject(f.result(), self.think_end_id)
-            )
-        )
+
+        def callback(f: Future):
+            if result := f.result():
+                grammar.set_result(ReasonerGrammarObject(result, self.think_end_id))
+            else:
+                grammar.set_result(None)
+
+        self.grammar_backend.get_future_value(key).add_done_callback(callback)
         return grammar
 
     def reset(self):

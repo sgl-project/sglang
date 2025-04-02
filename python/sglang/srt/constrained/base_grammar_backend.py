@@ -24,8 +24,6 @@ import torch
 
 from sglang.srt.server_args import ServerArgs
 
-from .reasoner_grammar_backend import ReasonerGrammarBackend
-
 logger = logging.getLogger(__name__)
 
 
@@ -62,6 +60,13 @@ class BaseGrammarObject(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def accept_token(self, token: int) -> None:
+        """
+        Accept a token in the grammar.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
@@ -92,7 +97,7 @@ class CacheEntry:
     event: Event
 
 
-class BaseGrammarBackend(ABC):
+class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], CacheEntry] = {}
@@ -109,19 +114,15 @@ class BaseGrammarBackend(ABC):
         """
         raise ValueError(f"Invalid key_type: {key_type}={key_string}")
 
-    @abstractmethod
     def dispatch_json(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("json", key_string)
 
-    @abstractmethod
     def dispatch_regex(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("regex", key_string)
 
-    @abstractmethod
     def dispatch_ebnf(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("ebnf", key_string)
 
-    @abstractmethod
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
@@ -198,6 +199,8 @@ def create_grammar_backend(
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 
     if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+        from .reasoner_grammar_backend import ReasonerGrammarBackend
+
         grammar_backend = ReasonerGrammarBackend(
             grammar_backend, tokenizer.think_end_id
         )
