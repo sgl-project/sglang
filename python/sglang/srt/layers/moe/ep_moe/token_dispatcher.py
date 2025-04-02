@@ -148,7 +148,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
 
-    def dispatch(
+    def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -158,6 +158,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.async_finish else None
+        return hidden_states, topk_idx, topk_weights, num_experts, previous_event
+
+    def dispatch_b(self, hidden_states, topk_idx, topk_weights, num_experts, previous_event):
         (
             hidden_states,
             topk_idx,
