@@ -498,7 +498,13 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
         forward_mode: ForwardMode = None,
     ) -> Tuple:
-        return self._get_dispatcher(forward_mode).dispatch(TODO)
+        return self._get_dispatcher(forward_mode).dispatch(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_experts=num_experts,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+        )
 
     def combine(
         self,
@@ -507,7 +513,11 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ) -> torch.Tensor:
-        return self._get_dispatcher(forward_mode).combine(TODO)
+        return self._get_dispatcher(forward_mode).combine(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
 
     def _get_dispatcher(self, forward_mode: ForwardMode):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
