@@ -160,13 +160,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, num_experts, previous_event
 
-    def dispatch_b(self, hidden_states, topk_idx, topk_weights, num_experts, previous_event):
+    def dispatch_b(
+        self, hidden_states, topk_idx, topk_weights, num_experts, previous_event
+    ):
         (
             hidden_states,
             topk_idx,
             topk_weights,
             event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, num_experts, previous_event)
+        ) = self._dispatch_core(
+            hidden_states, topk_idx, topk_weights, num_experts, previous_event
+        )
         event.current_stream_wait() if self.async_finish else ()
         if hidden_states.shape[0] > 0:
             reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
@@ -359,11 +363,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                         hidden_states.shape[0]
-                         * self.buffer_low_latency.group_size
-                         * topk_idx.shape[1]
-                         + num_experts
-                     ) // num_experts
+            hidden_states.shape[0]
+            * self.buffer_low_latency.group_size
+            * topk_idx.shape[1]
+            + num_experts
+        ) // num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
