@@ -50,6 +50,8 @@ class SamplingParams:
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
+        separate_reasoning: bool = True,
+        stream_reasoning: bool = True,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
