@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from scipy.stats import loggamma
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -170,14 +171,6 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-        if (
-            global_server_args_dict.get("disable_shared_experts_fusion", False)
-            or config.architectures[0] != "DeepseekV3ForCausalLM"
-            or config.n_routed_experts != 256
-            or config.routed_scaling_factor != 2.5
-        ):
-            self.n_share_experts_fusion = 0
 
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -1350,6 +1343,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.routed_scaling_factor != 2.5
         ):
             self.n_share_experts_fusion = 0
+            global_server_args_dict["n_share_experts_fusion"] = 0
+            logger.info(
+                "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+            )
         elif self.n_share_experts_fusion == 0:
             global_server_args_dict["n_share_experts_fusion"] = 8
             self.n_share_experts_fusion = 8
