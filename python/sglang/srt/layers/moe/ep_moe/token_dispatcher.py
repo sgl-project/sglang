@@ -368,10 +368,9 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
         forward_mode: ForwardMode = None,
     ) -> Tuple:
-        topk_idx = topk_idx.to(torch.int64)
-
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
+            topk_idx = topk_idx.to(torch.int64)
             (
                 hidden_states,
                 topk_idx,
@@ -391,6 +390,7 @@ class DeepEPDispatcher:
             # expected_m = 0
             masked_m = expected_m = None
         elif resolved_deepep_mode == DeepEPMode.low_latency:
+            topk_idx = topk_idx.to(torch.int64)
             expected_m = (
                              hidden_states.shape[0]
                              * self.buffer_low_latency.group_size
