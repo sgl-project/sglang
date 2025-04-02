@@ -183,7 +183,7 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
-    n_share_experts_fusion: int = 8
+    n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
@@ -1093,11 +1093,6 @@ class ServerArgs:
             required=False,
             default=ServerArgs.hicache_ratio,
             help="The ratio of the size of host KV cache memory pool to the size of device pool.",
-        )
-        parser.add_argument(
-            "--enable-deepep-moe",
-            action="store_true",
-            help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
