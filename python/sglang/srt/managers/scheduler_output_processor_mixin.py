@@ -203,6 +203,7 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
+
             if self.enable_overlap and req.finished():
                 # Free the one extra delayed token
                 if self.page_size == 1:
