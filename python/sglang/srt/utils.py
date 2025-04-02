@@ -1843,6 +1843,6 @@ def flatten_nested_list(nested_list):
 
 # TODO where should we put it?
 class DeepEPMode(Enum):
-    NORMAL = "normal"
-    LOW_LATENCY = "low_latency"
-    AUTO = "auto"
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
