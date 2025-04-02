@@ -1661,6 +1661,11 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     if len(all_requests) == 1:
         prompt = prompts[0]
         if isinstance(prompt, str) or isinstance(prompt[0], str):
+            # Handle empty string inputs
+            if isinstance(prompt, str) and prompt == "":
+                prompt = " "  # Replace empty string with a space character
+            elif isinstance(prompt, list):
+                prompt = [p if p != "" else " " for p in prompt]
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list) and isinstance(
             prompt[0], MultimodalEmbeddingInput
@@ -1686,6 +1691,14 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             prompt_kwargs = {"input_ids": prompt}
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
+            # Handle empty strings in multiple requests
+            if isinstance(prompts[0], str):
+                prompts = [p if p != "" else " " for p in prompts]
+            else:
+                prompts = [
+                    [p if p != "" else " " for p in prompt_list]
+                    for prompt_list in prompts
+                ]
             prompt_kwargs = {"text": prompts}
         elif isinstance(prompts[0], list) and isinstance(
             prompts[0][0], MultimodalEmbeddingInput
