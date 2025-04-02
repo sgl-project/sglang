@@ -95,7 +95,6 @@ class _DeepEPDispatcherBase:
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        deepep_mode: DeepEPMode,
         async_finish: bool,
         return_recv_hook: bool,
     ):
@@ -114,39 +113,37 @@ class _DeepEPDispatcherBase:
         self.params_dtype = params_dtype
         self.params_bytes = 2
 
-        self.deepep_mode = deepep_mode
         self.handle = None
-
-        if self.deepep_mode.enable_normal():
-            self.buffer_normal = get_buffer_normal(
-                self.group, self.hidden_size * self.params_bytes
-            )
-            self.async_finish = async_finish
-            self.src2dst = None
-        if self.deepep_mode.enable_low_latency():
-            """
-            num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
-            https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
-            """
-            # TODO(ch-wan): allow users to set this value
-            self.num_max_dispatch_tokens_per_rank = 128
-            self.buffer_low_latency = get_buffer_low_latency(
-                self.group,
-                self.num_max_dispatch_tokens_per_rank,
-                self.hidden_size,
-                self.num_experts,
-            )
-            self.return_recv_hook = return_recv_hook
 
 
 class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        self.buffer_normal = get_buffer_normal(
+            self.group, self.hidden_size * self.params_bytes
+        )
+        self.async_finish = async_finish
+        self.src2dst = None
+
 
 class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        """
+        num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
+        https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
+        """
+        # TODO(ch-wan): allow users to set this value
+        self.num_max_dispatch_tokens_per_rank = 128
+        self.buffer_low_latency = get_buffer_low_latency(
+            self.group,
+            self.num_max_dispatch_tokens_per_rank,
+            self.hidden_size,
+            self.num_experts,
+        )
+        self.return_recv_hook = return_recv_hook
 
 
 class DeepEPDispatcher:
@@ -163,7 +160,11 @@ class DeepEPDispatcher:
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
-        TODO
+        self.deepep_mode = deepep_mode
+        if self.deepep_mode.enable_normal():
+            TODO
+        if self.deepep_mode.enable_low_latency():
+            TODO
 
 
 class DeepEPDispatcher:
