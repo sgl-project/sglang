@@ -507,23 +507,8 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_experts: int,
-        num_max_dispatch_tokens_per_rank: int = 128,
-        forward_mode: ForwardMode = None,
-    ) -> Tuple:
-        self.dispatch_a(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_experts=num_experts,
-            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
-            forward_mode=forward_mode,
-        )
+    def dispatch(self, *args, **kwargs) -> Tuple:
+        self.dispatch_a(*args, **kwargs)
         return self.dispatch_b()
 
     def dispatch_a(
@@ -549,18 +534,9 @@ class DeepEPDispatcher:
         del self._dispatch_intermediate_state
         return self._get_dispatcher(forward_mode).dispatch_b(*inner_state)
 
-    def combine(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
-    ) -> torch.Tensor:
-        return self._get_dispatcher(forward_mode).combine(
-            hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-        )
+    def combine(self, *args, **kwargs) -> Tuple:
+        self.combine_a(*args, **kwargs)
+        return self.combine_b()
 
     def combine_a(
         self,
