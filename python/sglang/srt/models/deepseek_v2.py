@@ -30,9 +30,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
@@ -82,6 +79,11 @@ if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
 else:
     from vllm import _custom_ops as ops
+
+if _is_hip:
+    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+        decode_attention_fwd_grouped_rope,
+    )
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -186,19 +188,35 @@ class DeepseekV2MoE(nn.Module):
             if global_server_args_dict["enable_deepep_moe"]
             else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
         )
-        self.experts = MoEImpl(
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            prefix=add_prefix("experts", prefix),
-        )
+        if not global_server_args_dict["enable_deepep_moe"]:
+            self.experts = MoEImpl(
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                prefix=add_prefix("experts", prefix),
+            )
+        else:
+            self.experts = MoEImpl(
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                prefix=add_prefix("experts", prefix),
+                deepep_mode=global_server_args_dict["deepep_mode"],
+            )
 
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -225,6 +243,8 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if global_server_args_dict["enable_deepep_moe"]:
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -244,7 +264,9 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
+                deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,  # TODO
+                return_recv_hook=True,
             )
 
     def forward(
@@ -299,28 +321,39 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        if self.tp_size > 1:
-            recv_hidden_states, reorder_topk_ids, seg_indptr = (
-                self.deepep_dispatcher.dispatch(
-                    hidden_states,
-                    topk_idx,
-                    topk_weights,
-                    self.num_experts,
-                    forward_mode,
-                )
+        if self.ep_size > 1:
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                reorder_topk_ids,
+                seg_indptr,
+                masked_m,
+                expected_m,
+            ) = self.deepep_dispatcher.dispatch(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                self.num_experts,
+                forward_mode=forward_mode,
             )
         final_hidden_states = (
             self.experts(
-                hidden_states=recv_hidden_states,
+                hidden_states=hidden_states,
                 reorder_topk_ids=reorder_topk_ids,
                 seg_indptr=seg_indptr,
+                masked_m=masked_m,
+                expected_m=expected_m,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
         )
-        if self.tp_size > 1:
+        if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states, forward_mode
+                final_hidden_states,
+                topk_idx,
+                topk_weights,
+                forward_mode,
             )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1100,27 +1133,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+            assert not (
+                self.attn_tp_size != 1 and self.input_is_scattered
+            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
+
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-            )
-
-        if self.attn_tp_size != 1 and self.input_is_scattered:
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
-            residual, local_residual = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                residual,
-            )
-            tp_all_gather(
-                list(residual.tensor_split(self.attn_tp_size)), local_residual
             )
 
         # Gather
@@ -1221,6 +1242,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         if self.is_last_layer and self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
@@ -1228,19 +1251,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
-            residual, local_residual = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                residual,
-            )
-            tp_all_gather(
-                list(residual.tensor_split(self.attn_tp_size)), local_residual
-            )
 
         return hidden_states, residual
 
 
 class DeepseekV2Model(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -1294,7 +1309,10 @@ class DeepseekV2Model(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -1320,6 +1338,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(

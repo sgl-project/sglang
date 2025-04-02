@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from flash_attn_interface import flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 
 @dataclass
@@ -79,7 +79,7 @@ class FlashAttentionBackend(AttentionBackend):
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
         # Precompute maximum sequence length
-        metadata.max_seq_len_k = seqlens_in_batch.max().item()
+        metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
         # Precompute page table
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
