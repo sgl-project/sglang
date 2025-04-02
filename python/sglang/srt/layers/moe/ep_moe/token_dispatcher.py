@@ -216,6 +216,18 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
             event,
         )
 
+    def _combine_normal(self, x: torch.Tensor):
+        previous_event = Buffer.capture() if self.async_finish else None
+
+        combined_x, _, event = self.buffer_normal.combine(
+            x,
+            self.handle,
+            async_finish=self.async_finish,
+            previous_event=previous_event,
+            allocate_on_comm_stream=previous_event is not None,
+        )
+        return combined_x, event
+
 
 class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
@@ -288,6 +300,24 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
+
+    def _combine_low_latency(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        combined_hidden_states, event, hook = (
+            self.buffer_low_latency.low_latency_combine(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
+        )
+        return combined_hidden_states, event, hook
 
 
 class DeepEPDispatcher:
@@ -423,12 +453,12 @@ class DeepEPDispatcher:
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-            hidden_states, event = self.combine_normal(
+            hidden_states, event = self._combine_normal(
                 output,
             )
             event.current_stream_wait() if self.async_finish else ()
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            hidden_states, event, hook = self.combine_low_latency(
+            hidden_states, event, hook = self._combine_low_latency(
                 hidden_states,
                 topk_idx,
                 topk_weights,
@@ -438,33 +468,3 @@ class DeepEPDispatcher:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
         return hidden_states
-
-    def combine_normal(self, x: torch.Tensor):
-        previous_event = Buffer.capture() if self.async_finish else None
-
-        combined_x, _, event = self.buffer_normal.combine(
-            x,
-            self.handle,
-            async_finish=self.async_finish,
-            previous_event=previous_event,
-            allocate_on_comm_stream=previous_event is not None,
-        )
-        return combined_x, event
-
-    def combine_low_latency(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ):
-        combined_hidden_states, event, hook = (
-            self.buffer_low_latency.low_latency_combine(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                self.handle,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-            )
-        )
-        return combined_hidden_states, event, hook
