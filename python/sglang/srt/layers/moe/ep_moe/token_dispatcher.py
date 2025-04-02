@@ -160,9 +160,9 @@ class DeepEPDispatcher:
     ):
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_normal():
-            TODO
+            self._normal_dispatcher = _DeepEPDispatcherNormal()
         if self.deepep_mode.enable_low_latency():
-            TODO
+            self._low_latency_dispatcher = _DeepEPDispatcherLowLatency()
 
 
 class DeepEPDispatcher:
