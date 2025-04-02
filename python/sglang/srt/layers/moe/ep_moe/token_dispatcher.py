@@ -215,11 +215,6 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
             event,
         )
 
-    """
-    Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
-    https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
-    """
-
     def _deepep_permute(
         self,
         hidden_states: torch.Tensor,
@@ -228,6 +223,11 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
         use_fp8_w8a8: bool = False,
         use_block_quant: bool = False,
     ):
+        """
+        Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
+        https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
+        """
+
         reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
             topk_idx, self.num_experts
         )
