@@ -545,7 +545,7 @@ class DeepEPDispatcher:
     def dispatch_b(self):
         forward_mode, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_dispatcher(forward_mode).dispatch_b()
+        return self._get_dispatcher(forward_mode).dispatch_b(*inner_state)
 
     def combine(
         self,
