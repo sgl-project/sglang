@@ -1743,21 +1743,49 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
-    all_requests = [EmbeddingRequest(**request_json)]
-    adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+    original_input = request_json.get("input", "")
 
-    try:
-        ret = await tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
-    except ValueError as e:
-        return create_error_response(str(e))
+    is_batch = isinstance(original_input, list)
 
-    if not isinstance(ret, list):
-        ret = [ret]
+    if is_batch:
+        batch_inputs = original_input
+
+        all_results = []
+        for i, single_input in enumerate(batch_inputs):
+            single_request_json = request_json.copy()
+            single_request_json["input"] = single_input
+
+            single_request = EmbeddingRequest(**single_request_json)
+            all_requests = [single_request]
+            adapted_request, _ = v1_embedding_request(all_requests, tokenizer_manager)
+
+            try:
+                single_ret = await tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                ).__anext__()
+
+                if not isinstance(single_ret, list):
+                    single_ret = [single_ret]
+                all_results.extend(single_ret)
+            except ValueError as e:
+                return create_error_response(str(e))
+
+        ret = all_results
+    else:
+        all_requests = [EmbeddingRequest(**request_json)]
+        adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+
+        try:
+            ret = await tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+
+            if not isinstance(ret, list):
+                ret = [ret]
+        except ValueError as e:
+            return create_error_response(str(e))
 
     response = v1_embedding_response(ret, tokenizer_manager.model_path)
-
     return response
 
 

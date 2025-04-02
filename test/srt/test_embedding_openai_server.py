@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
@@ -90,12 +91,65 @@ class TestOpenAIServer(CustomTestCase):
         ), f"{response.usage.total_tokens} vs {num_prompt_tokens}"
 
     def run_batch(self):
-        # FIXME: not implemented
-        pass
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        inputs = ["Hello world", "This is a test", "SGLang is awesome"]
+        response = client.embeddings.create(
+            input=inputs,
+            model=self.model,
+        )
+
+        assert len(response.data) == len(inputs)
+        assert isinstance(response.data, list)
+
+        embedding_dim = len(response.data[0].embedding)
+        for i, embedding_data in enumerate(response.data):
+            assert embedding_data.index == i
+            assert embedding_data.object == "embedding"
+            assert len(embedding_data.embedding) == embedding_dim
+
+        expected_tokens = sum(len(self.tokenizer.encode(text)) for text in inputs)
+        assert response.usage.prompt_tokens == expected_tokens
+        assert response.usage.total_tokens == expected_tokens
+
+        mixed_inputs = ["", "Non-empty string", ""]
+        mixed_response = client.embeddings.create(
+            input=mixed_inputs,
+            model=self.model,
+        )
+
+        assert len(mixed_response.data) == len(mixed_inputs)
+        for embedding_data in mixed_response.data:
+            assert embedding_data.embedding is not None
+            assert len(embedding_data.embedding) > 0
+
+        text = "The quick brown fox jumps over the lazy dog"
+        single_response = client.embeddings.create(
+            input=text,
+            model=self.model,
+        )
+
+        batch_response = client.embeddings.create(
+            input=[text],
+            model=self.model,
+        )
+
+        single_embedding = np.array(single_response.data[0].embedding)
+        batch_embedding = np.array(batch_response.data[0].embedding)
+
+        np.testing.assert_allclose(single_embedding, batch_embedding, rtol=1e-5)
+
+        large_inputs = [f"Sample text number {i}" for i in range(10)]
+        large_response = client.embeddings.create(
+            input=large_inputs,
+            model=self.model,
+        )
+
+        assert len(large_response.data) == len(large_inputs)
+        for i, embedding_data in enumerate(large_response.data):
+            assert embedding_data.index == i
 
     def test_embedding(self):
-        # TODO: the fields of encoding_format, dimensions, user are skipped
-        # TODO: support use_list_input
         for use_list_input in [False, True]:
             for token_input in [False, True]:
                 self.run_embedding(use_list_input, token_input)
