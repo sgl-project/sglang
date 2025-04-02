@@ -389,6 +389,75 @@ class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
+class PPMissingLayer(torch.nn.Identity):
+    """
+    A placeholder layer for missing layers in a pipeline parallel model.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+from dataclasses import dataclass
+@dataclass
+class IntermediateTensors:
+    """For all pipeline stages except the last, we need to return the hidden
+    states and residuals to be sent to the next stage. This data structure
+    contains the hidden states and residuals for a request.
+    """
+
+    tensors: dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: Union[str, slice]):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def items(self):
+        return self.tensors.items()
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"IntermediateTensors(tensors={self.tensors})"
+         
+def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
+
+    def make_empty_intermediate_tensors(
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors({
+            key:
+            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
+            for key in keys
+        })
+
+    return make_empty_intermediate_tensors
+
+def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
+    """Check if a parameter is missing in a pipeline parallel model."""
+    if isinstance(model, PPMissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in get_pp_missing_layer_names(model))
 
 def make_layers(
     num_hidden_layers: int,
