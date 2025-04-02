@@ -171,13 +171,14 @@ class KVSender:
             '''
             completed wrs + metadata wrs
             '''
-            if self.qp.completed_wrs == len(self.mrs_to_send) + 1 and self.meta_has_sent:
+            if self.qp.completed_wrs == len(self.qp.wrs_to_send) + 1 and self.meta_has_sent:
                 print("Transferring complete")
                 # 写入远端 metadata //todo
                 self.state = KVPoll.Success
-            elif self.qp.completed_wrs == len(self.mrs_to_send) and not self.meta_has_sent:
+            elif self.qp.completed_wrs == len(self.qp.wrs_to_send) and not self.meta_has_sent:
                 self.qp.send_metadata_wrs()
                 self.meta_has_sent = True
+
 
         return self.state
 
@@ -255,6 +256,8 @@ class KVReceiver:
             self.state = KVPoll.WaitingForInput
             self.initialized = True
             print("boostraped success..")
+
+
 
     def init(self, kv_indices: np.ndarray[np.int32], aux_index: Optional[int] = None):
         """Initialize receiver with KV indices and auxiliary data index
