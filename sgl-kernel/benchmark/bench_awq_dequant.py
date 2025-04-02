@@ -59,14 +59,14 @@ def calculate_diff(dtype: torch.dtype, qweight_row: int, qweight_col: int):
         print("❌ Implementations differ")
 
 
-use_fp16x2_ptx_intrinsics_for_bf16x2 = [False]
+kernel_name = ["awq_dequantize"]
 dtypes = [torch.float16, torch.bfloat16]
 qweight_row_range = [3584, 18944, 128, 256, 512, 1024]
 qweight_cols_range = [448, 576, 4736, 16, 32, 64, 128]
 
 configs = list(
     itertools.product(
-        use_fp16x2_ptx_intrinsics_for_bf16x2,
+        kernel_name,
         dtypes,
         qweight_row_range,
         qweight_cols_range,
@@ -77,7 +77,7 @@ configs = list(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=[
-            "use_fp16x2_ptx_intrinsics_for_bf16x2",
+            "kernel_name",
             "dtype",
             "qweight_row",
             "qweight_col",
@@ -93,7 +93,7 @@ configs = list(
     )
 )
 def benchmark(
-    use_fp16x2_ptx_intrinsics_for_bf16x2, dtype, qweight_row, qweight_col, provider
+    kernel_name, dtype, qweight_row, qweight_col, provider
 ):
     device = torch.device("cuda")
     qweight = torch.randint(
