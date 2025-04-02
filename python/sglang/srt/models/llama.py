@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -427,6 +427,9 @@ class LlamaForCausalLM(nn.Module):
             )
         else:
             return self.pooler(hidden_states, forward_batch)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
