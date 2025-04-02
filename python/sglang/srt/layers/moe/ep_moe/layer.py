@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs, DeepEPMode
 
 _is_cuda = is_cuda()
 
@@ -814,7 +814,7 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        deepep_mode: str = "auto",
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
             num_experts,
