@@ -172,8 +172,6 @@ class BaseGrammarBackend(ABC):
 class ReasonerGrammarObject(ABC):
     def __init__(self, grammar:Optional[BaseGrammarObject]=None, think_end_id=0):
         self.grammar = grammar
-        self.idx = 0
-        self.vocab_mask = None
         self.think_end_id = think_end_id
         self.is_in_reasoning = True
 
@@ -191,7 +189,6 @@ class ReasonerGrammarObject(ABC):
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        self.vocab_mask, self.idx = vocab_mask, idx
         if not self.is_in_reasoning:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
@@ -205,7 +202,6 @@ class ReasonerGrammarObject(ABC):
     def accept_token(self, token: int):
         if token == self.think_end_id:
             self.is_in_reasoning = False
-            self.grammar.fill_vocab_mask(self.vocab_mask, self.idx)
 
         if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
