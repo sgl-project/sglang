@@ -97,32 +97,41 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     (1, 0),
                 )
-                # .repeat_interleave(self.topk) # tensor([7, 7, 7, 8, 8, 8])
-                # .repeat(self.topk) # tensor([7, 8, 7, 8, 7, 8])
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
                     self.step_id + 1
                 )
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]  # (bsz, max_seq_len)
+                ]
                 metadata.page_table = metadata.page_table.repeat_interleave(
                     self.topk, dim=0
                 )
                 cache_loc = forward_batch.out_cache_loc.view(
                     self.speculative_num_steps, -1
                 ).T
-
                 # Calculate page table indices and cache location indices to update the page table.
-                batch_indices = torch.arange(batch_size, device=device).repeat_interleave(self.topk * (self.step_id + 1))
-                topk_indices = torch.arange(self.topk, device=device).repeat(batch_size * (self.step_id + 1))
+                batch_indices = torch.arange(
+                    batch_size, device=device
+                ).repeat_interleave(self.topk * (self.step_id + 1))
+                topk_indices = torch.arange(self.topk, device=device).repeat(
+                    batch_size * (self.step_id + 1)
+                )
                 row_indices = batch_indices * self.topk + topk_indices
 
-                page_table_col_base_indices = seqlens_in_batch.unsqueeze(1) + torch.arange(self.step_id + 1, device=device)
-                page_table_col_indices = page_table_col_base_indices.view(-1).repeat(self.topk)
+                page_table_col_base_indices = seqlens_in_batch.unsqueeze(
+                    1
+                ) + torch.arange(self.step_id + 1, device=device)
+                page_table_col_indices = page_table_col_base_indices.view(-1).repeat(
+                    self.topk
+                )
 
-                cache_loc_col_indices = torch.arange(self.step_id + 1, device=device, dtype=torch.int32).repeat(batch_size * self.topk)
+                cache_loc_col_indices = torch.arange(
+                    self.step_id + 1, device=device, dtype=torch.int32
+                ).repeat(batch_size * self.topk)
 
-                metadata.page_table[row_indices, page_table_col_indices] = cache_loc[row_indices, cache_loc_col_indices].to(torch.int32)
+                metadata.page_table[row_indices, page_table_col_indices] = cache_loc[
+                    row_indices, cache_loc_col_indices
+                ].to(torch.int32)
             else:
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
