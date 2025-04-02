@@ -23,7 +23,7 @@ _buffer_normal = None
 _buffer_low_latency = None
 
 
-def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
+def _get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     """
     Copy from DeepEP example usage in model inference prefilling.
     https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-model-training-or-inference-prefilling
@@ -53,7 +53,7 @@ def get_buffer_normal(group: dist.ProcessGroup, hidden_bytes: int):
     return _buffer_normal
 
 
-def get_buffer_low_latency(
+def _get_buffer_low_latency(
     group: dist.ProcessGroup,
     num_max_dispatch_tokens_per_rank: int,
     hidden: int,
@@ -136,7 +136,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
-        self.buffer_normal = get_buffer_normal(
+        self.buffer_normal = _get_buffer_normal(
             self.group, self.hidden_size * self.params_bytes
         )
         self.async_finish = async_finish
@@ -331,7 +331,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         """
         # TODO(ch-wan): allow users to set this value
         self.num_max_dispatch_tokens_per_rank = 128
-        self.buffer_low_latency = get_buffer_low_latency(
+        self.buffer_low_latency = _get_buffer_low_latency(
             self.group,
             self.num_max_dispatch_tokens_per_rank,
             self.hidden_size,
