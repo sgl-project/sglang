@@ -1282,7 +1282,7 @@ class Scheduler(
         ]
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.read_to_load_cache()
+            self.tree_cache.ready_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
