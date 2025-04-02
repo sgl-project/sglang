@@ -6,6 +6,7 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.test.test_utils import CustomTestCase
 
 
 class MockModelRunner:
@@ -39,7 +40,7 @@ class MockReqToTokenPool:
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
-class TestFlashAttentionBackend(unittest.TestCase):
+class TestFlashAttentionBackend(CustomTestCase):
     def setUp(self):
         """Set up test fixtures before each test method."""
         self.model_runner = MockModelRunner()
