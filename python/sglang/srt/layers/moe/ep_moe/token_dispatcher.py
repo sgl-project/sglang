@@ -447,7 +447,7 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
         forward_mode: ForwardMode = None,
     ) -> Tuple:
-        self._get_dispatcher(forward_mode).dispatch(TODO)
+        return self._get_dispatcher(forward_mode).dispatch(TODO)
 
     def _get_dispatcher(self, forward_mode: ForwardMode):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
