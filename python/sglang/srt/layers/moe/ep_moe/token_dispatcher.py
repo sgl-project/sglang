@@ -516,13 +516,15 @@ class DeepEPDispatcher:
         num_max_dispatch_tokens_per_rank: int = 128,
         forward_mode: ForwardMode = None,
     ) -> Tuple:
-        return self._get_dispatcher(forward_mode).dispatch(
+        self.dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             num_experts=num_experts,
             num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            forward_mode=forward_mode,
         )
+        return self.dispatch_b()
 
     def dispatch_a(
         self,
