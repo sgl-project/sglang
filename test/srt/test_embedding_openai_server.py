@@ -27,6 +27,27 @@ class TestOpenAIServer(CustomTestCase):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
+    def test_empty_string_embedding(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.embeddings.create(
+            input="",
+            model=self.model,
+        )
+
+        assert len(response.data) == 1
+        assert isinstance(response.data, list)
+        assert response.data[0].embedding is not None
+        assert len(response.data[0].embedding) > 0
+        assert response.data[0].index == 0
+        assert response.data[0].object == "embedding"
+        assert response.model == self.model
+        assert response.object == "list"
+
+        empty_token_count = len(self.tokenizer.encode(""))
+        assert response.usage.prompt_tokens == empty_token_count
+        assert response.usage.total_tokens == empty_token_count
+
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
