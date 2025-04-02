@@ -128,5 +128,4 @@ def test_awq_dequant_compare_implementations(
 
 
 if __name__ == "__main__":
-    # Run the specific test function directly
     pytest.main([__file__])
