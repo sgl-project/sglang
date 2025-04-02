@@ -77,6 +77,8 @@ class SamplingParams:
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.no_stop_trim = no_stop_trim
         self.custom_params = custom_params
+        self.separate_reasoning = separate_reasoning
+        self.stream_reasoning = stream_reasoning
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
