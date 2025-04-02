@@ -507,7 +507,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),

@@ -423,6 +423,25 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen2VLForConditionalGeneration(nn.Module):
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]):
         processor = cached_get_processor(self.config._name_or_path)
         grid_t, grid_h, grid_w = image_grid_thw
@@ -447,9 +466,9 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         self.visual = Qwen2VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder does not support any
-            # quantization method now.
-            quant_config=None,
+            # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+            quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
 
@@ -558,6 +577,10 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             ("gate_up_proj", "up_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
         ]
+        # Just for bnb 4bit
+        is_bnb_weights = hasattr(
+            weights, "gi_code"
+        ) and weights.gi_code.co_name.startswith("_quantized_4bit_generator")
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -579,7 +602,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 break
             else:
 
-                if "visual" in name and "qkv.weight" in name:
+                if "visual" in name and "qkv.weight" in name and not is_bnb_weights:
                     visual_num_heads = self.config.vision_config.num_heads
                     visual_embed_dim = self.config.vision_config.embed_dim
                     head_size = visual_embed_dim // visual_num_heads
@@ -588,7 +611,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     )
                     loaded_weight = loaded_weight.transpose(0, 1)
                     loaded_weight = loaded_weight.reshape(-1, visual_embed_dim)
-                elif "visual" in name and "qkv.bias" in name:
+                elif "visual" in name and "qkv.bias" in name and not is_bnb_weights:
                     visual_num_heads = self.config.vision_config.num_heads
                     visual_embed_dim = self.config.vision_config.embed_dim
                     head_size = visual_embed_dim // visual_num_heads
