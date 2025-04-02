@@ -1846,3 +1846,9 @@ class DeepEPMode(Enum):
     normal = "normal"
     low_latency = "low_latency"
     auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]

@@ -834,7 +834,7 @@ class DeepEPMoE(EPMoE):
             activation,
         )
         self.deepep_mode = deepep_mode
-        if self.deepep_mode in ["low_latency", "auto"]:
+        if self.deepep_mode.enable_low_latency():
             assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
