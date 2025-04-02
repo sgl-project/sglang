@@ -396,6 +396,18 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning("Overlap scheduler is disabled for decode server")
 
+        if self.enable_memory_saver:
+            try:
+                import torch_memory_saver
+            except ImportError:
+                logger.warning(
+                    "enable_memory_saver is enabled, but "
+                    "torch-memory-saver is not installed. Please install it "
+                    "via `pip3 uninstall torch-memory-saver`. "
+                    "For normal operation, it will be disabled."
+                )
+                raise
+
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
