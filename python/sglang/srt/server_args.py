@@ -441,7 +441,9 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"runai_streamer" will load local Safetensors weights using Run:ai '
+            "Model Streamer.",
         )
         parser.add_argument(
             "--trust-remote-code",
