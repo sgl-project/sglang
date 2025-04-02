@@ -375,8 +375,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
-            hook,
             event,
+            hook,
         )
 
     def dispatch_b(
@@ -386,8 +386,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights,
         masked_m,
         expected_m,
-        hook,
         event,
+        hook,
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
@@ -464,19 +464,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
         return packed_recv_hidden, packed_recv_count, event, hook
 
-    def combine(
+    def combine_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
+    ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_idx,
             topk_weights,
         )
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        return hidden_states, event, hook
 
+    def combine_b(self, hidden_states, event, hook):
+        hook() if self.return_recv_hook else event.current_stream_wait()
         return hidden_states
 
     def _combine_core(
