@@ -347,7 +347,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
         self.return_recv_hook = return_recv_hook
 
-    def dispatch(
+    def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -369,6 +369,26 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             num_experts,
             use_fp8=True,
         )
+        return (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            masked_m,
+            expected_m,
+            hook,
+            event,
+        )
+
+    def dispatch_b(
+        self,
+        hidden_states,
+        topk_idx,
+        topk_weights,
+        masked_m,
+        expected_m,
+        hook,
+        event,
+    ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         # TODO
