@@ -111,6 +111,7 @@ elif _is_hip:
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -136,6 +137,8 @@ elif _is_hip:
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
         out_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=out_dtype)
 
         if scale is None:
