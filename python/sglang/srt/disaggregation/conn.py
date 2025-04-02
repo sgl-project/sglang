@@ -8,8 +8,6 @@ import numpy as np
 import numpy.typing as npt
 import uuid
 import zmq
-import pickle
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +39,6 @@ class KVManager:
         if nixl_agent is None:
             raise Exception("NIXL is not available")
         self.agent = nixl_agent(str(uuid.uuid4()))
-        print(f"Created NIXL agent for {self.args.engine_rank}")
-        print("num kv tensors:", len(args.kv_tensors))
-        for x in args.kv_tensors:
-            print(x.shape, x.get_device())
-        print(args.kv_tensors[0][0, :, :].get_device())
-        print("num aux tensors:", len(args.aux_tensors))
-        for x in args.aux_tensors:
-            print(x.shape, x.get_device())
-        print(args.aux_tensors[0][0, :].get_device())
         self.kv_descs = self.agent.register_memory(self.args.kv_tensors)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
@@ -64,7 +53,6 @@ class KVManager:
             self.socket.connect("tcp://127.0.0.1:8998")
         elif mode == "decode":
             self.socket.bind("tcp://127.0.0.1:8998")
-        print(f"{mode} socket connected")
 
         # Metadata exchange
         if mode == "prefill":
@@ -79,54 +67,6 @@ class KVManager:
                 raise Exception("KVSender failed to get metadata")
             self.socket.send(metadata)
             self.peer_name = self.socket.recv_string()
-        print(f"{mode} exchanged metadata")
-
-        # Create prepped xfer handle on sender
-        num_blocks = self.args.kv_tensors[0].shape[0]
-        start = time.time()
-        if mode == "prefill":
-            # KV
-            # Make remote prepped xfer list
-            remote_block_data = pickle.loads(self.socket.recv())
-            self.remote_prep_handle = self.agent.prep_xfer_dlist(self.peer_name, remote_block_data, "VRAM")
-            if not self.remote_prep_handle:
-                raise Exception("KVSender failed to create remote prep_xfer_dlist")
-            # Make local prepped xfer list
-            blocks = []
-            for kv_layer in self.args.kv_tensors:
-                blocks.extend([kv_layer[i, :, :] for i in range(num_blocks)])
-            self.local_prep_handle = self.agent.prep_xfer_dlist("NIXL_INIT_AGENT", blocks)
-            if not self.local_prep_handle:
-                raise Exception("KVSender failed to create local prep_xfer_dlist")
-            
-            # AUX
-            remote_aux_data = pickle.loads(self.socket.recv())
-            self.remote_prep_handle_aux = self.agent.prep_xfer_dlist(self.peer_name, remote_aux_data, "DRAM")
-            if not self.remote_prep_handle_aux:
-                raise Exception("KVSender failed to create remote prep_xfer_dlist")
-            aux = []
-            for i in range(self.args.aux_tensors[0].shape[0]):
-                aux.append(self.args.aux_tensors[0][i, :])
-            self.local_prep_handle_aux = self.agent.prep_xfer_dlist("NIXL_INIT_AGENT", aux)
-            if not self.local_prep_handle_aux:
-                raise Exception("KVSender failed to create local prep_xfer_dlist")
-        elif mode == "decode":
-            # kv
-            blocks = []
-            for kv_layer in self.args.kv_tensors:
-                blocks.extend([(kv_layer[i, :, :].data_ptr(), kv_layer[i, :, :].nbytes, kv_layer.get_device()) for i in range(num_blocks)])
-            self.socket.send(pickle.dumps(blocks))
-            # aux
-            aux = []
-            print("aux base ", self.args.aux_tensors[0].data_ptr())
-            print("aux size ", self.args.aux_tensors[0].nbytes)
-            print("aux[0, :] base ", self.args.aux_tensors[0][0, :].data_ptr())
-            print("aux[0, :] size ", self.args.aux_tensors[0][0, :].nbytes)
-            for i in range(self.args.aux_tensors[0].shape[0]):
-                # DRAM. use 0 for device_id
-                aux.append((self.args.aux_tensors[0][i, :].data_ptr(), self.args.aux_tensors[0][i, :].nbytes, 0))
-            self.socket.send(pickle.dumps(aux))
-        print("total time for prep dlist ", time.time() - start)
 
 class KVPoll:
     Failed = 0
@@ -149,35 +89,27 @@ class KVSender:
         self.num_blocks = self.mgr.args.kv_tensors[0].shape[0]
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
-        print(f"kvsender init() num_kv_indices={num_kv_indices} aux_index={aux_index}")
         self.aux_index = aux_index
 
     def send(self, kv_indices: npt.NDArray[np.int32]):
-        print(f"KVSender begin send kv_indices={kv_indices}")
-        remote_kv_indices, remote_aux_index = pickle.loads(self.mgr.socket.recv())
-        print(f"KVSender got remote kv_indices={remote_kv_indices} remote_aux_index={remote_aux_index}")
-        # Send kv
-        self.xfer_handle = self.mgr.agent.make_prepped_xfer(
-            "WRITE",
-            self.mgr.local_prep_handle,
-            self._kv_indices_to_dlist_indices(kv_indices),
-            self.mgr.remote_prep_handle,
-            self._kv_indices_to_dlist_indices(remote_kv_indices),
-            str(self.bootstrap_room),
+        # Get descs
+        remote_kv_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
+        remote_aux_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
+        kv_descs = self.mgr.agent.get_xfer_descs([kv_layer[i, :, :] for i in kv_indices for kv_layer in self.mgr.args.kv_tensors])
+        aux_descs = self.mgr.agent.get_xfer_descs([aux[self.aux_index, :] for aux in self.mgr.args.aux_tensors])
+        
+        # Send KV
+        self.xfer_handle = self.mgr.agent.initialize_xfer(
+            "WRITE", kv_descs, remote_kv_descs, self.mgr.peer_name, str(self.bootstrap_room)
         )
         if not self.xfer_handle:
             raise Exception("KVSender failed to create transfer")
         state = self.mgr.agent.transfer(self.xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
-        # send aux
-        self.xfer_handle_aux = self.mgr.agent.make_prepped_xfer(
-            "WRITE",
-            self.mgr.local_prep_handle_aux,
-            [self.aux_index],
-            self.mgr.remote_prep_handle_aux,
-            [remote_aux_index],
-            str(self.bootstrap_room) + "_aux",
+        # Send aux
+        self.xfer_handle_aux = self.mgr.agent.initialize_xfer(
+            "WRITE", aux_descs, remote_aux_descs, self.mgr.peer_name, str(self.bootstrap_room) + "_aux"
         )
         if not self.xfer_handle_aux:
             raise Exception("KVSender failed to create transfer")
@@ -199,14 +131,6 @@ class KVSender:
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
-    
-    
-    def _kv_indices_to_dlist_indices(self, kv_indices):
-        result = []
-        for i in range(self.num_layers):
-            for idx in kv_indices:
-                result.append(i * self.num_blocks + idx)
-        return result
 
 
 class KVReceiver:
@@ -220,17 +144,17 @@ class KVReceiver:
         self.aux_transfer_done = False
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        print(f"kvreceiver init() kv_indices={kv_indices} aux_index={aux_index}")
-        self.mgr.socket.send(pickle.dumps((kv_indices, aux_index)))
+        kv_descs = self.mgr.agent.get_xfer_descs([kv_layer[i, :, :] for i in kv_indices for kv_layer in self.mgr.args.kv_tensors])
+        aux_descs = self.mgr.agent.get_xfer_descs([aux[aux_index, :] for aux in self.mgr.args.aux_tensors])
+        self.mgr.socket.send(self.mgr.agent.get_serialized_descs(kv_descs))
+        self.mgr.socket.send(self.mgr.agent.get_serialized_descs(aux_descs))
         self.has_init = True
-        print("KVReceiver sent descs")
 
     def poll(self) -> KVPoll:
         if self.has_init is False:
-            # Assume handshake completed instantly
             return KVPoll.WaitingForInput
         if not self.kv_transfer_done:
-            self.kv_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, str(self.bootstrap_room)) 
+            self.kv_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, str(self.bootstrap_room))
         if not self.aux_transfer_done:
             self.aux_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, str(self.bootstrap_room) + "_aux")
         if self.kv_transfer_done and self.aux_transfer_done:
