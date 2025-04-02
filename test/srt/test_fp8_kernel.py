@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _ENABLE_JIT_DEEPGEMM,
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -19,7 +20,9 @@ class TestFP8Base(CustomTestCase):
         # with config and without config cases on all GPUs.
         cls.N = 576
         cls.K = 7168
-        cls.group_size = [128, 64]
+        cls.group_sizes = [128]
+        if not _ENABLE_JIT_DEEPGEMM:
+            cls.group_sizes.append(64)
         cls.quant_type = torch.float8_e4m3fn
         cls.output_type = torch.bfloat16
 
@@ -94,11 +97,11 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         major, minor = torch.cuda.get_device_capability()
         if major < 8 or (major == 8 and minor < 9):
             return
-        for group_size in self.group_size:
+        for group_size in self.group_sizes:
             A, A_quant_gt, scale_gt = self._make_A(
-                M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+                M=self.M, K=self.K, group_size=group_size, out_dtype=self.quant_type
             )
-            A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
+            A_quant, scale = per_token_group_quant_fp8(x=A, group_size=group_size)
             torch.testing.assert_close(scale, scale_gt)
             diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
             diff_count = (diff > 1e-5).count_nonzero()
@@ -111,7 +114,7 @@ class TestW8A8BlockFP8Matmul(TestFP8Base):
         if major < 8 or (major == 8 and minor < 9):
             return
         w8a8_block_fp8_matmul_compiled = torch.compile(w8a8_block_fp8_matmul)
-        for group_size in self.group_size:
+        for group_size in self.group_sizes:
             A, A_quant_gt, A_scale_gt = self._make_A(
                 M=self.M, K=self.K, group_size=group_size, out_dtype=self.quant_type
             )
