@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _enable_jit_deepgemm,
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -19,7 +20,9 @@ class TestFP8Base(CustomTestCase):
         # with config and without config cases on all GPUs.
         cls.N = 576
         cls.K = 7168
-        cls.group_size = [128, 64]
+        cls.group_size = [128]
+        if not _enable_jit_deepgemm:
+            cls.group_size.append(64)
         cls.quant_type = torch.float8_e4m3fn
         cls.output_type = torch.bfloat16
 
