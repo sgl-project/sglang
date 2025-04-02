@@ -449,6 +449,15 @@ class DeepEPDispatcher:
     ) -> Tuple:
         return self._get_dispatcher(forward_mode).dispatch(TODO)
 
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        return self._get_dispatcher(forward_mode).combine(TODO)
+
     def _get_dispatcher(self, forward_mode: ForwardMode):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
@@ -457,51 +466,3 @@ class DeepEPDispatcher:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
-
-    def combine(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_mode: ForwardMode,
-    ) -> torch.Tensor:
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
-        if resolved_deepep_mode == DeepEPMode.normal:
-            if hidden_states.shape[0] > 0:
-                num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.empty(
-                    (num_tokens, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-                deepep_post_reorder_triton_kernel[(num_tokens,)](
-                    hidden_states,
-                    output,
-                    self.src2dst,
-                    topk_idx,
-                    topk_weights,
-                    self.router_topk,
-                    hidden_states.shape[1],
-                    BLOCK_SIZE=512,
-                )
-            else:
-                output = torch.zeros(
-                    (0, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-            hidden_states, event = self._combine_normal(
-                output,
-            )
-            event.current_stream_wait() if self.async_finish else ()
-        elif resolved_deepep_mode == DeepEPMode.low_latency:
-            hidden_states, event, hook = self._combine_low_latency(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-            )
-            hook() if self.return_recv_hook else event.current_stream_wait()
-        else:
-            raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
-
-        return hidden_states
