@@ -95,8 +95,6 @@ class _DeepEPDispatcherBase:
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        async_finish: bool,
-        return_recv_hook: bool,
     ):
         if not use_deepep:
             raise ImportError(
@@ -117,8 +115,8 @@ class _DeepEPDispatcherBase:
 
 
 class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, async_finish: bool, **kwargs):
+        super().__init__(**kwargs)
 
         self.buffer_normal = get_buffer_normal(
             self.group, self.hidden_size * self.params_bytes
@@ -128,8 +126,8 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
 
 
 class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, return_recv_hook: bool, **kwargs):
+        super().__init__(**kwargs)
 
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
