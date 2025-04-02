@@ -40,7 +40,7 @@ If you see out of memory (OOM) errors, you can try to tune the following paramet
 
 ## Enabling cache for `torch.compile`
 
-To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. This does not work for FP8 currently. By default, `torch.compile` will automatically cache the FX graph and Triton in `/tmp/torchinductor_root`, which might be cleared according to the [system policy](https://serverfault.com/questions/377348/when-does-tmp-get-cleared). You can export the environment variable `TORCHINDUCTOR_CACHE_DIR` to save compilation cache in your desired directory to avoid unwanted deletion. You can also share the cache with other machines to reduce the compilation time.
+To enable `torch.compile` acceleration, add `--enable-torch-compile`. It accelerates small models on small batch sizes. By default, `torch.compile` will automatically cache the FX graph and Triton in `/tmp/torchinductor_root`, which might be cleared according to the [system policy](https://serverfault.com/questions/377348/when-does-tmp-get-cleared). You can export the environment variable `TORCHINDUCTOR_CACHE_DIR` to save compilation cache in your desired directory to avoid unwanted deletion. You can also share the cache with other machines to reduce the compilation time.
 
 SGLang uses `max-autotune-no-cudagraphs` mode of `torch.compile`. The auto-tuning can be slow.
 If you want to deploy a model on many different machines, you can ship the `torch.compile` cache to these machines and skip the compilation steps. This is based on [PyTorch official documentation](https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html).
