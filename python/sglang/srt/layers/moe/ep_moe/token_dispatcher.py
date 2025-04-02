@@ -113,7 +113,7 @@ class _DeepEPDispatcherImplBase:
 
         self.handle = None
 
-    def dispatch(
+    def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -123,12 +123,18 @@ class _DeepEPDispatcherImplBase:
     ):
         raise NotImplementedError
 
-    def combine(
+    def dispatch_b(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def combine_a(
         self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
+    ):
+        raise NotImplementedError
+
+    def combine_b(self, *args, **kwargs):
         raise NotImplementedError
 
 
