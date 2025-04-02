@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Optional, Literal
+from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
