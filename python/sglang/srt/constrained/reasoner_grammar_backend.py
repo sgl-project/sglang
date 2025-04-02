@@ -59,15 +59,17 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.grammar.accept_token(token)
 
     def try_jump_forward(self, tokenizer):
-        raise NotImplementedError()
+        return self.grammar.try_jump_forward(tokenizer)
 
-    def jump_forward_str_state(self, tokenizer, str_state: str):
-        raise NotImplementedError()
+    def jump_forward_str_state(self, helper):
+        return self.grammar.jump_forward_str_state(helper)
 
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
-        raise NotImplementedError()
+        return self.grammar.jump_and_retokenize(
+            old_output_ids, new_output_ids, next_state
+        )
 
     def copy(self) -> BaseGrammarObject:
         return ReasonerGrammarObject(self.grammar.copy(), self.think_end_id)
