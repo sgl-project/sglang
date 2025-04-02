@@ -254,6 +254,43 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
             event,
         )
 
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] > 0:
+            num_tokens = self.src2dst.shape[0] // self.router_topk
+            output = torch.empty(
+                (num_tokens, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            deepep_post_reorder_triton_kernel[(num_tokens,)](
+                hidden_states,
+                output,
+                self.src2dst,
+                topk_idx,
+                topk_weights,
+                self.router_topk,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
+        else:
+            output = torch.zeros(
+                (0, hidden_states.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        hidden_states, event = self._combine_normal(
+            output,
+        )
+        event.current_stream_wait() if self.async_finish else ()
+
+        return hidden_states
+
     def _combine_normal(self, x: torch.Tensor):
         previous_event = Buffer.capture() if self.async_finish else None
 
@@ -381,6 +418,22 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        hidden_states, event, hook = self._combine_low_latency(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+        )
+        hook() if self.return_recv_hook else event.current_stream_wait()
+
+        return hidden_states
 
     def _combine_low_latency(
         self,
