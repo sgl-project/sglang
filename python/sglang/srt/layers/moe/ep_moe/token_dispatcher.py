@@ -562,6 +562,25 @@ class DeepEPDispatcher:
             topk_weights=topk_weights,
         )
 
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        inner_state = self._get_dispatcher(forward_mode).combine_a(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+        )
+        self._combine_intermediate_state = forward_mode, inner_state
+
+    def combine_b(self):
+        forward_mode, inner_state = self._combine_intermediate_state
+        del self._combine_intermediate_state
+        return self._get_dispatcher(forward_mode).combine_b(*inner_state)
+
     def _get_dispatcher(self, forward_mode: ForwardMode) -> "_DeepEPDispatcherImplBase":
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
