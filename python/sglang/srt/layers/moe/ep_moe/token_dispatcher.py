@@ -163,7 +163,14 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
         )
         return reorder_topk_ids, seg_indptr, gateup_input
 
-    def dispatch(self):
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int,
+    ):
         topk_idx = topk_idx.to(torch.int64)
         (
             hidden_states,
@@ -278,7 +285,14 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
         )
         self.return_recv_hook = return_recv_hook
 
-    def dispatch(self):
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int,
+    ):
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
                          hidden_states.shape[0]
