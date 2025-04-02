@@ -208,7 +208,9 @@ class ReasonerGrammarObject(ABC):
 
 
 class ReasonerGrammarBackend(ABC):
-    def __init__(self, grammar_backend=None, think_end_id=0):
+    def __init__(
+        self, grammar_backend: Optional[BaseGrammarBackend] = None, think_end_id=0
+    ):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
