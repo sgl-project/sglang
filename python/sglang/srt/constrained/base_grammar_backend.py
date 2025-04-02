@@ -170,7 +170,7 @@ class BaseGrammarBackend(ABC):
 
 
 class ReasonerGrammarObject(ABC):
-    def __init__(self, grammar=None, think_end_id=0):
+    def __init__(self, grammar:Optional[BaseGrammarObject]=None, think_end_id=0):
         self.grammar = grammar
         self.idx = 0
         self.vocab_mask = None
