@@ -198,9 +198,8 @@ class DeepEPDispatcher:
         )
         expected_m = 0
 
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             (
                 hidden_states,
                 topk_idx,
@@ -212,9 +211,7 @@ class DeepEPDispatcher:
                 reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             expected_m = (
                              hidden_states.shape[0]
                              * self.buffer_low_latency.group_size
