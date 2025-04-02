@@ -1852,3 +1852,13 @@ class DeepEPMode(Enum):
 
     def enable_low_latency(self):
         return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
+       
