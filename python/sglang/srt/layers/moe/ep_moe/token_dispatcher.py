@@ -163,6 +163,59 @@ class _DeepEPDispatcherNormal(_DeepEPDispatcherBase):
         )
         return reorder_topk_ids, seg_indptr, gateup_input
 
+    def _dispatch_normal(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+    ):
+        previous_event = Buffer.capture() if self.async_finish else None
+
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            previous_event,
+        ) = self.buffer_normal.get_dispatch_layout(
+            topk_idx,
+            num_experts,
+            previous_event=previous_event,
+            async_finish=self.async_finish,
+            allocate_on_comm_stream=previous_event is not None,
+        )
+
+        # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
+        # However, doing this would incur an unknown synchronization error, but keeping
+        # `handle` as a member variable works.
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            _,  # num_recv_tokens_per_expert_list
+            self.handle,
+            event,
+        ) = self.buffer_normal.dispatch(
+            x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            previous_event=previous_event,
+            async_finish=self.async_finish,
+            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+        )
+
+        return (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            event,
+        )
+
 
 class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
@@ -181,6 +234,60 @@ class _DeepEPDispatcherLowLatency(_DeepEPDispatcherBase):
             self.num_experts,
         )
         self.return_recv_hook = return_recv_hook
+
+    def _dispatch_low_latency(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        use_fp8: bool = False,
+    ):
+        """
+        # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'.
+        # Please make sure to change DeepEP code in internode_ll.cu dispatch / combine as below first and then reinstall.
+        # More details refer: https://github.com/deepseek-ai/DeepEP/issues/15#issuecomment-2709715782
+
+        diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
+        index 76ae2e2..8ecd08f 100644
+        --- a/csrc/kernels/internode_ll.cu
+        +++ b/csrc/kernels/internode_ll.cu
+        @@ -310,8 +310,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
+                    int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
+                    void* workspace, cudaStream_t stream, int phases) {
+            constexpr int kNumMaxTopK = 9;
+        -    constexpr int kNumWarpsPerGroup = 10;
+        -    constexpr int kNumWarpGroups = 3;
+        +    constexpr int kNumWarpsPerGroup = 8;
+        +    constexpr int kNumWarpGroups = 4;
+            EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
+
+            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+        @@ -501,8 +501,8 @@ void combine(void* combined_x,
+                    int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
+                    int num_topk, int num_experts, int rank, int num_ranks,
+                    void* workspace, cudaStream_t stream, int phases) {
+        -    constexpr int kNumWarpsPerGroup = 10;
+        -    constexpr int kNumWarpGroups = 3;
+        +    constexpr int kNumWarpsPerGroup = 8;
+        +    constexpr int kNumWarpGroups = 4;
+            constexpr int kNumMaxTopk = 9;
+
+            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+        """
+
+        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
+            self.buffer_low_latency.low_latency_dispatch(
+                hidden_states,
+                topk_idx,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                use_fp8=use_fp8,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
+        )
+        return packed_recv_hidden, packed_recv_count, event, hook
 
 
 class DeepEPDispatcher:
@@ -250,7 +357,7 @@ class DeepEPDispatcher:
                 topk_idx,
                 topk_weights,
                 event,
-            ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
+            ) = self._dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
             event.current_stream_wait() if self.async_finish else ()
             if hidden_states.shape[0] > 0:
                 reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
@@ -263,7 +370,7 @@ class DeepEPDispatcher:
                              * topk_idx.shape[1]
                              + num_experts
                          ) // num_experts
-            hidden_states, masked_m, event, hook = self.dispatch_low_latency(
+            hidden_states, masked_m, event, hook = self._dispatch_low_latency(
                 hidden_states,
                 topk_idx,
                 num_max_dispatch_tokens_per_rank,
@@ -283,113 +390,6 @@ class DeepEPDispatcher:
             masked_m,
             expected_m,
         )
-
-    def dispatch_normal(
-        self,
-        x: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_experts: int,
-    ):
-        previous_event = Buffer.capture() if self.async_finish else None
-
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            previous_event,
-        ) = self.buffer_normal.get_dispatch_layout(
-            topk_idx,
-            num_experts,
-            previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=previous_event is not None,
-        )
-
-        # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
-        # However, doing this would incur an unknown synchronization error, but keeping
-        # `handle` as a member variable works.
-        (
-            recv_x,
-            recv_topk_idx,
-            recv_topk_weights,
-            _,  # num_recv_tokens_per_expert_list
-            self.handle,
-            event,
-        ) = self.buffer_normal.dispatch(
-            x,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=previous_event,
-            async_finish=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-        )
-
-        return (
-            recv_x,
-            recv_topk_idx,
-            recv_topk_weights,
-            event,
-        )
-
-    def dispatch_low_latency(
-        self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        num_max_dispatch_tokens_per_rank: int,
-        num_experts: int,
-        use_fp8: bool = False,
-    ):
-        """
-        # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'.
-        # Please make sure to change DeepEP code in internode_ll.cu dispatch / combine as below first and then reinstall.
-        # More details refer: https://github.com/deepseek-ai/DeepEP/issues/15#issuecomment-2709715782
-
-        diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
-        index 76ae2e2..8ecd08f 100644
-        --- a/csrc/kernels/internode_ll.cu
-        +++ b/csrc/kernels/internode_ll.cu
-        @@ -310,8 +310,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
-                    int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-                    void* workspace, cudaStream_t stream, int phases) {
-            constexpr int kNumMaxTopK = 9;
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
-
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-        @@ -501,8 +501,8 @@ void combine(void* combined_x,
-                    int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-                    int num_topk, int num_experts, int rank, int num_ranks,
-                    void* workspace, cudaStream_t stream, int phases) {
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            constexpr int kNumMaxTopk = 9;
-
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-        """
-
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
-            self.buffer_low_latency.low_latency_dispatch(
-                hidden_states,
-                topk_idx,
-                num_max_dispatch_tokens_per_rank,
-                num_experts,
-                use_fp8=use_fp8,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-            )
-        )
-        return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine(
         self,
