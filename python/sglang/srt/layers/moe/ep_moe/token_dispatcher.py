@@ -349,11 +349,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                         hidden_states.shape[0]
-                         * self.buffer_low_latency.group_size
-                         * topk_idx.shape[1]
-                         + num_experts
-                     ) // num_experts
+            hidden_states.shape[0]
+            * self.buffer_low_latency.group_size
+            * topk_idx.shape[1]
+            + num_experts
+        ) // num_experts
         hidden_states, masked_m, event, hook = self._dispatch_low_latency(
             hidden_states,
             topk_idx,
@@ -537,7 +537,7 @@ class DeepEPDispatcher:
             topk_weights=topk_weights,
         )
 
-    def _get_dispatcher(self, forward_mode: ForwardMode) -> '_DeepEPDispatcherImplBase':
+    def _get_dispatcher(self, forward_mode: ForwardMode) -> "_DeepEPDispatcherImplBase":
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
