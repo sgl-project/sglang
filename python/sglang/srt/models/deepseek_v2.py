@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import logging
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -88,6 +89,8 @@ if _is_hip:
     )
 
 expert_distribution_recorder = ExpertDistributionRecorder()
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekV2MLP(nn.Module):
