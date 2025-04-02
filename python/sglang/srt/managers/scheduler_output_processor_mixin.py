@@ -88,20 +88,6 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
-                    is_finished_zero_tokens = (
-                        isinstance(req.finished_reason, FINISH_LENGTH)
-                        and req.finished_reason.length == 0
-                    )
-                    if is_finished_zero_tokens:
-                        if current_req_extend_len > 0:
-                            token_slot_to_free = batch.out_cache_loc[
-                                out_cache_loc_offset
-                                + current_req_extend_len
-                                - 1 : out_cache_loc_offset
-                                + current_req_extend_len
-                            ]
-                            self.token_to_kv_pool_allocator.free(token_slot_to_free)
-
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:

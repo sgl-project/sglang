@@ -586,6 +586,9 @@ class Req:
             )
             return
 
+        if not self.output_ids:
+            return
+
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
