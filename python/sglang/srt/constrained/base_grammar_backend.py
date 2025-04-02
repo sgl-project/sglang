@@ -175,7 +175,7 @@ class ReasonerGrammarObject(ABC):
         self.idx = 0
         self.vocab_mask = None
         self.think_end_id = think_end_id
-        self.is_in_reasoing = True
+        self.is_in_reasoning = True
 
     @property
     def finished(self):
@@ -192,7 +192,7 @@ class ReasonerGrammarObject(ABC):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.vocab_mask, self.idx = vocab_mask, idx
-        if not self.is_in_reasoing:
+        if not self.is_in_reasoning:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -204,10 +204,10 @@ class ReasonerGrammarObject(ABC):
 
     def accept_token(self, token: int):
         if token == self.think_end_id:
-            self.is_in_reasoing = False
+            self.is_in_reasoning = False
             self.grammar.fill_vocab_mask(self.vocab_mask, self.idx)
 
-        if not self.is_in_reasoing and token != self.think_end_id:
+        if not self.is_in_reasoning and token != self.think_end_id:
             self.grammar.accept_token(token)
 
 
