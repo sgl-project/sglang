@@ -164,12 +164,13 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
     else:
         chat_template_name = chat_template_arg
 
-    if chat_template_name is None:
-        chat_template_name = get_conv_template_by_model_path(model_path)
 
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
+def guess_chat_template_name_from_model_path(model_path):
+    global chat_template_name
+    chat_template_name = get_conv_template_by_model_path(model_path)
+    logger.info(
+        f"guess chat template name from model path, get chat template name: {chat_template_name}"
+    )
 
 
 async def v1_files_create(

@@ -807,13 +807,13 @@ register_conv_template(
 )
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_deepseek_janus_pro(model_path: str):
     if "janus" in model_path.lower():
         return "janus-pro"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_vicuna(model_path: str):
     if "vicuna" in model_path.lower():
         return "vicuna_v1.1"
@@ -823,7 +823,7 @@ def match_vicuna(model_path: str):
         return "vicuna_v1.1"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_llama2_chat(model_path: str):
     model_path = model_path.lower()
     if "llama-2" in model_path and "chat" in model_path:
@@ -836,14 +836,14 @@ def match_llama2_chat(model_path: str):
         return "llama-2"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_deepseek_vl(model_path: str):
     model_path = model_path.lower()
     if "deepseek" in model_path and "vl2" in model_path:
         return "deepseek-vl2"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_chat_ml(model_path: str):
     # import pdb;pdb.set_trace()
     model_path = model_path.lower()
@@ -864,7 +864,7 @@ def match_chat_ml(model_path: str):
         return "chatml-llava"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_gemma_it(model_path: str):
     model_path = model_path.lower()
     if "gemma" in model_path and "it" in model_path:
@@ -874,7 +874,7 @@ def match_gemma_it(model_path: str):
         return "gemma-it"
 
 
-@get_conv_template_by_model_path
+@register_conv_template_matching_function
 def match_openbmb_minicpm(model_path: str):
     model_path = model_path.lower()
     if "minicpm-v" in model_path:
