@@ -357,8 +357,6 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
-
-class DeepEPDispatcher:
     def dispatch(
         self,
         hidden_states: torch.Tensor,
