@@ -63,10 +63,6 @@ from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    UnquantizedEmbeddingMethod,
-)
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -175,6 +171,11 @@ def get_linear_quant_method(
     prefix: str,
     linear_method_cls: type,
 ):
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        UnquantizedEmbeddingMethod,
+    )
+
     cloned_config = deepcopy(config)
     parallel_lm_head_quantized = (
         isinstance(layer, ParallelLMHead) and cloned_config.lm_head_quantized
