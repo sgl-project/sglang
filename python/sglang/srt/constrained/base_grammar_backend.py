@@ -28,6 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 class BaseGrammarObject(ABC):
+
+    def __init__(self):
+        self._finished = False
+
+    @property
+    def finished(self):
+        return self._finished
+
+    @finished.setter
+    def finished(self, finished):
+        self._finished = finished
+
     @abstractmethod
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         """

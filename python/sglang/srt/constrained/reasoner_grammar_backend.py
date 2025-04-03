@@ -23,6 +23,7 @@ from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 class ReasonerGrammarObject(BaseGrammarObject):
     def __init__(self, grammar: BaseGrammarObject, think_end_id):
+        super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.is_in_reasoning = True
