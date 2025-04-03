@@ -566,10 +566,14 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
+def load_image(
+    image_file: Union[Image.Image, str, bytes]
+) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
-
-    if isinstance(image_file, bytes):
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
