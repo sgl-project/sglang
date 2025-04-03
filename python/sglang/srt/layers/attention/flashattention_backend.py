@@ -87,7 +87,6 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, : metadata.max_seq_len_k
         ]
-
         # Precompute strided indices
         # [0, page_size, 2 * page_size, ...]
         if self.page_size > 1:
@@ -203,7 +202,6 @@ class FlashAttentionBackend(AttentionBackend):
             c_kv_cache = c_kv.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
-
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]

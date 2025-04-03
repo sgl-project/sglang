@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.model_runner import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -15,49 +16,55 @@ class MockModelRunner:
     def __init__(
         self,
         attention_arch=AttentionArch.MHA,
-        context_len=2048,
         page_size=1,
         is_multimodal=False,
         device="cuda",
+        dtype=torch.float16,
+        num_heads=2,
+        head_dim=8,
     ):
+        # Max batch size for the test.
+        max_batch_size = 160
+        # Total tokens(prefix + extend + decode) in the test should not exceed this length.
+        max_context_len = 2048
         self.model_config = type(
             "ModelConfig",
             (),
             {
-                "context_len": context_len,
+                "context_len": max_context_len,
                 "is_multimodal": is_multimodal,
                 "attention_arch": attention_arch,
             },
         )
         self.sliding_window_size = None
         self.device = device
-        batch_size = 160
-        # Create a proper req_to_token_pool with the req_to_token attribute
+        # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",
             (),
             {
                 # A typical max_bs * max_context_len for cuda graph decode
-                "size": batch_size,
+                "size": max_batch_size,
                 # Add req_to_token attribute
                 "req_to_token": torch.zeros(
-                    batch_size, context_len, dtype=torch.int32, device=device
+                    max_batch_size, max_context_len, dtype=torch.int32, device=device
                 ),
             },
         )
-        self.page_size = page_size
-        from sglang.srt.model_executor.model_runner import ServerArgs
-
-        self.server_args = ServerArgs(model_path="fake_model_path")
-
-
-class MockReqToTokenPool:
-    def __init__(self, batch_size, seq_len, device):
-        self.req_to_token = (
-            torch.arange(batch_size * seq_len, device=device)
-            .reshape(batch_size, seq_len)
-            .to(torch.int32)
+        max_total_num_tokens = max_batch_size * max_context_len
+        self.token_to_kv_pool = MHATokenToKVPool(
+            size=max_total_num_tokens,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=num_heads,
+            head_dim=head_dim,
+            layer_num=1,  # only consider layer=1 for unit test
+            device=device,
+            enable_memory_saver=False,
         )
+        self.page_size = page_size
+        # Required by torch native backend
+        self.server_args = ServerArgs(model_path="fake_model_path")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -71,15 +78,31 @@ class TestFlashAttentionBackend(CustomTestCase):
         self.device = "cuda"
         self.dtype = torch.float16
 
-        # Initialize model runner and backend
-        self.model_runner = MockModelRunner(attention_arch=AttentionArch.MHA)
+    def _init_model_runner(self, page_size=1):
+        self.model_runner = MockModelRunner(
+            attention_arch=AttentionArch.MHA,
+            page_size=page_size,
+            device=self.device,
+            dtype=self.dtype,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+        )
         self.backend = FlashAttentionBackend(self.model_runner)
-
-        # Reference backend for comparison
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
-
-        # Set number of heads for reference backend comparison
         self.model_runner.model_config.num_attention_heads = self.num_heads
+
+    def _mock_write_to_req_to_token_pool(self, batch_size, seq_len, page_size):
+        # if page_size > 1, the token pool stores the index to the page.
+        # so we need to multiply the index by page_size.
+        self.req_to_token = (
+            torch.arange(0, batch_size, dtype=torch.int32, device=self.device)[:, None]
+            * seq_len
+            + torch.arange(0, seq_len, dtype=torch.int32, device=self.device)[None, :]
+            + page_size
+        )
+        self.model_runner.req_to_token_pool.req_to_token[:batch_size, :seq_len] = (
+            self.req_to_token
+        )
 
     def _create_attention_layer(self):
         """Create attention layer for testing."""
@@ -89,19 +112,6 @@ class TestFlashAttentionBackend(CustomTestCase):
             scaling=1.0,
             num_kv_heads=self.num_heads,
             layer_id=0,
-        )
-
-    def _create_kv_pool(self, size, page_size=1):
-        """Create KV pool for testing."""
-        return MHATokenToKVPool(
-            size=size,
-            page_size=page_size,
-            dtype=self.dtype,
-            head_num=self.num_heads,
-            head_dim=self.head_dim,
-            layer_num=1,  # only consider layer=1 for unit test
-            device=self.device,
-            enable_memory_saver=False,
         )
 
     def _create_qkv_tensors(self, tokens_len):
@@ -138,24 +148,24 @@ class TestFlashAttentionBackend(CustomTestCase):
 
         if output_ref is not None:
             if not torch.allclose(output, output_ref, atol=1e-1, rtol=0.0):
-                diff = torch.abs(output - output_ref)
-                max_diff = torch.max(diff)
-                max_idx = torch.argmax(diff.view(-1))
-                flat_output = output.view(-1)
-                flat_ref = output_ref.view(-1)
-                print(
-                    f"Output is not close to the reference output. Max diff: {max_diff}"
-                )
-                print(
-                    f"Max diff at index {max_idx}: output={flat_output[max_idx]}, reference={flat_ref[max_idx]}"
-                )
+                # Check where the values differ beyond the given tolerances
+                diff_mask = ~torch.isclose(output, output_ref, atol=1e-1, rtol=0.0)
+
+                # Find the first index where the difference occurs
+                if diff_mask.any():
+                    first_mismatch_idx = diff_mask.nonzero()[0]
+                    print(
+                        "First mismatch at index:", tuple(first_mismatch_idx.tolist())
+                    )
+                    print("output:", output[tuple(first_mismatch_idx.tolist())])
+                    print("output_ref:", output_ref[tuple(first_mismatch_idx.tolist())])
                 raise AssertionError(
                     "Attention output is not close to the torch native backend output"
                 )
 
     def _create_forward_batch(self, mode, q_len=None, prefix_len=0, page_size=1):
         """Create a forward batch for testing based on mode and lengths."""
-        self.model_runner.page_size = page_size
+        self._init_model_runner(page_size=page_size)
 
         # Default to self.seq_len if not specified
         q_len = q_len or self.seq_len
@@ -194,21 +204,27 @@ class TestFlashAttentionBackend(CustomTestCase):
                 ),
                 attn_backend=self.backend,
             )
-            kv_pool_size = self.batch_size * total_len
-
         else:  # ForwardMode.DECODE
-            decode_len = q_len  # typically 1 for decode mode
+            decode_len = q_len  # Assuming 1 for decode testing
             total_len = self.seq_len + decode_len
-            out_cache_start = self.batch_size * self.seq_len
-            out_cache_end = self.batch_size * total_len
+            if mode == ForwardMode.DECODE and page_size > 1:
+                # Get next page_size multiple of self.seq_len
+                out_cache_start = (
+                    self.batch_size * self.seq_len // page_size + 1
+                ) * page_size
+                # out_cache_end is the start of the next block
+                out_cache_end = out_cache_start + decode_len * page_size
+            else:
+                out_cache_start = self.batch_size * self.seq_len
+                out_cache_end = self.batch_size * total_len
 
             forward_batch = ForwardBatch(
                 batch_size=self.batch_size,
                 input_ids=torch.randint(
                     0, 100, (self.batch_size, decode_len), device=self.device
                 ),
-                out_cache_loc=torch.arange(
-                    out_cache_start, out_cache_end, device=self.device
+                out_cache_loc=torch.tensor(
+                    [out_cache_start, out_cache_end], device=self.device
                 ),
                 seq_lens_sum=self.batch_size * total_len,
                 forward_mode=mode,
@@ -220,31 +236,17 @@ class TestFlashAttentionBackend(CustomTestCase):
                 attn_backend=self.backend,
             )
 
-            # Calculate KV pool size divisible by page_size
-            if page_size > 1:
-                kv_pool_size = self.batch_size * ((total_len // page_size) * page_size)
-                if kv_pool_size < total_len * self.batch_size:
-                    kv_pool_size += page_size
-            else:
-                kv_pool_size = self.batch_size * total_len
-
         # Add token pool
-        forward_batch.req_to_token_pool = MockReqToTokenPool(
-            self.batch_size, total_len, self.device
-        )
+        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
 
-        # Add KV cache
-        forward_batch.token_to_kv_pool = self._create_kv_pool(
-            kv_pool_size, page_size=page_size
-        )
+        # Write current batch's req_to_token to req_to_token_pool
+        self._mock_write_to_req_to_token_pool(self.batch_size, total_len, page_size)
+        # Add kv pool for this forward batch
+        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
         return forward_batch
 
     def _setup_kv_cache(self, forward_batch, layer, cache_len):
-        """Set up KV cache with prefix tokens."""
-        if cache_len <= 0:
-            return
-
         # Create constant values for the prefix cache for easy debugging
         cache_k = torch.ones(
             self.batch_size * cache_len,
@@ -295,7 +297,8 @@ class TestFlashAttentionBackend(CustomTestCase):
         # KV cache for decode is same as seq_len
         # No KV cache for extend without prefix
         if mode == ForwardMode.EXTEND:
-            self._setup_kv_cache(forward_batch, layer, prefix_len)
+            if prefix_len > 0:
+                self._setup_kv_cache(forward_batch, layer, prefix_len)
         else:
             self._setup_kv_cache(forward_batch, layer, self.seq_len)
 
@@ -306,12 +309,9 @@ class TestFlashAttentionBackend(CustomTestCase):
                 self.batch_size * q_len,
                 self.num_heads * self.head_dim,
             )
-        else:
-            expected_shape = (self.batch_size, self.num_heads * self.head_dim)
-
-        if mode == ForwardMode.EXTEND:
             output = self.backend.forward_extend(q, k, v, layer, forward_batch)
         else:
+            expected_shape = (self.batch_size, self.num_heads * self.head_dim)
             output = self.backend.forward_decode(q, k, v, layer, forward_batch)
 
         output_ref = self._run_reference_forward(
