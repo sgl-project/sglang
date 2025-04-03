@@ -30,7 +30,7 @@ FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
     GIT_TAG        6f4921858b3bb0a82d7cbeb4e499690e9ae60d16
-    GIT_SHALLOW    ON
+    GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
 # DeepGEMM
