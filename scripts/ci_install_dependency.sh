@@ -8,19 +8,26 @@ FLASHINFER_REPO="${FLASHINFER_REPO:-https://flashinfer.ai/whl/cu124/torch2.5/fla
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
-pip install --upgrade pip
-pip uninstall flashinfer -y
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
-
+# Clean up existing installations
+pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
+pip cache purge
 rm -rf /root/.cache/flashinfer
-# Force reinstall flashinfer and torch_memory_saver
-pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
-pip install sgl-kernel==0.0.6 --force-reinstall
+rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
+rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
+# Update pip
+pip install --upgrade pip
+
+# Install flashinfer and sgl-kernel
+pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --no-cache-dir
+pip install sgl-kernel==0.0.6 --no-cache-dir
+
+# Install the main package
+pip install -e "python[all]" --find-links ${FLASHINFER_REPO}
+
+# Install additional dependencies
 pip install torch_memory_saver
 pip install transformers==4.50.0 sentence_transformers accelerate==1.4.0 peft pandas datasets timm torchaudio
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12
-
-pip uninstall vllm -y || true

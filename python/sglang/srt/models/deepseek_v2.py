@@ -70,7 +70,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -215,7 +215,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=config.topk_group,
                 correction_bias=self.gate.e_score_correction_bias,
                 prefix=add_prefix("experts", prefix),
-                deepep_mode=global_server_args_dict["deepep_mode"],
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
             )
 
         if config.n_shared_experts is not None:
@@ -264,7 +264,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=global_server_args_dict["deepep_mode"],
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,  # TODO
                 return_recv_hook=True,
             )
@@ -684,7 +684,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_vc = None
         self.w_scale = None
 
-        self.enable_flashinfer_mla = global_server_args_dict["enable_flashinfer_mla"]
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
@@ -692,7 +691,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.enable_flashinfer_mla:
+        if self.attention_backend == "flashinfer_mla":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             return (
                 not self.flashinfer_mla_disable_ragged

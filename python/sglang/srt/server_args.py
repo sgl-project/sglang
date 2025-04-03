@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -161,7 +161,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    deepep_mode: Optional[str] = "auto"
+    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -179,7 +179,7 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False
+    enable_flashinfer_mla: bool = False  # TODO: remove this argument
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
@@ -836,7 +836,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-mla",
             action="store_true",
-            help="Enable FlashInfer MLA optimization",
+            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
         )
         parser.add_argument(
             "--enable-flashmla",
