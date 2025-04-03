@@ -67,6 +67,12 @@ class ServerArgs:
     host: str = "127.0.0.1"
     port: int = 30000
 
+    # SSL options
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_cert_reqs: int = 0
+    
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
@@ -551,6 +557,33 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+        
+        # SSL options
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="The file path to the SSL key file.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="The file path to the SSL cert file.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="The CA certificates file.",
+        )
+        parser.add_argument(
+            "--ssl-cert-reqs",
+            type=int,
+            default=ServerArgs.ssl_cert_reqs,
+            help="Whether client certificate is required. ",
+        )
+        
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",

@@ -76,6 +76,13 @@ Please consult the documentation below to learn more about the parameters you ma
 * `file_storage_path`: Directory for storing uploaded or generated files from API calls.
 * `enable_cache_report`: If set, includes detailed usage of cached tokens in the response usage.
 
+### SSL configuration
+
+* `ssl_keyfile`: The file path to the SSL key file.
+* `ssl_certfile`: The file path to the SSL cert file.
+* `ssl_ca_certs`: The CA certificates file.
+* `ssl_cert_reqs`: Whether client certificate is required, see [ssl module](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.verify_mode).
+
 ## Parallelism
 
 ### Tensor parallelism

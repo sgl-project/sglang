@@ -718,6 +718,10 @@ def launch_server(
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
+            ssl_certfile=server_args.ssl_certfile,
+            ssl_keyfile=server_args.ssl_keyfile,
+            ssl_ca_certs=server_args.ssl_ca_certs,
+            ssl_cert_reqs=server_args.ssl_cert_reqs,
         )
     finally:
         warmup_thread.join()
