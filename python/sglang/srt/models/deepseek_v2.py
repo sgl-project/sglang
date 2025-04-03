@@ -387,7 +387,7 @@ class DeepseekV2MoE(nn.Module):
             topk_idx,
             topk_weights,
             self.num_experts,
-            forward_mode,
+            forward_mode=forward_mode,
         )
 
     def _forward_deepep_expert(
