@@ -284,8 +284,8 @@ void transfer_kv_to_cpu_all_layer_naive(
     at::Tensor device_indices,
     at::Tensor device_k_buffer,
     at::Tensor device_v_buffer,
-    std::int64_t page_size,
-    std::int64_t layer_num);
+    int64_t page_size,
+    int64_t layer_num);
 
 void transfer_kv_to_gpu_per_layer_naive(
     at::Tensor host_indices,
@@ -294,8 +294,8 @@ void transfer_kv_to_gpu_per_layer_naive(
     at::Tensor device_indices,
     at::Tensor device_k_buffer,
     at::Tensor device_v_buffer,
-    std::int64_t page_size,
-    std::int64_t layer_id);
+    int64_t page_size,
+    int64_t layer_id);
 
 /*
  * From FlashInfer

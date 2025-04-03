@@ -34,7 +34,12 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer, transfer_kv_per_layer
+from sgl_kernel.kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_per_layer,
+    transfer_kv_to_cpu_all_layer_naive,
+    transfer_kv_to_gpu_per_layer_naive,
+)
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_compiler_backend
@@ -861,33 +866,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.kv_buffer[:, :, indices] = flat_data
 
     def write_page_all_layers(self, host_indices, device_indices, device_pool):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            for j in range(self.layer_num):
-                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
-                )
-                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
-                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
-                    non_blocking=True,
-                )
+        transfer_kv_to_cpu_all_layer_naive(
+            host_indices=host_indices,
+            host_k_buffer=self.kv_buffer[0],
+            host_v_buffer=self.kv_buffer[1],
+            device_indices=device_indices,
+            device_k_buffer=device_pool.k_buffer,
+            device_v_buffer=device_pool.v_buffer,
+            page_size=self.page_size,
+            layer_num=self.layer_num,
+        )
 
     def load_page_per_layer(self, host_indices, device_indices, device_pool, layer_id):
-        device_indices_cpu = device_indices[:: self.page_size].cpu()
-        for i in range(len(device_indices_cpu)):
-            h_index = host_indices[i * self.page_size]
-            d_index = device_indices_cpu[i]
-            device_pool.k_buffer[layer_id][d_index : d_index + self.page_size].copy_(
-                self.kv_buffer[0, layer_id, h_index : h_index + self.page_size],
-                non_blocking=True,
-            )
-            device_pool.v_buffer[layer_id][d_index : d_index + self.page_size].copy_(
-                self.kv_buffer[1, layer_id, h_index : h_index + self.page_size],
-                non_blocking=True,
-            )
+        transfer_kv_to_gpu_per_layer_naive(
+            host_indices=host_indices,
+            host_k_buffer=self.kv_buffer[0],
+            host_v_buffer=self.kv_buffer[1],
+            device_indices=device_indices,
+            device_k_buffer=device_pool.k_buffer,
+            device_v_buffer=device_pool.v_buffer,
+            page_size=self.page_size,
+            layer_id=layer_id,
+        )
 
 
 class MLATokenToKVPoolHost(HostKVCache):

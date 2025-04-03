@@ -231,8 +231,8 @@ void transfer_kv_to_cpu_all_layer_naive(
     at::Tensor device_indices,
     at::Tensor device_k_buffer,
     at::Tensor device_v_buffer,
-    int page_size,
-    int layer_num) {
+    int64_t page_size,
+    int64_t layer_num) {
   if (device_indices.size(0) != host_indices.size(0)) {
     throw std::invalid_argument("Source and destination indices must have the same length");
   }
@@ -265,8 +265,8 @@ void transfer_kv_to_gpu_per_layer_naive(
     at::Tensor device_indices,
     at::Tensor device_k_buffer,
     at::Tensor device_v_buffer,
-    std::int64_t page_size,
-    std::int64_t layer_id) {
+    int64_t page_size,
+    int64_t layer_id) {
   if (device_indices.size(0) != host_indices.size(0)) {
     throw std::invalid_argument("Source and destination indices must have the same length");
   }
