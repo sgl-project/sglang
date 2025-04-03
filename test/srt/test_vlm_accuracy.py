@@ -3,6 +3,7 @@
 
 import unittest
 from io import BytesIO
+from typing import List
 
 import numpy as np
 import requests
@@ -13,6 +14,12 @@ from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.conversation import generate_chat_conv
+from sglang.srt.managers.mm_utils import embed_mm_inputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
@@ -134,7 +141,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         return inputs
 
     def get_sglang_model(self):
-        model_runner = ModelRunner(
+        self.model_runner = ModelRunner(
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
@@ -146,7 +153,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
                 disable_cuda_graph=True,
             ),
         )
-        return model_runner.model
+        return self.model_runner.model
 
 
 class TestMiniCPMVLogits(VisionLLMLogitsBase):
@@ -163,42 +170,68 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
         cls.chat_template = "minicpmv"
 
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        cls.model = AutoModel.from_pretrained(
-            cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
-        ).eval()
-        cls.model.to(cls.device)
+        cls.hf_model = (
+            AutoModel.from_pretrained(
+                cls.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+            )
+            .eval()
+            .to(cls.device)
+        )
 
-    async def test_encode_output(self):
+    async def test_vlm_embedding_output(self):
+        """
+        Compares the embedding output of vlm
+        """
         inputs = self.get_processor_output()
 
         with torch.no_grad():
+            # hf
             model_inputs = {
                 "input_ids": inputs.input_ids,
                 "image_bound": inputs.image_bound,
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            (hf_output, _) = self.model.get_vllm_embedding(
+            (hf_output, _) = self.hf_model.get_vllm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)
 
-        with torch.no_grad():
+            # sglang
             model = self.get_sglang_model()
             input_ids = inputs["input_ids"].to(self.device).flatten()
-            image_inputs = model._parse_and_validate_inputs(
+
+            pixel_values = inputs["pixel_values"]
+            tgt_sizes = inputs["tgt_sizes"]
+            pixel_values_flat: List[torch.Tensor] = []
+            tgt_sizes_flat: List[torch.Tensor] = []
+            for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
+                # per image
+                if len(pixel_b) != len(tgt_b):
+                    raise ValueError(
+                        "Inconsistent N lengths, found: "
+                        f"{len(pixel_b)} vs {len(tgt_b)}"
+                    )
+                for pixel_n, tgt_n in zip(pixel_b, tgt_b):
+                    pixel_values_flat += [pixel_n]
+                    tgt_sizes_flat += [tgt_n]
+            sglang_output = embed_mm_inputs(
+                mm_inputs=MultimodalInputs(
+                    mm_items=[
+                        MultimodalDataItem(
+                            pixel_values=pixel_values_flat,
+                            tgt_size=tgt_sizes_flat,
+                            modality=Modality.IMAGE,
+                            pad_value=self.processor.tokenizer.unk_token_id,
+                        )
+                    ]
+                ),
                 input_ids=input_ids,
-                **{
-                    "pixel_values": [inputs["pixel_values"]],
-                    "tgt_sizes": [inputs["tgt_sizes"]],
-                    "im_start_id": self.tokenizer.im_start_id,
-                    "im_end_id": self.tokenizer.im_end_id,
-                    "slice_start_id": self.tokenizer.slice_start_id,
-                    "slice_end_id": self.tokenizer.slice_end_id,
-                },
-            )
-            (sglang_output, _) = model.get_embedding(
-                input_ids=input_ids, image_inputs=image_inputs
+                input_embedding=model.get_input_embeddings(),
+                image_data_embedding_func=model.get_image_feature,
+                placeholder_token_ids=[
+                    self.processor.tokenizer.unk_token_id,
+                ],
             )
 
         self.compare_outputs(sglang_output, hf_output)

@@ -17,7 +17,7 @@ def tree_speculative_sampling_target_only(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
-    torch.ops.sgl_kernel.tree_speculative_sampling_target_only(
+    torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
         predicts,
         accept_index,
         accept_token_num,
@@ -45,7 +45,7 @@ def verify_tree_greedy(
     retrive_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.verify_tree_greedy(
+    torch.ops.sgl_kernel.verify_tree_greedy.default(
         predicts,
         accept_index,
         accept_token_num,
@@ -71,7 +71,7 @@ def build_tree_kernel_efficient(
     depth: int,
     draft_token_num: int,
 ) -> None:
-    torch.ops.sgl_kernel.build_tree_kernel_efficient(
+    torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
         parent_list,
         selected_index,
         verified_seq_len,
@@ -92,7 +92,7 @@ def segment_packbits(
     output_indptr: torch.Tensor,
     y: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.segment_packbits(
+    torch.ops.sgl_kernel.segment_packbits.default(
         x,
         input_indptr,
         output_indptr,
