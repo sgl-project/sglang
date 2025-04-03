@@ -194,6 +194,7 @@ set(SOURCES
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/kvcacheio/transfer.cu"
     "csrc/torch_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
