@@ -544,7 +544,7 @@ class DeepEPDispatcher:
             topk_weights=topk_weights,
         )
 
-    def _get_dispatcher(self, forward_mode: ForwardMode) -> "_DeepEPDispatcherImplBase":
+    def _get_dispatcher(self, forward_mode: ForwardMode) -> _DeepEPDispatcherImplBase:
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
