@@ -35,6 +35,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -50,10 +51,11 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     ReqToMetadataIdxAllocator,
 )
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -101,6 +103,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -121,6 +124,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    enable_colocated_batch_gen,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -130,8 +134,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +281,7 @@ class Scheduler(
             self.random_seed,
             self.device,
             worker_global_server_args_dict,
+            self.expert_location_metadata,
             _,
             _,
             _,
@@ -374,6 +377,12 @@ class Scheduler(
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
+        )
+
+        self.input_blocker = (
+            SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
+            if enable_colocated_batch_gen()
+            else None
         )
 
         # Init profiler
@@ -728,6 +737,9 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
@@ -1376,7 +1388,7 @@ class Scheduler(
             self.profiler_target_forward_ct
             and self.profiler_target_forward_ct <= self.forward_ct
         ):
-            self.stop_profile()
+            self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
         # Run forward
         if self.is_generation:
@@ -1456,14 +1468,38 @@ class Scheduler(
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_dp_attn_batch_raw(
+            local_batch,
+            dp_size=self.server_args.dp_size,
+            attn_tp_size=self.attn_tp_size,
+            tp_cpu_group=self.tp_cpu_group,
+            get_idle_batch=self.get_idle_batch,
+            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
+            spec_algorithm=self.spec_algorithm,
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+        )
+
+    @staticmethod
+    def prepare_dp_attn_batch_raw(
+        local_batch: ScheduleBatch,
+        dp_size,
+        attn_tp_size: int,
+        tp_cpu_group,
+        get_idle_batch,
+        disable_cuda_graph: bool,
+        enable_two_batch_overlap: bool,
+        spec_algorithm,
+        speculative_num_draft_tokens,
+    ):
         # Check if other DP workers have running batches
         if local_batch is None:
             num_tokens = 0
             global_num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not self.spec_algorithm.is_none() and self.spec_algorithm.is_eagle():
-                num_tokens = num_tokens * self.server_args.speculative_num_draft_tokens
+            if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
+                num_tokens = num_tokens * speculative_num_draft_tokens
             global_num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1482,7 +1518,7 @@ class Scheduler(
         else:
             can_cuda_graph = 0
 
-        if not self.spec_algorithm.is_none():
+        if not spec_algorithm.is_none():
             # TODO(sang): Support cuda graph when idle batch is there.
             if local_batch is None or local_batch.forward_mode.is_idle():
                 can_cuda_graph = 0
@@ -1490,38 +1526,62 @@ class Scheduler(
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+
+        if local_batch is not None:
+            local_tbo_split_seq_index = two_batch_overlap.compute_split_seq_index(
+                forward_mode=local_batch.forward_mode,
+                num_tokens=local_batch.input_ids.shape[0],
+                extend_lens=local_batch.extend_lens,
+            )
+        else:
+            local_tbo_split_seq_index = None
+        local_can_run_tbo = local_tbo_split_seq_index is not None
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 global_num_tokens_for_logprob,
                 is_extend_in_batch,
+                local_can_run_tbo,
+                local_batch.forward_mode.value if local_batch is not None else -1,
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (self.server_args.dp_size, self.attn_tp_size, 4),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
             global_info.flatten(),
             local_info,
-            group=self.tp_cpu_group,
+            group=tp_cpu_group,
         )
         global_num_tokens = global_info[:, 0, 0].tolist()
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+        local_can_run_tbo_aggregated = min(global_info[:, 0, 4].tolist())
+        forward_mode_same = _is_all_same(global_info[:, 0, 5].tolist())
+
+        can_run_tbo = (
+            enable_two_batch_overlap
+            and local_can_run_tbo_aggregated
+            and forward_mode_same
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
-            local_batch = self.get_idle_batch()
+            local_batch = get_idle_batch()
 
         if local_batch is not None:
             local_batch.global_num_tokens = global_num_tokens
             local_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+            local_batch.tbo_split_seq_index = (
+                local_tbo_split_seq_index if can_run_tbo else None
+            )
 
             # Check forward mode for cuda graph
-            if not self.server_args.disable_cuda_graph:
+            if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
         return local_batch, any(is_extend_in_batch)
@@ -1873,7 +1933,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
@@ -1904,21 +1967,19 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             expert_distribution_recorder.start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             expert_distribution_recorder.stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            expert_distribution_recorder.dump_record()
+            dump_output = expert_distribution_recorder.dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput()
+        return ExpertDistributionReqOutput(dump_output=dump_output)
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -1962,6 +2023,10 @@ def _import_static_state(model, static_params):
         self_named_buffers[name][...] = tensor
 
 
+def _is_all_same(x):
+    return all(value == x[0] for value in x)
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2002,6 +2067,7 @@ def run_scheduler_process(
                 "status": "ready",
                 "max_total_num_tokens": scheduler.max_total_num_tokens,
                 "max_req_input_len": scheduler.max_req_input_len,
+                "expert_location_metadata": scheduler.expert_location_metadata,
             }
         )
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

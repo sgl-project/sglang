@@ -336,7 +336,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -366,11 +366,8 @@ async def stop_expert_distribution_record_async():
 @app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
-    return Response(
-        content="Dump expert distribution record.\n",
-        status_code=200,
-    )
+    content = await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    return ORJSONResponse(content, status_code=200)
 
 
 @app.post("/update_weights_from_disk")

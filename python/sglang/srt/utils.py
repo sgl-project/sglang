@@ -37,13 +37,26 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -188,6 +201,10 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__(self.mode)
         else:
             return self.__class__()
+
+
+def enable_colocated_batch_gen():
+    return get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN", "false")
 
 
 def enable_show_time_cost():
@@ -1838,3 +1855,58 @@ def flatten_nested_list(nested_list):
         ]
     else:
         return [nested_list]
+
+
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
+
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    import deep_gemm
+
+    original_num_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(num_sms)
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(original_num_sms)

@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs
 
 _is_cuda = is_cuda()
 
@@ -46,7 +46,6 @@ if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
-
 
 logger = logging.getLogger(__name__)
 
@@ -814,7 +813,7 @@ class DeepEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        deepep_mode: str = "auto",
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
             num_experts,
@@ -834,7 +833,7 @@ class DeepEPMoE(EPMoE):
             activation,
         )
         self.deepep_mode = deepep_mode
-        if self.deepep_mode in ["low_latency", "auto"]:
+        if self.deepep_mode.enable_low_latency():
             assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
@@ -858,13 +857,10 @@ class DeepEPMoE(EPMoE):
         expected_m: int,
         forward_mode: ForwardMode,
     ):
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")

@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -159,9 +159,10 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    enable_two_batch_overlap: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    deepep_mode: Optional[str] = "auto"
+    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -183,6 +184,7 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -245,6 +247,11 @@ class ServerArgs:
                 self.chunked_prefill_size = 8192
 
         assert self.chunked_prefill_size % self.page_size == 0
+
+        assert self.moe_dense_tp_size in {
+            1,
+            None,
+        }, f"moe_dense_tp_size only support 1 and None currently"
 
         if self.enable_flashmla is True:
             logger.warning(
@@ -987,6 +994,11 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
         )
         parser.add_argument(
+            "--enable-two-batch-overlap",
+            action="store_true",
+            help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
             "--enable-ep-moe",
             action="store_true",
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
@@ -1099,6 +1111,12 @@ class ServerArgs:
             type=str,
             choices=["normal", "low_latency", "auto"],
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="tp_size for MoE dense MLP layers",
         )
 
         # Server warmups

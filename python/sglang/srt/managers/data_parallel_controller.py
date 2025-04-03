@@ -25,6 +25,7 @@ import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -100,6 +101,7 @@ class DataParallelController:
                 )
 
         self.max_req_input_len = None
+        self.expert_location_metadata = None
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -219,6 +221,7 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.expert_location_metadata = scheduler_info[0]["expert_location_metadata"]
 
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)
@@ -243,6 +246,9 @@ class DataParallelController:
                     ),
                 ):
                     self.dispatching(recv_req)
+                elif isinstance(recv_req, BlockReqInput):
+                    for worker in self.workers:
+                        worker.send_pyobj(recv_req)
                 else:
                     # Send other control messages to first worker of tp group
                     for worker in self.workers[:: self.control_message_step]:
@@ -265,6 +271,7 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "expert_location_metadata": controller.expert_location_metadata,
             }
         )
         if server_args.node_rank == 0:
