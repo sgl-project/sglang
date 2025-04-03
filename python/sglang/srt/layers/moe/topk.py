@@ -218,10 +218,8 @@ def biased_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     compiled: bool = True,
-    n_share_experts_fusion: int = None,
+    n_share_experts_fusion: int = 0,
 ):
-    if n_share_experts_fusion is None:
-        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     biased_grouped_topk_fn = (
         torch.compile(
             biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
@@ -253,9 +251,9 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
 ):
-    n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-    if global_server_args_dict.get("disable_shared_experts_fusion", False):
-        n_share_experts_fusion = 0
+    n_share_experts_fusion = 0
+    if global_server_args_dict["n_share_experts_fusion"] is not None:
+        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None

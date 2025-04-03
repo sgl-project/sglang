@@ -172,7 +172,7 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] if global_server_args_dict["n_share_experts_fusion"] is not None else 0
 
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -1335,6 +1335,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -1344,16 +1345,16 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.n_routed_experts != 256
             or self.config.routed_scaling_factor != 2.5
         ):
-            self.n_share_experts_fusion = 0
-            global_server_args_dict["n_share_experts_fusion"] = 0
+            self.n_share_experts_fusion = None
+            global_server_args_dict["n_share_experts_fusion"] = None
             logger.info(
                 "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
             )
-        elif self.n_share_experts_fusion == 0:
-            global_server_args_dict["n_share_experts_fusion"] = 8
-            self.n_share_experts_fusion = 8
+        elif self.n_share_experts_fusion is None:
+            global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+            self.n_share_experts_fusion = self.tp_size
             logger.info(
-                "Shared experts fusion optimization is default enabled in DeepSeek V3/R1, and n_share_experts_fusion is set to 8. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
+                f"Shared experts fusion optimization is default enabled in DeepSeek V3/R1, and n_share_experts_fusion is set to {self.tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
             )
 
         self.model = DeepseekV2Model(
@@ -1392,7 +1393,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion != 0:
+        if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
             suffix_list = [
@@ -1415,21 +1416,17 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
+                        shared_expert_weight_name = f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
                                 f"mlp.experts."
                                 f"{self.config.n_routed_experts + num_repeat}"
                                 f".{suffix}",
-                                weights_dict[
-                                    f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                                ].clone(),
+                                weights_dict[shared_expert_weight_name].clone(),
                             )
                         )
-                    names_to_remove += [
-                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        for suffix in suffix_list
-                    ]
+                        names_to_remove += [shared_expert_weight_name]
             weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1443,7 +1440,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=self.config.n_routed_experts + (self.n_share_experts_fusion if self.n_share_experts_fusion is not None else 0),
         )
 
         params_dict = dict(self.named_parameters())
