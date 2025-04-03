@@ -14,7 +14,7 @@ pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2
 
 rm -rf /root/.cache/flashinfer
 # Force reinstall flashinfer and torch_memory_saver
-pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
+pip install flashinfer_python==0.2.4 --find-links ${FLASHINFER_REPO} --force-reinstall --no-deps
 pip install sgl-kernel==0.0.6 --force-reinstall
 
 pip install torch_memory_saver
