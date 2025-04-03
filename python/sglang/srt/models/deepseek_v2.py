@@ -85,6 +85,7 @@ from sglang.srt.utils import (
 )
 from torch import nn
 from transformers import PretrainedConfig
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -214,6 +215,11 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
+            **(
+                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
+                if global_server_args_dict["enable_deepep_moe"]
+                else {}
+            ),
         )
 
         if config.n_shared_experts is not None:
@@ -241,6 +247,8 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if global_server_args_dict["enable_deepep_moe"]:
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -269,7 +277,9 @@ class DeepseekV2MoE(nn.Module):
             num_local_experts=config.n_routed_experts // self.tp_size,
             hidden_size=config.hidden_size,
             params_dtype=config.torch_dtype,
-            enable_async=global_server_args_dict["enable_two_batch_overlap"],
+            deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+            async_finish=True,  # TODO
+            return_recv_hook=True,
         )
 
     def forward(
@@ -309,7 +319,15 @@ class DeepseekV2MoE(nn.Module):
         self._forward_deepep_dispatch_a(
             self.deepep_dispatcher, forward_mode, hidden_states, router_logits
         )
-        recv_hidden_states, reorder_topk_ids, seg_indptr = (
+        (
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            reorder_topk_ids,
+            seg_indptr,
+            masked_m,
+            expected_m,
+        ) = (
             self.deepep_dispatcher.dispatch_b()
         )
 
@@ -319,7 +337,10 @@ class DeepseekV2MoE(nn.Module):
 
         if self.tp_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states, forward_mode
+                final_hidden_states,
+                topk_idx,
+                topk_weights,
+                forward_mode,
             )
 
         if shared_output is not None:
@@ -373,9 +394,11 @@ class DeepseekV2MoE(nn.Module):
     ):
         return (
             self.experts(
-                hidden_states=recv_hidden_states,
+                hidden_states=hidden_states,
                 reorder_topk_ids=reorder_topk_ids,
                 seg_indptr=seg_indptr,
+                masked_m=masked_m,
+                expected_m=expected_m,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor

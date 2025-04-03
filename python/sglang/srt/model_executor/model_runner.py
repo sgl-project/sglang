@@ -154,6 +154,7 @@ class ModelRunner:
                 "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
+                "deepep_mode": server_args.deepep_mode,
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
@@ -288,7 +289,7 @@ class ModelRunner:
                 server_args.disable_radix_cache = True
 
         if server_args.enable_deepep_moe:
-            logger.info("DeepEP is turned on.")
+            logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

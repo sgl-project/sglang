@@ -37,6 +37,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -582,10 +583,14 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
+def load_image(
+    image_file: Union[Image.Image, str, bytes]
+) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
-
-    if isinstance(image_file, bytes):
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
@@ -1850,6 +1855,27 @@ def flatten_nested_list(nested_list):
         ]
     else:
         return [nested_list]
+
+
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
 
 
 T = TypeVar("T")
