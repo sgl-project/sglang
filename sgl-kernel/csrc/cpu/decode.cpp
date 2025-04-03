@@ -641,18 +641,32 @@ void decode_attention_kernel_impl(
     int64_t k_strideH,
     int64_t v_strideN,
     int64_t v_strideH,
+    int64_t nk_strideN,
+    int64_t nk_strideH,
+    int64_t nv_strideN,
+    int64_t nv_strideH,
     float scaling,
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-  int64_t loc_val = loc[0];
-  for (int64_t i = 0; i < num_heads; i++) {
-    scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + i * k_strideH;
-    scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + i * v_strideH;
-    copy_stub<scalar_t>(k_buffer_ptr, key + i * head_size, head_size);
-    copy_stub<scalar_t>(v_buffer_ptr, value + i * head_size_v, head_size_v);
-  }
+  at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_id{0};
+    data_index_init(begin, bs, batches, head_id, num_heads);
+
+    for (int64_t i = begin; i < end; i++) {
+      int64_t loc_val = loc[bs];
+      scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_id * k_strideH;
+      scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_id * v_strideH;
+      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_id * nk_strideH;
+      const scalar_t* new_value_ptr = value + bs * nv_strideN + head_id * nv_strideH;
+      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
+      copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+
+      // move to the next index
+      data_index_step(bs, batches, head_id, num_heads);
+    }
+  });
 
   using Vec = at::vec::Vectorized<float>;
 
@@ -833,18 +847,32 @@ void decode_attention_grouped_kernel_impl(
     int64_t k_strideH,
     int64_t v_strideN,
     int64_t v_strideH,
+    int64_t nk_strideN,
+    int64_t nk_strideH,
+    int64_t nv_strideN,
+    int64_t nv_strideH,
     float scaling,
     float logit_cap,
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-  int64_t loc_val = loc[0];
-  for (int64_t i = 0; i < num_heads_kv; i++) {
-    scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + i * k_strideH;
-    scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + i * v_strideH;
-    copy_stub<scalar_t>(k_buffer_ptr, key + i * head_size, head_size);
-    copy_stub<scalar_t>(v_buffer_ptr, value + i * head_size_v, head_size_v);
-  }
+  at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_kv_id{0};
+    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
+
+    for (int64_t i = begin; i < end; i++) {
+      int64_t loc_val = loc[bs];
+      scalar_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
+      scalar_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
+      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
+      const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
+      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
+      copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+
+      // move to the next index
+      data_index_step(bs, batches, head_kv_id, num_heads_kv);
+    }
+  });
 
   using Vec = at::vec::Vectorized<float>;
 
@@ -1059,15 +1087,16 @@ void decode_attention_cpu(
   CHECK_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_buffer);
+  // for MLA, key and value shares the same storage and value could be non-contiguous
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
   CHECK_DIM(3, query);
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
   CHECK_INPUT(key);
-  CHECK_INPUT(value);
   CHECK_DIM(3, key);
   CHECK_DIM(3, value);
   CHECK_DIM(1, loc);
-  TORCH_CHECK(loc.numel() == 1, "decode_attention_cpu: expect loc to be a scalar, got ", loc.numel());
 
   int64_t num_seqs = seq_lens.size(0);
   int64_t max_num_reqs = req_to_token.size(0);
@@ -1081,6 +1110,7 @@ void decode_attention_cpu(
 
   int64_t num_kv_splits = attn_logits.size(2);
 
+  CHECK_EQ(loc.numel(), num_seqs);
   CHECK_EQ(attn_logits.size(0), num_seqs);
   CHECK_EQ(attn_logits.size(1), num_heads);
   CHECK_EQ(attn_logits.size(3), head_size_v + 1);
@@ -1091,6 +1121,11 @@ void decode_attention_cpu(
   int64_t k_strideH = k_buffer.stride(1);
   int64_t v_strideN = v_buffer.stride(0);
   int64_t v_strideH = v_buffer.stride(1);
+  // strides for new key and value
+  int64_t nk_strideN = key.stride(0);
+  int64_t nk_strideH = key.stride(1);
+  int64_t nv_strideN = value.stride(0);
+  int64_t nv_strideH = value.stride(1);
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
@@ -1129,6 +1164,10 @@ void decode_attention_cpu(
             k_strideH,
             v_strideN,
             v_strideH,
+            nk_strideN,
+            nv_strideH,
+            nv_strideN,
+            nv_strideH,
             sm_scale,
             logit_cap,
             max_num_reqs,
@@ -1158,6 +1197,10 @@ void decode_attention_cpu(
             k_strideH,
             v_strideN,
             v_strideH,
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
             sm_scale,
             logit_cap,
             max_num_reqs,
