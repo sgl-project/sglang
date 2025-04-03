@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
 import json
-import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, TypedDict
@@ -569,7 +568,7 @@ if __name__ == "__main__":
         "--n-share-experts-fusion",
         type=int,
         default=0,
-        help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1"
+        help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1",
     )
     args = parser.parse_args()
 

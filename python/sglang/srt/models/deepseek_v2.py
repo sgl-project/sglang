@@ -172,7 +172,11 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] if global_server_args_dict["n_share_experts_fusion"] is not None else 0
+        self.n_share_experts_fusion = (
+            global_server_args_dict["n_share_experts_fusion"]
+            if global_server_args_dict["n_share_experts_fusion"] is not None
+            else 0
+        )
 
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -1416,7 +1420,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
-                        shared_expert_weight_name = f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                        shared_expert_weight_name = (
+                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                        )
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
@@ -1440,7 +1446,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + (self.n_share_experts_fusion if self.n_share_experts_fusion is not None else 0),
+            num_experts=self.config.n_routed_experts
+            + (
+                self.n_share_experts_fusion
+                if self.n_share_experts_fusion is not None
+                else 0
+            ),
         )
 
         params_dict = dict(self.named_parameters())
