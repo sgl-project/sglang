@@ -144,7 +144,7 @@ Note:
 
 The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
 
-#### Build with CCACHE
+#### Build with [ccache](https://github.com/ccache/ccache)
 ```bash
 # or `yum install -y ccache`.
 apt-get install -y ccache
