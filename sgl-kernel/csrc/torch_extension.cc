@@ -241,6 +241,23 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+
+  /*
+   * From TensorRT-LLM fp8 blockwise gemm
+   */
+  m.def("trt_fp8_block_scaling_gemm(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b) -> Tensor");
+  m.impl("trt_fp8_block_scaling_gemm", torch::kCUDA, &trt_fp8_block_scaling_gemm);
+
+  m.def("trt_fp8_block_scaling_bmm(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, ScalarType? out_dtype)
+        -> Tensor");
+  m.impl("trt_fp8_block_scaling_bmm", torch::kCUDA, &trt_fp8_block_scaling_bmm);
+
+  m.def("trt_fp8_block_scaling_moe_gemm(Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, Tensor token_offset)
+        -> Tensor");
+  m.impl("trt_fp8_block_scaling_moe_gemm", torch::kCUDA, &trt_fp8_block_scaling_moe_gemm);
+
+  m.def("trt_per_token_1x128_quant_fp8_kernel(Tensor a) -> (Tensor, Tensor)");
+  m.impl("trt_per_token_1x128_quant_fp8_kernel", torch::kCUDA, &trt_per_token_1x128_quant_fp8_kernel);
 }
 
 REGISTER_EXTENSION(common_ops)

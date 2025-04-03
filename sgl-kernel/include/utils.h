@@ -231,6 +231,8 @@ struct cuda_error : public std::runtime_error {
   CHECK_IS_CUDA(x);         \
   CHECK_IS_CONTIGUOUS(x)
 
+#define CHECK_CUDA_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
+
 inline int getSMVersion() {
   int device{-1};
   CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
@@ -239,6 +241,14 @@ inline int getSMVersion() {
   CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
   CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
   return sm_major * 10 + sm_minor;
+}
+
+inline int getMultiProcessorCount() {
+  int nSM{0};
+  int deviceID{0};
+  CHECK_CUDA_SUCCESS(cudaGetDevice(&deviceID));
+  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&nSM, cudaDevAttrMultiProcessorCount, deviceID));
+  return nSM;
 }
 
 // SGLANG_SHFL_XOR_* adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/csrc/cuda_compat.h#L19-L28

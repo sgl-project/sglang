@@ -338,3 +338,25 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin);
+
+torch::Tensor trt_fp8_block_scaling_gemm(
+    torch::Tensor const& mat1,
+    torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale,
+    torch::Tensor const& mat2Scale);
+
+torch::Tensor trt_fp8_block_scaling_bmm(
+    torch::Tensor const& mat1,
+    torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale,
+    torch::Tensor const& mat2Scale,
+    std::optional<c10::ScalarType> out_dtype);
+
+torch::Tensor trt_fp8_block_scaling_moe_gemm(
+    torch::Tensor const& mat1,
+    torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale,
+    torch::Tensor const& mat2Scale,
+    torch::Tensor const& token_offset);
+
+std::tuple<at::Tensor, at::Tensor> trt_per_token_1x128_quant_fp8_kernel(at::Tensor const& self);

@@ -196,6 +196,8 @@ set(SOURCES
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
+    "csrc/gemm/trt_gemm/trt_fp8_blockscale_gemm_runner.cu"
+    "csrc/gemm/trt_gemm/trt_fp8_blockscale_gemm.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
