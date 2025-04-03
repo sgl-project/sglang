@@ -320,8 +320,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        del self.handle
-        del self.src2dst
+        self.handle = None
+        self.src2dst = None
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
@@ -503,7 +503,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
             )
         )
-        del self.handle
+        self.handle = None
         return combined_hidden_states, event, hook
 
 
