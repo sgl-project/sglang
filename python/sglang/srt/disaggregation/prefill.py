@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVSender
+from sglang.srt.disaggregation.verbs_conn import KVArgs, KVManager, KVPoll, KVSender
 from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,

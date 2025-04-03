@@ -817,6 +817,8 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
