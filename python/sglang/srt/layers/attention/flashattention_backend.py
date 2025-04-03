@@ -27,7 +27,10 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 @dataclass
 class FlashAttentionMetadata:
-    """Metadata for decode operations to avoid redundant computations."""
+    """
+    Metadata used by FlashAttention backend. This metadata is initialized differently for extend and decode
+    in init_forward_metadata or init_forward_metadata_capture_cuda_graph.
+    """
 
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
@@ -95,20 +98,21 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
 
+        # Precompute cumulative and max seq lengths for Query
         if forward_batch.forward_mode == ForwardMode.DECODE:
-            # Precompute cumulative sequence lengths
             metadata.cu_seqlens_q = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
         else:
-            # Precompute cumulative sequence lengths
             if any(forward_batch.extend_prefix_lens_cpu):
+                # With prefix length, pad a 0 at the beginning of the sequence to mark the start.
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
             else:
+                # No prefix length, q and k have the same seq length during prefill.
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
                 metadata.max_seq_len_q = metadata.max_seq_len_k
         self.forward_metadata = metadata
@@ -160,8 +164,9 @@ class FlashAttentionBackend(AttentionBackend):
         # # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -270,8 +275,9 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
 
             # Get KV cache
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
