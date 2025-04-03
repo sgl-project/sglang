@@ -450,7 +450,10 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_combine_a(self, state):
         self.tbo_deepep_dispatchers[state.tbo_subbatch_index].combine_a(
-            state.expert_output_hidden_states, state.forward_batch.forward_mode
+            final_hidden_states=state.expert_output_hidden_states,
+            topk_idx=state.topk_idx_from_dispatch,
+            topk_weights=state.topk_weights_from_dispatch,
+            forward_mode=state.forward_batch.forward_mode,
         )
 
     def _forward_tbo_op_combine_b(self, state):
