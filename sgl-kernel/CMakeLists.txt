@@ -179,6 +179,7 @@ set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 set(SOURCES
     "csrc/allreduce/trt_reduce_internal.cu"
     "csrc/allreduce/trt_reduce_kernel.cu"
+    "csrc/alltoall/trt_alltoall_internal.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"

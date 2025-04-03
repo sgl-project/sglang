@@ -79,6 +79,17 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+void all_to_all(fptr_t _fa, torch::Tensor& output, torch::Tensor& input, torch::Tensor& plan_meta, int64_t block_size);
+void all_to_all_plan(
+    fptr_t _fa,
+    torch::Tensor& output,
+    torch::Tensor& input,
+    torch::Tensor& output_split_sizes,
+    torch::Tensor& input_split_sizes,
+    torch::Tensor& output_split_offsets,
+    torch::Tensor& input_split_offsets,
+    torch::Tensor& plan_meta,
+    int64_t block_size);
 #endif
 
 /*

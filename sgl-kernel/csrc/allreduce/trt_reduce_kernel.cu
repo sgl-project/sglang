@@ -24,54 +24,6 @@ limitations under the License.
 
 using namespace trt_llm;
 
-using fptr_t = int64_t;
-using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
-
-class AllReduceMeta {
- public:
-  AllReduceMeta(
-      int64_t rank_id,
-      int64_t world_size,
-      torch::Tensor& rank_data,
-      const std::vector<fptr_t>& buffers,
-      const std::vector<fptr_t>& tmp_result_buffers,
-      const std::vector<fptr_t>& barrier_in,
-      const std::vector<fptr_t>& barrier_out) {
-    this->rank_id = (int)rank_id;
-    this->world_size = (int)world_size;
-    this->barrier_in = barrier_in;
-    this->barrier_out = barrier_out;
-    this->tmp_result_buffers = tmp_result_buffers;
-
-    this->rank_data_base = reinterpret_cast<RankData*>(rank_data.data_ptr());
-    RankData data;
-    for (int i = 0; i < world_size; i++) {
-      data.ptrs[i] = (void*)buffers[i];
-    }
-    auto d_data = this->rank_data_base++;
-    CHECK_CUDA_SUCCESS(cudaMemcpy(d_data, &data, sizeof(RankData), cudaMemcpyHostToDevice));
-    this->buffers = d_data;
-  }
-
-  ~AllReduceMeta() {
-    for (auto [_, ptr] : ipc_handles_) {
-      CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
-    }
-  }
-
- public:
-  int world_size;
-  int rank_id;
-  std::vector<fptr_t> barrier_in;
-  std::vector<fptr_t> barrier_out;
-  std::vector<fptr_t> tmp_result_buffers;
-  int barrier_flag = 1;
-  RankData* buffers;
-  RankData* rank_data_base;
-  std::vector<void*> graph_unreg_buffers;
-  std::map<IPC_KEY, char*> ipc_handles_;
-};
-
 // Get the number of bits for a given data type.
 inline int get_bits(at::ScalarType dtype) {
   switch (dtype) {
