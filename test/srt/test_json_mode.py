@@ -53,11 +53,15 @@ class TestJSONModeOutlines(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_json_mode_response(self):
-        """Test that response_format json_object (also known as "json mode") produces valid JSON."""
+        """Test that response_format json_object (also known as "json mode") produces valid JSON, even without a system prompt that mentions JSON."""
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
+                # We are deliberately omitting "That produces JSON" or similar phrases from the assistant prompt so that we don't have misleading test results
+                {
+                    "role": "system",
+                    "content": "You are a helpful AI assistant that gives a short answer.",
+                },
                 {"role": "user", "content": "What is the capital of Bulgaria?"},
             ],
             temperature=0,
@@ -66,7 +70,7 @@ class TestJSONModeOutlines(unittest.TestCase):
         )
         text = response.choices[0].message.content
 
-        print(f"Response: {text}")
+        print(f"Response ({len(text)} characters): {text}")
 
         # Verify the response is valid JSON
         try:
@@ -78,12 +82,15 @@ class TestJSONModeOutlines(unittest.TestCase):
         self.assertIsInstance(js_obj, dict, f"Response is not a JSON object: {text}")
 
     def test_json_mode_with_streaming(self):
-        """Test that streaming with json_object response (also known as "json mode") format works correctly."""
+        """Test that streaming with json_object response (also known as "json mode") format works correctly, even without a system prompt that mentions JSON."""
         stream = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                # We are deliberately omitting "That produces JSON" from the system prompt to avoid misleading test results
-                {"role": "system", "content": "You are a helpful AI assistant"},
+                # We are deliberately omitting "That produces JSON" or similar phrases from the assistant prompt so that we don't have misleading test results
+                {
+                    "role": "system",
+                    "content": "You are a helpful AI assistant that gives a short answer.",
+                },
                 {"role": "user", "content": "What is the capital of Bulgaria?"},
             ],
             temperature=0,
@@ -99,6 +106,10 @@ class TestJSONModeOutlines(unittest.TestCase):
                 chunks.append(chunk.choices[0].delta.content)
         full_response = "".join(chunks)
 
+        print(
+            f"Concatenated Response ({len(full_response)} characters): {full_response}"
+        )
+
         # Verify the combined response is valid JSON
         try:
             js_obj = json.loads(full_response)
@@ -110,9 +121,6 @@ class TestJSONModeOutlines(unittest.TestCase):
         self.assertIsInstance(js_obj, dict)
 
 
-@unittest.skip(
-    "xgrammar has an open issue to fix this behavior: https://github.com/mlc-ai/xgrammar/issues/256"
-)
 class TestJSONModeXGrammar(TestJSONModeOutlines):
     @classmethod
     def setUpClass(cls):
