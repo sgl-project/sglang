@@ -65,7 +65,6 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         self._unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=stride)
-        print("Hey! ", in_channels * kernel_size[0] * kernel_size[1], out_channels)
         self._linear = ColumnParallelLinear(
             in_channels * kernel_size[0] * kernel_size[1],
             out_channels,
@@ -1020,7 +1019,6 @@ class MllamaForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        print("vision_model.global_transformer.layers.0.self_attn.proj.weight" in params_dict)
         updated_params = set()
         for name, loaded_weight in weights:
             
@@ -1036,7 +1034,6 @@ class MllamaForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 updated_params.add(name)
                 weight_loader = param.weight_loader 
-                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1044,9 +1041,7 @@ class MllamaForConditionalGeneration(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace("self_attn.o_proj", "self_attn.proj")
                 param = params_dict.get(name)
-                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                print(name)
                 weight_loader(param, loaded_weight)
 
 

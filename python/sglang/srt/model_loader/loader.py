@@ -1055,7 +1055,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         torch.cuda.empty_cache()
 
         param_dict = dict(model.named_parameters())
-        print("vision_model.global_transformer.layers.0.self_attn.proj.weight" in param_dict)
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
         for quant_param_name in quant_state_dict:
             
