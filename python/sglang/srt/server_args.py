@@ -72,7 +72,7 @@ class ServerArgs:
     ssl_certfile: Optional[str] = None
     ssl_ca_certs: Optional[str] = None
     ssl_cert_reqs: int = 0
-    
+
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
@@ -557,7 +557,7 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-        
+
         # SSL options
         parser.add_argument(
             "--ssl-keyfile",
@@ -583,7 +583,7 @@ class ServerArgs:
             default=ServerArgs.ssl_cert_reqs,
             help="Whether client certificate is required. ",
         )
-        
+
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
