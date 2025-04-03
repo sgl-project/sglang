@@ -47,7 +47,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE, PermutedEPMoE
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
@@ -337,6 +337,31 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
+class PermutedDeepseekV2MoE(DeepseekV2MoE):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        layer_ep_load_tensor: torch.Tensor = None,
+    ):
+        super().__init__(config, quant_config, prefix)
+        self.layer_ep_load_tensor = layer_ep_load_tensor
+
+        self.experts = PermutedEPMoE(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            prefix=add_prefix("experts", prefix),
+            layer_ep_load_tensor=self.layer_ep_load_tensor,
+        )
 
 class DeepseekV2Attention(nn.Module):
 
@@ -1042,12 +1067,22 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         if is_nextn or is_sparse_layer(layer_id):
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-            self.is_sparse = True
+            if global_server_args_dict["enable_permuted_moe"]:
+                layer_ep_load_tensor = global_server_args_dict["ep_load_tensor"][layer_id]
+                print(f"layer_id: {layer_id}")
+                self.mlp = PermutedDeepseekV2MoE(
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                    layer_ep_load_tensor=layer_ep_load_tensor,
+                )
+            else:
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                )
+                self.is_sparse = True
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,

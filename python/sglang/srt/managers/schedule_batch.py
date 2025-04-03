@@ -54,6 +54,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.epmoe_permute_tensor import EP_PERMUTE_TENSOR
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -80,6 +81,8 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "enable_permuted_moe": ServerArgs.enable_permuted_moe,
+    "ep_load_tensor": EP_PERMUTE_TENSOR,
 }
 
 logger = logging.getLogger(__name__)

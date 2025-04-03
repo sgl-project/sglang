@@ -161,6 +161,8 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_permuted_moe: bool = False
+
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -306,6 +308,12 @@ class ServerArgs:
             )
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+        # Permuted MoE
+        if self.enable_permuted_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"Permuted MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
         # Speculative Decoding
@@ -1081,6 +1089,11 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-permuted-moe",
+            action="store_true",
+            help="Enabling Permuted MoE implementation for EP MoE.",
         )
 
         # Server warmups

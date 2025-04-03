@@ -1044,3 +1044,85 @@ class DeepEPMoE(EPMoE):
             """
 
         return down_output
+
+
+class PermutedEPMoE(EPMoE):
+    """
+    MOE EP with permuted expert loading.
+    """
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        layer_ep_load_tensor: torch.Tensor = None,
+    ):
+        super().__init__(
+            num_experts,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            params_dtype,
+            renormalize,
+            use_grouped_topk,
+            num_expert_group,
+            topk_group,
+            quant_config,
+            tp_size,
+            prefix,
+            correction_bias,
+            custom_routing_function,
+            activation,
+        )
+        self.layer_ep_load_tensor = layer_ep_load_tensor[self.start_expert_id:self.end_expert_id]
+        # print(f"Layer {self.layer_id} is loading, tp_rank {self.tp_rank}, load tensor for this layer: {self.layer_ep_load_tensor}")
+    
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        if expert_id not in self.layer_ep_load_tensor:
+            return
+        
+        # Find the index of the expert_id in the layer_ep_load_tensor
+        expert_id = (self.layer_ep_load_tensor == expert_id).nonzero(as_tuple=True)[0].item()
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+            )
+
+        # Special case for fp8 scales.
+        if "scale" in weight_name:
+            self._load_fp8_scale(
+                param.data,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+            return
+
+        if shard_id == "w2":
+            param.data[expert_id] = loaded_weight
+        elif shard_id == "w1":
+            param.data[expert_id][: self.intermediate_size, :] = loaded_weight
+        elif shard_id == "w3":
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+        else:
+            raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
