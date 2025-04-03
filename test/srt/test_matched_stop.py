@@ -40,6 +40,7 @@ class TestMatchedStop(CustomTestCase):
         prompt=MANY_NEW_TOKENS_PROMPT,
         max_tokens=1,
         stop=None,
+        stop_regex=None,
         finish_reason=None,
         matched_stop=None,
     ):
@@ -53,6 +54,9 @@ class TestMatchedStop(CustomTestCase):
 
         if stop is not None:
             payload["stop"] = stop
+
+        if stop_regex is not None:
+            payload["stop_regex"] = stop_regex
 
         response_completions = requests.post(
             self.base_url + "/v1/completions",
@@ -71,6 +75,7 @@ class TestMatchedStop(CustomTestCase):
         prompt=MANY_NEW_TOKENS_PROMPT,
         max_tokens=1,
         stop=None,
+        stop_regex=None,
         finish_reason=None,
         matched_stop=None,
     ):
@@ -88,6 +93,9 @@ class TestMatchedStop(CustomTestCase):
         if stop is not None:
             chat_payload["stop"] = stop
 
+        if stop_regex is not None:
+            chat_payload["stop_regex"] = stop_regex
+
         response_chat = requests.post(
             self.base_url + "/v1/chat/completions",
             json=chat_payload,
@@ -104,6 +112,29 @@ class TestMatchedStop(CustomTestCase):
         )
         self.run_chat_completions_generation(
             max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
+        )
+
+    def test_finish_stop_regex_str(self):
+        stop_regex = r"and |or "
+        self.run_completions_generation(
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop_regex",
+            matched_stop=stop_regex,
+        )
+        self.run_chat_completions_generation(
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop_regex",
+            matched_stop=stop_regex,
+        )
+        # match a complete sentence
+        stop_regex = r"[.!?]\s*$"
+        self.run_chat_completions_generation(
+            max_tokens=1000,
+            stop_regex=stop_regex,
+            finish_reason="stop_regex",
+            matched_stop=stop_regex,
         )
 
     def test_finish_stop_eos(self):
