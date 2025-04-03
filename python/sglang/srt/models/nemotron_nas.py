@@ -1,15 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-
-# Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -21,6 +10,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ==============================================================================
+# Adapted from
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/nemotron_nas.py
+
 """Inference-only deci model compatible with HuggingFace weights."""
 from typing import Iterable, Optional, Set, Tuple, Type, Union
 
@@ -164,6 +157,7 @@ class DeciLMDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors],
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -180,6 +174,7 @@ class DeciLMDecoderLayer(nn.Module):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=intermediate_tensors
             )
 
         # Fully Connected
@@ -291,11 +286,11 @@ class DeciModel(nn.Module):
             layer = self.layers[i]
             if not layer._is_no_op_attention:
                 hidden_states, residual = layer(positions, hidden_states,
-                                                residual)
+                                                intermediate_tensors, residual)
                 kv_cache_index += 1
             else:
                 hidden_states, residual = layer(positions, hidden_states,
-                                                residual)
+                                                intermediate_tensors, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -495,15 +490,67 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         hidden_states: torch.Tensor,
         sampling_metadata,#: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        # logits = self.logits_processor(self.lm_head, hidden_states,
+        #                                sampling_metadata)
+        logits = self.logits_processor(input_ids= None,
+                                       hidden_states=hidden_states,
+                                       lm_head=self.lm_head,
+                                       logits_metadata=sampling_metadata)
         return logits
 
-    def sample(self, logits: torch.Tensor,
-               sampling_metadata,#: SamplingMetadata
+    def _preprocess_logits(
+        self, logits_output,#: LogitsProcessorOutput, 
+        sampling_info#: SamplingBatchInfo
     ):
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        # Apply logit bias
+        if sampling_info.sampling_info_done:
+            # Overlap mode: the function update_regex_vocab_mask was executed
+            # in process_batch_result of the last batch.
+            if sampling_info.grammars:
+                sampling_info.sampling_info_done.wait()
+        else:
+            # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
+            sampling_info.update_regex_vocab_mask()
+        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+    def sample(
+        self,
+        logits_output,#: LogitsProcessorOutput,
+        forward_batch#: ForwardBatch,
+    ) -> torch.Tensor:
+        """Sample and compute logprobs and update logits_output.
+
+        Args:
+            logits_output: The logits output from the model forward
+            forward_batch: The forward batch that generates logits_output
+
+        Returns:
+            A list of next_token_ids
+        """
+        # For duplex models with multiple output streams.
+        if isinstance(logits_output, tuple):
+            return torch.stack(
+                [self.sample(values, forward_batch) for values in logits_output],
+                axis=-1,
+            )
+
+        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
+        # Sample the next tokens
+        next_token_ids = self.sampler(
+            logits_output,
+            forward_batch.sampling_info,
+            forward_batch.return_logprob,
+            forward_batch.top_logprobs_nums,
+            forward_batch.token_ids_logprobs,
+        )
+        return next_token_ids
+
+    # def sample(self, logits: torch.Tensor,
+    #            sampling_metadata,#: SamplingMetadata
+    # ):
+    #     next_tokens = self.sampler(logits, sampling_metadata)
+    #     return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
