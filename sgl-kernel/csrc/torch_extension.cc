@@ -187,7 +187,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("transfer_kv_to_cpu_all_layer_naive", torch::kCUDA, &transfer_kv_to_cpu_all_layer_naive);
   m.def(
       "transfer_kv_to_gpu_per_layer_naive(Tensor host_indices, Tensor host_k_buffer, Tensor host_v_buffer, "
-      "Tensor device_indices, Tensor device_k_buffer, Tensor device_v_buffer, int page_size, int layer_num) -> ()");
+      "Tensor device_indices, Tensor device_k_buffer, Tensor device_v_buffer, int page_size, int layer_id) -> ()");
   m.impl("transfer_kv_to_gpu_per_layer_naive", torch::kCUDA, &transfer_kv_to_gpu_per_layer_naive);
 
   /*
