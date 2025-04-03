@@ -312,6 +312,10 @@ class ServerArgs:
                 assert (
                     not self.enable_dp_attention
                 ), "DeepEP MoE `auto` mode is not supported with DP Attention."
+            if self.deepep_mode == "normal":
+                assert (
+                    self.disable_cuda_graph
+                ), "DeepEP MoE `normal` mode is not supported with CUDA Graph."
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
