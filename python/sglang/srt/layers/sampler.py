@@ -154,6 +154,25 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
+            if (logits_output.next_token_logprobs < -100).any():
+                next_lp = logits_output.next_token_logprobs
+                argmin = next_lp.argmin()
+                argmin_id = batch_next_token_ids[argmin]
+                torch.save({
+                    "probs": probs,
+                    "logprobs": logprobs,
+                    "next_lp": next_lp,
+                    "batch_next_token_ids": batch_next_token_ids,
+                    "sampling_info": {
+                        "top_ks": sampling_info.top_ks,
+                        "top_ps": sampling_info.top_ps,
+                        "min_ps": sampling_info.min_ps,
+                        "need_min_p_sampling": sampling_info.need_min_p_sampling,
+                    },
+                }, "logs/probs1.pt")
+                print(f"nodedup {next_lp.min()=} {next_lp.shape=} {argmin=} {argmin_id=} {next_lp[argmin]=} {logprobs[argmin][argmin_id]=} {probs[argmin][argmin_id]=} {global_server_args_dict['sampling_backend']=} {probs[argmin].topk(k=5)=} {logprobs[argmin].topk(k=5)=}")
+                exit()
+
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
@@ -225,6 +244,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 
     sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    probs = probs_sort.gather(1, sampled_index).view(-1)
+    if (probs < 1e-5).any():
+        print(f"nodedup {probs.shape=} {probs.min()=}")
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
@@ -238,8 +260,10 @@ def top_p_normalize_probs_torch(
     # See also top_k_top_p_min_p_sampling_from_probs_torch
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    # sort is non-deterministic, prevent probs masked to zero
+    probs_sort_copy = probs_sort.clone()
+    probs_sort_copy[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort_copy.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
