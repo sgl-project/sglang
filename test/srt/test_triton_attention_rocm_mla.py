@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
 from sglang.srt.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -19,14 +20,16 @@ class TestTritonAttentionMLA(CustomTestCase):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     def setUp(self):
         # Set seeds before each test method
         self._set_all_seeds(42)
+        self.device = get_device()
 
     def preprocess_kv_cache(self, kv_cache, kv_lora_rank):
         latent_cache = kv_cache
@@ -73,7 +76,7 @@ class TestTritonAttentionMLA(CustomTestCase):
             rope_scaling,
             q.dtype,
             device="cpu",
-        ).cuda()
+        ).to(self.device)
         positions = torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1)
 
         return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions
@@ -211,7 +214,7 @@ class TestTritonAttentionMLA(CustomTestCase):
             rotary_emb,
             positions,
             use_rope,
-            device="cuda",
+            device=self.device,
         )
 
         if use_rope:
@@ -252,6 +255,7 @@ class TestTritonAttentionMLA(CustomTestCase):
                             dtype,
                             use_rope,
                             is_neox_style,
+                            device=self.device,
                         )
 
 
