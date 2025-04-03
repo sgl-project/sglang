@@ -55,7 +55,10 @@ class PrefillBootstrapQueue:
         tp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
+        scheduler: Scheduler,
     ):
+        self.scheduler = scheduler
+
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
 

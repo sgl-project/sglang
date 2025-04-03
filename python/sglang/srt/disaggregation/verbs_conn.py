@@ -11,18 +11,18 @@ import requests
 
 from sglang.srt.bootstrap.app import start_bootstrap_server
 
-
 import uuid
 from typing import Dict, Optional
 import numpy as np
 from sglang.srt.bootstrap.rdma_utils import RdmaServer, RdmaClient
 
 from python.sglang.srt.disaggregation.group_indics import groups_by_continuity_numpy
+from python.sglang.srt.utils import get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
 from sglang.srt.utils import get_open_port
-
+from sglang.srt.disaggregation.ib_devices import find_best_roce_for_gpu
 
 
 class KVBootstrapServer:
@@ -59,6 +59,14 @@ class KVManager:
         self.aux_item_lens = args.aux_item_lens
 
         self.bootstrap_server = bootstrap_server
+        self.args.ib_device, net_card = find_best_roce_for_gpu(self.args.gpu_id)
+        if self.args.ib_device:
+            logger.info(
+                "Current Process Using the  gpu id: {}, ib_device: {} net:{}".format(self.args.gpu_id,
+                                                                                     self.args.ib_device,
+                                                                                     net_card))
+        else:
+            raise Exception("No ROCE IB device found...")
 
     def set_bootstrap_server(self, bootstrap_server):
         self.bootstrap_server = bootstrap_server
@@ -109,9 +117,6 @@ class KVSender:
         # Network configuration
         self.target_ip = None
 
-        # todo get dynamic ip
-        self.ip_address = "10.246.59.104"
-
         # Memory management
         self.mrs_to_send = []  # Memory regions for data segments to be sent
         self.meta_has_sent = False  # Flag indicating if metadata has been sent
@@ -142,7 +147,8 @@ class KVSender:
         metadata_ptr_length = self.mgr.aux_item_lens[0]
 
         try:
-            self.qp = RdmaClient(host_ip=self.target_ip, socket_port=self.target_port)
+            self.qp = RdmaClient(host_ip=self.target_ip, ib_device=self.mgr.args.ib_device,
+                                 socket_port=self.target_port)
             if self.qp.init(metadata_ptr, metadata_ptr_length):
                 logger.debug("Transferring...")
                 self.state = KVPoll.Transferring
@@ -179,7 +185,6 @@ class KVSender:
                 self.qp.send_metadata_wrs()
                 self.meta_has_sent = True
 
-
         return self.state
 
     def send(self, kv_indices: np.ndarray[np.int32]):
@@ -203,7 +208,6 @@ class KVSender:
         self.qp.send_wrs(groups_mrs_info)
 
 
-
 class KVReceiver:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None):
         self.kv_layers_mrs = []
@@ -225,8 +229,8 @@ class KVReceiver:
         self.start_time = time.time()
 
         # todo get dynamic ip
-        self.ip_address = "10.246.59.104"
-        self.qp = RdmaServer(socket_port=self.rdma_port)
+        self.ip_address = get_local_ip_by_remote(self.bootstrap_addr)
+        self.qp = RdmaServer(socket_port=self.rdma_port, ib_device=self.mgr.args.ib_device)
 
         # Initialize connection
         # todo can use other rapid method...
@@ -257,8 +261,6 @@ class KVReceiver:
             self.initialized = True
             print("boostraped success..")
 
-
-
     def init(self, kv_indices: np.ndarray[np.int32], aux_index: Optional[int] = None):
         """Initialize receiver with KV indices and auxiliary data index
 
@@ -273,7 +275,7 @@ class KVReceiver:
         metadata_ptr = self.mgr.aux_data_ptrs[0] + (aux_index * self.mgr.aux_item_lens[0])
         metadata_length = self.mgr.aux_item_lens[0]
         # 创建每一岑layer的mr 得到对应的key 传给客户端
-        rkeys= []
+        rkeys = []
 
         for layer_id, base_addr in enumerate(self.mgr.kv_data_ptrs):
             layer_mr = self.qp.create_mr(base_addr, self.mgr.kv_data_lens[layer_id])
@@ -294,14 +296,13 @@ class KVReceiver:
             groups_mrs_info.append(mrs_info)
 
         try:
-            self.qp.init( groups_mrs_info, metadata_ptr, metadata_length)
+            self.qp.init(groups_mrs_info, metadata_ptr, metadata_length)
             self.state = KVPoll.Transferring
             self.qp.recv_metadata_mr()
 
         except Exception as e:
             self.state = KVPoll.Bootstrapping
             return
-
 
     def poll(self) -> KVPoll:
         """Poll receive status and handle state transitions"""
