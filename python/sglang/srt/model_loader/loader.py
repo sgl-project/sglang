@@ -1055,10 +1055,14 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         torch.cuda.empty_cache()
 
         param_dict = dict(model.named_parameters())
+        print("vision_model.global_transformer.layers.0.self_attn.proj.weight" in param_dict)
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
         for quant_param_name in quant_state_dict:
+            
             non_stacked_param_name = quant_param_name
-
+            if "vision_model" in quant_param_name:
+                    # adapt to VisionAttention
+                    quant_param_name = quant_param_name.replace("self_attn.o_proj", "self_attn.proj")
             shard_index = 0
             for shard_name, (
                 weight_name,

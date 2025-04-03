@@ -22,6 +22,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -64,6 +65,7 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         self._unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=stride)
+        print("Hey! ", in_channels * kernel_size[0] * kernel_size[1], out_channels)
         self._linear = ColumnParallelLinear(
             in_channels * kernel_size[0] * kernel_size[1],
             out_channels,
@@ -184,6 +186,7 @@ class MllamaVisionEncoderLayer(nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaVisionConfig,
+        quant_config: Optional[QuantizationConfig] = None,
         is_gated: bool = False,
         prefix: str = "",
     ):
@@ -199,14 +202,16 @@ class MllamaVisionEncoderLayer(nn.Module):
             self.num_attention_heads,
             self.hidden_size,
             use_qkv_parallel=True,
-            quant_config=None,
+            quant_config=quant_config,
             dropout=0.0,
             use_context_forward=False,
             softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = MllamaVisionMLP(config, prefix=add_prefix("mlp", prefix))
+        self.mlp = MllamaVisionMLP(
+            config, quant_config, prefix=add_prefix("mlp", prefix)
+        )
 
         self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(
@@ -244,6 +249,7 @@ class MllamaVisionEncoder(nn.Module):
     def __init__(
         self,
         config: config_mllama.MllamaVisionConfig,
+        quant_config: Optional[QuantizationConfig] = None,
         num_layers=32,
         is_gated=False,
         output_hidden_states=None,
@@ -254,7 +260,10 @@ class MllamaVisionEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [
                 MllamaVisionEncoderLayer(
-                    config, is_gated, prefix=add_prefix(f"layers.{i}", prefix)
+                    config,
+                    quant_config,
+                    is_gated,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(num_layers)
             ]
@@ -283,7 +292,12 @@ class MllamaVisionEncoder(nn.Module):
 
 
 class MllamaVisionModel(nn.Module):
-    def __init__(self, config: config_mllama.MllamaVisionConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: config_mllama.MllamaVisionConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.image_size = config.image_size
         self.patch_size = config.patch_size
@@ -320,6 +334,7 @@ class MllamaVisionModel(nn.Module):
         # encoders
         self.transformer = MllamaVisionEncoder(
             config,
+            quant_config,
             config.num_hidden_layers,
             is_gated=False,
             output_hidden_states=config.intermediate_layers_indices,
@@ -327,6 +342,7 @@ class MllamaVisionModel(nn.Module):
         )
         self.global_transformer = MllamaVisionEncoder(
             config,
+            quant_config,
             config.num_global_layers,
             is_gated=True,
             prefix=add_prefix("global_transformer", prefix),
@@ -803,21 +819,23 @@ class MllamaForConditionalGeneration(nn.Module):
         self.image_size = config.vision_config.image_size
 
         self.vision_model = MllamaVisionModel(
-            config.vision_config, prefix=add_prefix("vision_model", prefix)
+            config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_model", prefix),
         )
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.multi_modal_projector = ColumnParallelLinear(
+        self.multi_modal_projector = ReplicatedLinear(
             config.vision_config.vision_output_dim,
             config.text_config.hidden_size,
             bias=True,
             quant_config=quant_config,
-            gather_output=True,
             prefix="multi_modal_projector",
         )
+        # ReplicatedLinear
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
 
@@ -1002,6 +1020,7 @@ class MllamaForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        print("vision_model.global_transformer.layers.0.self_attn.proj.weight" in params_dict)
         updated_params = set()
         for name, loaded_weight in weights:
             
@@ -1010,18 +1029,6 @@ class MllamaForConditionalGeneration(nn.Module):
                     "patch_embedding.weight", "patch_embedding._linear.weight"
                 )
                 loaded_weight = loaded_weight.view(loaded_weight.shape[0], -1)
-            if (self.quant_config is not None and
-                (scale_name := self.quant_config.get_cache_scale(name))):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
-                                 loaded_weight[0])
-                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
-                weight_loader(param, loaded_weight)
-                updated_params.add(scale_name)
-                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1036,10 +1043,10 @@ class MllamaForConditionalGeneration(nn.Module):
                 if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace("self_attn.o_proj", "self_attn.proj")
-                
-                param = params_dict.pop(name)
+                param = params_dict.get(name)
                 print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                print(name)
                 weight_loader(param, loaded_weight)
 
 
