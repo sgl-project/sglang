@@ -19,6 +19,10 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from sglang.srt.layers.triton_ops.layernorm import (
+    fused_add_rms_norm_triton,
+    rms_norm_triton,
+)
 from sglang.srt.utils import is_cuda_available
 
 _is_cuda = is_cuda_available()
@@ -32,6 +36,7 @@ if _is_cuda:
     )
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.utils import libentry
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,26 @@ class RMSNorm(CustomOp):
             return x
         else:
             return x, residual
+
+    def forward_triton(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            fused_add_rms_norm_triton(
+                x,
+                residual,
+                [len(self.weight.data)],
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            return x, residual
+
+        out = rms_norm_triton(
+            x, [len(self.weight.data)], self.weight.data, self.variance_epsilon
+        )
+        return out
 
 
 class GemmaRMSNorm(CustomOp):

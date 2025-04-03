@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     init_custom_process_group,
     is_cuda,
     is_hip,
@@ -123,6 +124,9 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+        if get_bool_env_var("SGL_USE_TRITON_NON_ATTN"):
+            logger.info("SGL_USE_TRITON_NON_ATTN is enabled")
 
         # Model-specific adjustment
         self.model_specific_adjustment()
