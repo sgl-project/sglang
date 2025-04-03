@@ -1057,7 +1057,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         param_dict = dict(model.named_parameters())
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
         for quant_param_name in quant_state_dict:
-            
             non_stacked_param_name = quant_param_name
             if "vision_model" in quant_param_name:
                     # adapt to VisionAttention
