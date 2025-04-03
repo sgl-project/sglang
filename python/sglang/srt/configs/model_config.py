@@ -474,6 +474,7 @@ multimodal_model_archs = [
     "MiniCPMV",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "Llama4ForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
