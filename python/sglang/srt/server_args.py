@@ -194,13 +194,6 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
-            logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
