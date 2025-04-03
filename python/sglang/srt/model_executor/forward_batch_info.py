@@ -100,9 +100,15 @@ class ForwardMode(IntEnum):
     def is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
-            or self == ForwardMode.TARGET_VERIFY
+            # Just for demo, do not merge this change
+            # To community developers: FA3 Cuda Graph only works for DECODE
+            # If we enable TARGET_VERIFY, send_one's result will be a mess
+            # or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
         )
+
+    def is_extend_or_draft_extend(self):
+        return self == ForwardMode.EXTEND or self == ForwardMode.DRAFT_EXTEND
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
