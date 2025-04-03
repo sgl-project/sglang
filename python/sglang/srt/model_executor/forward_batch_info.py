@@ -148,6 +148,9 @@ class ForwardBatch:
     # The sum of all sequence lengths
     seq_lens_sum: int
 
+    # Optional seq_lens on cpu
+    seq_lens_cpu: Optional[torch.Tensor] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -161,9 +164,6 @@ class ForwardBatch:
 
     # Position information
     positions: torch.Tensor = None
-
-    # For decode
-    decode_seq_lens_cpu: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -293,12 +293,14 @@ class ForwardBatch:
         ):
             ret.positions = ret.spec_info.positions
 
+        # Get seq_lens_cpu if needed
+        if ret.seq_lens_cpu is None:
+            ret.seq_lens_cpu = batch.seq_lens_cpu
+
         # Init position information
         if ret.forward_mode.is_decode():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
-            if ret.decode_seq_lens_cpu is None:
-                ret.decode_seq_lens_cpu = batch.decode_seq_lens
         else:
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
@@ -352,11 +354,6 @@ class ForwardBatch:
         # Merge remaining inputs
         for mm_input in valid_inputs[1:]:
             merged.merge(mm_input)
-
-        if isinstance(merged.pixel_values, np.ndarray):
-            merged.pixel_values = torch.from_numpy(merged.pixel_values)
-        if isinstance(merged.audio_features, np.ndarray):
-            merged.audio_features = torch.from_numpy(merged.audio_features)
 
         return merged
 

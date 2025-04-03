@@ -22,18 +22,18 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
+
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
+  m.def("dispose", &dispose);
+
   m.def(
       "init_custom_ar(int rank_id, int world_size, Tensor rank_data, int[] buffers, int[] tmp_result_buffers, int[] "
       "barrier_in, int[] barrier_out) -> int");
   m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
 
-  m.def("dispose", &dispose);
-
   m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
-
-  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
-  m.def("register_graph_buffers", &register_graph_buffers);
 
   /*
    * From csrc/attention
@@ -202,6 +202,45 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "top_p_sampling_from_probs(Tensor probs, Tensor uniform_samples, Tensor! samples, Tensor! success, Tensor? "
       "maybe_top_p_arr, float top_p_val, bool deterministic, int cuda_stream) -> ()");
   m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
+
+  /*
+   * From flash-attention
+   */
+  m.def(
+      "fwd(Tensor!  q,"
+      "    Tensor   k,"
+      "    Tensor   v,"
+      "    Tensor?  k_new,"
+      "    Tensor?  v_new,"
+      "    Tensor?  q_v,"
+      "    Tensor!? out,"
+      "    Tensor?  cu_seqlens_q,"
+      "    Tensor?  cu_seqlens_k,"
+      "    Tensor?  cu_seqlens_k_new,"
+      "    Tensor?  seqused_q,"
+      "    Tensor?  seqused_k,"
+      "    int?     max_seqlen_q,"
+      "    int?     max_seqlen_k,"
+      "    Tensor?  page_table,"
+      "    Tensor?  kv_batch_idx,"
+      "    Tensor?  leftpad_k,"
+      "    Tensor?  rotary_cos,"
+      "    Tensor?  rotary_sin,"
+      "    Tensor?  seqlens_rotary,"
+      "    Tensor?  q_descale,"
+      "    Tensor?  k_descale,"
+      "    Tensor?  v_descale,"
+      "    float    softmax_scale,"
+      "    bool     is_causal,"
+      "    int      window_size_left,"
+      "    int      window_size_right,"
+      "    float    softcap,"
+      "    bool     is_rotary_interleaved,"
+      "    Tensor?  scheduler_metadata,"
+      "    int      num_splits,"
+      "    bool?    pack_gqa,"
+      "    int      sm_margin) -> Tensor[]");
+  m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -25,20 +25,23 @@ find_package(Torch REQUIRED)
 
 include(FetchContent)
 
+# cutlass
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        62750a2b75c802660e4894434dc55e839f322277
-    GIT_SHALLOW    ON
+    GIT_TAG        6f4921858b3bb0a82d7cbeb4e499690e9ae60d16
+    GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
+# DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        c57699ac933a93651c34d365797c2d8b41a4765b
-    GIT_SHALLOW    ON
+    GIT_TAG        c187c23ba8dcdbad91720737e8be9c43700cb9e9
+    GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
+# flashinfer
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/sgl-project/flashinfer
@@ -46,6 +49,23 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
+# flash-attention
+FetchContent_Declare(
+    repo-flash-attention
+    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+    GIT_TAG sgl-kernel
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-flash-attention)
+
+# ccache option
+option(ENABLE_CCACHE "Whether to use ccache" ON)
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
+    message(STATUS "Building with CCACHE enabled")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "ccache")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -54,6 +74,7 @@ include_directories(
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-flash-attention_SOURCE_DIR}/hopper
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -78,6 +99,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
+    "--use_fast_math"
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 )
@@ -130,6 +152,30 @@ string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
+# set flash-attention sources file
+# BF16 source files
+file(GLOB FA3_BF16_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+file(GLOB FA3_BF16_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
+list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+
+# FP16 source files
+file(GLOB FA3_FP16_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+file(GLOB FA3_FP16_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
+list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+
+# FP8 source files
+file(GLOB FA3_FP8_GEN_SRCS
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+file(GLOB FA3_FP8_GEN_SRCS_
+    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
+list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+
+set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+
 set(SOURCES
     "csrc/allreduce/trt_reduce_internal.cu"
     "csrc/allreduce/trt_reduce_kernel.cu"
@@ -160,6 +206,10 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
+    "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+    "${FA3_GEN_SRCS}"
 )
 
 # Support abi3 for build
@@ -172,6 +222,18 @@ target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
+
+# Add some flash-attention custom flag for inference
+target_compile_definitions(common_ops PRIVATE
+    FLASHATTENTION_DISABLE_SM8x
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    # FLASHATTENTION_DISABLE_ALIBI
+    # FLASHATTENTION_DISABLE_SOFTCAP
+    FLASHATTENTION_DISABLE_UNEVEN_K
+    # FLASHATTENTION_DISABLE_LOCAL
+    FLASHATTENTION_VARLEN_ONLY
+)
 
 # JIT Logic
 # DeepGEMM
