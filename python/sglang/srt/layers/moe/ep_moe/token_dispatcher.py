@@ -184,11 +184,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
             )
 
-        # TODO
-        # masked_m = torch.empty(
-        #     (self.num_local_experts,), device=hidden_states.device, dtype=torch.int64
-        # )
-        # expected_m = 0
         masked_m = expected_m = None
 
         return (
@@ -404,13 +399,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        # TODO
-        # reorder_topk_ids = torch.empty(
-        #     (0,), device=hidden_states.device, dtype=torch.int64
-        # )
-        # seg_indptr = torch.zeros(
-        #     (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
-        # )
         reorder_topk_ids = seg_indptr = None
 
         return (
