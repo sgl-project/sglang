@@ -217,3 +217,44 @@ def scaled_fp4_quant(
     )
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
+
+
+def trt_fp8_blockwise_scaled_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.trt_fp8_block_scaling_gemm.default(
+        a, b, block_scale_a, block_scale_b
+    )
+
+
+def trt_fp8_blockwise_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.trt_fp8_block_scaling_bmm.default(
+        a, b, block_scale_a, block_scale_b, out_dtype
+    )
+
+
+def trt_fp8_blockwise_scaled_moe_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    token_offset: torch.Tensor,
+):
+    return torch.ops.sgl_kernel.trt_fp8_block_scaling_moe_gemm(
+        a, b, block_scale_a, block_scale_b, token_offset
+    )
+
+
+def trt_per_token_1x128_quant_fp8_kernel(
+    a: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.sgl_kernel.trt_per_token_1x128_quant_fp8_kernel(a)

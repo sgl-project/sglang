@@ -35,6 +35,10 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
+    trt_fp8_blockwise_scaled_bmm,
+    trt_fp8_blockwise_scaled_mm,
+    trt_fp8_blockwise_scaled_moe_mm,
+    trt_per_token_1x128_quant_fp8_kernel,
 )
 from sgl_kernel.moe import moe_align_block_size, moe_fused_gate, topk_softmax
 from sgl_kernel.sampling import (

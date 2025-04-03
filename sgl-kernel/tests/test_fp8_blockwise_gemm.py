@@ -1,10 +1,14 @@
 import os
 import random
-from typing import Optional, Type
+from typing import Optional, Tuple, Type
 
 import pytest
 import torch
-from sgl_kernel import fp8_blockwise_scaled_mm
+from sgl_kernel import (
+    fp8_blockwise_scaled_mm,
+    trt_fp8_blockwise_scaled_mm,
+    trt_per_token_1x128_quant_fp8_kernel,
+)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -88,6 +92,63 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
+
+
+# trt fp8 blockwise test
+def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = fp8_info.max
+    assert x.dim() == 2
+    m, n = x.shape
+    x_padded = torch.zeros(
+        (cdiv(m, 128) * 128, cdiv(n, 128) * 128), dtype=x.dtype, device=x.device
+    )
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    x_scaled = (x_view * (fp8_max / x_amax)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / fp8_max).view(
+        x_view.size(0), x_view.size(2)
+    )
+
+
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
+def _test_trt_accuracy_once(M, N, K):
+    a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16) / K
+    b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16) / K
+
+    act_a_fp8, act_a_sf = trt_per_token_1x128_quant_fp8_kernel(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output = trt_fp8_blockwise_scaled_mm(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+
+    output_expected = a @ b.t()
+    assert calc_diff(output_expected, output) < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+    print(f"trt M={M}, N={N}, K={K} torch.bfloat16: OK")
+
+
+@pytest.mark.parametrize("M", [1, 7, 64, 128, 256, 4096])
+@pytest.mark.parametrize(
+    "K, N",
+    [
+        (7168, 2112),
+        (1536, 24576),
+        (512, 32768),
+        (16384, 7168),
+        (7168, 4096),
+        (2048, 7168),
+        (1024, 1024),
+    ],
+)
+def test_trt_accuracy(M, N, K):
+    _test_trt_accuracy_once(M, N, K)
 
 
 if __name__ == "__main__":
