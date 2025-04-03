@@ -332,7 +332,12 @@ class DeepseekV2MoE(nn.Module):
         )
 
         final_hidden_states = self._forward_deepep_expert(
-            forward_mode, recv_hidden_states, reorder_topk_ids, seg_indptr
+            hidden_states=hidden_states,
+            reorder_topk_ids=reorder_topk_ids,
+            seg_indptr=seg_indptr,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            forward_mode=forward_mode,
         )
 
         if self.tp_size > 1:
@@ -387,10 +392,12 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_deepep_expert(
         self,
-        forward_mode,
-        recv_hidden_states,
+        hidden_states,
         reorder_topk_ids,
         seg_indptr,
+        masked_m,
+        expected_m,
+        forward_mode,
     ):
         return (
             self.experts(
