@@ -176,6 +176,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
                 hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
             )
+        else:
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+            )
 
         # TODO
         # masked_m = torch.empty(
