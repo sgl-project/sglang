@@ -687,11 +687,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
-        self.attention_backend = global_server_args_dict["attention_backend"]
+        self.mla_backend = global_server_args_dict["mla_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.attention_backend == "flashinfer_mla":
+        if self.mla_backend == "flashinfer_mla":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             return (
                 not self.flashinfer_mla_disable_ragged
@@ -700,7 +700,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
             )
-        elif self.attention_backend == "fa3":
+        elif self.mla_backend == "fa3":
             # Flash Attention: Keep absorbing for all extend/decode
             return False
         else:

@@ -123,6 +123,10 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.use_mla = (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not server_args.disable_mla
+        )
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -139,6 +143,7 @@ class ModelRunner:
         global_server_args_dict.update(
             {
                 "attention_backend": server_args.attention_backend,
+                "mla_backend": server_args.mla_backend,
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
@@ -203,11 +208,17 @@ class ModelRunner:
         )
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
+            if not self.use_mla:
+                self.init_attention_backend()
+            else:
+                self.init_mla_backend()
             self.init_cuda_graphs()
         else:
             self.cuda_graph_runner = None
-            self.init_attention_backend()
+            if not self.use_mla:
+                self.init_attention_backend()
+            else:
+                self.init_mla_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -216,31 +227,27 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not server_args.disable_mla
-        ):
+        if self.use_mla:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
                 if (
-                    server_args.attention_backend == "flashinfer"
+                    server_args.mla_backend == "flashinfer"
                     or server_args.enable_flashinfer_mla
                 ):
                     logger.info(
                         "MLA optimization is turned on. Use flashinfer backend."
                     )
-                    # Here we use a special flashinfer_mla tag to differentiate it from normal flashinfer backend
-                    server_args.attention_backend = "flashinfer_mla"
+                    server_args.mla_backend == "flashinfer"
                 elif server_args.enable_flashmla:
                     logger.info("MLA optimization is turned on. Use flashmla decode.")
-                    server_args.attention_backend = "flashmla"
-                elif server_args.attention_backend == "fa3":
+                    server_args.mla_backend = "flashmla"
+                elif server_args.mla_backend == "fa3":
                     logger.info(
                         f"MLA optimization is turned on. Use flash attention 3 backend."
                     )
                 else:
                     logger.info("MLA optimization is turned on. Use triton backend.")
-                    server_args.attention_backend = "triton"
+                    server_args.mla_backend = "triton"
 
         if server_args.enable_double_sparsity:
             logger.info(
@@ -859,16 +866,6 @@ class ModelRunner:
             )
 
             self.attn_backend = TorchNativeAttnBackend(self)
-        elif self.server_args.attention_backend == "flashinfer_mla":
-            from sglang.srt.layers.attention.flashinfer_mla_backend import (
-                FlashInferMLAAttnBackend,
-            )
-
-            self.attn_backend = FlashInferMLAAttnBackend(self)
-        elif self.server_args.attention_backend == "flashmla":
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            self.attn_backend = FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert torch.cuda.get_device_capability()[0] >= 9, (
                 "FlashAttention v3 Backend requires SM>=90. "
@@ -886,6 +883,50 @@ class ModelRunner:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
+
+    def init_mla_backend(self):
+        """Init mla kernel backend."""
+        if self.server_args.mla_backend == "flashinfer":
+            from sglang.srt.layers.attention.flashinfer_mla_backend import (
+                FlashInferMLAAttnBackend,
+            )
+
+            self.attn_backend = FlashInferMLAAttnBackend(self)
+        elif self.server_args.mla_backend == "triton":
+            assert self.sliding_window_size is None, (
+                "Window attention is not supported in the triton attention backend. "
+                "Please use fa3 or flashinfer mla backend."
+            )
+            assert not self.model_config.is_encoder_decoder, (
+                "Cross attention is not supported in the triton attention backend. "
+                "Please use fa3 or flashinfer mla backend."
+            )
+            assert not self.server_args.enable_double_sparsity, {
+                "Double sparsity is not supported in the triton attention backend when enabling MLA. "
+                "Please use fa3 or flashinfer mla backend."
+            }
+            from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+            self.attn_backend = TritonAttnBackend(self)
+        elif self.server_args.mla_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+            self.attn_backend = FlashMLABackend(self)
+        elif self.server_args.mla_backend == "fa3":
+            assert torch.cuda.get_device_capability()[0] >= 9, (
+                "FlashAttention v3 Backend requires SM>=90. "
+                "Please use flashinfer or triton mla backend."
+            )
+            logger.warning(
+                "FlashAttention v3 Backend is in Beta. Multimodal, FP8, and Speculative Decoding are not supported."
+            )
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            self.attn_backend = FlashAttentionBackend(self)
+        else:
+            raise ValueError(f"Invalid mla backend: {self.server_args.mla_backend}")
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"

@@ -127,6 +127,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: Optional[str] = None
+    mla_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
 
@@ -265,12 +266,17 @@ class ServerArgs:
         # Choose kernel backends
         if self.device == "hpu":
             self.attention_backend = "torch_native"
+            self.mla_backend = "triton"
             self.sampling_backend = "pytorch"
 
         if self.attention_backend is None:
             self.attention_backend = (
                 "flashinfer" if is_flashinfer_available() else "triton"
             )
+
+        if self.mla_backend is None:
+            self.mla_backend = "triton"
+
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -820,6 +826,13 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
         )
         parser.add_argument(
+            "--mla-backend",
+            type=str,
+            choices=["flashinfer", "triton", "fa3"],
+            default=ServerArgs.mla_backend,
+            help="Choose the kernels for multi-head latent attention layers.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=["flashinfer", "pytorch"],
@@ -836,7 +849,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-mla",
             action="store_true",
-            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
+            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--mla-backend flashinfer' instead for switching on flashfiner mla!",
         )
         parser.add_argument(
             "--enable-flashmla",

@@ -64,6 +64,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Put some global args for easy access
 global_server_args_dict = {
     "attention_backend": ServerArgs.attention_backend,
+    "mla_backend": ServerArgs.mla_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "disable_mla": ServerArgs.disable_mla,
@@ -1434,9 +1435,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["attention_backend"] == "flashinfer_mla"
+            global_server_args_dict["mla_backend"] == "flashinfer"
             or global_server_args_dict["enable_flashmla"]
-            or global_server_args_dict["attention_backend"] == "fa3"
+            or global_server_args_dict["mla_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
