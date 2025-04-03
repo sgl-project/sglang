@@ -45,6 +45,9 @@ if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
+    from sglang.srt.layers.quantization.int8_kernel import (
+        sglang_per_token_group_quant_int8,
+    )
 else:
     from vllm import _custom_ops as vllm_ops
 
@@ -543,7 +546,10 @@ def invoke_fused_moe_kernel(
             # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            A, A_scale = per_token_group_quant_int8(A, block_k)
+            if _is_cuda:
+                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            else:
+                A, A_scale = per_token_group_quant_int8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
