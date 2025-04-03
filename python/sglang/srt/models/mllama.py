@@ -985,7 +985,9 @@ class MllamaForConditionalGeneration(nn.Module):
             cross_attention_states = self.vision_model(
                 batched_images, batched_ar_ids, batched_ar_mask
             )
-            cross_attention_states, _ = self.multi_modal_projector(cross_attention_states)
+            cross_attention_states, _ = self.multi_modal_projector(
+                cross_attention_states
+            )
 
             bs, _, _, _, image_token_dim = cross_attention_states.shape
             cross_attention_states = cross_attention_states.view(
@@ -1021,7 +1023,7 @@ class MllamaForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
         updated_params = set()
         for name, loaded_weight in weights:
-            
+
             if "patch_embedding.weight" in name:
                 name = name.replace(
                     "patch_embedding.weight", "patch_embedding._linear.weight"
@@ -1033,7 +1035,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 updated_params.add(name)
-                weight_loader = param.weight_loader 
+                weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
