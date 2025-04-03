@@ -50,7 +50,8 @@ from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 # from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
 #                     make_empty_intermediate_tensors_factory, make_layers,
 #                     maybe_prefix)
-from sglang.srt.utils import(IntermediateTensors, make_empty_intermediate_tensors_factory,
+from sglang.srt.utils import(AutoWeightsLoader, IntermediateTensors, 
+                             make_empty_intermediate_tensors_factory,
                             PPMissingLayer, is_pp_missing_parameter,
                             make_layers, add_prefix) 
 
@@ -72,15 +73,13 @@ class DeciLMDecoderLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
-        idx: int,
-        #layer_idx: int,
+        layer_idx: int,
         #cache_config,#: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        #block_config = config.block_configs[layer_idx]
-        block_config = config.block_configs[idx]
+        block_config = config.block_configs[layer_idx]
         self._is_no_op_attention = block_config.attention.no_op
         self._is_no_op_ffn = block_config.ffn.no_op
 
@@ -125,7 +124,7 @@ class DeciLMDecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
                 num_kv_heads=num_kv_heads,
-                layer_id=idx,
+                layer_id=layer_idx,
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 rope_is_neox_style=rope_is_neox_style,
@@ -235,20 +234,25 @@ class DeciModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        def get_layer(prefix: str):
+        def get_layer(idx: int, prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
             return layer_type(
                 config,
-                layer_idx,
+                layer_idx=idx,
                 #cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
             )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        # self.start_layer, self.end_layer, self.layers = make_layers(
+        #     config.num_hidden_layers,
+        #     get_layer,
+        #     prefix=add_prefix("layers",prefix)
+        # )
+        self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
-            prefix=f"{prefix}.layers",
+            prefix=add_prefix("layers",prefix)
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -282,7 +286,8 @@ class DeciModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         kv_cache_index = 0
-        for i in range(self.start_layer, self.end_layer):
+        #for i in range(self.start_layer, self.end_layer):
+        for i in range(len(self.layers)):
             layer = self.layers[i]
             if not layer._is_no_op_attention:
                 hidden_states, residual = layer(positions, hidden_states,
@@ -470,7 +475,7 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
                     quant_config: Optional[QuantizationConfig] = None, 
                     prefix: str = ""):
         return DeciModel(config=config, quant_config=quant_config, prefix=prefix)
-'''
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
@@ -488,14 +493,15 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata,#: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
 
     def sample(self, logits: torch.Tensor,
-               sampling_metadata: SamplingMetadata):
+               sampling_metadata,#: SamplingMetadata
+    ):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
@@ -507,5 +513,5 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
                            if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(weights)
-'''
+
 EntryClass = [DeciLMForCausalLM]
