@@ -58,6 +58,14 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# ccache option
+option(ENABLE_CCACHE "Whether to use ccache" ON)
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
+    message(STATUS "Building with CCACHE enabled")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "ccache")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
