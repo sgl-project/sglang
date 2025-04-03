@@ -347,15 +347,16 @@ class HiCacheController:
                     continue
 
                 self.layer_done_counter.reset()
+                host_indices_device = batch_operation.host_indices.to(
+                    self.mem_pool_device.device
+                )
                 for i in range(self.mem_pool_host.layer_num):
                     if not self.oracle:
                         if self.page_size == 1:
                             if isinstance(self.mem_pool_host, MHATokenToKVPoolHost):
                                 self.mem_pool_device.transfer_per_layer_kernel(
                                     self.mem_pool_host,
-                                    batch_operation.host_indices.to(
-                                        self.mem_pool_device.device
-                                    ),
+                                    host_indices_device,
                                     batch_operation.device_indices,
                                     i,
                                 )

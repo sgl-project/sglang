@@ -70,7 +70,7 @@ void transfer_kv_launcher_T(
   }
   const int64_t num_items = src_indices.size(0);
 
-  const int32_t num_warps_per_block = 4;
+  const int32_t num_warps_per_block = 32;
   const int32_t threads_per_block = num_warps_per_block * 32;
   const int32_t blocks_per_grid = (num_items + num_warps_per_block - 1) / num_warps_per_block;
 
