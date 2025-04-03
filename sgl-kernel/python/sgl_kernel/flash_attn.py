@@ -3,15 +3,20 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+try:
+    from sgl_kernel import flash_ops
+except:
+    raise ImportError("Can not import sgl_kernel. Please check your installation.")
+
 
 def is_fa3_supported(device=None) -> bool:
     # FA3 can fail without a enough shared memory for a some shapes, currently
     #  only 8.0 and 8.7 have enough shared memory for all shapes
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  now sgl-kernel only build fa3 for sm90a
+    #  now sgl-kernel only build fa3 for sm90a && cuda >= 12.4
     return (
-        torch.cuda.get_device_capability(device)[0]
-        >= 9
+        (torch.cuda.get_device_capability(device)[0] >= 9)
+        and (torch.version.cuda >= "12.4")
         # or torch.cuda.get_device_capability(device) == (8, 0)
         # or torch.cuda.get_device_capability(device) == (8, 7)
     )
