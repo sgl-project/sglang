@@ -1,5 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/util/irange.h>
+
+#include <cstdint>
 
 #include "pytorch_extension_utils.h"
 
@@ -219,4 +222,70 @@ void transfer_kv_all_layer(
       src_layer_offset,
       dst_layer_offset,
       block_quota);
+}
+
+void transfer_kv_to_cpu_all_layer_naive(
+    at::Tensor host_indices,
+    at::Tensor host_k_buffer,
+    at::Tensor host_v_buffer,
+    at::Tensor device_indices,
+    at::Tensor device_k_buffer,
+    at::Tensor device_v_buffer,
+    int page_size,
+    int layer_num) {
+  if (device_indices.size(0) != host_indices.size(0)) {
+    throw std::invalid_argument("Source and destination indices must have the same length");
+  }
+  if (device_indices.size(0) % page_size != 0) {
+    throw std::invalid_argument("Source indice size must be divisible by page size");
+  }
+  device_indices = device_indices.cpu();
+  for (const auto i : c10::irange(device_indices.size(0) / page_size)) {
+    auto h_index = host_indices[i * page_size].item<int64_t>();
+    auto d_index = device_indices[i * page_size].item<int64_t>();
+    for (const auto j : c10::irange(layer_num)) {
+      host_k_buffer[j]
+          .slice(0, h_index, h_index + page_size)
+          .copy_(
+              device_k_buffer[j].slice(0, d_index, d_index + page_size),
+              /* non_blocking= */ true);
+      host_v_buffer[j]
+          .slice(0, h_index, h_index + page_size)
+          .copy_(
+              device_v_buffer[j].slice(0, d_index, d_index + page_size),
+              /* non_blocking= */ true);
+    }
+  }
+}
+
+void transfer_kv_to_gpu_per_layer_naive(
+    at::Tensor host_indices,
+    at::Tensor host_k_buffer,
+    at::Tensor host_v_buffer,
+    at::Tensor device_indices,
+    at::Tensor device_k_buffer,
+    at::Tensor device_v_buffer,
+    std::int64_t page_size,
+    std::int64_t layer_id) {
+  if (device_indices.size(0) != host_indices.size(0)) {
+    throw std::invalid_argument("Source and destination indices must have the same length");
+  }
+  if (device_indices.size(0) % page_size != 0) {
+    throw std::invalid_argument("Source indice size must be divisible by page size");
+  }
+  device_indices = device_indices.cpu();
+  for (const auto i : c10::irange(device_indices.size(0) / page_size)) {
+    auto h_index = host_indices[i * page_size].item<int64_t>();
+    auto d_index = device_indices[i * page_size].item<int64_t>();
+    device_k_buffer[layer_id]
+        .slice(0, d_index, d_index + page_size)
+        .copy_(
+            host_k_buffer[layer_id].slice(0, h_index, h_index + page_size),
+            /* non_blocking= */ true);
+    device_v_buffer[layer_id]
+        .slice(0, d_index, d_index + page_size)
+        .copy_(
+            host_v_buffer[layer_id].slice(0, h_index, h_index + page_size),
+            /* non_blocking= */ true);
+  }
 }

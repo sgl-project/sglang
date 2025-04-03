@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <vector>
 
 #include "sgl_kernel_torch_shim.h"
@@ -275,6 +276,26 @@ void transfer_kv_all_layer(
     int64_t src_layer_offset,
     int64_t dst_layer_offset,
     int64_t block_quota);
+
+void transfer_kv_to_cpu_all_layer_naive(
+    at::Tensor host_indices,
+    at::Tensor host_k_buffer,
+    at::Tensor host_v_buffer,
+    at::Tensor device_indices,
+    at::Tensor device_k_buffer,
+    at::Tensor device_v_buffer,
+    std::int64_t page_size,
+    std::int64_t layer_num);
+
+void transfer_kv_to_gpu_per_layer_naive(
+    at::Tensor host_indices,
+    at::Tensor host_k_buffer,
+    at::Tensor host_v_buffer,
+    at::Tensor device_indices,
+    at::Tensor device_k_buffer,
+    at::Tensor device_v_buffer,
+    std::int64_t page_size,
+    std::int64_t layer_id);
 
 /*
  * From FlashInfer

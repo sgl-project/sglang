@@ -42,3 +42,47 @@ def transfer_kv_all_layer(
         dst_layer_offset,
         block_quota,
     )
+
+
+def transfer_kv_to_cpu_all_layer_naive(
+    host_indices: torch.Tensor,
+    host_k_buffer: torch.Tensor,
+    host_v_buffer: torch.Tensor,
+    device_indices: torch.Tensor,
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    page_size: int,
+    layer_num: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_to_cpu_all_layer_naive(
+        host_k_buffer,
+        device_k_buffer,
+        host_v_buffer,
+        device_v_buffer,
+        host_indices,
+        device_indices,
+        page_size,
+        layer_num,
+    )
+
+
+def transfer_kv_to_gpu_per_layer_naive(
+    host_indices: torch.Tensor,
+    host_k_buffer: torch.Tensor,
+    host_v_buffer: torch.Tensor,
+    device_indices: torch.Tensor,
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    page_size: int,
+    layer_id: int,
+):
+    torch.ops.sgl_kernel.transfer_kv_to_gpu_per_layer_naive(
+        host_k_buffer,
+        device_k_buffer,
+        host_v_buffer,
+        device_v_buffer,
+        host_indices,
+        device_indices,
+        page_size,
+        layer_id,
+    )
