@@ -342,10 +342,10 @@ class DeepseekV2MoE(nn.Module):
 
         if self.tp_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_mode,
+                final_hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
             )
 
         if shared_output is not None:
