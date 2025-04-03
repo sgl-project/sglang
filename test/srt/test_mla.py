@@ -7,11 +7,12 @@ from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestMLA(unittest.TestCase):
+class TestMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -20,7 +21,12 @@ class TestMLA(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code"],
+            other_args=[
+                "--trust-remote-code",
+                "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                "2",
+            ],
         )
 
     @classmethod

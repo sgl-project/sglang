@@ -1,5 +1,8 @@
-import os
 import weakref
+
+import nest_asyncio
+
+nest_asyncio.apply()
 
 from sglang.utils import execute_shell_command, reserve_port
 
