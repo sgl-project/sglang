@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     init_custom_process_group,
     is_cuda,
+    is_flashinfer_available,
     is_hip,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
@@ -123,6 +124,10 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.use_mla = (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not server_args.disable_mla
+        )
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -151,7 +156,6 @@ class ModelRunner:
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
                 "enable_flashmla": server_args.enable_flashmla,
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
@@ -219,27 +223,44 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if (
-            self.model_config.attention_arch == AttentionArch.MLA
-            and not server_args.disable_mla
-        ):
+        if server_args.enable_flashinfer_mla:
+            # TODO: remove this branch after enable_flashinfer_mla is deprecated
+            logger.info("MLA optimization is turned on. Use flashinfer backend.")
+            server_args.attention_backend = "flashinfer_mla"
+        elif server_args.enable_flashmla:
+            # TODO: remove this branch after enable_flashmla is deprecated
+            logger.info("MLA optimization is turned on. Use flashmla decode.")
+            server_args.attention_backend = "flashmla"
+        elif server_args.attention_backend is None:
+            # By default, use flashinfer for non-mla attention and triton for mla attention
+            if not self.use_mla:
+                server_args.attention_backend = (
+                    "flashinfer" if is_flashinfer_available() else "triton"
+                )
+            else:
+                server_args.attention_backend = "triton"
+            logger.info(
+                f"Attention backend not set. Use {server_args.attention_backend} backend."
+            )
+        elif self.use_mla:
             # TODO: add MLA optimization on CPU
             if server_args.device != "cpu":
-                if server_args.enable_flashinfer_mla:
+                if server_args.attention_backend == "flashinfer":
                     logger.info(
-                        "MLA optimization is turned on. Use flashinfer mla backend."
+                        "MLA optimization is turned on. Use flashinfer backend."
                     )
+                    # Here we use a special flashinfer_mla tag to differentiate it from normal flashinfer backend
                     server_args.attention_backend = "flashinfer_mla"
-                elif server_args.enable_flashmla:
-                    logger.info("MLA optimization is turned on. Use flashmla decode.")
-                    server_args.attention_backend = "flashmla"
                 elif server_args.attention_backend == "fa3":
                     logger.info(
-                        f"MLA optimization is turned on. Use flash attention 3 backend."
+                        "MLA optimization is turned on. Use flash attention 3 backend."
                     )
-                else:
+                elif server_args.attention_backend == "triton":
                     logger.info("MLA optimization is turned on. Use triton backend.")
-                    server_args.attention_backend = "triton"
+                else:
+                    raise ValueError(
+                        f"Invalid attention backend for MLA: {server_args.attention_backend}"
+                    )
 
         if server_args.enable_double_sparsity:
             logger.info(
