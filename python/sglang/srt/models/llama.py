@@ -634,7 +634,9 @@ class LlamaForCausalLM(nn.Module):
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
+    # init empty bnb mapping for phi3/phi4 mini model
+    bitsandbytes_stacked_params_mapping = {}
+
 
 
 class InternLM3ForCausalLM(LlamaForCausalLM):

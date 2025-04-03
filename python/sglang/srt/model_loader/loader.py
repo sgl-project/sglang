@@ -1022,7 +1022,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        print(f"quant_config: {quant_config}")
 
         pre_quant = False
         if quant_config is not None:
@@ -1051,9 +1050,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, pre_quant, load_8bit
         )
 
-        # print(f"qweight_iterator: {qweight_iterator}")
-        print(f"quant_state_dict: {quant_state_dict}")
-
         model.load_weights(qweight_iterator)
 
         torch.cuda.empty_cache()
@@ -1064,47 +1060,32 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             non_stacked_param_name = quant_param_name
 
             shard_index = 0
-            shard_indices = []
-            replaced_quant_param_name = quant_param_name
             for shard_name, (
                 weight_name,
                 index,
             ) in model.bitsandbytes_stacked_params_mapping.items():
-                print(f"shard_name: {shard_name}")
-                print(f"quant_param_name: {quant_param_name}")
-                if shard_name in quant_param_name or (shard_name in ['q_proj', 'k_proj', 'v_proj'] and 'qkv_proj' in quant_param_name):
-                    print(f"add shard_index: {index} for {quant_param_name}")
-                    shard_indices.append(index)
-                    print(f"before replace quant_param_name: {quant_param_name}")
-                    # if weight_name not in quant_param_name:
-                    if shard_name != weight_name and shard_name in quant_param_name and weight_name not in quant_param_name:
-                        replaced_quant_param_name = quant_param_name.replace(shard_name, weight_name)
-                        print(f"after replace quant_param_name: {replaced_quant_param_name}")
+                if shard_name in quant_param_name:
+                    shard_index = index
+                    quant_param_name = quant_param_name.replace(shard_name, weight_name)
+                    break
 
-            if replaced_quant_param_name not in param_dict:
+            if quant_param_name not in param_dict:
                 raise ValueError(
-                    f"Parameter {replaced_quant_param_name} not found in the model."
+                    f"Parameter {quant_param_name} not found in the model."
                 )
 
-            if replaced_quant_param_name not in stacked_quant_state_dict:
-                stacked_quant_state_dict[replaced_quant_param_name] = {}
+            if quant_param_name not in stacked_quant_state_dict:
+                stacked_quant_state_dict[quant_param_name] = {}
 
-            if len(shard_indices) == 0:
-                shard_indices.append(shard_index)
-            for shard_index in shard_indices:
-                stacked_quant_state_dict[replaced_quant_param_name][shard_index] = quant_state_dict[
-                    non_stacked_param_name
-                ]
-                print(f"add quant_state [quant_param_name: {replaced_quant_param_name}, shard_index: {shard_index}]: {non_stacked_param_name}")
+            stacked_quant_state_dict[quant_param_name][shard_index] = quant_state_dict[
+                non_stacked_param_name
+            ]
 
         # save quant_states and offsets as the attributes of the parameters
         for param_name, param in param_dict.items():
             if param_name in stacked_quant_state_dict:
                 quant_states = stacked_quant_state_dict[param_name]
                 set_weight_attrs(param, {"bnb_quant_state": quant_states})
-                print(f"param_name: {param_name}")
-                print(f"quant_states: {quant_states}")
-
 
                 pack_ratio = getattr(param, "pack_factor", -1)
                 if pack_ratio == -1:
@@ -1173,6 +1154,17 @@ class GGUFModelLoader(BaseModelLoader):
         See "Standardized tensor names" in
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
+
+        # only load the gguf module when needed
+        try:
+            import gguf
+
+            # FIXME: add version check for gguf
+        except ImportError as err:
+            raise ImportError(
+                "Please install gguf via `pip install gguf` to use gguf quantizer."
+            ) from err
+
         config = model_config.hf_config
         model_type = config.model_type
         # hack: ggufs have a different name than transformers
