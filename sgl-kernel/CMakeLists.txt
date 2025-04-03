@@ -4,6 +4,7 @@ project(sgl-kernel LANGUAGES CXX CUDA)
 # we only want to download 3rd, but not build them.
 # FetchContent_MakeAvailable will build it.
 cmake_policy(SET CMP0169 OLD)
+set(BUILD_FA3, OFF)
 
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -53,8 +54,8 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG sgl-kernel
-    GIT_SHALLOW OFF
+    GIT_TAG        sgl-kernel
+    GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
 
@@ -122,6 +123,7 @@ else()
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
+    set(BUILD_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -151,30 +153,6 @@ string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"       "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
-
-# set flash-attention sources file
-# BF16 source files
-file(GLOB FA3_BF16_GEN_SRCS
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
-file(GLOB FA3_BF16_GEN_SRCS_
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-
-# FP16 source files
-file(GLOB FA3_FP16_GEN_SRCS
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
-file(GLOB FA3_FP16_GEN_SRCS_
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-
-# FP8 source files
-file(GLOB FA3_FP8_GEN_SRCS
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
-file(GLOB FA3_FP8_GEN_SRCS_
-    "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
-
-set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
 set(SOURCES
     "csrc/allreduce/trt_reduce_internal.cu"
@@ -209,8 +187,39 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
     "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
-    "${FA3_GEN_SRCS}"
 )
+
+# set flash-attention sources file
+# BF16 source files
+if (BUILD_FA3)
+    file(GLOB FA3_BF16_GEN_SRCS
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+    file(GLOB FA3_BF16_GEN_SRCS_
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
+    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+
+    # FP16 source files
+    file(GLOB FA3_FP16_GEN_SRCS
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+    file(GLOB FA3_FP16_GEN_SRCS_
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
+    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+
+    # FP8 source files
+    file(GLOB FA3_FP8_GEN_SRCS
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+    file(GLOB FA3_FP8_GEN_SRCS_
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
+    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+
+    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+
+    list(APPEND SOURCES
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
+        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
+        "${FA3_GEN_SRCS}")
+endif()
 
 # Support abi3 for build
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -224,16 +233,18 @@ target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cubl
 install(TARGETS common_ops LIBRARY DESTINATION "sgl_kernel")
 
 # Add some flash-attention custom flag for inference
-target_compile_definitions(common_ops PRIVATE
-    FLASHATTENTION_DISABLE_SM8x
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    # FLASHATTENTION_DISABLE_ALIBI
-    # FLASHATTENTION_DISABLE_SOFTCAP
-    FLASHATTENTION_DISABLE_UNEVEN_K
-    # FLASHATTENTION_DISABLE_LOCAL
-    FLASHATTENTION_VARLEN_ONLY
-)
+if (BUILD_FA3)
+    target_compile_definitions(common_ops PRIVATE
+        FLASHATTENTION_DISABLE_SM8x
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        # FLASHATTENTION_DISABLE_ALIBI
+        # FLASHATTENTION_DISABLE_SOFTCAP
+        FLASHATTENTION_DISABLE_UNEVEN_K
+        # FLASHATTENTION_DISABLE_LOCAL
+        FLASHATTENTION_VARLEN_ONLY
+    )
+endif()
 
 # JIT Logic
 # DeepGEMM

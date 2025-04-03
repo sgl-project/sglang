@@ -10,7 +10,7 @@ from einops import rearrange, repeat
 
 apply_rotary_emb = None
 
-from sgl_kernel.flash_attn import flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_with_kvcache, is_fa3_supported
 
 DISABLE_BACKWARD = True
 # For CI test, we close them to True.
@@ -284,6 +284,10 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+@pytest.mark.skipif(
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 and above",
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
