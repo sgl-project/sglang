@@ -18,9 +18,6 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 # Update pip
 pip install --upgrade pip
 
-# Install core dependencies first
-pip install torch==2.5.1
-
 # Install flashinfer and sgl-kernel
 pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --no-cache-dir
 pip install sgl-kernel==0.0.6 --no-cache-dir
