@@ -37,8 +37,8 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        c57699ac933a93651c34d365797c2d8b41a4765b
-    GIT_SHALLOW    ON
+    GIT_TAG        c187c23ba8dcdbad91720737e8be9c43700cb9e9
+    GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
 # flashinfer
@@ -58,6 +58,14 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# ccache option
+option(ENABLE_CCACHE "Whether to use ccache" ON)
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
+    message(STATUS "Building with CCACHE enabled")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "ccache")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
+endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
