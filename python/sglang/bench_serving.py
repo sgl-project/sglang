@@ -1268,6 +1268,10 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
 
+    # Set default value for warmup_requests if not present
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1578,7 +1582,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup-requests",
         type=int,
-        default=20,
+        default=1,
         help="Number of warmup requests to run before the benchmark",
     )
 
