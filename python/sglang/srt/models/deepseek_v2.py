@@ -76,6 +76,7 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 from sglang.srt.utils import (
     add_prefix,
     configure_deep_gemm_num_sms,
@@ -85,7 +86,6 @@ from sglang.srt.utils import (
 )
 from torch import nn
 from transformers import PretrainedConfig
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -437,9 +437,13 @@ class DeepseekV2MoE(nn.Module):
         with expert_distribution_recorder.with_current_layer(
             self.layer_id), expert_distribution_recorder.with_debug_name(["child_a", "child_b"][tbo_child_index]):
             (
-                state.recv_hidden_states_from_dispatch,
+                state.hidden_states_from_dispatch,
+                state.topk_idx_from_dispatch,
+                state.topk_weights_from_dispatch,
                 state.reorder_topk_ids_from_dispatch,
                 state.seg_indptr_from_dispatch,
+                state.masked_m_from_dispatch,
+                state.expected_m_from_dispatch,
             ) = dispatcher.dispatch_b()
 
     def _forward_tbo_op_combine_a(self, state):
