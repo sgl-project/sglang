@@ -764,6 +764,27 @@ class MllamaForCausalLM(nn.Module):
 
 
 class MllamaForConditionalGeneration(nn.Module):
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+    # in TP, these weights are partitioned along the column dimension (dim=-1)
+    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def __init__(
         self,
         config: config_mllama.MllamaConfig,
@@ -771,6 +792,7 @@ class MllamaForConditionalGeneration(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.quant_config = quant_config
         self.vocab_size = config.text_config.vocab_size
         self.hidden_size = config.text_config.hidden_size
         self.max_num_tiles = config.vision_config.max_num_tiles
@@ -788,10 +810,13 @@ class MllamaForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-        self.multi_modal_projector = nn.Linear(
+        self.multi_modal_projector = ColumnParallelLinear(
             config.vision_config.vision_output_dim,
             config.text_config.hidden_size,
             bias=True,
+            quant_config=quant_config,
+            gather_output=True,
+            prefix="multi_modal_projector",
         )
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
@@ -943,7 +968,7 @@ class MllamaForConditionalGeneration(nn.Module):
             cross_attention_states = self.vision_model(
                 batched_images, batched_ar_ids, batched_ar_mask
             )
-            cross_attention_states = self.multi_modal_projector(cross_attention_states)
+            cross_attention_states, _ = self.multi_modal_projector(cross_attention_states)
 
             bs, _, _, _, image_token_dim = cross_attention_states.shape
             cross_attention_states = cross_attention_states.view(
@@ -979,26 +1004,41 @@ class MllamaForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
         updated_params = set()
         for name, loaded_weight in weights:
+            
             if "patch_embedding.weight" in name:
                 name = name.replace(
                     "patch_embedding.weight", "patch_embedding._linear.weight"
                 )
                 loaded_weight = loaded_weight.view(loaded_weight.shape[0], -1)
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
+                                 loaded_weight[0])
+                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
+                weight_loader(param, loaded_weight)
+                updated_params.add(scale_name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 updated_params.add(name)
-                weight_loader = param.weight_loader
+                weight_loader = param.weight_loader 
+                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace("self_attn.o_proj", "self_attn.proj")
-
+                
                 param = params_dict.pop(name)
+                print("Loaded_weight:" , name, loaded_weight.shape, "param: ", param.shape)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
