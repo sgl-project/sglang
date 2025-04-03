@@ -418,10 +418,12 @@ class DeepseekV2MoE(nn.Module):
 
     def _forward_tbo_op_mlp(self, state):
         state.expert_output_hidden_states = self._forward_deepep_expert(
-            state.forward_batch.forward_mode,
-            state.recv_hidden_states_from_dispatch,
-            state.reorder_topk_ids_from_dispatch,
-            state.seg_indptr_from_dispatch,
+            hidden_states=state.hidden_states_from_dispatch,
+            reorder_topk_ids=state.reorder_topk_ids_from_dispatch,
+            seg_indptr=state.seg_indptr_from_dispatch,
+            masked_m=state.masked_m_from_dispatch,
+            expected_m=state.expected_m_from_dispatch,
+            forward_mode=state.forward_batch.forward_mode,
         )
 
     def _forward_tbo_op_dispatch_a(self, state):
