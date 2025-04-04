@@ -157,6 +157,8 @@ class ModelRunner:
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
+                "n_share_experts_fusion": server_args.n_share_experts_fusion,
+                "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
             }
         )
 

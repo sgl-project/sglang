@@ -144,6 +144,18 @@ Note:
 
 The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
 
+#### Build with [ccache](https://github.com/ccache/ccache)
+```bash
+# or `yum install -y ccache`.
+apt-get install -y ccache
+# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
+export CCACHE_DIR=/path/to/your/ccache/dir
+export CCACHE_BACKEND=""
+export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+unset CCACHE_READONLY
+python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests)

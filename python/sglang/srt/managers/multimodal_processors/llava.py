@@ -8,14 +8,23 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mm_utils import expand2square, process_anyres_image
-from sglang.srt.models.llava import LlavaMistralForCausalLM, LlavaQwenForCausalLM
+from sglang.srt.models.llava import (
+    LlavaLlamaForCausalLM,
+    LlavaMistralForCausalLM,
+    LlavaQwenForCausalLM,
+)
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
-    models = [LlavaVidForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+    models = [
+        LlavaLlamaForCausalLM,
+        LlavaVidForCausalLM,
+        LlavaQwenForCausalLM,
+        LlavaMistralForCausalLM,
+    ]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
