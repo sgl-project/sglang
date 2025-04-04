@@ -127,6 +127,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.load_cache_event = None
 
     def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
         """Find the matching prefix from the radix tree.

@@ -485,6 +485,8 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                 )
 
+        self.tp_worker.register_load_cache_event(self.tree_cache.load_cache_event)
+
         self.decode_mem_cache_buf_multiplier = (
             1
             if self.spec_algorithm.is_none()
@@ -1297,9 +1299,6 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
