@@ -120,6 +120,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
+    DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
@@ -1478,6 +1479,8 @@ class Scheduler(
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_deepep_moe=self.server_args.enable_deepep_moe,
+            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
         )
 
     @staticmethod
@@ -1491,6 +1494,8 @@ class Scheduler(
         enable_two_batch_overlap: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
+        enable_deepep_moe: bool,
+        deepep_mode: DeepEPMode,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1533,9 +1538,15 @@ class Scheduler(
                 num_tokens=local_batch.input_ids.shape[0],
                 extend_lens=local_batch.extend_lens,
             )
+            resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
+            local_can_run_tbo = (local_tbo_split_seq_index is not None) and not (
+                local_batch.forward_mode.is_extend()
+                and enable_deepep_moe
+                and (resolved_deepep_mode == DeepEPMode.low_latency)
+            )
         else:
             local_tbo_split_seq_index = None
-        local_can_run_tbo = local_tbo_split_seq_index is not None
+            local_can_run_tbo = False
 
         local_info = torch.tensor(
             [
