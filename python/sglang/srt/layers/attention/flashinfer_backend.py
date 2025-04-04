@@ -1230,6 +1230,8 @@ def fast_decode_plan(
             torch.cuda.current_stream().cuda_stream,
         )
     else:
+        # According to the documentation, the plan method should take these parameters
+        # https://docs.flashinfer.ai/api/decode.html#flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
