@@ -22,7 +22,7 @@ from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs, flatten_nested_list
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -58,7 +58,7 @@ class LlavaVidForCausalLM(nn.Module):
             )
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        pad_values = image_inputs.pad_values
+        pad_values = [item.pad_value for item in image_inputs.mm_items]
         new_image_feature_len = self.image_feature_len
 
         pad_ids = pad_values * (
@@ -133,11 +133,19 @@ class LlavaVidForCausalLM(nn.Module):
             need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
-                pixel_values = [
-                    image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
-                ]
+                pixel_values = flatten_nested_list(
+                    [
+                        [item.pixel_values for item in image_inputs[i].mm_items]
+                        for i in range(bs)
+                        if need_vision[i]
+                    ]
+                )
                 image_offsets = [
-                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+                    flatten_nested_list(
+                        [item.image_offsets for item in image_inputs[i].mm_items]
+                    )
+                    for i in range(bs)
+                    if need_vision[i]
                 ]
 
                 ########## Encode Image ########
@@ -246,7 +254,8 @@ class LlavaVidForCausalLM(nn.Module):
             "model.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_resampler.mm_projector.0": "multi_modal_projector.linear_1",
             "model.vision_resampler.mm_projector.2": "multi_modal_projector.linear_2",
-            "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            "model.vision_tower.vision_tower": "vision_tower",
+            # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())

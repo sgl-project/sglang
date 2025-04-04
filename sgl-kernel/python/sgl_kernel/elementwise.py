@@ -142,12 +142,12 @@ def apply_rope_with_cos_sin_cache_inplace(
         raise ValueError("cos_sin_cache should be float32")
 
     torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        q=query.view(query.shape[0], -1, head_size),
-        k=key.view(key.shape[0], -1, head_size),
-        q_rope=query.view(query.shape[0], -1, head_size),
-        k_rope=key.view(key.shape[0], -1, head_size),
-        cos_sin_cache=cos_sin_cache,
-        pos_ids=positions.long(),
-        interleave=(not is_neox),
-        cuda_stream=get_cuda_stream(),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        query.view(query.shape[0], -1, head_size),
+        key.view(key.shape[0], -1, head_size),
+        cos_sin_cache,
+        positions.long(),
+        (not is_neox),
+        get_cuda_stream(),
     )

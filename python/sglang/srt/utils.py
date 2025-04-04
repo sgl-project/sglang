@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 import base64
 import builtins
 import ctypes
@@ -38,6 +37,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -54,6 +54,7 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from decord import VideoReader, cpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -513,13 +514,18 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     import soundfile as sf
     from scipy.signal import resample
 
-    # print(f"loading {audio_file}")
     # Load audio data
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
         audio, original_sr = sf.read(BytesIO(base64.b64decode(audio_file)))
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -537,10 +543,38 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
-    image = image_size = None
+def encode_video(video_path, frame_count_limit=None):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
 
-    if isinstance(image_file, bytes):
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    return frames
+
+
+def load_image(
+    image_file: Union[Image.Image, str, bytes]
+) -> tuple[Image.Image, tuple[int, int]]:
+    image = image_size = None
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
@@ -564,6 +598,10 @@ def load_image(image_file: Union[str, bytes]) -> tuple[Image, tuple[int, int]]:
 
 
 def suppress_other_loggers():
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
     try:
         from vllm.logger import logger as vllm_default_logger
     except ImportError:
@@ -577,10 +615,6 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
-
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -1796,3 +1830,33 @@ def retry(
             traceback.print_exc()
 
             time.sleep(delay)
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
+
+
+class DeepEPMode(Enum):
+    normal = "normal"
+    low_latency = "low_latency"
+    auto = "auto"
+
+    def enable_normal(self):
+        return self in [DeepEPMode.normal, DeepEPMode.auto]
+
+    def enable_low_latency(self):
+        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
+
+    def resolve(self, forward_mode):
+        if self != DeepEPMode.auto:
+            return self
+
+        if forward_mode.is_decode():
+            return DeepEPMode.low_latency
+        else:
+            return DeepEPMode.normal
