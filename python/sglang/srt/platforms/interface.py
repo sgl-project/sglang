@@ -6,6 +6,7 @@
 import enum
 import platform
 import random
+from functools import lru_cache
 from platform import uname
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple, Union
 
@@ -31,7 +32,7 @@ def in_wsl() -> bool:
 
 class PlatformEnum(enum.Enum):
     CUDA = enum.auto()
-    ROCM = enum.auto()
+    HIP = enum.auto()
     HPU = enum.auto()
     XPU = enum.auto()
     CPU = enum.auto()
@@ -100,8 +101,8 @@ class Platform:
     def is_cuda(self) -> bool:
         return self._enum == PlatformEnum.CUDA
 
-    def is_rocm(self) -> bool:
-        return self._enum == PlatformEnum.ROCM
+    def is_hip(self) -> bool:
+        return self._enum == PlatformEnum.HIP
 
     def is_hpu(self) -> bool:
         return self._enum == PlatformEnum.HPU
@@ -115,9 +116,12 @@ class Platform:
     def is_out_of_tree(self) -> bool:
         return self._enum == PlatformEnum.OOT
 
+    def is_unspecified(self) -> bool:
+        return self._enum == PlatformEnum.UNSPECIFIED
+
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.HIP)
 
     @classmethod
     def get_device_capability(
@@ -151,6 +155,12 @@ class Platform:
         return current_capability.to_int() >= capability
 
     @classmethod
+    @lru_cache(maxsize=16)
+    def get_device(cls, device_id: int = 0) -> str:
+        """Get device str on current platform"""
+        return f"{cls.device_type}:{device_id}"
+
+    @classmethod
     def get_device_module(cls) -> Any:
         """Get `torch.device_module` like `torch.cuda` of current platform."""
         raise NotImplementedError
@@ -168,12 +178,19 @@ class Platform:
     @classmethod
     def get_device_core_count(cls, device_id: int = 0) -> str:
         """Get the core count of a device, e.g. SMs of CUDA, CUs of ROCM."""
-        raise NotImplementedError
+        return 0
 
     @classmethod
     def get_device_count(cls) -> int:
         """Get device count on current platform"""
         raise NotImplementedError
+
+    @classmethod
+    def get_memory_capacity(cls) -> Optional[float]:
+        """
+        Get memory capacity in megabytes.
+        """
+        return None
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0, distributed=False) -> float:
@@ -197,7 +214,7 @@ class Platform:
         """
         Check if the current platform supports overlap scheduler
         """
-        raise NotImplementedError
+        return False
 
     @classmethod
     def seed_everything(cls, seed: Optional[int] = None) -> None:
@@ -356,7 +373,7 @@ class Platform:
 
     @classmethod
     def is_triton_avaliable(cls) -> bool:
-        raise NotImplementedError
+        return False
 
     @classmethod
     def init_environments(cls) -> None:

@@ -41,24 +41,26 @@ def cuda_platform_plugin() -> Optional[str]:
     return "sglang.srt.platforms.cuda.CudaPlatform" if is_cuda else None
 
 
-def rocm_platform_plugin() -> Optional[str]:
-    is_rocm = False
-    logger.debug("Checking if ROCm platform is available.")
+def hip_platform_plugin() -> Optional[str]:
+    is_hip = False
+    logger.debug("Checking if HIP platform is available.")
     try:
         if torch.cuda.is_available() and torch.version.hip:
-            is_rocm = True
-            logger.debug("Confirmed ROCm platform is available.")
+            is_hip = True
+            logger.debug("Confirmed HIP platform is available.")
     except Exception as e:
-        logger.debug("ROCm platform is not available because: %s", str(e))
+        logger.debug("HIP platform is not available because: %s", str(e))
         pass
 
-    return "sglang.srt.platforms.rocm.RocmPlatform" if is_rocm else None
+    return "sglang.srt.platforms.hip.HipPlatform" if is_hip else None
 
 
 def hpu_platform_plugin() -> Optional[str]:
     is_hpu = False
     logger.debug("Checking if HPU platform is available.")
     try:
+        import habana_frameworks.torch.hpu
+
         if hasattr(torch, "hpu") and torch.hpu.is_available():
             is_hpu = True
             logger.debug("Confirmed HPU platform is available.")
@@ -76,7 +78,6 @@ def xpu_platform_plugin() -> Optional[str]:
         # installed IPEX if the machine has XPUs.
         import intel_extension_for_pytorch  # noqa: F401
         import oneccl_bindings_for_pytorch  # noqa: F401
-        import torch
 
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             is_xpu = True
@@ -106,7 +107,7 @@ def cpu_platform_plugin() -> Optional[str]:
 
 builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
-    "rocm": rocm_platform_plugin,
+    "hip": hip_platform_plugin,
     "hpu": hpu_platform_plugin,
     "xpu": xpu_platform_plugin,
     "cpu": cpu_platform_plugin,
@@ -114,7 +115,7 @@ builtin_platform_plugins = {
 # Let platform detection order be controllable
 builtin_platform_names = [
     "cuda",
-    "rocm",
+    "hip",
     "hpu",
     "xpu",
     "cpu",

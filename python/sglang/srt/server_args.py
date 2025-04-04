@@ -31,11 +31,6 @@ from sglang.srt.platforms import (
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
-    get_amdgpu_memory_capacity,
-    get_device,
-    get_hpu_memory_capacity,
-    get_nvgpu_memory_capacity,
-    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -202,6 +197,12 @@ class ServerArgs:
         # Init Platform
         set_current_platform(self.device)
 
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_unspecified():
+            logger.error(f"SGLang cannot launch unspecified platform server")
+            raise NotImplementedError()
+
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -213,24 +214,11 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
 
-        if self.device is None:
-            self.device = get_device()
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
-
-        if is_cuda():
-            gpu_mem = get_nvgpu_memory_capacity()
-        elif is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif self.device == "hpu":
-            gpu_mem = get_hpu_memory_capacity()
-        else:
-            # GPU memory is not known yet or no GPU is available.
-            gpu_mem = None
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
@@ -246,6 +234,7 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
 
         # Set chunked prefill size, which depends on the gpu memory capacity
+        gpu_mem = current_platform.get_memory_capacity()
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
