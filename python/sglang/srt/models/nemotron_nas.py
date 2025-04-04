@@ -56,7 +56,7 @@ def _find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
-class DeciLMDecodeLayer(nn.module):
+class DeciLMDecodeLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -218,7 +218,7 @@ class DeciLMForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = DeciModel(config=config, quant_config=quant_config, prefix=prefix)
 
-        if self.config.tire_word_embeddings:
+        if self.config.tie_e:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
@@ -262,6 +262,9 @@ class DeciLMForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            print(
+                f"1 load_weights name:{name} and loaded_weight.shape:{loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
