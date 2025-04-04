@@ -33,17 +33,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
-#from .interfaces import HasNoOps, SupportsLoRA, SupportsPP
-#from vllm.compilation.decorators import support_torch_compile
-
-## remove cacheconfig and vllmconfig to LlamaConfig
-# from vllm.config import CacheConfig, VllmConfig
-# from vllm.model_executor.sampling_metadata import SamplingMetadata
-## import from utils
-# from vllm.sequence import IntermediateTensors
-# from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
-#                     make_empty_intermediate_tensors_factory, make_layers,
-#                     maybe_prefix)
 from sglang.srt.utils import(AutoWeightsLoader, IntermediateTensors, 
                              make_empty_intermediate_tensors_factory,
                             PPMissingLayer, is_pp_missing_parameter,
@@ -68,7 +57,6 @@ class DeciLMDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         layer_idx: int,
-        #cache_config,#: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -99,20 +87,6 @@ class DeciLMDecoderLayer(nn.Module):
         if not self._is_no_op_attention:
             num_kv_heads = (config.num_attention_heads //
                             block_config.attention.n_heads_in_group)
-            # self.self_attn = LlamaAttention(
-            #     config=config,
-            #     hidden_size=self.hidden_size,
-            #     num_heads=config.num_attention_heads,
-            #     num_kv_heads=num_kv_heads,
-            #     rope_theta=rope_theta,
-            #     rope_scaling=rope_scaling,
-            #     max_position_embeddings=max_position_embeddings,
-            #     quant_config=quant_config,
-            #     bias=attention_bias,
-            #     bias_o_proj=bias_o_proj,
-            #     cache_config=cache_config,
-            #     prefix=f"{prefix}.self_attn",
-            # )
             self.self_attn = LlamaAttention(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -134,15 +108,6 @@ class DeciLMDecoderLayer(nn.Module):
             ffn_mult = block_config.ffn.ffn_mult
             intermediate_size = _ffn_mult_to_intermediate_size(
                 ffn_mult, config.hidden_size)
-
-            # self.mlp = LlamaMLP(
-            #     hidden_size=self.hidden_size,
-            #     intermediate_size=intermediate_size,
-            #     hidden_act=config.hidden_act,
-            #     quant_config=quant_config,
-            #     bias=getattr(config, "mlp_bias", False),
-            #     prefix=f"{prefix}.mlp",
-            # )
             self.mlp = LlamaMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=intermediate_size,
@@ -185,17 +150,7 @@ class DeciLMDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
-#@support_torch_compile
 class DeciModel(nn.Module):
-
-    # def __init__(
-    #     self,
-    #     *,
-    #     vllm_config: VllmConfig,
-    #     prefix: str = "",
-    #     layer_type: Type[DeciLMDecoderLayer] = DeciLMDecoderLayer,
-    # ):
     def __init__(
         self,
         *,
@@ -206,11 +161,6 @@ class DeciModel(nn.Module):
     ):
         super().__init__()
 
-        #config = vllm_config.model_config.hf_config
-        # skip cache_config
-        #cache_config = vllm_config.cache_config
-        #quant_config = vllm_config.quant_config
-        #lora_config = vllm_config.lora_config
         lora_config = None    
         self.config = config
         self.quant_config = quant_config
@@ -240,11 +190,6 @@ class DeciModel(nn.Module):
                 prefix=prefix,
             )
 
-        # self.start_layer, self.end_layer, self.layers = make_layers_startend(
-        #     config.num_hidden_layers,
-        #     get_layer,
-        #     prefix=add_prefix("layers",prefix)
-        # )
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
@@ -282,7 +227,6 @@ class DeciModel(nn.Module):
             residual = forward_batch["residual"]
 
         kv_cache_index = 0
-        #for i in range(self.start_layer, self.end_layer):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             if not layer._is_no_op_attention:
@@ -410,24 +354,15 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         "norm": "model.norm",
     }
 
-    # def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
     def __init__(self, *, 
                  config: LlamaConfig, 
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         super().__init__()
-        # This is already model_config.hf_config
-        #config = vllm_config.model_config.hf_config 
-        # Take this from augments
-        #quant_config = vllm_config.quant_config
-        # None here
-        #lora_config = vllm_config.lora_config
         lora_config = None
         self.config = config
         self.lora_config = lora_config
 
-        #self.model = self._init_model(vllm_config=vllm_config, 
-        #                               prefix=maybe_prefix(prefix, "model"))
         self.model = self._init_model(config=config, quant_config=quant_config,
                                      prefix=add_prefix(prefix, "model"))
     
@@ -465,9 +400,6 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
-    # def _init_model(self, vllm_config: VllmConfig, 
-    #                 prefix: str = ""):
-    #     return DeciModel(vllm_config=vllm_config, prefix=prefix)
     def _init_model(self, config: LlamaConfig, 
                     quant_config: Optional[QuantizationConfig] = None, 
                     prefix: str = ""):
@@ -493,8 +425,6 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         hidden_states: torch.Tensor,
         sampling_metadata,#: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        # logits = self.logits_processor(self.lm_head, hidden_states,
-        #                                sampling_metadata)
         logits = self.logits_processor(input_ids= None,
                                        hidden_states=hidden_states,
                                        lm_head=self.lm_head,
@@ -548,12 +478,6 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
             forward_batch.token_ids_logprobs,
         )
         return next_token_ids
-
-    # def sample(self, logits: torch.Tensor,
-    #            sampling_metadata,#: SamplingMetadata
-    # ):
-    #     next_tokens = self.sampler(logits, sampling_metadata)
-    #     return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
