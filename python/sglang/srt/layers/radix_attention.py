@@ -63,11 +63,9 @@ class RadixAttention(nn.Module):
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None
-            logger.info(f"rationAttn, self.tp_k_head_num.shape:{self.tp_k_head_num} and self.qk_head_dim:{self.qk_head_dim} and self.tp_v_head_num:{self.tp_v_head_num}")
             assert v is not None
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            logger.info(f"ratioAtt, k.shape:{k.shape} and v.shape:{v.shape}")
         return forward_batch.attn_backend.forward(
             q, k, v, self, forward_batch, save_kv_cache
         )
