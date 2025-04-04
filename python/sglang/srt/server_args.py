@@ -179,7 +179,7 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False  # TODO: remove this argument
+    enable_flashinfer_mla: bool = False
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
@@ -501,6 +501,7 @@ class ServerArgs:
                 "modelopt",
                 "w8a8_int8",
                 "w8a8_fp8",
+                "moe_wna16",
             ],
             help="The quantization method.",
         )
@@ -841,7 +842,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-mla",
             action="store_true",
-            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
+            help="Enable FlashInfer MLA optimization",
         )
         parser.add_argument(
             "--enable-flashmla",

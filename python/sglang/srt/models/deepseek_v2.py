@@ -199,35 +199,24 @@ class DeepseekV2MoE(nn.Module):
             else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
         )
 
-        if not global_server_args_dict["enable_deepep_moe"]:
-            self.experts = MoEImpl(
-                num_experts=config.n_routed_experts + self.n_share_experts_fusion,
-                top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                prefix=add_prefix("experts", prefix),
-            )
-        else:
-            self.experts = MoEImpl(
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                prefix=add_prefix("experts", prefix),
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-            )
+        self.experts = MoEImpl(
+            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            prefix=add_prefix("experts", prefix),
+            **(
+                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
+                if global_server_args_dict["enable_deepep_moe"]
+                else {}
+            ),
+        )
 
         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -697,6 +686,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_vc = None
         self.w_scale = None
 
+        self.enable_flashinfer_mla = global_server_args_dict["enable_flashinfer_mla"]
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
@@ -704,7 +694,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.attention_backend == "flashinfer_mla":
+        if self.enable_flashinfer_mla:
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             return (
                 not self.flashinfer_mla_disable_ragged
