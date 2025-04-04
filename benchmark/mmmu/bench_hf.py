@@ -1,5 +1,6 @@
 import argparse
 
+import PIL
 import torch
 from data_utils import save_json
 from eval_utils import (
