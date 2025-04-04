@@ -169,7 +169,9 @@ class BaseGrammarBackend(ABC):
             self.cache.clear()
 
 
-def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
+def create_grammar_backend(
+    server_args: ServerArgs, tokenizer, vocab_size: int
+) -> Optional[BaseGrammarBackend]:
     if server_args.grammar_backend == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 
@@ -188,6 +190,8 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
             tokenizer=tokenizer,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
+    elif server_args.grammar_backend == "none":
+        return None
     else:
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 

@@ -1,12 +1,4 @@
-[submodule "sgl-kernel/3rdparty/cutlass"]
-	path = sgl-kernel/3rdparty/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
-[submodule "sgl-kernel/3rdparty/cccl"]
-	path = sgl-kernel/3rdparty/cccl
-	url = https://github.com/NVIDIA/cccl.git
 [submodule "sgl-kernel/3rdparty/flashinfer"]
 	path = sgl-kernel/3rdparty/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer.git
-[submodule "sgl-kernel/3rdparty/deepgemm"]
-	path = sgl-kernel/3rdparty/deepgemm
-	url = https://github.com/deepseek-ai/DeepGEMM
+	url = https://github.com/sgl-project/flashinfer.git
+	branch = sgl-kernel

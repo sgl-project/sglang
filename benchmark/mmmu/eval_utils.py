@@ -442,6 +442,8 @@ def calculate_ins_level_acc(results: Dict):
 
 
 def process_result(response, sample, answer_dict, out_samples):
+    if response is None:
+        return
     if sample["question_type"] == "multiple-choice":
         pred_ans = parse_multi_choice_response(
             response, sample["all_choices"], sample["index2ans"]

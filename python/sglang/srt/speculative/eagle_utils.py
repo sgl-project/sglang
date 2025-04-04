@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -10,11 +11,15 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    get_last_loc,
+    global_server_args_dict,
+)
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
-from sglang.srt.utils import is_cuda_available, is_hip
+from sglang.srt.utils import is_cuda_available, is_hip, next_power_of_2
 
 if is_cuda_available():
     from sgl_kernel import (
@@ -32,6 +37,9 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 
 
 @dataclass
@@ -93,7 +101,7 @@ class EagleDraftInput:
             torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
             self.positions,
             new_verified_id,
-            triton.next_power_of_2(speculative_num_steps + 1),
+            next_power_of_2(speculative_num_steps + 1),
         )
 
         batch.seq_lens_sum = sum(seq_lens_cpu)
@@ -225,18 +233,34 @@ class EagleVerifyInput:
             CaptureHiddenMode.FULL,
         )
 
-    def prepare_for_verify(self, batch: ScheduleBatch):
+    def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         batch.input_ids = self.draft_token
-        batch.out_cache_loc = batch.alloc_token_slots(batch.input_ids.numel())
+
+        if page_size == 1:
+            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            end_offset = batch.seq_lens + self.draft_token_num
+        else:
+            prefix_lens = batch.seq_lens
+            end_offset = prefix_lens + self.draft_token_num
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                prefix_lens,
+            )
+            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+            )
+            self.last_loc = last_loc
+
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + self.draft_token_num,
+            end_offset,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
-            triton.next_power_of_2(bs),
+            next_power_of_2(bs),
         )
 
     def generate_attn_arg_prefill(
@@ -282,6 +306,7 @@ class EagleVerifyInput:
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        page_size: int,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -305,6 +330,7 @@ class EagleVerifyInput:
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
+        # Apply penalty
         if sampling_info.penalizer_orchestrator.is_required:
             # This is a relaxed version of penalties for speculative decoding.
             linear_penalty = torch.zeros(
@@ -317,6 +343,7 @@ class EagleVerifyInput:
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
             )
 
+        # Sample tokens
         if batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
@@ -378,13 +405,24 @@ class EagleVerifyInput:
                 deterministic=True,
             )
 
+        if SIMULATE_ACC_LEN:
+            # Do simulation
+            accept_index = _generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                accept_length=accept_length,  # mutable
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                bs=bs,
+                spec_steps=self.spec_steps,
+            )
+
         new_accept_index = []
         unfinished_index = []
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
 
-        # iterate every accepted token and check if req has finished after append the token
+        # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
             new_accept_index_ = []
@@ -407,13 +445,28 @@ class EagleVerifyInput:
                 unfinished_index.append(i)
             req.spec_verify_ct += 1
 
+        if has_finished:
+            accept_length = (accept_index != -1).sum(dim=1) - 1
+
+        # Free the KV cache for unaccepted tokens
+        accept_index = accept_index[accept_index != -1]
+        verified_id = predict[accept_index]
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
+
+        if page_size != 1:
+            align_evict_mask_to_page_size[len(batch.seq_lens),](
+                batch.seq_lens,
+                evict_mask,
+                page_size,
+                self.draft_token_num,
+                next_power_of_2(self.draft_token_num),
+            )
+
+        token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+
+        # Construct EagleVerifyOutput
         if not has_finished:
-            accept_index = accept_index[accept_index != -1]
-            verified_id = predict[accept_index]
-            evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-            evict_mask[accept_index] = False
-            mem_need_free_idx = batch.out_cache_loc[evict_mask]
-            token_to_kv_pool_allocator.free(mem_need_free_idx)
             batch.out_cache_loc = batch.out_cache_loc[accept_index]
             assign_req_to_token_pool[(bs,)](
                 batch.req_pool_indices,
@@ -422,7 +475,7 @@ class EagleVerifyInput:
                 batch.seq_lens + accept_length + 1,
                 batch.out_cache_loc,
                 batch.req_to_token_pool.req_to_token.shape[1],
-                triton.next_power_of_2(bs),
+                next_power_of_2(bs),
             )
             batch.seq_lens.add_(accept_length + 1)
             accept_length_cpu = accept_length.tolist()
@@ -443,13 +496,6 @@ class EagleVerifyInput:
                 accepeted_indices=accept_index,
             )
         else:
-            accept_length = (accept_index != -1).sum(dim=1) - 1
-            accept_index = accept_index[accept_index != -1]
-            verified_id = predict[accept_index]
-            evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-            evict_mask[accept_index] = False
-            mem_need_free_idx = batch.out_cache_loc[evict_mask]
-            token_to_kv_pool_allocator.free(mem_need_free_idx)
             assign_req_to_token_pool[(bs,)](
                 batch.req_pool_indices,
                 batch.req_to_token_pool.req_to_token,
@@ -457,7 +503,7 @@ class EagleVerifyInput:
                 batch.seq_lens + accept_length + 1,
                 batch.out_cache_loc[accept_index],
                 batch.req_to_token_pool.req_to_token.shape[1],
-                triton.next_power_of_2(bs),
+                next_power_of_2(bs),
             )
             batch.seq_lens.add_(accept_length + 1)
             accept_length_cpu = accept_length.tolist()
@@ -465,20 +511,21 @@ class EagleVerifyInput:
             draft_input = EagleDraftInput()
             if len(new_accept_index) > 0:
                 new_accept_index = torch.tensor(new_accept_index, device="cuda")
+                unfinished_index_device = torch.tensor(unfinished_index, device="cuda")
                 draft_input.hidden_states = batch.spec_info.hidden_states[
                     new_accept_index
                 ]
                 draft_input.verified_id = predict[new_accept_index]
-                draft_input.accept_length = accept_length[unfinished_index]
                 draft_input.accept_length_cpu = [
                     accept_length_cpu[i] for i in unfinished_index
                 ]
+                draft_input.accept_length = accept_length[unfinished_index_device]
                 if has_finished:
                     draft_input.seq_lens_for_draft_extend = batch.seq_lens[
-                        unfinished_index
+                        unfinished_index_device
                     ]
                     draft_input.req_pool_indices_for_draft_extend = (
-                        batch.req_pool_indices[unfinished_index]
+                        batch.req_pool_indices[unfinished_index_device]
                     )
                 else:
                     draft_input.seq_lens_for_draft_extend = batch.seq_lens
@@ -564,13 +611,24 @@ def assign_draft_cache_locs(
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
+    page_size: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
     kv_start = tl.load(seq_lens + pid)
-    kv_end = tl.load(seq_lens + pid) + topk * speculative_num_steps
+
+    if page_size == 1 or topk == 1:
+        kv_end = tl.load(seq_lens + pid) + topk * speculative_num_steps
+        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
+    else:
+        prefix_len = tl.load(seq_lens + pid)
+        last_page_len = prefix_len % page_size
+        num_new_page = (
+            last_page_len + speculative_num_steps + page_size - 1
+        ) // page_size
+        kv_end = prefix_len // page_size * page_size + num_new_page * (page_size * topk)
+
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-    out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
 
     num_loop = tl.cdiv(topk * speculative_num_steps, BLOCK_SIZE)
     for i in range(num_loop):
@@ -642,6 +700,29 @@ def generate_draft_decode_kv_indices(
     tl.store(kv_indptr + zid, base + zid * iters)
 
 
+@triton.jit
+def align_evict_mask_to_page_size(
+    seq_lens,
+    evict_mask,
+    page_size: tl.constexpr,
+    num_draft_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    t_range = tl.arange(0, BLOCK_SIZE)
+
+    bid = tl.program_id(axis=0)
+    seq_len = tl.load(seq_lens + bid)
+    io_mask = t_range < num_draft_tokens
+    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask)
+
+    num_trues = tl.sum(mask_row)
+    num_false = num_draft_tokens - num_trues
+
+    start = (seq_len + num_false - 1) // page_size * page_size - seq_len
+    for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
+        tl.store(evict_mask + bid * num_draft_tokens + i, False)
+
+
 @torch.compile(dynamic=True)
 def select_top_k_tokens(
     i: int,
@@ -699,3 +780,34 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def _generate_simulated_accept_index(
+    accept_index,
+    predict,
+    accept_length,
+    simulate_acc_len,
+    bs,
+    spec_steps,
+):
+    simulate_acc_len_float = float(simulate_acc_len)
+    simulated_values = torch.normal(
+        mean=simulate_acc_len_float,
+        std=1.0,
+        size=(1,),
+        device="cpu",
+    )
+    # clamp simulated values to be between 1 and self.spec_steps
+    simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps)
+    simulate_acc_len = int(simulated_values.round().item())
+
+    accept_indx_first_col = accept_index[:, 0].view(-1, 1)
+    sim_accept_index = torch.full(
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+    )
+    sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
+        simulate_acc_len, device=accept_index.device
+    )
+    accept_length.fill_(simulate_acc_len - 1)
+    predict.fill_(100)  # some legit token id
+    return sim_accept_index

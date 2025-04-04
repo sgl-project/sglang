@@ -736,7 +736,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+        ), "dp_size must be 1 for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.

@@ -796,14 +796,16 @@ class MllamaForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        pixel_values = image_inputs.pixel_values
-        pad_values = image_inputs.pad_values
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pixel_values = torch.cat(
+            [item.pixel_values for item in mm_inputs.mm_items], dim=0
+        )
+        pad_values = [item.pad_value for item in mm_inputs.mm_items]
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
         image_len = num_concurrent_media * num_tiles * num_patches
-        image_inputs.num_image_tokens = image_len
+        mm_inputs.num_image_tokens = image_len
 
         pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
 
@@ -815,10 +817,16 @@ class MllamaForConditionalGeneration(nn.Module):
 
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
-        for i, im in enumerate(forward_batch.mm_inputs):
-            if not forward_batch.encoder_cached[i] and im is not None:
-                max_num_images = max(max_num_images, im.pixel_values.shape[1])
-                max_num_tiles = max(max_num_tiles, im.pixel_values.shape[2])
+        for i, mm_input in enumerate(forward_batch.mm_inputs):
+
+            if not forward_batch.encoder_cached[i] and mm_input is not None:
+                pixel_values = torch.cat(
+                    [item.pixel_values for item in mm_input.mm_items], dim=0
+                )
+                # max_num_images = max(max_num_images, sum(1 if item.is_image() else 0 for item in mm_input.items))
+                max_num_images = max(max_num_images, pixel_values.shape[1])
+
+                max_num_tiles = max(max_num_tiles, pixel_values.shape[2])
                 bs += 1
 
         if max_num_images * max_num_tiles * bs == 0:
@@ -842,17 +850,24 @@ class MllamaForConditionalGeneration(nn.Module):
             )
             i = 0
             encoder_lens_need = []
-            for k, im in enumerate(forward_batch.mm_inputs):
-                if forward_batch.encoder_cached[k] or im is None:
+
+            for k, mm_input in enumerate(forward_batch.mm_inputs):
+                if forward_batch.encoder_cached[k] or mm_input is None:
                     continue
 
                 encoder_lens_need.append(forward_batch.encoder_lens[k])
-                for j in range(im.pixel_values.shape[1]):
-                    img = im.pixel_values[0, j]
+                pixel_values = torch.cat(
+                    [item.pixel_values for item in mm_input.mm_items], dim=0
+                )
+                for j in range(pixel_values.shape[1]):
+                    img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = im.aspect_ratio_ids[0, j]
-                    batched_ar_mask[i, j, :num_tiles] = im.aspect_ratio_mask[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_id[0, j]
+
+                    batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
+                        0
+                    ].aspect_ratio_mask[0, j]
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need

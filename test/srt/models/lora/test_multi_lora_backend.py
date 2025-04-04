@@ -13,16 +13,21 @@
 # ==============================================================================
 
 import multiprocessing as mp
+import os
 import unittest
 from typing import List
 
-import torch
-from utils import BACKENDS, TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
+from utils import (
+    BACKENDS,
+    TORCH_DTYPES,
+    LoRAAdaptor,
+    LoRAModelCase,
+    run_batch_lora_test,
+)
 
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-MULTI_LORA_MODELS = [
+CI_MULTI_LORA_MODELS = [
     # multi-rank case
     LoRAModelCase(
         base="meta-llama/Llama-2-7b-hf",
@@ -38,6 +43,9 @@ MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
     ),
+]
+
+ALL_OTHER_MULTI_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
@@ -70,141 +78,8 @@ PROMPTS = [
 
 
 class TestMultiLoRABackend(CustomTestCase):
-    def run_backend_batch(
-        self,
-        prompts: List[str],
-        model_case: LoRAModelCase,
-        torch_dtype: torch.dtype,
-        max_new_tokens: int,
-        backend: str,
-    ):
-        """
-        The multi-LoRA backend test functionality is not supported yet.
-        This function uses all prompts at once and prints a message indicating that support is pending.
-        """
-        base_path = model_case.base
-        adaptor_names = [adaptor.name for adaptor in model_case.adaptors]
-        print(
-            f"\n========== Testing multi-LoRA backend '{backend}' for base '{model_case.base}' --- "
-            f"Using prompts {[p[:50] for p in prompts]} with adaptors: {adaptor_names} ---"
-        )
-        print(
-            "run_backend_batch: Multi-LoRA backend test functionality is pending support."
-        )
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=model_case.tp_size,
-            lora_paths=[adaptor.name for adaptor in model_case.adaptors],
-            max_loras_per_batch=model_case.max_loras_per_batch,
-            lora_backend=backend,
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            mem_fraction_static=0.88,
-        ) as srt_runner:
-            srt_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
-            )
 
-        with HFRunner(
-            base_path, torch_dtype=torch_dtype, model_type="generation"
-        ) as hf_runner:
-            hf_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
-            )
-
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=model_case.tp_size,
-            mem_fraction_static=0.88,
-        ) as srt_runner:
-            srt_no_lora_outputs = srt_runner.forward(
-                prompts, max_new_tokens=max_new_tokens
-            )
-
-        with HFRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-        ) as hf_runner:
-            hf_no_lora_outputs = hf_runner.forward(
-                prompts, max_new_tokens=max_new_tokens
-            )
-
-        # Compare prefill stage logprobs (HF vs SRTRunner with LoRA)
-        for i in range(len(prompts)):
-            adaptor = model_case.adaptors[i]
-            # Use individual adapter tolerances if set, otherwise use model defaults
-            prefill_tol = (
-                adaptor.prefill_tolerance
-                if adaptor.prefill_tolerance is not None
-                else model_case.prefill_tolerance
-            )
-            decode_tol = (
-                adaptor.decode_tolerance
-                if adaptor.decode_tolerance is not None
-                else model_case.decode_tolerance
-            )
-            rouge_tol = (
-                adaptor.rouge_l_tolerance
-                if adaptor.rouge_l_tolerance is not None
-                else model_case.rouge_l_tolerance
-            )
-            # Compare prefill stage logprobs (HF vs SRTRunner with LoRA)
-            hf_prefill = torch.tensor(hf_outputs.top_input_logprobs[i])
-            srt_prefill = torch.tensor(srt_outputs.top_input_logprobs[i])
-            max_prefill_diff = torch.max(torch.abs(hf_prefill - srt_prefill))
-            print("Max prefill diff (HF vs SRT):", max_prefill_diff)
-
-            # Compare decode stage logprobs
-            hf_decode = torch.tensor(hf_outputs.top_output_logprobs[i])
-            srt_decode = torch.tensor(srt_outputs.top_output_logprobs[i])
-            max_decode_diff = torch.max(torch.abs(hf_decode - srt_decode))
-            print("Max decode diff (HF vs SRT):", max_decode_diff)
-
-            srt_output_str = srt_outputs.output_strs[i].strip()
-            hf_output_str = hf_outputs.output_strs[i].strip()
-            rouge_score = calculate_rouge_l([srt_output_str], [hf_output_str])[0]
-            print("ROUGE-L score:", rouge_score)
-            print("SRT output:", srt_output_str)
-            print("HF output:", hf_output_str)
-
-            # Additional: compare prefill outputs between base model (no LoRA) and LoRA model for reference
-            hf_no_lora_prefill = torch.tensor(hf_no_lora_outputs.top_input_logprobs[i])
-            srt_no_lora_prefill = torch.tensor(
-                srt_no_lora_outputs.top_input_logprobs[i]
-            )
-            print(
-                "Max diff (SRT base vs SRT LoRA prefill):",
-                torch.max(torch.abs(srt_no_lora_prefill - srt_prefill)),
-            )
-            print(
-                "Max diff (HF base vs HF LoRA prefill):",
-                torch.max(torch.abs(hf_no_lora_prefill - hf_prefill)),
-            )
-
-            if hf_prefill.shape[0] <= 100:
-                assert torch.all(torch.abs(hf_prefill - srt_prefill) < prefill_tol), (
-                    f"Prefill logprobs mismatch for base '{base_path}', adaptor '{adaptor_names}', "
-                    f"backend '{backend}', prompt: '{prompts[0][:50]}...'"
-                )
-
-            if hf_decode.shape[0] <= 100:
-                assert torch.all(torch.abs(hf_decode - srt_decode) < decode_tol), (
-                    f"Decode logprobs mismatch for base '{base_path}', adaptor '{adaptor_names}', "
-                    f"backend '{backend}', prompt: '{prompts[0][:50]}...'"
-                )
-
-            if rouge_score < rouge_tol:
-                raise AssertionError(
-                    f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                    f"for base '{base_path}', adaptor '{adaptor_names}', backend '{backend}', prompt: '{prompts[0][:50]}...'"
-                )
-
-    def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    def _run_multi_lora_test_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters.
             batch_prompts = (
@@ -214,19 +89,30 @@ class TestMultiLoRABackend(CustomTestCase):
             )
             for torch_dtype in TORCH_DTYPES:
                 for backend in BACKENDS:
-                    self.run_backend_batch(
+                    run_batch_lora_test(
                         batch_prompts,
                         model_case,
                         torch_dtype,
                         max_new_tokens=32,
                         backend=backend,
+                        test_tag="multi-lora-backend",
                     )
 
-    def test_multi_lora_models(self):
-        # Optionally skip tests in CI environments.
+    def test_ci_lora_models(self):
+        self._run_multi_lora_test_on_model_cases(CI_MULTI_LORA_MODELS)
+
+    def test_all_lora_models(self):
         if is_in_ci():
             return
-        self._run_backend_on_model_cases(MULTI_LORA_MODELS)
+
+        # Retain ONLY_RUN check here
+        filtered_models = []
+        for model_case in ALL_OTHER_MULTI_LORA_MODELS:
+            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
+                continue
+            filtered_models.append(model_case)
+
+        self._run_multi_lora_test_on_model_cases(filtered_models)
 
 
 if __name__ == "__main__":

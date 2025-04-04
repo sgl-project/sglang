@@ -151,10 +151,6 @@ class Engine:
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        modalities_list = []
-        if image_data is not None:
-            modalities_list.append("image")
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -165,7 +161,6 @@ class Engine:
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
-            modalities=modalities_list,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             stream=stream,
