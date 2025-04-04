@@ -258,6 +258,7 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -453,6 +454,8 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen2ForSequenceClassification" in model_architectures
+        or "CLIPModel" in model_architectures
     ):
         return False
     else:
@@ -461,18 +464,20 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
-    "LlavaLlamaForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaMistralForCausalLM",
-    "LlavaVidForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    "LlavaLlamaForCausalLM",
+    "LlavaMistralForCausalLM",
+    "LlavaQwenForCausalLM",
+    "LlavaVidForCausalLM",
+    "MiniCPMO",
+    "MiniCPMV",
+    "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
-    "MiniCPMV",
-    "MultiModalityCausalLM",
+    "CLIPModel",
 ]
 
 

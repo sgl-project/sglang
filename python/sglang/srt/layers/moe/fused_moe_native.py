@@ -8,7 +8,6 @@ from typing import Callable, Optional
 import torch
 from torch.nn import functional as F
 
-from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.moe.topk import select_experts
 
 
@@ -68,6 +67,8 @@ def moe_forward_native(
     correction_bias: Optional[torch.Tensor] = None,
     activation: str = "silu",
 ) -> torch.Tensor:
+
+    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 
     topk_weights, topk_ids = select_experts(
         hidden_states=x,
