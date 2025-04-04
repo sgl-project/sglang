@@ -43,8 +43,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, 
-                    Optional, Protocol, Set, Tuple, Union)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -390,6 +401,7 @@ class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
 
+
 class PPMissingLayer(torch.nn.Identity):
     """
     A placeholder layer for missing layers in a pipeline parallel model.
@@ -398,7 +410,10 @@ class PPMissingLayer(torch.nn.Identity):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
+
 from dataclasses import dataclass, field
+
+
 @dataclass
 class IntermediateTensors:
     """For all pipeline stages except the last, we need to return the hidden
@@ -435,7 +450,8 @@ class IntermediateTensors:
 
     def __repr__(self) -> str:
         return f"IntermediateTensors(tensors={self.tensors})"
-         
+
+
 def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
 
     def make_empty_intermediate_tensors(
@@ -443,13 +459,15 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        return IntermediateTensors({
-            key:
-            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
-            for key in keys
-        })
+        return IntermediateTensors(
+            {
+                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
+                for key in keys
+            }
+        )
 
     return make_empty_intermediate_tensors
+
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
 _model_to_pp_missing_layer_names: Dict[int, List[str]] = {}
@@ -467,10 +485,11 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> List[str]:
             # NOTE: the trailing dot is used to match the prefix of the layer.
             # without the dot, we could match a layer that is not missing,
             # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
-            missing_layer_names.append(name + '.')
+            missing_layer_names.append(name + ".")
     _model_to_pp_missing_layer_names[model_id] = missing_layer_names
 
     return missing_layer_names
+
 
 def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
     """Check if a parameter is missing in a pipeline parallel model."""
@@ -479,7 +498,9 @@ def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
 
     return any(
         name.startswith(missing_layer_name)
-        for missing_layer_name in get_pp_missing_layer_names(model))
+        for missing_layer_name in get_pp_missing_layer_names(model)
+    )
+
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
@@ -501,8 +522,11 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         # debug weight loading issues.
         raise
 
+
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns."""
@@ -538,9 +562,13 @@ class WeightsMapper:
     def apply(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Iterable[Tuple[str, torch.Tensor]]:
-        return ((out_name, data) for name, data in weights
-                if (out_name := self._map_name(name)) is not None)
-    
+        return (
+            (out_name, data)
+            for name, data in weights
+            if (out_name := self._map_name(name)) is not None
+        )
+
+
 class AutoWeightsLoader:
     """
     Helper class to load weights into a :class:`torch.nn.Module`. It is able
@@ -574,17 +602,20 @@ class AutoWeightsLoader:
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
     ) -> Iterable[Tuple[str, Iterable[Tuple[str, torch.Tensor]]]]:
-        weights_by_parts = ((weight_name.split(".", 1), weight_data)
-                            for weight_name, weight_data in weights)
+        weights_by_parts = (
+            (weight_name.split(".", 1), weight_data)
+            for weight_name, weight_data in weights
+        )
 
-        for prefix, group in itertools.groupby(weights_by_parts,
-                                               key=lambda x: x[0][0]):
+        for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
             yield (
                 prefix,
                 # Because maxsplit=1 in weight_name.split(...),
                 # the length of `parts` must either be 1 or 2
-                (("" if len(parts) == 1 else parts[1], weights_data)
-                 for parts, weights_data in group),
+                (
+                    ("" if len(parts) == 1 else parts[1], weights_data)
+                    for parts, weights_data in group
+                ),
             )
 
     def _get_qualname(self, prefix: str, rest: str) -> str:
@@ -599,8 +630,7 @@ class AutoWeightsLoader:
         return any(qualname.startswith(p) for p in self.skip_prefixes)
 
     def _can_ignore_unexpected(self, qualname: str) -> bool:
-        return any(
-            qualname.startswith(p) for p in self.ignore_unexpected_prefixes)
+        return any(qualname.startswith(p) for p in self.ignore_unexpected_prefixes)
 
     def _load_param(
         self,
@@ -624,14 +654,13 @@ class AutoWeightsLoader:
 
                 raise ValueError(
                     f"Attempted to load nested weight '{weight_qualname}' "
-                    f"into a single parameter '{base_prefix}'")
+                    f"into a single parameter '{base_prefix}'"
+                )
 
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, weight_data)
 
-            logger.debug("Loaded weight %s with shape %s", weight_qualname,
-                         param.shape)
+            logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 
             yield weight_qualname
 
@@ -652,8 +681,8 @@ class AutoWeightsLoader:
                 loaded_params = module_load_weights(weights)
                 if loaded_params is None:
                     logger.warning(
-                        "Unable to collect loaded parameters "
-                        "for module %s", module)
+                        "Unable to collect loaded parameters " "for module %s", module
+                    )
                 else:
                     yield from map(
                         lambda x: self._get_qualname(base_prefix, x),
@@ -672,17 +701,18 @@ class AutoWeightsLoader:
 
                     continue
 
-                yield from self._load_module(prefix,
-                                             child_modules[child_prefix],
-                                             child_weights)
+                yield from self._load_module(
+                    prefix, child_modules[child_prefix], child_weights
+                )
             elif child_prefix in child_params:
                 if self._can_skip(prefix):
                     logger.debug("Skipping param %s", prefix)
 
                     continue
 
-                yield from self._load_param(prefix, child_params[child_prefix],
-                                            child_weights)
+                yield from self._load_param(
+                    prefix, child_params[child_prefix], child_weights
+                )
             else:
                 can_skip_module = self._can_skip(prefix + ".")
                 can_skip_param = self._can_skip(prefix)
@@ -698,8 +728,10 @@ class AutoWeightsLoader:
 
                     continue
 
-                msg = (f"There is no module or parameter named '{prefix}' "
-                       f"in {type(self.module).__name__}")
+                msg = (
+                    f"There is no module or parameter named '{prefix}' "
+                    f"in {type(self.module).__name__}"
+                )
                 raise ValueError(msg)
 
     def load_weights(
@@ -713,7 +745,8 @@ class AutoWeightsLoader:
 
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
-    
+
+
 def make_layers_startend(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -723,15 +756,20 @@ def make_layers_startend(
     pipeline parallelism into account.
     """
     from sglang.srt.distributed import get_pp_group, get_pp_indices
-    start_layer, end_layer = get_pp_indices(num_hidden_layers,
-                                            get_pp_group().rank_in_group,
-                                            get_pp_group().world_size)
+
+    start_layer, end_layer = get_pp_indices(
+        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
+    )
     modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)] + [
+        [PPMissingLayer() for _ in range(start_layer)]
+        + [
             maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
             for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+        ]
+        + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
+    )
     return start_layer, end_layer, modules
+
 
 def make_layers(
     num_hidden_layers: int,
