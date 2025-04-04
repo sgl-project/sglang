@@ -260,7 +260,8 @@ void transfer_kv_per_layer(
     at::Tensor dst_v,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
-    int64_t item_size);
+    int64_t item_size,
+    int64_t block_quota);
 
 void transfer_kv_all_layer(
     const at::Tensor src_k,
@@ -272,7 +273,8 @@ void transfer_kv_all_layer(
     int64_t item_size,
     int64_t num_layers,
     int64_t src_layer_offset,
-    int64_t dst_layer_offset);
+    int64_t dst_layer_offset,
+    int64_t block_quota);
 
 /*
  * From FlashInfer

@@ -9,9 +9,10 @@ def transfer_kv_per_layer(
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
     cache_size: int,
+    block_quota: int = 4,
 ):
     torch.ops.sgl_kernel.transfer_kv_per_layer(
-        src_k, dst_k, src_v, dst_v, src_indices, dst_indices, cache_size
+        src_k, dst_k, src_v, dst_v, src_indices, dst_indices, cache_size, block_quota
     )
 
 
@@ -26,6 +27,7 @@ def transfer_kv_all_layer(
     num_layers: int,
     src_layer_offset: int,
     dst_layer_offset: int,
+    block_quota: int = 4,
 ):
     torch.ops.sgl_kernel.transfer_kv_all_layer(
         src_k,
@@ -38,4 +40,5 @@ def transfer_kv_all_layer(
         num_layers,
         src_layer_offset,
         dst_layer_offset,
+        block_quota,
     )
