@@ -63,8 +63,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
 
-        print(f"{request_obj=}")
-
         if isinstance(image_data, str):
             image_data = [image_data]
         audio_data = request_obj.audio_data
@@ -80,7 +78,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             max_req_input_len=max_req_input_len,
         )
-        print(f"11 {base_output=}")
 
         def smart_resize(
             height: int,
@@ -147,14 +144,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if base_output.images:
             resize_tasks = [resize_image_async(image) for image in resized_images]
             resized_images = await asyncio.gather(*resize_tasks)
-        print(f"{base_output=}")
         res = self.process_mm_data(
             input_text=base_output.input_text,
             images=resized_images,
             audios=base_output.audios,
         )
-
-        print(f"{res=}")
 
         items = []
 
