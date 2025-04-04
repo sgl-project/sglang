@@ -199,7 +199,9 @@ class DeciModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
             else:
-                hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
