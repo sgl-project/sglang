@@ -75,14 +75,15 @@ class HttpServerEngineAdapter:
     ):
 
         print(f"update_weights_from_tensor of HttpServerEngineAdapter")
+        serialized_named_tensors = HttpSerializer.serialize(
+            MultiprocessingSerializer.serialize(named_tensors)
+        )
+
         response = requests.post(
             self._url("update_weights_from_tensor"),
             json={
                 "serialized_named_tensors": [
-                    HttpSerializer.serialize(
-                        MultiprocessingSerializer.serialize(named_tensors)
-                    )
-                    for _ in range(self.server_args.tp_size)
+                    serialized_named_tensors for _ in range(self.server_args.tp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
