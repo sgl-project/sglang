@@ -32,7 +32,6 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
     is_flashinfer_available,
-    is_hip,
     is_port_available,
     is_remote_url,
     is_valid_ipv6_address,
@@ -222,7 +221,7 @@ class ServerArgs:
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_hip():
+        if current_platform.is_hip():
             self.disable_shared_experts_fusion = True
 
         # Set mem fraction static, which depends on the tensor parallelism size
@@ -369,7 +368,7 @@ class ServerArgs:
             self.load_format = "remote"
 
         # AMD-specific Triton attention KV splits default number
-        if is_hip():
+        if current_platform.is_hip():
             self.triton_attention_num_kv_splits = 16
 
         # PD disaggregation
