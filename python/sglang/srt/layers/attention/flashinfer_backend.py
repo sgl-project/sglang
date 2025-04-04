@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import torch._dynamo
+<<<<<<< HEAD
 torch._dynamo.config.suppress_errors = True
+=======
+>>>>>>> 6b1c019d (wraps the FlashInfer custom kernel calls with dynamo)
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1333,7 +1336,11 @@ def fast_decode_plan(
     self._rope_theta = rope_theta
 
 
+<<<<<<< HEAD
 # Add a decorator similar to the one in flashinfer_mla_backend.py
+=======
+# Add this function to make custom ops opaque to torch.compile/dynamo
+>>>>>>> 6b1c019d (wraps the FlashInfer custom kernel calls with dynamo)
 def make_custom_op_dynamo_safe(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
