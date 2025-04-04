@@ -180,6 +180,7 @@ class GenerateReqInput:
                 assert (
                     len(self.image_data) == self.batch_size
                 ), "The length of image_data should be equal to the batch size."
+                self.modalities = []
                 if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
                     # Already a list of lists, keep as is
                     for i in range(len(self.image_data)):
