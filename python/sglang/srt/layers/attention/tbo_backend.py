@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
-
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -25,7 +24,8 @@ class TboAttnBackend(AttentionBackend):
                 child.init_forward_metadata(forward_batch=forward_batch_child)
 
     def init_cuda_graph_state(self, max_bs: int):
-        for item in self._primary_and_children:
+        self.primary.init_cuda_graph_state(max_bs=max_bs)
+        for item in self.children:
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs)
 
@@ -63,7 +63,6 @@ class TboAttnBackend(AttentionBackend):
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
-        num_kv_heads: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
@@ -74,7 +73,6 @@ class TboAttnBackend(AttentionBackend):
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
-            num_kv_heads=num_kv_heads,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_sum=seq_lens_sum,
@@ -92,7 +90,6 @@ class TboAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
-            replay_num_kv_heads=num_kv_heads,
             replay_seq_lens_sum=seq_lens_sum,
             replay_seq_lens_cpu=seq_lens_cpu,
         )
@@ -110,7 +107,6 @@ class TboAttnBackend(AttentionBackend):
         # capture args
         capture_num_tokens: int = None,
         # replay args
-        replay_num_kv_heads: int = None,
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
@@ -143,7 +139,6 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=spec_info,
             capture_num_tokens=capture_num_tokens,
-            replay_num_kv_heads=replay_num_kv_heads,
             replay_seq_lens_sum=replay_seq_lens_sum,
             replay_seq_lens_cpu=replay_seq_lens_cpu,
         )
@@ -190,7 +185,6 @@ def _init_forward_metadata_cuda_graph_split(
     # capture args
     capture_num_tokens: int = None,
     # replay args
-    replay_num_kv_heads: int = None,
     replay_seq_lens_sum: int = None,
     replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
@@ -219,7 +213,6 @@ def _init_forward_metadata_cuda_graph_split(
         output_seq_lens_cpu = replay_seq_lens_cpu[seq_slice]
         ans.update(
             dict(
-                num_kv_heads=replay_num_kv_heads,
                 seq_lens_sum=output_seq_lens_cpu.sum().item(),
                 seq_lens_cpu=output_seq_lens_cpu,
             )
