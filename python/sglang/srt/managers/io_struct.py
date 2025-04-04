@@ -667,7 +667,7 @@ class ProfileReqInput:
             torch_profile = True
         if nsys_profile and torch_profile:
             raise ValueError(
-                "CUDA_PROFILER is for nsys profiling. "
+                "CUDA_PROFILER is for nsys profiler. "
                 "CPU, GPU, and MEM are for torch profiler. "
                 "nsys profiling and torch profiling cannot be used at the same time. "
                 "Please choose one of them."
