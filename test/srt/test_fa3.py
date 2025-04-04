@@ -35,15 +35,12 @@ class BaseFlashAttentionTest(unittest.TestCase):
     @classmethod
     def get_server_args(cls):
         """Return the arguments for the server launch. Override in subclasses."""
-        args = ["--trust-remote-code"]
-        if torch.cuda.is_available() and torch.version.cuda:
-            args.extend(
-                [
-                    "--enable-torch-compile",
-                    "--attention-backend",
-                    "fa3",
-                ]
-            )
+        args = [
+            "--trust-remote-code",
+            "--enable-torch-compile",
+            "--attention-backend",
+            "fa3",
+        ]
         return args
 
     @classmethod
