@@ -22,6 +22,7 @@ pip install --upgrade pip
 pip install sgl-kernel==0.0.8 --no-cache-dir
 pip install flashinfer_python==0.2.5 --find-links ${FLASHINFER_REPO} --no-cache-dir
 
+
 # Install the main package
 pip install -e "python[all]" --find-links ${FLASHINFER_REPO}
 
