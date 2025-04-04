@@ -26,8 +26,7 @@ class TestFlashinferMLA(CustomTestCase):
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
-                    "--attention-backend",
-                    "flashinfer",
+                    "--enable-flashinfer-mla",
                 ]
             )
         cls.process = popen_launch_server(
@@ -70,8 +69,8 @@ class TestFlashinferMLANoRagged(CustomTestCase):
                     "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
                     "4",
-                    "--attention-backend",
-                    "flashinfer",
+                    "--enable-flashinfer-mla",
+                    "--flashinfer-mla-disable-ragged",
                 ]
             )
         cls.process = popen_launch_server(
@@ -126,8 +125,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-num-draft-tokens",
                     "4",
-                    "--attention-backend",
-                    "flashinfer",
+                    "--enable-flashinfer-mla",
                 ]
             )
         cls.process = popen_launch_server(
