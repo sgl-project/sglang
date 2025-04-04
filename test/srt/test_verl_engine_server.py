@@ -186,13 +186,9 @@ def _run_subprocess(
             trust_remote_code=True,
             dtype=get_dtype_str(_TORCH_DTYPE),
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
-            launch_server=True,
-            server_args=ServerArgs(
-                model_path=model_path,
-                tp_size=tp_size,
-                port=PORT,
-                mem_fraction_static=0.5,
-            ),
+            backend="server",
+            enable_memory_saver=True,
+            port=PORT,
         )
         print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
 
@@ -211,7 +207,7 @@ def _run_subprocess(
         time.sleep(1)
         engine.resume_memory_occupation()
         print("Memory resumed")
-        time.sleep(1)
+        time.sleep(2)
         # openai API test for reference
         torch.distributed.barrier()
         if tp_rank == 0:
@@ -235,6 +231,12 @@ def _run_subprocess(
             #         timeout=20,
             #     )
             #     print(response.json())
+        print(f"subprocess[{tp_rank=}] testing direct generate API")
+        direct_response = engine.generate(
+            prompt="Hello, world!",
+            sampling_params={"temperature": 0.7, "max_new_tokens": 20},
+        )
+        print(f"Direct generate response: {direct_response}")
 
         execution_ok = True
 

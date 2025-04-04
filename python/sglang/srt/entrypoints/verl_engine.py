@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,7 @@ class VerlEngine:
         self,
         device_mesh_cpu: DeviceMesh,
         nnodes: int = 1,
+        backend: Literal["engine", "server"] = "engine",
         **kwargs,
     ):
         monkey_patch_torch_reductions()
@@ -41,28 +42,24 @@ class VerlEngine:
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
 
-        if first_rank_in_node and "launch_server" not in kwargs:
-            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = Engine(
-                **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
-            )
-        elif "launch_server" in kwargs and kwargs["launch_server"]:
-            del kwargs["launch_server"]
-            if "server_args" in kwargs:
-                # Directly load server_args
-                server_args = kwargs["server_args"]
+        if backend == "engine":
+            if first_rank_in_node:
+                os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+                self._engine = Engine(
+                    **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
+                )
             else:
-                # Construct server_args from kwargs
-                if "log_level" not in kwargs:
-                    # Do not print logs by default
-                    kwargs["log_level"] = "error"
-                server_args = ServerArgs(**kwargs)
+                self._engine = None
+
+        elif backend == "server":
             if self._tp_rank == 0:
-                self._engine = HttpServerEngineAdapter(server_args)
+                self._engine = HttpServerEngineAdapter(
+                    **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
+                )
             else:
                 self._engine = None
         else:
-            self._engine = None
+            raise ValueError(f"Unsupported backend: {backend}")
 
         dist.barrier(group=self._device_mesh_cpu.get_group())
 

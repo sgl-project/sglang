@@ -1531,6 +1531,18 @@ class MultiprocessingSerializer:
         return ForkingPickler.loads(data)
 
 
+class HttpSerializer:
+    @staticmethod
+    def serialize(data):
+        pickled = pickle.dumps(data)
+        return base64.b64encode(pickled).decode("utf-8")
+
+    @staticmethod
+    def deserialize(data):
+        pickled = base64.b64decode(data)
+        return pickle.loads(pickled)
+
+
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):

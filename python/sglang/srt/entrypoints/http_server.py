@@ -26,11 +26,13 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import AsyncIterator, Callable, Dict, Optional, Union
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import base64
+import pickle
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -81,6 +83,7 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    HttpSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -412,30 +415,30 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
-def deserialize_from_http(encoded_data):
-    import base64
-    import pickle
-
-    # Convert from base64 string back to original data
-    pickled = base64.b64decode(encoded_data)
-    return pickle.loads(pickled)
-
-
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
+    obj: Union[UpdateWeightsFromTensorReqInput, str], request: Request
 ):
-    obj.serialized_named_tensors = [
-        deserialize_from_http(item) for item in obj.serialized_named_tensors
-    ]
+    if isinstance(obj, str):
+        try:
+            obj = HttpSerializer.deserialize(obj)
+        except Exception as e:
+            return ORJSONResponse(
+                {"success": False, "message": f"Failed to decode input: {str(e)}"},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+    else:
+        obj.serialized_named_tensors = [
+            HttpSerializer.deserialize(item) for item in obj.serialized_named_tensors
+        ]
+
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
     )
     content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_distributed")

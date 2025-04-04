@@ -1,84 +1,107 @@
 import base64
 import copy
+import dataclasses
+import multiprocessing
 import pickle
 import threading
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DeviceMesh, DTensor
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_server,
+from sglang.srt.utils import (
+    HttpSerializer,
+    MultiprocessingSerializer,
+    kill_process_tree,
 )
+from sglang.test.test_utils import popen_launch_server
 
 
-def serialize_for_http(data):
-    # First pickle the data, then convert to base64 for safe HTTP transmission
-    pickled = pickle.dumps(data)
-    return base64.b64encode(pickled).decode("utf-8")
+def launch_server_worker(server_args: ServerArgs):
+    launch_server(server_args)
 
 
-import dataclasses
+def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+
+    p = multiprocessing.Process(target=launch_server_worker, args=(server_args,))
+    p.start()
+
+    base_url = server_args.url()
+    timeout = 120.0
+    start_time = time.time()
+
+    with requests.Session() as session:
+        while time.time() - start_time < timeout:
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {server_args.api_key}",
+                }
+                response = session.get(f"{base_url}/health_generate", headers=headers)
+                if response.status_code == 200:
+                    return p
+            except requests.RequestException:
+                pass
+
+            if not p.is_alive():
+                raise Exception("Server process terminated unexpectedly.")
+
+            time.sleep(2)
+
+    p.terminate()
+    raise TimeoutError("Server failed to start within the timeout period.")
 
 
-def server_args_to_launch_params(args: ServerArgs, timeout: float = 120.0):
-    # 1. model path
-    model = args.model_path
+# def convert_dataclass_to_argparse(
+#     args: Any, exclude_keys: set[str] = set()
+# ) -> List[str]:
+#     """Convert a dataclass instance into a list of CLI-style arguments."""
+#     cli_args = []
+#     for field in dataclasses.fields(args):
+#         key = field.name
+#         if key in exclude_keys:
+#             continue
+#         val = getattr(args, key)
+#         cli_key = f"--{key.replace('_', '-')}"
+#         if isinstance(val, bool):
+#             if val:
+#                 cli_args.append(cli_key)
+#         elif val is not None:
+#             if isinstance(val, list):
+#                 for v in val:
+#                     cli_args.extend([cli_key, str(v)])
+#             else:
+#                 cli_args.extend([cli_key, str(val)])
+#     return cli_args
 
-    # 2. base url
-    base_url = args.url()
 
-    # 3. timeout
-    timeout = timeout
+# def server_args_to_launch_params(args: Any, timeout: float = 120.0):
+#     model = args.model_path
+#     base_url = args.url()
+#     timeout = timeout
+#     api_key = args.api_key
 
-    # 4. api key
-    api_key = args.api_key
+#     exclude_keys = {"model_path", "host", "port", "api_key"}
+#     other_args = convert_dataclass_to_argparse(args, exclude_keys=exclude_keys)
 
-    # 5. other args: convert to CLI style, excluding handled keys
-    exclude_keys = {"model_path", "host", "port", "api_key"}
-    other_args = []
-
-    for field in dataclasses.fields(ServerArgs):
-        key = field.name
-        if key in exclude_keys:
-            continue
-        val = getattr(args, key)
-        if isinstance(val, bool):
-            if val:
-                other_args.append(f"--{key.replace('_', '-')}")
-        elif val is not None:
-            if isinstance(val, list):
-                for v in val:
-                    other_args.extend([f"--{key.replace('_', '-')}", str(v)])
-            else:
-                other_args.extend([f"--{key.replace('_', '-')}", str(val)])
-
-    return model, base_url, timeout, api_key, other_args
+#     return model, base_url, timeout, api_key, other_args
 
 
 class HttpServerEngineAdapter:
-    def __init__(self, server_args: ServerArgs):
-        self.server_args = copy.deepcopy(server_args)
+    def __init__(self, **kwargs):
+        self.server_args = ServerArgs(**kwargs)
+        # self.server_args = copy.deepcopy(server_args)
         print(f"launch_server_from_verl_engine {self.server_args.port}")
+        self.process = launch_server_process(self.server_args)
 
-        model, base_url, timeout, api_key, other_args = server_args_to_launch_params(
-            self.server_args
-        )
-        self.process = popen_launch_server(
-            model=model,
-            base_url=base_url,
-            timeout=timeout,
-            api_key=api_key,
-            other_args=other_args + ["--enable-memory-saver"],
-        )
+    def _url(self, path: str) -> str:
+        """Construct full URL for server endpoint."""
+        return f"http://{self.server_args.host}:{self.server_args.port}/{path}"
 
     def update_weights_from_tensor(
         self,
@@ -88,11 +111,11 @@ class HttpServerEngineAdapter:
     ):
 
         print(f"update_weights_from_tensor of HttpServerEngineAdapter")
-        return requests.post(
-            f"http://localhost:{self.server_args.port}/update_weights_from_tensor",
+        response = requests.post(
+            self._url("update_weights_from_tensor"),
             json={
                 "serialized_named_tensors": [
-                    serialize_for_http(
+                    HttpSerializer.serialize(
                         MultiprocessingSerializer.serialize(named_tensors)
                     )
                     for _ in range(self.server_args.tp_size)
@@ -101,6 +124,8 @@ class HttpServerEngineAdapter:
                 "flush_cache": flush_cache,
             },
         )
+        response.raise_for_status()
+        return response.json()
 
     def shutdown(self):
         kill_process_tree(self.process.pid)
@@ -118,12 +143,6 @@ class HttpServerEngineAdapter:
         lora_path=None,
         custom_logit_processor=None,
     ):
-        """Implements text generation functionality by forwarding the request to the veRL Engine via HTTP.
-
-        This method packages all generation parameters into a JSON payload, filters out any None values,
-        and sends the request to the locally running server. It then returns the parsed response or
-        raises an exception if the generation fails.
-        """
         payload = {
             "text": prompt,
             "sampling_params": sampling_params,
@@ -139,31 +158,16 @@ class HttpServerEngineAdapter:
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}
 
-        response = requests.post(
-            f"http://localhost:{self.server_args.port}/generate", json=payload
-        )
-
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise Exception(f"Generate request failed: {response.text}")
+        response = requests.post(self._url("generate"), json=payload)
+        response.raise_for_status()
+        return response.json()
 
     def release_memory_occupation(self):
-        """release memory occupation by HTTP"""
-        response = requests.post(
-            f"http://localhost:{self.server_args.port}/release_memory_occupation",
-            json={},
-        )
-        if response.status_code != 200:
-            raise Exception(f"Failed to release memory: {response.text}")
-        return response
+        response = requests.post(self._url("release_memory_occupation"), json={})
+        response.raise_for_status()
+        return response.json()
 
     def resume_memory_occupation(self):
-        """resume memory occupation by HTTP"""
-        response = requests.post(
-            f"http://localhost:{self.server_args.port}/resume_memory_occupation",
-            json={},
-        )
-        if response.status_code != 200:
-            raise Exception(f"Failed to resume memory: {response.text}")
-        return response
+        response = requests.post(self._url("resume_memory_occupation"), json={})
+        response.raise_for_status()
+        return response.json()
