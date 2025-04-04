@@ -837,7 +837,7 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
                     },
                     {
                         "type": "text",
-                        "text": "Here is an image and audio. Please first describe the image in a very short sentence, and then repeat the exact words from the audio",
+                        "text": "I have an image and audio, which are not related at all. Please:  1. Describe the image in a sentence, 2. Repeat the exact words from the audio I provided. Be exact",
                     },
                 ],
             },
@@ -876,47 +876,9 @@ class TestMinicpmoServer(TestOpenAIOmniServer):
                 "minicpmo",
                 "--mem-fraction-static",
                 "0.7",
-                # "--tp=2",
             ],
         )
         cls.base_url += "/v1"
-
-    def test_mixed_modality_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                    },
-                    {
-                        "type": "audio_url",
-                        "audio_url": {"url": AUDIO_TRUMP_SPEECH_URL},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Here is an image and audio. Please first describe the image in a very short sentence, and then repeat exactly the person says in the audio",
-                    },
-                ],
-            },
-        ]
-        response = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=128,
-            stream=False,
-        )
-
-        text = response.choices[0].message.content
-
-        print("-" * 30)
-        print(f"Mixed modality response:\n{text}")
-        print("-" * 30)
-
-        self.verify_single_image_response(response=response)
 
 
 if __name__ == "__main__":
