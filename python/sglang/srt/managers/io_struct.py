@@ -20,9 +20,13 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
-from PIL.Image import Image
+# handle serialization of Image for pydantic
+if TYPE_CHECKING:
+    from PIL.Image import Image
+else:
+    Image = Any
 
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
