@@ -144,7 +144,7 @@ def moe_align_block_size_triton(
             [32, 64, 128, 256],  # block_size
             [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
             [1, 2, 4, 8, 16, 32, 64],  # topk
-            [64, 160, 256],  #  num_experts
+            [64, 160, 256, 257, 260, 264],  #  num_experts
         )
     ),
 )

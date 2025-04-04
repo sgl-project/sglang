@@ -51,7 +51,6 @@ except ImportError:
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -203,6 +202,8 @@ def get_linear_quant_method(
 
 
 def gptq_get_quant_method(self, layer, prefix):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
 
