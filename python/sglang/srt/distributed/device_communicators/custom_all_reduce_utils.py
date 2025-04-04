@@ -11,11 +11,11 @@ import tempfile
 from itertools import product
 from typing import Dict, List, Optional, Sequence
 
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.utils import cuda_device_count_stateless
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +218,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
 
     is_distributed = dist.is_initialized()
 
-    num_dev = cuda_device_count_stateless()
+    num_dev = torch.cuda.device_count()
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices is None:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))

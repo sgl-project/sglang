@@ -81,6 +81,8 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
 
 logger = logging.getLogger(__name__)
@@ -1220,10 +1222,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = (
-                    (len(req.prefix_indices) + server_args.page_size - 1)
-                    // server_args.page_size
-                    * server_args.page_size
-                )
+                    len(req.prefix_indices) // server_args.page_size
+                ) * server_args.page_size
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
                 ]
