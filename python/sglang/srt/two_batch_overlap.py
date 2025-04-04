@@ -15,6 +15,7 @@ from typing import (
 )
 
 import torch
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 if TYPE_CHECKING:
@@ -22,9 +23,9 @@ if TYPE_CHECKING:
 
 
 def compute_split_seq_index(
-        forward_mode: "ForwardMode",
-        num_tokens: int,
-        extend_lens: Optional[Sequence[int]],
+    forward_mode: "ForwardMode",
+    num_tokens: int,
+    extend_lens: Optional[Sequence[int]],
 ) -> Optional[int]:
     if forward_mode.is_extend():
         assert extend_lens is not None
@@ -54,9 +55,9 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 
 def compute_split_token_index(
-        split_seq_index: int,
-        forward_mode: "ForwardMode",
-        extend_seq_lens: Optional[Sequence[int]],
+    split_seq_index: int,
+    forward_mode: "ForwardMode",
+    extend_seq_lens: Optional[Sequence[int]],
 ) -> int:
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
@@ -68,10 +69,10 @@ def compute_split_token_index(
 
 
 def model_forward_split_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: "ForwardBatch",
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
 ) -> Tuple[Dict, Dict]:
     return tuple(
         [
@@ -83,18 +84,18 @@ def model_forward_split_inputs(
                 tbo_subbatch_index=tbo_subbatch_index,
             )
             for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
-        )
+                forward_batch.tbo_children
+            )
         ]
     )
 
 
 def _model_forward_filter_inputs(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        positions: torch.Tensor,
-        output_forward_batch: "ForwardBatch",
-        tbo_subbatch_index: int,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
+    output_forward_batch: "ForwardBatch",
+    tbo_subbatch_index: int,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     return dict(
@@ -134,10 +135,10 @@ Stage = List[ExecutionOperation]
 
 
 def model_forward_execute_two_batch(
-        inputs,
-        operations_a: List[Operation],
-        operations_b: List[Operation],
-        delta_stages: int,
+    inputs,
+    operations_a: List[Operation],
+    operations_b: List[Operation],
+    delta_stages: int,
 ):
     splitted_inputs = model_forward_split_inputs(**inputs)
     inputs_a, inputs_b = splitted_inputs
@@ -147,7 +148,9 @@ def model_forward_execute_two_batch(
     return model_forward_merge_outputs(output_a, output_b)
 
 
-def _execute_two_batch_raw(inputs_a, inputs_b, operations_a, operations_b, delta_stages: int):
+def _execute_two_batch_raw(
+    inputs_a, inputs_b, operations_a, operations_b, delta_stages: int
+):
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
     executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
@@ -222,7 +225,7 @@ class _StateDict:
             super().__setattr__(key, value)
             return
         assert (
-                key not in self._data
+            key not in self._data
         ), f"`{key}` already exist, are you sure you want to override it?"
         self._data[key] = value
 
@@ -246,7 +249,7 @@ def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:
 
 
 def _chunk_by_separator(
-        items: List[Any], is_separator: Callable[[Any], bool]
+    items: List[Any], is_separator: Callable[[Any], bool]
 ) -> Generator[List[Any], None, None]:
     pending_items = []
     for item in items:
@@ -268,6 +271,6 @@ def _decorate_operation(operation: Operation, debug_name_prefix: str):
         return operation
     return ExecutionOperation(
         debug_name=debug_name_prefix
-                   + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
+        + getattr(operation, "__name__", "unknown").replace("_forward_tbo_op_", ""),
         fn=operation,
     )

@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -168,7 +169,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -919,7 +920,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                :, : self.server_args.ds_heavy_channel_num
+                    :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -1007,7 +1008,8 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
         print(
-            f'hi forward_raw {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=}')
+            f"hi forward_raw {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=}"
+        )
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner

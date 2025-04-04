@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput

@@ -25,6 +25,7 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
+
 from sglang.srt import fine_grained_benchmark
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -70,7 +71,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-                 "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--profile-activities",
@@ -87,8 +88,11 @@ class BenchArgs:
             "--enable-expert-distribution-recorder",
             action="store_true",
         )
-        parser.add_argument("--expert-distribution-recorder-dir", type=str,
-                            default=BenchArgs.expert_distribution_recorder_dir)
+        parser.add_argument(
+            "--expert-distribution-recorder-dir",
+            type=str,
+            default=BenchArgs.expert_distribution_recorder_dir,
+        )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
 
     @classmethod
@@ -208,25 +212,45 @@ def run_one_case(
 def _process_expert_distribution_record(bench_args, response):
     response.raise_for_status()
     data = response.json()
-    path = Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
+    path = (
+        Path(bench_args.expert_distribution_recorder_dir) / "expert_distribution.json"
+    )
     print(f"Write expert_distribution_recorder information to {path}", flush=True)
     path.write_text(json.dumps(data))
 
     import polars as pl
+
     df = pl.read_json(path, infer_schema_length=1000000)
-    df = df.with_row_index('temp_index')
-    df = df.explode('physical_count')
-    df = df.with_columns(layer_id=(pl.col('physical_count').cum_count() - 1).over('temp_index'))
-    df = df.drop('temp_index')
+    df = df.with_row_index("temp_index")
+    df = df.explode("physical_count")
     df = df.with_columns(
-        total_num_tokens=pl.col('physical_count').list.sum(),
-        max_expert_num_tokens=pl.col('physical_count').list.max(),
-        min_expert_num_tokens=pl.col('physical_count').list.min())
-    df = df.filter(pl.col('total_num_tokens') > 0)
-    df = df.sort('forward_pass_id', 'layer_id', 'gatherer_key', 'rank')
-    df = df.select('forward_pass_id', 'layer_id', 'gatherer_key', 'rank', 'total_num_tokens', 'max_expert_num_tokens',
-                   'min_expert_num_tokens', 'physical_count')
-    with pl.Config(fmt_str_lengths=1000, tbl_cols=-1, tbl_rows=-1, fmt_table_cell_list_len=1000, tbl_width_chars=-1):
+        layer_id=(pl.col("physical_count").cum_count() - 1).over("temp_index")
+    )
+    df = df.drop("temp_index")
+    df = df.with_columns(
+        total_num_tokens=pl.col("physical_count").list.sum(),
+        max_expert_num_tokens=pl.col("physical_count").list.max(),
+        min_expert_num_tokens=pl.col("physical_count").list.min(),
+    )
+    df = df.filter(pl.col("total_num_tokens") > 0)
+    df = df.sort("forward_pass_id", "layer_id", "gatherer_key", "rank")
+    df = df.select(
+        "forward_pass_id",
+        "layer_id",
+        "gatherer_key",
+        "rank",
+        "total_num_tokens",
+        "max_expert_num_tokens",
+        "min_expert_num_tokens",
+        "physical_count",
+    )
+    with pl.Config(
+        fmt_str_lengths=1000,
+        tbl_cols=-1,
+        tbl_rows=-1,
+        fmt_table_cell_list_len=1000,
+        tbl_width_chars=-1,
+    ):
         print(df, flush=True)
 
 
@@ -290,8 +314,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 base_url + "/stop_expert_distribution_record"
             ).raise_for_status()
             _process_expert_distribution_record(
-                bench_args,
-                requests.post(base_url + "/dump_expert_distribution_record")
+                bench_args, requests.post(base_url + "/dump_expert_distribution_record")
             )
         if bench_args.profile:
             # TODO extract to PR
