@@ -23,6 +23,11 @@ import tempfile
 from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.platforms import (
+    recommended_platform,
+    resolve_available_platforms,
+    set_current_platform,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -56,7 +61,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
-    device: Optional[str] = None
+    device: Optional[str] = recommended_platform()
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
@@ -194,6 +199,9 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
+        # Init Platform
+        set_current_platform(self.device)
+
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -519,7 +527,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help=f"The device to use {resolve_available_platforms()}. Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",

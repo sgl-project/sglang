@@ -16,6 +16,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import importlib
 import io
 import ipaddress
 import itertools
@@ -630,6 +631,15 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
             f"{pkg} with minimum required version {min_version} is not installed. "
             + message
         )
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):

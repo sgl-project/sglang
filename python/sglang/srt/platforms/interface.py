@@ -10,8 +10,11 @@ from platform import uname
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple, Union
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
+else:
+    ServerArgs = None
+    ModelConfig = None
 
 import logging
 
