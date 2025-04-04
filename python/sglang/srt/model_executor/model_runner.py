@@ -1006,7 +1006,8 @@ class ModelRunner:
     def _forward_raw(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
-        print(f'hi forward_raw {forward_batch.forward_mode=} {forward_batch.tbo_split_seq_index=}')
+        print(
+            f'hi forward_raw {forward_batch.forward_mode=} {forward_batch.batch_size=} {forward_batch.tbo_split_seq_index=}')
         if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
