@@ -145,6 +145,7 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_dp_mla": server_args.enable_dp_mla,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_mode": server_args.deepep_mode,
@@ -315,7 +316,10 @@ class ModelRunner:
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
             )
-            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+            initialize_model_parallel(
+                tensor_model_parallel_size=self.tp_size,
+                enable_dp_mla=self.server_args.enable_dp_mla,
+            )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
