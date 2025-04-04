@@ -218,7 +218,7 @@ class DeciLMForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = DeciModel(config=config, quant_config=quant_config, prefix=prefix)
 
-        if self.config.tie_e:
+        if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
