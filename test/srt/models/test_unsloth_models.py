@@ -51,7 +51,10 @@ class TestUnslothPhi4Bnb4bit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--load-format",
+                "bitsandbytes",
+            ],
         )
 
     @classmethod
@@ -82,7 +85,10 @@ class TestUnslothPhi4UnslothBnb4bit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--load-format",
+                "bitsandbytes",
+            ],
         )
 
     @classmethod
@@ -144,7 +150,10 @@ class TestUnslothPhi4MiniBnb4bit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--load-format",
+                "bitsandbytes",
+            ],
         )
 
     @classmethod
@@ -175,7 +184,10 @@ class TestUnslothPhi4MiniUnslothBnb4bit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[],
+            other_args=[
+                "--load-format",
+                "bitsandbytes",
+            ],
         )
 
     @classmethod
