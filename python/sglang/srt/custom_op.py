@@ -104,3 +104,58 @@ if _is_cuda:
             )  # True for static
 
         return output, scale
+
+elif _is_hip:
+    from aiter import dynamic_per_token_scaled_fp8_quant, static_scaled_fp8_quant
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize input tensor to FP8 (8-bit floating point) format.
+
+        Args:
+            input (torch.Tensor): Input tensor to be quantized
+            scale (Optional[torch.Tensor]): Pre-computed scaling factor for static quantization.
+                If None, scales will be computed dynamically.
+            use_per_token_if_dynamic (bool): When using dynamic scaling (scale=None),
+                determines the quantization granularity:
+                - True: compute scale per token
+                - False: compute single scale per tensor
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - quantized_tensor: The FP8 quantized version of input
+                - scale_tensor: The scaling factors used for quantization
+
+        Raises:
+            AssertionError: If input is not 2D or if static scale's numel != 1
+        """
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        shape = input.shape
+        out_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+        if num_token_padding:
+            shape = (max(num_token_padding, input.shape[0]), shape[1])
+        output = torch.empty(shape, device=input.device, dtype=out_dtype)
+
+        if scale is None:
+            # Dynamic scaling
+            if use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                dynamic_per_token_scaled_fp8_quant(output, input, scale)
+            else:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                static_scaled_fp8_quant(output, input, scale)
+        else:
+            # Static scaling
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
+            static_scaled_fp8_quant(output, input, scale)
+
+        return output, scale

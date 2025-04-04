@@ -41,15 +41,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 _buffer = None
 
@@ -740,7 +739,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
 
             for expert in range(layer.num_experts_per_partition):
-                if _is_cuda:
+                if _is_cuda or _is_hip:
                     w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
                         sgl_scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                     )

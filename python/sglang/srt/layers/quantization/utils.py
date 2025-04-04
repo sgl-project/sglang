@@ -5,11 +5,12 @@ from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 else:
     from vllm import _custom_ops as vllm_ops
@@ -116,7 +117,7 @@ def requantize_with_max_scale(
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
             weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
-            if _is_cuda:
+            if _is_cuda or _is_hip:
                 weight[start:end, :], _ = sgl_scaled_fp8_quant(weight_dq, max_w_scale)
             else:
                 weight[start:end, :], _ = vllm_ops.scaled_fp8_quant(
