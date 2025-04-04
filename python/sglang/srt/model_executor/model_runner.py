@@ -776,7 +776,6 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
         else:
-            logger.info(f"ModelRunner::init_memory_poool, the head_num:{self.model_config.get_num_kv_heads(get_attention_tp_size())}")
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

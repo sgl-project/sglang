@@ -214,9 +214,7 @@ class ModelConfig:
             #lama-3_3-Nemotron-Super-49B-v1
             if attr == "block_configs":
                 block_configs = getattr(self.hf_text_config, attr, None)
-                
                 if block_configs is not None:
-                    logger.info(f"2 attr:{attr} and  block_configs is not None:{block_configs is not None} and num_kv_heads:{self.hf_text_config.num_attention_heads //  block_configs[0].attention.n_heads_in_group}")
                     return self.hf_text_config.num_attention_heads //  block_configs[0].attention.n_heads_in_group
             if num_kv_heads is not None:
                 return num_kv_heads

@@ -367,7 +367,6 @@ class MHATokenToKVPool(KVCache):
             self.v_buffer[layer_id][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            logger.info(f"self.k_buffer[0].shape:{self.k_buffer[0].shape} and cache_k.shape:{cache_k.shape}")
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
 
