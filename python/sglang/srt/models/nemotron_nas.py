@@ -18,10 +18,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -33,12 +29,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
