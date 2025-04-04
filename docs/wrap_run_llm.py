@@ -31,17 +31,18 @@ def process_html_files(build_dir):
                     f.write(modified_content)
 
 
+
 def main():
     # Get the build directory path
     build_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "_build", "html"
     )
-
     # Process all HTML files
     if os.path.exists(build_dir):
         process_html_files(build_dir)
     else:
         print(f"Build directory not found: {build_dir}")
+
 
 
 if __name__ == "__main__":

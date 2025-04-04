@@ -1,3 +1,5 @@
+from sglang.srt.utils import DeepEPMode
+
 try:
     from deep_ep import Buffer
 
@@ -98,7 +100,7 @@ class DeepEPDispatcher:
         num_local_experts: int = None,
         hidden_size: int = None,
         params_dtype: torch.dtype = None,
-        deepep_mode: str = "auto",
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
@@ -120,13 +122,13 @@ class DeepEPDispatcher:
         self.deepep_mode = deepep_mode
         self.handle = None
 
-        if self.deepep_mode in ["normal", "auto"]:  # for normal / auto mode
+        if self.deepep_mode.enable_normal():
             self.buffer_normal = get_buffer_normal(
                 self.group, self.hidden_size * self.params_bytes
             )
             self.async_finish = async_finish
             self.src2dst = None
-        if self.deepep_mode in ["low_latency", "auto"]:  # for low_latency / auto mode
+        if self.deepep_mode.enable_low_latency():
             """
             num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
             https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
@@ -196,9 +198,8 @@ class DeepEPDispatcher:
         )
         expected_m = 0
 
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             (
                 hidden_states,
                 topk_idx,
@@ -210,9 +211,7 @@ class DeepEPDispatcher:
                 reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
                     hidden_states, topk_idx, fp8_dtype=hidden_states.dtype
                 )
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             expected_m = (
                 hidden_states.shape[0]
                 * self.buffer_low_latency.group_size
@@ -354,9 +353,8 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ) -> torch.Tensor:
-        if self.deepep_mode == "normal" or (
-            self.deepep_mode == "auto" and not forward_mode.is_decode()
-        ):
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        if resolved_deepep_mode == DeepEPMode.normal:
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
                 output = torch.empty(
@@ -384,9 +382,7 @@ class DeepEPDispatcher:
                 output,
             )
             event.current_stream_wait() if self.async_finish else ()
-        elif self.deepep_mode == "low_latency" or (
-            self.deepep_mode == "auto" and forward_mode.is_decode()
-        ):
+        elif resolved_deepep_mode == DeepEPMode.low_latency:
             hidden_states, event, hook = self.combine_low_latency(
                 hidden_states,
                 topk_idx,
