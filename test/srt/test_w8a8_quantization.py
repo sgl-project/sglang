@@ -9,11 +9,12 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestW8A8(unittest.TestCase):
+class TestW8A8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"

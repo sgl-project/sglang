@@ -1,32 +1,30 @@
 # Deploy On Kubernetes
 
-This docs is for deploying a RoCE Network-Based SGLANG Two-Node Inference Service on a Kubernetes (K8S) Cluster.
+This document is for deploying a RoCE network-based SGLang two-node inference service on a Kubernetes (K8S) cluster.
 
-LeaderWorkerSet (LWS) is a Kubernetes API that aims to address common deployment patterns of AI/ML inference workloads. A major use case is for multi-host/multi-node distributed inference.
+[LeaderWorkerSet (LWS)](https://github.com/kubernetes-sigs/lws) is a Kubernetes API that aims to address common deployment patterns of AI/ML inference workloads. A major use case is for multi-host/multi-node distributed inference.
 
-Sglang can also be deployed with LWS on Kubernetes for distributed model serving.
+SGLang can also be deployed with LWS on Kubernetes for distributed model serving.
 
 Please see this guide for more details on deploying SGLang on Kubernetes using LWS.
 
-Here we take the deployment of deepseekR1 as an example.
+Here we take the deployment of DeepSeek-R1 as an example.
 
 ## Prerequisites
 
-1. At least two Kubernetes nodes, each with 2 H20 systems and 8 GPUs, are required.
+1. At least two Kubernetes nodes, each with two H20 systems and eight GPUs, are required.
 
-2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the instructions in this [document](https://github.com/kubernetes-sigs/lws/blob/main/docs/setup/install.md)
+2. Make sure your K8S cluster has LWS correctly installed. If it hasn't been set up yet, please follow the [installation instructions](https://github.com/kubernetes-sigs/lws/blob/main/site/content/en/docs/installation/_index.md).
 
+## Basic example
 
-## Basic Example
-
-The Basic Example documentation is introduced here: [visit this guide](https://github.com/kubernetes-sigs/lws/tree/main/docs/examples/sglang)
+For the basic example documentation, refer to [Deploy Distributed Inference Service with SGLang and LWS on GPUs](https://github.com/kubernetes-sigs/lws/tree/main/docs/examples/sglang).
 
 However, that document only covers the basic NCCL socket mode.
 
 In this section, we’ll make some simple modifications to adapt the setup to the RDMA scenario.
 
-
-## RDMA ROCE case
+## RDMA RoCE case
 
 * Check your env:
 
@@ -237,12 +235,11 @@ sglang-0-1     1/1     Running   0              9s
 
 Wait for the sglang leader (`sglang-0`) status to change to 1/1, which indicates it is `Ready`.
 
-Once successful, you should see output like this:
-
 You can use the command `kubectl logs -f sglang-0` to view the logs of the leader node.
 
-```text
+Once successful, you should see output like this:
 
+```text
 [2025-02-17 05:27:24 TP1] Capture cuda graph end. Time elapsed: 84.89 s
 [2025-02-17 05:27:24 TP6] max_total_num_tokens=712400, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=50, context_len=163840
 [2025-02-17 05:27:24 TP0] max_total_num_tokens=712400, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=50, context_len=163840
@@ -260,24 +257,24 @@ You can use the command `kubectl logs -f sglang-0` to view the logs of the leade
 [2025-02-17 05:27:25 TP0] Prefill batch. #new-seq: 1, #new-token: 7, #cached-token: 0, cache hit rate: 0.00%, token usage: 0.00, #running-req: 0, #queue-req: 0
 [2025-02-17 05:27:32] INFO:     127.0.0.1:48924 - "POST /generate HTTP/1.1" 200 OK
 [2025-02-17 05:27:32] The server is fired up and ready to roll!
-
 ```
 
-if not successfully startup, please follow this steps to check or see the remaining issues... thanks.
+If it doesn’t start up successfully, please follow these steps to check for any remaining issues. Thanks!
 
 ### Debug
 
-* Set `NCCL_DEBUG=TRACE` to check if it is a nccl communication problem
+* Set `NCCL_DEBUG=TRACE` to check if it is a NCCL communication problem.
 
 This should resolve most NCCL-related issues.
 
-***Noticed: If you find that NCCL_DEBUG=TRACE is not effective in the container environment, but the process is stuck or you encounter hard-to-diagnose issues, try switching to a different container image. Some images may not handle standard error output properly.***
+***Notice: If you find that NCCL_DEBUG=TRACE is not effective in the container environment, but the process is stuck or you encounter hard-to-diagnose issues, try switching to a different container image. Some images may not handle standard error output properly.***
 
-#### ROCE scenario
+#### RoCE scenario
 
 * Please make sure that RDMA devices are available in the cluster environment.
-* Please make sure that the nodes in the cluster have mellanox NICs with RoCE. In this example, we use mellanox ConnectX 5 model NICs, and the proper OFED driver has been installed, if not, please refer to the document Install OFED Driver to install the driver.
-* Env Check:
+* Please make sure that the nodes in the cluster have Mellanox NICs with RoCE. In this example, we use Mellanox ConnectX 5 model NICs, and the proper OFED driver has been installed. If not, please refer to the document [Install OFED Driver](https://docs.nvidia.com/networking/display/mlnxofedv461000/installing+mellanox+ofed) to install the driver.
+* Check your env:
+
   ```shell
   $ lspci -nn | grep Eth | grep Mellanox
   0000:7f:00.0 Ethernet controller [0200]: Mellanox Technologies MT43244 BlueField-3 integrated ConnectX-7 network controller [15b3:a2dc] (rev 01)
@@ -289,12 +286,16 @@ This should resolve most NCCL-related issues.
   0001:a2:00.0 Ethernet controller [0200]: Mellanox Technologies MT43244 BlueField-3 integrated ConnectX-7 network controller [15b3:a2dc] (rev 01)
   0001:a2:00.1 Ethernet controller [0200]: Mellanox Technologies MT43244 BlueField-3 integrated ConnectX-7 network controller [15b3:a2dc] (rev 01)
   ```
-* ofed driver
+
+* Check the OFED driver:
+
   ```shell
-   ofed_info -s
+  ofed_info -s
   OFED-internal-23.07-0.5.0:
   ```
-* rdma link show and check ib dev
+
+* Show RDMA link status and check IB devices:
+
   ```shell
   $ rdma link show
   8/1: mlx5_bond_0/1: state ACTIVE physical_state LINK_UP netdev reth0
@@ -308,22 +309,25 @@ This should resolve most NCCL-related issues.
   10/1: mlx5_bond_2/1: state ACTIVE physical_state LINK_UP netdev reth4
   11/1: mlx5_bond_3/1: state ACTIVE physical_state LINK_UP netdev reth6
   ```
-* test roce network speed in th host
- ```shell
+
+* Test RoCE network speed on the host:
+
+  ```shell
   yum install qperf
   # for server：
-  excute qperf
+  execute qperf
   # for client
   qperf -t 60 -cm1 <server_ip>   rc_rdma_write_bw
-```
-
-* check rdma accessible in  your container...
- ```shell
-   # ibv_devices
-   # ibv_devinfo
   ```
 
-## Keys to Success
+* Check RDMA accessible in your container:
+
+  ```shell
+  # ibv_devices
+  # ibv_devinfo
+  ```
+
+## Keys to success
 
 * In the YAML configuration above, pay attention to the NCCL environment variable. For older versions of NCCL, you should check the NCCL_IB_GID_INDEX environment setting.
 * NCCL_SOCKET_IFNAME is also crucial, but in a containerized environment, this typically isn’t an issue.
@@ -334,8 +338,8 @@ This should resolve most NCCL-related issues.
 ## Remaining issues
 
 * In Kubernetes, Docker, or Containerd environments, we use hostNetwork to prevent performance degradation.
-* We utilize privileged mode, which  isn’t secure. Additionally, in containerized environments, GPU isolation cannot be fully achieved.
+* We utilize privileged mode, which  isn’t secure. Additionally, in containerized environments, full GPU isolation cannot be achieved.
 
-## Todo
+## TODO
 
-* Integrated with [k8s rdma share plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin).
+* Integrated with [k8s-rdma-shared-dev-plugin](https://github.com/Mellanox/k8s-rdma-shared-dev-plugin).

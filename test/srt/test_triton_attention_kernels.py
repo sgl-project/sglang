@@ -15,9 +15,10 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTritonAttention(unittest.TestCase):
+class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
@@ -265,7 +266,8 @@ class TestTritonAttention(unittest.TestCase):
             o,
             kv_indptr,
             kv_indices,
-            (attn_logits, attn_lse),
+            attn_logits,
+            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale,
@@ -329,7 +331,8 @@ class TestTritonAttention(unittest.TestCase):
             o,
             kv_indptr,
             kv_indices,
-            (attn_logits, attn_lse),
+            attn_logits,
+            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale,
@@ -353,7 +356,8 @@ class TestTritonAttention(unittest.TestCase):
             o_grouped,
             kv_indptr,
             kv_indices,
-            (attn_logits1, attn_lse1),
+            attn_logits1,
+            attn_lse1,
             num_kv_splits,
             max_kv_splits,
             sm_scale,

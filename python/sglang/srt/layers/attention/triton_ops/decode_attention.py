@@ -609,6 +609,7 @@ def decode_attention_fwd_normal(
     kv_indptr,
     kv_indices,
     attn_logits,
+    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -618,8 +619,8 @@ def decode_attention_fwd_normal(
         q,
         k_buffer,
         v_buffer,
-        attn_logits[0],
-        attn_logits[1],
+        attn_logits,
+        attn_lse,
         kv_indptr,
         kv_indices,
         num_kv_splits,
@@ -628,8 +629,8 @@ def decode_attention_fwd_normal(
         logit_cap,
     )
     _decode_softmax_reducev_fwd(
-        attn_logits[0],
-        attn_logits[1],
+        attn_logits,
+        attn_lse,
         q,
         o,
         v_buffer,
@@ -647,6 +648,7 @@ def decode_attention_fwd_grouped(
     kv_indptr,
     kv_indices,
     attn_logits,
+    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -656,8 +658,8 @@ def decode_attention_fwd_grouped(
         q,
         k_buffer,
         v_buffer,
-        attn_logits[0],
-        attn_logits[1],
+        attn_logits,
+        attn_lse,
         kv_indptr,
         kv_indices,
         num_kv_splits,
@@ -666,8 +668,8 @@ def decode_attention_fwd_grouped(
         logit_cap,
     )
     _decode_softmax_reducev_fwd(
-        attn_logits[0],
-        attn_logits[1],
+        attn_logits,
+        attn_lse,
         q,
         o,
         v_buffer,
@@ -685,14 +687,15 @@ def decode_attention_fwd(
     kv_indptr,
     kv_indices,
     attn_logits,
+    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
-    assert max_kv_splits == attn_logits[0].shape[2]
+    assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
-    assert q.shape[0] <= attn_logits[0].shape[0]
+    assert q.shape[0] <= attn_logits.shape[0]
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
@@ -706,6 +709,7 @@ def decode_attention_fwd(
             kv_indptr,
             kv_indices,
             attn_logits,
+            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale,
@@ -721,6 +725,7 @@ def decode_attention_fwd(
             kv_indptr,
             kv_indices,
             attn_logits,
+            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale,

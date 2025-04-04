@@ -3,9 +3,10 @@ import unittest
 from huggingface_hub import hf_hub_download
 
 import sglang as sgl
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestGGUF(unittest.TestCase):
+class TestGGUF(CustomTestCase):
     def test_models(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
