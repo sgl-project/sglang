@@ -70,7 +70,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -188,35 +188,24 @@ class DeepseekV2MoE(nn.Module):
             if global_server_args_dict["enable_deepep_moe"]
             else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
         )
-        if not global_server_args_dict["enable_deepep_moe"]:
-            self.experts = MoEImpl(
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                prefix=add_prefix("experts", prefix),
-            )
-        else:
-            self.experts = MoEImpl(
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                prefix=add_prefix("experts", prefix),
-                deepep_mode=global_server_args_dict["deepep_mode"],
-            )
+        self.experts = MoEImpl(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            prefix=add_prefix("experts", prefix),
+            **(
+                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
+                if global_server_args_dict["enable_deepep_moe"]
+                else {}
+            ),
+        )
 
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -264,7 +253,7 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=global_server_args_dict["deepep_mode"],
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,  # TODO
                 return_recv_hook=True,
             )
