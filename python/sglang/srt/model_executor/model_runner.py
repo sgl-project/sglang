@@ -158,6 +158,8 @@ class ModelRunner:
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
+                "n_share_experts_fusion": server_args.n_share_experts_fusion,
+                "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
             }
         )
 
