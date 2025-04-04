@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -24,7 +24,8 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.sampler import Sampler #SamplerOutput, get_sampler
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -46,7 +47,7 @@ from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.utils import(AutoWeightsLoader, IntermediateTensors, 
                              make_empty_intermediate_tensors_factory,
                             PPMissingLayer, is_pp_missing_parameter,
-                            make_layers, add_prefix) 
+                            make_layers_startend, make_layers, add_prefix) 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
     # DeciLM-specific code
@@ -157,7 +158,7 @@ class DeciLMDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -174,7 +175,7 @@ class DeciLMDecoderLayer(nn.Module):
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
-                forward_batch=intermediate_tensors
+                forward_batch=forward_batch
             )
 
         # Fully Connected
@@ -239,7 +240,7 @@ class DeciModel(nn.Module):
                 prefix=prefix,
             )
 
-        # self.start_layer, self.end_layer, self.layers = make_layers(
+        # self.start_layer, self.end_layer, self.layers = make_layers_startend(
         #     config.num_hidden_layers,
         #     get_layer,
         #     prefix=add_prefix("layers",prefix)
@@ -266,7 +267,7 @@ class DeciModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
+        forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
@@ -276,9 +277,9 @@ class DeciModel(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            assert forward_batch is not None
+            hidden_states = forward_batch["hidden_states"]
+            residual = forward_batch["residual"]
 
         kv_cache_index = 0
         #for i in range(self.start_layer, self.end_layer):
@@ -286,11 +287,11 @@ class DeciModel(nn.Module):
             layer = self.layers[i]
             if not layer._is_no_op_attention:
                 hidden_states, residual = layer(positions, hidden_states,
-                                                intermediate_tensors, residual)
+                                                forward_batch, residual)
                 kv_cache_index += 1
             else:
                 hidden_states, residual = layer(positions, hidden_states,
-                                                intermediate_tensors, residual)
+                                                forward_batch, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -479,12 +480,13 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
+        forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        model_output = self.model(input_ids, positions, intermediate_tensors,
+    ) -> LogitsProcessorOutput:
+        hidden_states = self.model(input_ids, positions, forward_batch,
                                   inputs_embeds)
-        return model_output
+        return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch)
 
     def compute_logits(
         self,
@@ -500,8 +502,8 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
         return logits
 
     def _preprocess_logits(
-        self, logits_output,#: LogitsProcessorOutput, 
-        sampling_info#: SamplingBatchInfo
+        self, logits_output: LogitsProcessorOutput, 
+        sampling_info,#: SamplingBatchInfo
     ):
         # Apply logit bias
         if sampling_info.sampling_info_done:
@@ -516,8 +518,8 @@ class DeciLMForCausalLM(nn.Module): #, SupportsLoRA, SupportsPP, HasNoOps):
 
     def sample(
         self,
-        logits_output,#: LogitsProcessorOutput,
-        forward_batch#: ForwardBatch,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Sample and compute logprobs and update logits_output.
 

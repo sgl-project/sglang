@@ -714,6 +714,25 @@ class AutoWeightsLoader:
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
     
+def make_layers_startend(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str,
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Make a list of layers with the given layer function, taking
+    pipeline parallelism into account.
+    """
+    from sglang.srt.distributed import get_pp_group, get_pp_indices
+    start_layer, end_layer = get_pp_indices(num_hidden_layers,
+                                            get_pp_group().rank_in_group,
+                                            get_pp_group().world_size)
+    modules = torch.nn.ModuleList(
+        [PPMissingLayer() for _ in range(start_layer)] + [
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
+            for idx in range(start_layer, end_layer)
+        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+    return start_layer, end_layer, modules
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
