@@ -19,7 +19,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     kill_process_tree,
 )
-from sglang.test.test_utils import popen_launch_server
 
 
 def launch_server_worker(server_args: ServerArgs):
@@ -55,41 +54,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     p.terminate()
     raise TimeoutError("Server failed to start within the timeout period.")
-
-
-# def convert_dataclass_to_argparse(
-#     args: Any, exclude_keys: set[str] = set()
-# ) -> List[str]:
-#     """Convert a dataclass instance into a list of CLI-style arguments."""
-#     cli_args = []
-#     for field in dataclasses.fields(args):
-#         key = field.name
-#         if key in exclude_keys:
-#             continue
-#         val = getattr(args, key)
-#         cli_key = f"--{key.replace('_', '-')}"
-#         if isinstance(val, bool):
-#             if val:
-#                 cli_args.append(cli_key)
-#         elif val is not None:
-#             if isinstance(val, list):
-#                 for v in val:
-#                     cli_args.extend([cli_key, str(v)])
-#             else:
-#                 cli_args.extend([cli_key, str(val)])
-#     return cli_args
-
-
-# def server_args_to_launch_params(args: Any, timeout: float = 120.0):
-#     model = args.model_path
-#     base_url = args.url()
-#     timeout = timeout
-#     api_key = args.api_key
-
-#     exclude_keys = {"model_path", "host", "port", "api_key"}
-#     other_args = convert_dataclass_to_argparse(args, exclude_keys=exclude_keys)
-
-#     return model, base_url, timeout, api_key, other_args
 
 
 class HttpServerEngineAdapter:
