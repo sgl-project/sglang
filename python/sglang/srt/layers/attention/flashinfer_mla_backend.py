@@ -10,11 +10,12 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+import torch._dynamo
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -37,6 +38,15 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
+
+# Add this function to make custom ops opaque to torch.compile/dynamo
+def make_custom_op_dynamo_safe(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Disable tracing for this function
+        with torch._dynamo.disable():
+            return func(*args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -392,15 +402,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+        
+        # Use dynamo-safe wrapper for the run call
+        @make_custom_op_dynamo_safe
+        def safe_run_call(reshaped_q, k_buffer):
+            return decode_wrapper.run(
+                reshaped_q[:, :, : layer.v_head_dim],
+                reshaped_q[:, :, layer.v_head_dim :],
+                k_buffer[:, :, : layer.v_head_dim],
+                k_buffer[:, :, layer.v_head_dim :],
+            )
+        
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
-        o = decode_wrapper.run(
-            reshaped_q[:, :, : layer.v_head_dim],
-            reshaped_q[:, :, layer.v_head_dim :],
-            reshaped_k[:, :, : layer.v_head_dim],
-            reshaped_k[:, :, layer.v_head_dim :],
-        )
+        
+        o = safe_run_call(reshaped_q, k_buffer)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
