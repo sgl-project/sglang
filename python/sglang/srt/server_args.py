@@ -161,7 +161,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
-    deepep_mode: Optional[str] = "auto"
+    deepep_mode: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -1098,6 +1098,7 @@ class ServerArgs:
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
