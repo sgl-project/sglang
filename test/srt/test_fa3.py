@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -24,6 +24,7 @@ MODEL_USED_FOR_TEST_MLA = DEFAULT_MLA_MODEL_NAME_FOR_TEST
 DATA_PATH = None
 
 
+@unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class BaseFlashAttentionTest(unittest.TestCase):
     """Base class for FlashAttention tests to reduce code duplication."""
 
@@ -84,13 +85,12 @@ class TestFlashAttention3(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         args = super().get_server_args()
-        if torch.cuda.is_available() and torch.version.cuda:
-            args.extend(
-                [
-                    "--cuda-graph-max-bs",
-                    "2",
-                ]
-            )
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+            ]
+        )
         return args
 
 
@@ -100,12 +100,11 @@ class TestFlashAttention3DisableCudaGraph(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         args = super().get_server_args()
-        if torch.cuda.is_available() and torch.version.cuda:
-            args.extend(
-                [
-                    "--disable-cuda-graph",
-                ]
-            )
+        args.extend(
+            [
+                "--disable-cuda-graph",
+            ]
+        )
         return args
 
 
@@ -115,14 +114,13 @@ class TestFlashAttention3DisableMLA(BaseFlashAttentionTest):
     @classmethod
     def get_server_args(cls):
         args = super().get_server_args()
-        if torch.cuda.is_available() and torch.version.cuda:
-            args.extend(
-                [
-                    "--cuda-graph-max-bs",
-                    "2",
-                    "--disable-mla",
-                ]
-            )
+        args.extend(
+            [
+                "--cuda-graph-max-bs",
+                "2",
+                "--disable-mla",
+            ]
+        )
         return args
 
 
