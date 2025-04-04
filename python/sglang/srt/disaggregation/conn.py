@@ -42,7 +42,7 @@ WaitingPoolType = Dict[
     int, Tuple[str, list[int], npt.NDArray[np.int32], list[int], int]
 ]
 KVSENDER_POLLING_PORT = 17788
-KVRECIVER_POLLING_PORT = 27788
+KVRECEIVER_POLLING_PORT = 27788
 
 
 class KVManager:
@@ -153,7 +153,7 @@ class KVManager:
             "tcp://"
             + remote
             + ":"
-            + str(KVRECIVER_POLLING_PORT + self.kv_args.engine_rank)
+            + str(KVRECEIVER_POLLING_PORT + self.kv_args.engine_rank)
         ).send_multipart(
             [
                 str(room).encode("ascii"),
@@ -249,8 +249,8 @@ class KVManager:
         threading.Thread(target=transfer_thread).start()
 
     def start_decode_thread(self):
-        reciver_rank_port = KVRECIVER_POLLING_PORT + self.kv_args.engine_rank
-        self.server_socket.bind("tcp://*:" + str(reciver_rank_port))
+        receiver_rank_port = KVRECEIVER_POLLING_PORT + self.kv_args.engine_rank
+        self.server_socket.bind("tcp://*:" + str(receiver_rank_port))
 
         def decode_thread():
             while True:
@@ -373,10 +373,10 @@ class KVBootstrapServer:
         self._setup_routes()
 
         # Start bootstrap server
+        self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
     def run(self):
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
 
     def _setup_routes(self):
@@ -445,7 +445,7 @@ class KVBootstrapServer:
             self._loop.close()
 
     def close(self):
-        """Shuttedown"""
+        """Shutdown"""
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
             logger.info("Stopping server loop...")
