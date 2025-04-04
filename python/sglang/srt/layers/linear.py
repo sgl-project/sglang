@@ -1,7 +1,7 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
-import logging
 import itertools
+import logging
 from abc import abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -586,7 +586,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
                     )
-                
+
                 if use_bitsandbytes_4bit:
                     index = list(itertools.accumulate([0] + self.output_sizes))
                     orig_offsets = {
@@ -595,7 +595,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     }
                     orig_offsets["total"] = (self.output_size, 0)
                     shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                        param, orig_offsets, str(shard_id))
+                        param, orig_offsets, str(shard_id)
+                    )
 
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size

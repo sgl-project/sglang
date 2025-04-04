@@ -637,7 +637,6 @@ class Phi3ForCausalLM(LlamaForCausalLM):
     pass
 
 
-
 class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
