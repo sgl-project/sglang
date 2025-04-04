@@ -16,12 +16,14 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import logging
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -30,9 +32,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_scatter,
@@ -73,7 +72,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_cuda_available, is_hip
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -83,7 +82,14 @@ if _is_cuda:
 else:
     from vllm import _custom_ops as ops
 
+if _is_hip:
+    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+        decode_attention_fwd_grouped_rope,
+    )
+
 expert_distribution_recorder = ExpertDistributionRecorder()
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -166,6 +172,12 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.n_share_experts_fusion = (
+            global_server_args_dict["n_share_experts_fusion"]
+            if global_server_args_dict["n_share_experts_fusion"] is not None
+            else 0
+        )
+
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -186,9 +198,10 @@ class DeepseekV2MoE(nn.Module):
             if global_server_args_dict["enable_deepep_moe"]
             else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
         )
+
         self.experts = MoEImpl(
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
@@ -198,9 +211,14 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
+            **(
+                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
+                if global_server_args_dict["enable_deepep_moe"]
+                else {}
+            ),
         )
 
-        if config.n_shared_experts is not None:
+        if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             if not global_server_args_dict["enable_deepep_moe"]:
@@ -225,6 +243,8 @@ class DeepseekV2MoE(nn.Module):
                 )
 
         if global_server_args_dict["enable_deepep_moe"]:
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = config.n_routed_experts
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -244,7 +264,9 @@ class DeepseekV2MoE(nn.Module):
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
                 async_finish=True,  # TODO
+                return_recv_hook=True,
             )
 
     def forward(
@@ -256,8 +278,10 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.n_shared_experts is not None:
+        if self.n_shared_experts is not None and self.n_share_experts_fusion == 0:
             shared_output = self.shared_experts(hidden_states)
+        else:
+            shared_output = None
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
@@ -299,28 +323,39 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
-        if self.tp_size > 1:
-            recv_hidden_states, reorder_topk_ids, seg_indptr = (
-                self.deepep_dispatcher.dispatch(
-                    hidden_states,
-                    topk_idx,
-                    topk_weights,
-                    self.num_experts,
-                    forward_mode,
-                )
+        if self.ep_size > 1:
+            (
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                reorder_topk_ids,
+                seg_indptr,
+                masked_m,
+                expected_m,
+            ) = self.deepep_dispatcher.dispatch(
+                hidden_states,
+                topk_idx,
+                topk_weights,
+                self.num_experts,
+                forward_mode=forward_mode,
             )
         final_hidden_states = (
             self.experts(
-                hidden_states=recv_hidden_states,
+                hidden_states=hidden_states,
                 reorder_topk_ids=reorder_topk_ids,
                 seg_indptr=seg_indptr,
+                masked_m=masked_m,
+                expected_m=expected_m,
                 forward_mode=forward_mode,
             )
             * self.routed_scaling_factor
         )
-        if self.tp_size > 1:
+        if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states, forward_mode
+                final_hidden_states,
+                topk_idx,
+                topk_weights,
+                forward_mode,
             )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -655,6 +690,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
+        self.attention_backend = global_server_args_dict["attention_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
@@ -667,6 +703,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
             )
+        elif self.attention_backend == "fa3":
+            # Flash Attention: Keep absorbing for all extend/decode
+            return False
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             return (
@@ -1096,27 +1135,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+            assert not (
+                self.attn_tp_size != 1 and self.input_is_scattered
+            ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
+
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-            )
-
-        if self.attn_tp_size != 1 and self.input_is_scattered:
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
-            residual, local_residual = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                residual,
-            )
-            tp_all_gather(
-                list(residual.tensor_split(self.attn_tp_size)), local_residual
             )
 
         # Gather
@@ -1217,6 +1244,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         if self.is_last_layer and self.attn_tp_size != 1:
+            hidden_states += residual
+            residual = None
             hidden_states, local_hidden_states = (
                 forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
                 hidden_states,
@@ -1224,19 +1253,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             tp_all_gather(
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
-            residual, local_residual = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                residual,
-            )
-            tp_all_gather(
-                list(residual.tensor_split(self.attn_tp_size)), local_residual
-            )
 
         return hidden_states, residual
 
 
 class DeepseekV2Model(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -1290,7 +1311,10 @@ class DeepseekV2Model(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -1304,7 +1328,28 @@ class DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        if (
+            global_server_args_dict.get("disable_shared_experts_fusion", False)
+            or self.config.architectures[0] != "DeepseekV3ForCausalLM"
+            or self.config.n_routed_experts != 256
+            or self.config.routed_scaling_factor != 2.5
+        ):
+            self.n_share_experts_fusion = None
+            global_server_args_dict["n_share_experts_fusion"] = None
+            logger.info(
+                "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+            )
+        elif self.n_share_experts_fusion is None:
+            global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+            self.n_share_experts_fusion = self.tp_size
+            logger.info(
+                f"Shared experts fusion optimization is default enabled in DeepSeek V3/R1, and n_share_experts_fusion is set to {self.tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
+            )
+
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1316,6 +1361,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -1338,6 +1386,43 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
+            weights_list = list(weights)
+            weights_dict = dict(weights_list)
+            suffix_list = [
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+                "gate_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight",
+                "up_proj.weight_scale_inv",
+            ]
+            names_to_remove = []
+            for moe_layer in tqdm(
+                range(
+                    self.config.first_k_dense_replace,
+                    self.config.num_hidden_layers,
+                    self.config.moe_layer_freq,
+                ),
+                desc=f"Cloning {self.n_share_experts_fusion} "
+                "replicas of the shared expert into MoE",
+            ):
+                for num_repeat in range(self.n_share_experts_fusion):
+                    for suffix in suffix_list:
+                        shared_expert_weight_name = (
+                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                        )
+                        weights_list.append(
+                            (
+                                f"model.layers.{moe_layer}."
+                                f"mlp.experts."
+                                f"{self.config.n_routed_experts + num_repeat}"
+                                f".{suffix}",
+                                weights_dict[shared_expert_weight_name].clone(),
+                            )
+                        )
+                        names_to_remove += [shared_expert_weight_name]
+            weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1350,7 +1435,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts
+            + (
+                self.n_share_experts_fusion
+                if self.n_share_experts_fusion is not None
+                else 0
+            ),
         )
 
         params_dict = dict(self.named_parameters())

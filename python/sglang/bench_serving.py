@@ -44,6 +44,12 @@ ASSISTANT_SUFFIX = "Assistant:"
 global args
 
 
+# don't want to import sglang package here
+def _get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.lower() in ("true", "1")
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -965,10 +971,11 @@ async def benchmark(
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
-    lora_name: str,
+    lora_names: List[str],
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_seperated: bool = False,
+    flush_cache: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -986,8 +993,16 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print("Starting initial single prompt test run...")
+    print(f"Starting warmup with {args.warmup_requests} sequences...")
+
+    # Use the first request for all warmup iterations
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    if lora_names != None and len(lora_names) != 0:
+        lora_name = lora_names[0]
+    else:
+        lora_name = None
+
+    # Create the test input once
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
@@ -997,17 +1012,29 @@ async def benchmark(
         lora_name=lora_name,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
+
+    # Run warmup requests
+    warmup_tasks = []
+    for _ in range(args.warmup_requests):
+        warmup_tasks.append(
+            asyncio.create_task(request_func(request_func_input=test_input))
+        )
+
+    warmup_outputs = await asyncio.gather(*warmup_tasks)
+
+    # Check if at least one warmup request succeeded
+    if not any(output.success for output in warmup_outputs):
         raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+            "Warmup failed - Please make sure benchmark arguments "
+            f"are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print(
+            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+        )
 
     # Flush cache
-    if "sglang" in backend:
+    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)
@@ -1028,6 +1055,12 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
+        if lora_names != None and len(lora_names) != 0:
+            idx = random.randint(0, len(lora_names) - 1)
+            lora_name = lora_names[idx]
+        else:
+            lora_name = None
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=prompt,
@@ -1235,6 +1268,10 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "max_concurrency"):
         args.max_concurrency = None
 
+    # Set default value for warmup_requests if not present
+    if not hasattr(args, "warmup_requests"):
+        args.warmup_requests = 1
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1336,6 +1373,10 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
 
+    # compatible with SimpleNamespace
+    if not hasattr(args, "flush_cache"):
+        args.flush_cache = False
+
     return asyncio.run(
         benchmark(
             backend=backend,
@@ -1347,10 +1388,11 @@ def run_benchmark(args_: argparse.Namespace):
             request_rate=args.request_rate,
             max_concurrency=args.max_concurrency,
             disable_tqdm=args.disable_tqdm,
-            lora_name=args.lora_name,
+            lora_names=args.lora_name,
             extra_request_body=extra_request_body,
             profile=args.profile,
             pd_seperated=args.pd_seperated,
+            flush_cache=args.flush_cache,
         )
     )
 
@@ -1364,6 +1406,13 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             print(f"Fail to set RLIMIT_NOFILE: {e}")
+
+
+class LoRAPathAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, [])
+        for lora_name in values:
+            getattr(namespace, self.dest).append(lora_name)
 
 
 if __name__ == "__main__":
@@ -1509,8 +1558,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora-name",
         type=str,
+        nargs="*",
         default=None,
-        help="The name of LoRA adapter",
+        action=LoRAPathAction,
+        help="The names of LoRA adapters. You can provide a list of names in the format {name} {name} {name}...",
     )
     parser.add_argument(
         "--prompt-suffix",
@@ -1522,6 +1573,17 @@ if __name__ == "__main__":
         "--pd-seperated",
         action="store_true",
         help="Benchmark PD disaggregation server",
+    )
+    parser.add_argument(
+        "--flush-cache",
+        action="store_true",
+        help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before the benchmark",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
