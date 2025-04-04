@@ -18,6 +18,7 @@
 
 import logging
 import os
+from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -90,6 +91,19 @@ if _is_hip:
 expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
+
+
+class AttnForwardMethod(IntEnum):
+
+    # Use multi-head attention
+    MHA = auto()
+
+    # Use absorbed multi-latent attention
+    MLA = auto()
+
+    # Use multi-head attention, but with KV cache chunked.
+    # This method can avoid OOM when prefix lengths are long.
+    MHA_CHUNKED_KV = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -698,24 +712,37 @@ class DeepseekV2AttentionMLA(nn.Module):
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
-            return (
+            if (
                 not self.flashinfer_mla_disable_ragged
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            )
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
         elif self.attention_backend == "fa3":
-            # Flash Attention: Keep absorbing for all extend/decode
-            return False
+            # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA_CHUNKED_KV
+            else:
+                return AttnForwardMethod.MLA
         else:
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
-            return (
+            if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            )
+            ):
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
 
     def forward(
         self,
@@ -729,8 +756,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states
 
-        if self.no_absorb(forward_batch):
+        attn_forward_method = self.get_attn_forward_method(forward_batch)
+
+        if attn_forward_method == AttnForwardMethod.MHA:
             return self.forward_normal(positions, hidden_states, forward_batch)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            return self.forward_normal_chunked_kv(
+                positions, hidden_states, forward_batch
+            )
         else:
             if _is_hip:
                 if (
@@ -1004,6 +1037,21 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
 
         return output
+
+    def forward_normal_chunked_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # In normal mha, the k and v tensors will become overly large when the prefix length is long.
+        # To avoid this, we split the kv cache into chunks and process them one after another.
+        # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
+        # The top comments in https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
+        # will be helpful for understanding the purpose of this function.
+
+        # TODO: Implement the for loop here!
+        pass
 
 
 class DeepseekV2DecoderLayer(nn.Module):
