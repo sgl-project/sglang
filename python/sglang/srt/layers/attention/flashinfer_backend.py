@@ -1245,8 +1245,7 @@ def fast_decode_plan(
             head_dim,
             head_dim,
             self.empty_q_data,
-            self.empty_kv_cache,
-            torch.cuda.current_stream().cuda_stream,
+            self.empty_kv_cache
         )
 
     self._pos_encoding_mode = pos_encoding_mode
