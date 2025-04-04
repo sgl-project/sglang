@@ -324,7 +324,9 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.ep_size > 1:
+            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
+                buffer,
                 hidden_states,
                 topk_idx,
                 topk_weights,
@@ -336,7 +338,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                self.num_experts,
+                self.num_experts,  # num_max_dispatch_tokens_per_rank=128,
                 forward_mode=forward_mode,
             )
         final_hidden_states = (
@@ -352,6 +354,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
+                buffer,
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
