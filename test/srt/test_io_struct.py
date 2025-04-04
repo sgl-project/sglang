@@ -1,11 +1,22 @@
 import copy
 import unittest
-from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+)
 
 
-class TestGenerateReqInputNormalization(unittest.TestCase):
+class TestGenerateReqInputNormalization(CustomTestCase):
+    """Test the normalization of GenerateReqInput for batch processing and different input formats."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+
     def setUp(self):
         # Common setup for all tests
         self.base_req = GenerateReqInput(
