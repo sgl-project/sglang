@@ -69,7 +69,7 @@ class DeciLMDecodeLayer(nn.Module):
         self._is_no_op_attention = block_config.attention.no_op
         self._is_no_op_ffn = block_config.ffn.no_op
         self.hidden_size = config.hidden_size
-
+        logger.info(f"DecodeLayer::init, the self.hidden_size:{self.hidden_size}")
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -93,7 +93,8 @@ class DeciLMDecodeLayer(nn.Module):
             num_kv_heads = (
                 config.num_attention_heads // block_config.attention.n_heads_in_group
             )
-
+            logger.info(f"2 DecodeLayer::init, config.num_attention_heads:{config.num_attention_heads} and block_config.attention.n_heads_in_group:{block_config.attention.n_heads_in_group}")
+            logger.info(f"3 DecodeLayer::init, num_heads:{config.num_attention_heads} and  num_kv_heads:{num_kv_heads}")
             self.self_attn = LlamaAttention(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -138,11 +139,12 @@ class DeciLMDecodeLayer(nn.Module):
         if self._is_no_op_attention:
             pass
         else:
-            if residual is not None:
+            if residual is None:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            logger.info(f"DeciLMDecodeLayer, positions.shape:{positions.shape} and hidden_states.shape:{hidden_states.shape}")
             hidden_states = self.self_attn(positions, hidden_states, forward_batch)
 
         # FFN
@@ -262,9 +264,6 @@ class DeciLMForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
-            print(
-                f"1 load_weights name:{name} and loaded_weight.shape:{loaded_weight.shape}"
-            )
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
