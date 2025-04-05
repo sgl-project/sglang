@@ -299,7 +299,7 @@ class ModelRunner:
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
-            server_args.chunked_prefill_size = -1
+            self.chunked_prefill_size = -1
 
             if self.model_config.hf_config.architectures == [
                 "Qwen2VLForConditionalGeneration"
