@@ -174,6 +174,9 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+        if self.attn_tp_rank == 0:
+            self.log_prefill_stats()
+
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,
