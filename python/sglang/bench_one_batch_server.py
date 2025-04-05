@@ -14,17 +14,15 @@ import argparse
 import dataclasses
 import itertools
 import json
-import multiprocessing
-import os
 import time
 from typing import Tuple
 
 import numpy as np
 import requests
 
-from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import launch_server_process
 
 
 @dataclasses.dataclass
@@ -62,36 +60,6 @@ class BenchArgs:
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
-
-
-def launch_server_internal(server_args):
-    try:
-        launch_server(server_args)
-    except Exception as e:
-        raise e
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
-
-
-def launch_server_process(server_args: ServerArgs):
-    proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
-    proc.start()
-    base_url = f"http://{server_args.host}:{server_args.port}"
-    timeout = 600
-
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-            }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
-            if response.status_code == 200:
-                return proc, base_url
-        except requests.RequestException:
-            pass
-        time.sleep(10)
-    raise TimeoutError("Server failed to start within the timeout period.")
 
 
 def run_one_case(
