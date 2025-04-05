@@ -1028,7 +1028,9 @@ class CustomTestCase(unittest.TestCase):
 def launch_server_process(server_args: ServerArgs):
     """launch_server, but in a subprocess"""
 
-    proc = multiprocessing.Process(target=_launch_server_process_internal, args=(server_args,))
+    proc = multiprocessing.Process(
+        target=_launch_server_process_internal, args=(server_args,)
+    )
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
