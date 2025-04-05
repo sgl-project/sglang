@@ -20,10 +20,15 @@ from sglang.test.test_utils import launch_server_process, get_benchmark_args
 
 def run_bench_multi(args: argparse.Namespace):
     _log(f"run_bench_multi start {args=}")
-    _init_process_group(args)
+
+    enable_ctrl_dist = args.nnodes > 1
+    if enable_ctrl_dist:
+        _init_process_group(args)
+
     configs = _get_configs(preset_name=args.preset_name, start_index=args.start_index, end_index=args.end_index)
+
     for config in configs:
-        _run_one_config(config, args)
+        _run_one_config(config, args, enable_ctrl_dist)
 
 
 def _init_process_group(args):
@@ -38,12 +43,17 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
     return getattr(presets, f"get_configs_{preset_name}")()[start_index:end_index]
 
 
-def _run_one_config(config: Config, args: argparse.Namespace):
+def _run_one_config(config: Config, args: argparse.Namespace, enable_ctrl_dist: bool):
     _log(f"_run_one_config start {config=}")
     server_args = ServerArgs(**config.server_args, nnodes=args.nnodes, node_rank=args.node_rank)
-    dist.barrier()
-    with _with_server(server_args) as launch_server_id:
+
+    if enable_ctrl_dist:
         dist.barrier()
+
+    with _with_server(server_args) as launch_server_id:
+        if enable_ctrl_dist:
+            dist.barrier()
+
         if args.node_rank == 0:
             for bench_serving_args in config.bench_serving_args_list:
                 _log(f"run_benchmark start {bench_serving_args=}")
@@ -59,17 +69,20 @@ def _run_one_config(config: Config, args: argparse.Namespace):
                 )
         else:
             _log("Wait until node 0 finish bench serving...")
-        dist.barrier()
+
+        if enable_ctrl_dist:
+            dist.barrier()
 
 
 @contextmanager
 def _with_server(server_args: ServerArgs):
     launch_server_id = uuid.uuid4().hex
-    _log(f"launch_server_process start")
+    _log(f"launch_server_process start {launch_server_id=}")
     proc, base_url = launch_server_process(server_args)
     try:
         yield launch_server_id
     finally:
+        _log(f"launch_server_process kill {proc.pid}")
         kill_process_tree(proc.pid)
 
 
