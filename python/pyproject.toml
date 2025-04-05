@@ -17,10 +17,12 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
-    "compressed-tensors",
+    "accelerate>=1.5.2",
+    "compressed-tensors>=0.9.2",
     "datasets",
     "decord",
     "fastapi",
+    "gguf>=0.14.0",
     "hf_transfer",
     "huggingface_hub",
     "interegular",
@@ -29,6 +31,7 @@ runtime_common = [
     "ninja",
     "orjson",
     "packaging",
+    "partial_json_parser>=0.2.1",
     "pillow",
     "prometheus-client>=0.20.0",
     "psutil",
@@ -38,10 +41,10 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "torchao>=0.7.0",
+    "torchvision>=0.21.0",
     "transformers==4.50.0",
     "uvicorn",
     "uvloop",
-    "compressed-tensors",
     "xgrammar==0.1.17",
 ]
 
