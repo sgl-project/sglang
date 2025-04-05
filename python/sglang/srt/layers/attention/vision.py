@@ -50,6 +50,7 @@ class VisionAttention(nn.Module):
         use_context_forward: bool = True,
         softmax_in_single_precision: bool = False,
         flatten_batch: bool = False,
+        bias: bool = True,
         prefix: str = "",
     ):
         super().__init__()
@@ -81,6 +82,7 @@ class VisionAttention(nn.Module):
                 head_size=self.head_size,
                 total_num_heads=num_heads,
                 quant_config=quant_config,
+                bias=bias,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -88,12 +90,14 @@ class VisionAttention(nn.Module):
                 input_size=embed_dim,
                 output_size=3 * projection_size,
                 quant_config=quant_config,
+                bias=bias,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.proj = RowParallelLinear(
             input_size=embed_dim,
             output_size=embed_dim,
             quant_config=quant_config,
+            bias=bias,
             prefix=add_prefix("out_proj", prefix),
         )
 
