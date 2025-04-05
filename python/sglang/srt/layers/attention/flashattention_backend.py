@@ -411,7 +411,13 @@ class FlashAttentionBackend(AttentionBackend):
         to avoid memory allocations.
         """
         self.decode_cuda_graph_metadata = {
-            # Page table for token mapping (batch_size, max_context_len)
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
                 (self.max_context_len + self.page_size - 1) // self.page_size,
@@ -426,13 +432,6 @@ class FlashAttentionBackend(AttentionBackend):
             ),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
-            ),
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.arange(
-                0, max_bs + 128, dtype=torch.int32, device=self.device
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 128, dtype=torch.int32, device=self.device
             ),
         }
 
@@ -471,25 +470,20 @@ class FlashAttentionBackend(AttentionBackend):
         if forward_mode.is_decode():
             if spec_info is not None:
                 # Draft Decode
-                metadata.cu_seqlens_q = torch.arange(
-                    0, bs + 1, dtype=torch.int32, device=device
-                )
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
-
+                metadata.max_seq_len_k = seq_lens.max().item() + (
+                    self.speculative_step_id + 1
+                )
                 metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
                     : bs + 1
                 ]
-
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
                     ),
                     (1, 0),
-                )
-                metadata.max_seq_len_k = seq_lens.max().item() + (
-                    self.speculative_step_id + 1
                 )
                 metadata.page_table = self.decode_cuda_graph_metadata[
                     "page_table_draft_decode"
@@ -560,18 +554,14 @@ class FlashAttentionBackend(AttentionBackend):
         out_cache_loc: torch.Tensor = None,
     ):
         # """Initialize forward metadata for replaying CUDA graph."""
-        device = seq_lens.device
         seq_lens = seq_lens[:bs]
-        req_pool_indices = req_pool_indices[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
         if forward_mode.is_decode():
             metadata = self.decode_cuda_graph_metadata[bs]
 
             if spec_info is not None:
                 # Draft Decode
-                max_len = seq_lens_cpu.max().item()
-                metadata.max_seq_len_k = max_len + (self.speculative_step_id + 1)
-
                 metadata.cache_seqlens_int32.copy_(
                     (seq_lens + (self.speculative_step_id + 1)).to(torch.int32)
                 )
@@ -579,7 +569,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k = seq_lens_cpu.max().item() + (
                     self.speculative_step_id + 1
                 )
-
                 metadata.cu_seqlens_k.copy_(
                     torch.nn.functional.pad(
                         torch.cumsum(
