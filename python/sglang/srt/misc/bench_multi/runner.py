@@ -46,7 +46,7 @@ def _run_one_config(config: Config, args: argparse.Namespace):
         dist.barrier()
         if args.node_rank == 0:
             for bench_serving_args in config.bench_serving_args_list:
-                _log(f"run_benchmark start")
+                _log(f"run_benchmark start {bench_serving_args=}")
                 bench_serving_args = get_benchmark_args(*bench_serving_args)
                 bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
                 _write_output(
@@ -58,7 +58,7 @@ def _run_one_config(config: Config, args: argparse.Namespace):
                     launch_server_id=launch_server_id,
                 )
         else:
-            TODO
+            _log("Wait until node 0 finish bench serving...")
         dist.barrier()
 
 
