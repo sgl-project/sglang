@@ -15,18 +15,18 @@ def _get_configs() -> List[Config]:
 
 
 def _run_one_config(config: Config):
-    with _with_launch_server():
+    with _with_server():
         for _ in range(TODO):
             _run_bench_serving()
 
 
 @contextmanager
-def _with_launch_server():
-    TODO
+def _with_server():
+    _start_server()
     try:
         yield
     finally:
-        TODO
+        _stop_server()
 
 
 def _run_bench_serving():
