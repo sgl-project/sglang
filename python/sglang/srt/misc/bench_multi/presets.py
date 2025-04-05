@@ -3,29 +3,19 @@ from typing import List, Any, Dict
 from sglang.srt.misc.bench_multi.configs import Config
 
 
-def get_configs(preset_name: str) -> List[Config]:
-    if preset_name == "scan_DeepSeekV3_8xH200":
-        return _get_configs_scan_deepseekv3_8xh200()
-    if preset_name == "scan_DeepSeekV3_2x8xH100":
-        return _get_configs_scan_deepseekv3_2x8xh100()
-    if preset_name == "scan_DeepSeekV3_4x8xH100":
-        return _get_configs_scan_deepseekv3_4x8xh100()
-
-    if preset_name == "debug":
-        return TODO
-
-    raise NotImplementedError(f"Unknown {preset_name=}")
-
-
-def _get_configs_scan_deepseekv3_8xh200():
+def get_configs_debug():
     return TODO
 
 
-def _get_configs_scan_deepseekv3_2x8xh100():
+def get_configs_scan_DeepSeekV3_8xH200():
     return TODO
 
 
-def _get_configs_scan_deepseekv3_4x8xh100():
+def get_configs_scan_DeepSeekV3_2x8xH100():
+    return TODO
+
+
+def get_configs_scan_DeepSeekV3_4x8xH100():
     return TODO
 
 
