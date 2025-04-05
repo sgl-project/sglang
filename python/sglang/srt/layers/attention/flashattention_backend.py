@@ -651,7 +651,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
         elif forward_mode.is_target_verify():
-            # torch.distributed.breakpoint()
             metadata = self.target_verify_metadata[bs]
             draft_token_num = spec_info.draft_token_num
 

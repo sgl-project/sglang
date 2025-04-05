@@ -291,9 +291,6 @@ class CudaGraphRunner:
             self.model_runner.token_to_kv_pool.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_decode():
-            return False
-
         if self.enable_dp_attention or self.enable_sp_layernorm:
             total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
 

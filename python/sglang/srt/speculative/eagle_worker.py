@@ -249,7 +249,6 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
-            # torch.distributed.breakpoint()
             logits_output, verify_output, model_worker_batch = self.verify(
                 batch, spec_info
             )
@@ -405,7 +404,6 @@ class EAGLEWorker(TpModelWorker):
             )
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
-            # torch.distributed.breakpoint()
 
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
@@ -480,7 +478,6 @@ class EAGLEWorker(TpModelWorker):
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
-        # torch.distributed.breakpoint()
         model_worker_batch = batch.get_model_worker_batch()
         logits_output, _ = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True
