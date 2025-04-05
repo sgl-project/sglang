@@ -19,6 +19,7 @@ from sglang.test.test_utils import launch_server_process, get_benchmark_args
 
 
 def run_bench_multi(args: argparse.Namespace):
+    _log(f"run_bench_multi start {args=}")
     torch.distributed.init_process_group(rank=args.node_rank, world_size=args.nnodes)
     configs = _get_configs(preset_name=args.preset_name, start_index=args.start_index, end_index=args.end_index)
     for config in configs:
@@ -31,12 +32,14 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
 
 
 def _run_one_config(config: Config, args: argparse.Namespace):
+    _log(f"_run_one_config start {config=}")
     server_args = ServerArgs(**config.server_args, nnodes=args.nnodes, node_rank=args.node_rank)
     dist.barrier()
     with _with_server(server_args) as launch_server_id:
         dist.barrier()
         if args.node_rank == 0:
             for bench_serving_args in config.bench_serving_args_list:
+                _log(f"run_benchmark start")
                 bench_serving_args = get_benchmark_args(*bench_serving_args)
                 bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
                 _write_output(
@@ -55,6 +58,7 @@ def _run_one_config(config: Config, args: argparse.Namespace):
 @contextmanager
 def _with_server(server_args: ServerArgs):
     launch_server_id = uuid.uuid4().hex
+    _log(f"launch_server_process start")
     proc, base_url = launch_server_process(server_args)
     try:
         yield launch_server_id
@@ -87,3 +91,7 @@ def _write_output(
 
 
 _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS = ["generated_texts", "errors"]
+
+
+def _log(message):
+    print(message, flush=True)
