@@ -138,7 +138,7 @@ Please consult the documentation below to learn more about the parameters you ma
 
 ## Kernel backend
 
-* `attention_backend`: The backend for attention computation and KV cache management, and can be one of `fa3`, `flashinfer`, `triton` or `torch_native`. When deploying deepseek models, this argument is for specifying the MLA backend it uses.
+* `attention_backend`: This argument specifies the backend for attention computation and KV cache management, which can be `fa3`, `flashinfer`, `triton`, or `torch_native`. When deploying DeepSeek models, use this argument to specify the MLA backend.
 * `sampling_backend`: The backend for sampling.
 
 ## Constrained Decoding
