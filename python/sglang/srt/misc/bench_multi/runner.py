@@ -1,4 +1,3 @@
-import multiprocessing
 from contextlib import contextmanager
 from typing import List
 
@@ -36,13 +35,6 @@ def _with_server(server_args: ServerArgs):
 
 
 def _run_bench_serving():
-    proc = multiprocessing.Process(target=_run_bench_serving_internal)
-    proc.start()
-    proc.join()
-    return TODO
-
-
-def _run_bench_serving_internal():
     return bench_serving.run_benchmark(TODO)
 
 
