@@ -1031,7 +1031,7 @@ class CustomTestCase(unittest.TestCase):
         )
 
 
-def launch_server_process(server_args: ServerArgs):
+def launch_server_process(server_args: ServerArgs, await_startup: bool = True):
     """launch_server, but in a subprocess"""
 
     proc = multiprocessing.Process(
@@ -1040,6 +1040,9 @@ def launch_server_process(server_args: ServerArgs):
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
+
+    if not await_startup:
+        return proc, base_url
 
     start_time = time.time()
     while time.time() - start_time < timeout:
