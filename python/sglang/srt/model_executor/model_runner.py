@@ -227,7 +227,7 @@ class ModelRunner:
         if server_args.enable_flashinfer_mla:
             # TODO: remove this branch after enable_flashinfer_mla is deprecated
             logger.info("MLA optimization is turned on. Use flashinfer backend.")
-            server_args.attention_backend = "flashinfer_mla"
+            server_args.attention_backend = "flashinfer"
         elif server_args.enable_flashmla:
             # TODO: remove this branch after enable_flashmla is deprecated
             logger.info("MLA optimization is turned on. Use flashmla decode.")
