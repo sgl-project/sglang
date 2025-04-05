@@ -95,7 +95,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize forward metadata to cache repetitive calculations."""
+        """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = len(seqlens_in_batch)
@@ -220,7 +220,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v,
                     )
 
-        # Use precomputed metadata
+        # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -232,9 +232,6 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
 
-        page_table = metadata.page_table
-
-        # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -249,7 +246,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -284,7 +281,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -307,8 +304,6 @@ class FlashAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ) -> torch.Tensor:
-        """Forward pass with FlashAttention using precomputed metadata."""
-        # Save KV cache if needed
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -329,7 +324,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v,
                     )
 
-        # Use precomputed metadata
+        # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -340,12 +335,9 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None
             else (-1, -1)
         )
-        page_table = metadata.page_table
 
         if not self.use_mla:
             # Do multi-head attention
-
-            # Get KV cache
             kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             key_cache = key_cache.view(
@@ -355,13 +347,12 @@ class FlashAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
 
-            # Pre-reshape query tensor
             q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             o = flash_attn_with_kvcache(
                 q=q_reshaped,
                 k_cache=key_cache,
                 v_cache=value_cache,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -397,7 +388,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
