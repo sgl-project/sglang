@@ -112,14 +112,6 @@ def _write_output(
         launch_server_id: str,
 ):
     content = dict(
-        script_args=vars(script_args),
-        server_args=dataclasses.asdict(server_args),
-        bench_serving_args=vars(bench_serving_args),
-        bench_serving_output={
-            k: v
-            for k, v in bench_serving_output.items()
-            if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS
-        },
         metadata=dict(
             launch_server_id=launch_server_id,
             timestamp=time.time(),
@@ -128,6 +120,14 @@ def _write_output(
                 for device in range(torch.cuda.device_count())
             ],
         ),
+        script_args=vars(script_args),
+        server_args=dataclasses.asdict(server_args),
+        bench_serving_args=vars(bench_serving_args),
+        bench_serving_output={
+            k: v
+            for k, v in bench_serving_output.items()
+            if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS
+        },
     )
 
     path = (
