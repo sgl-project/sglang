@@ -31,3 +31,7 @@ Benchmark Results:
 | MiniCPM-V-2.6          | 0.435  | —            |
 | Deepseek-Janus-Pro-7B  | 0.373  | -            |
 | Gemma-3-it-4B          | 0.41   | 0.403        |
+| llama3-llava-next-8b | 0.245 | - |
+| llava-v1.6-mistral-7b-sglang | 0.338 | - |
+| llava-onevision-qwen2-7b-ov | 0.423 | - |
+| Mlama - Llama-3.2-11B-Vision-Instruct | 0.321 | - |
