@@ -15,6 +15,7 @@ def _parse_args():
     parser.add_argument("--end-index", type=int, default=1000000)
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--ctrl-dist-init-addr", type=str, default="")
     return parser.parse_args()
 
 
