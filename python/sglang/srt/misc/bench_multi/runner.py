@@ -42,12 +42,13 @@ def _with_server(server_args: ServerArgs):
 
 def _write_output(
     dir_output: Path,
+    script_args,
     server_args: ServerArgs,
     bench_serving_args,
     bench_serving_output: Dict[str, Any],
 ):
     content = dict(
-        script_args=TODO,
+        script_args=vars(script_args),
         server_args=dataclasses.asdict(server_args),
         bench_serving_args=vars(bench_serving_args),
         bench_serving_output=bench_serving_output,
