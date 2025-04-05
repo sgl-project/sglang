@@ -3,6 +3,7 @@ from typing import List
 
 from sglang.srt.misc.bench_multi.configs import Config
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import launch_server_process
 
 
@@ -28,7 +29,7 @@ def _with_server(server_args: ServerArgs):
     try:
         yield
     finally:
-        _stop_server()
+        kill_process_tree(proc.pid)
 
 
 def _run_bench_serving():
