@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import random
 import time
@@ -38,10 +39,13 @@ def _with_server(server_args: ServerArgs):
         kill_process_tree(proc.pid)
 
 
-def _write_output(dir_output: Path):
+def _write_output(
+    dir_output: Path,
+    server_args: ServerArgs,
+):
     content = dict(
         script_args=TODO,
-        server_args=TODO,
+        server_args=dataclasses.asdict(server_args),
         bench_serving_args=TODO,
         bench_serving_output=TODO,
         timestamp=time.time(),
