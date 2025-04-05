@@ -16,10 +16,12 @@ def get_configs(preset_name: str) -> List[Config]:
 def _compute_scan_config():
     return Config(
         server_args=dict(
-            TODO=TODO,
+            stream_output=True,
+            disable_radix_cache=True,
         ),
         bench_serving_args_list=[
             dict(
+                dataset_name="random",
                 flush_cache=True,
             )
             for what in TODO
