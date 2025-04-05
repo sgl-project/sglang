@@ -34,8 +34,8 @@ def run_bench_multi(args: argparse.Namespace):
         end_index=args.end_index,
     )
 
-    for config in configs:
-        _run_one_config(config, args, enable_ctrl_dist)
+    for config_index, config in enumerate(configs):
+        _run_one_config(config_index, config, args, enable_ctrl_dist)
 
 
 def _init_process_group(args):
@@ -56,8 +56,8 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
     return getattr(presets, f"get_configs_{preset_name}")()[start_index:end_index]
 
 
-def _run_one_config(config: Config, args: argparse.Namespace, enable_ctrl_dist: bool):
-    _log(f"_run_one_config start {config=}")
+def _run_one_config(config_index, config: Config, args: argparse.Namespace, enable_ctrl_dist: bool):
+    _log(f"_run_one_config start {config_index=} {config=}")
     server_args = ServerArgs(
         **config.server_args, nnodes=args.nnodes, node_rank=args.node_rank
     )
@@ -70,8 +70,8 @@ def _run_one_config(config: Config, args: argparse.Namespace, enable_ctrl_dist: 
             dist.barrier()
 
         if args.node_rank == 0:
-            for bench_serving_args in config.bench_serving_args_list:
-                _log(f"run_benchmark start {bench_serving_args=}")
+            for bench_serving_args_index, bench_serving_args in enumerate(config.bench_serving_args_list):
+                _log(f"run_benchmark start {bench_serving_args_index=} {bench_serving_args=}")
                 bench_serving_args = get_benchmark_args(
                     **bench_serving_args, host=server_args.host, port=server_args.port, tokenizer=None, base_url=None,
                 )
