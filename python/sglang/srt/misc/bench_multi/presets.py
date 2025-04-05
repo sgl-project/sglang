@@ -30,7 +30,10 @@ def _compute_scan_config():
                 random_range_ratio=0.0,  # TODO
                 max_concurrency=128,  # TODO
                 num_prompts=512,  # TODO
+                random_input_len=random_input_len,
+                random_output_len=random_output_len,
             )
-            for what in TODO
+            for random_input_len in random_input_lens
+            for random_output_len in random_output_lens
         ],
     )
