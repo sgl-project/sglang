@@ -1,3 +1,4 @@
+import argparse
 import dataclasses
 import json
 import random
@@ -16,7 +17,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import launch_server_process, get_benchmark_args
 
 
-def run_bench_multi():
+def run_bench_multi(args: argparse.Namespace):
     configs = _get_configs()
     for config in configs:
         _run_one_config(config)
@@ -54,12 +55,12 @@ def _with_server(server_args: ServerArgs):
 
 
 def _write_output(
-    dir_output: Path,
-    script_args,
-    server_args: ServerArgs,
-    bench_serving_args,
-    bench_serving_output: Dict[str, Any],
-    launch_server_id: str,
+        dir_output: Path,
+        script_args,
+        server_args: ServerArgs,
+        bench_serving_args,
+        bench_serving_output: Dict[str, Any],
+        launch_server_id: str,
 ):
     content = dict(
         script_args=vars(script_args),
