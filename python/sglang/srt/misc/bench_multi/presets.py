@@ -25,6 +25,7 @@ def _compute_scan_config():
                 flush_cache=True,
                 random_range_ratio=0.0,  # TODO
                 max_concurrency=128,  # TODO
+                num_prompts=512,  # TODO
             )
             for what in TODO
         ],
