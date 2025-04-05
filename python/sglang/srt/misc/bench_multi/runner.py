@@ -9,6 +9,7 @@ from typing import List, Any, Dict
 
 import torch.cuda
 from sglang import bench_serving
+from sglang.srt.misc.bench_multi import presets
 from sglang.srt.misc.bench_multi.configs import Config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -21,8 +22,8 @@ def run_bench_multi():
         _run_one_config(config)
 
 
-def _get_configs() -> List[Config]:
-    return TODO
+def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Config]:
+    return presets.get_configs(preset_name)[start_index:end_index]
 
 
 def _run_one_config(config: Config):
