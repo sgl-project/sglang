@@ -23,6 +23,7 @@ def run_bench_multi():
 
 
 def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Config]:
+    # If users want to provide their own presets, we can add a flag to support custom preset file path
     return presets.get_configs(preset_name)[start_index:end_index]
 
 
