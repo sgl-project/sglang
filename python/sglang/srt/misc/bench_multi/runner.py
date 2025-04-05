@@ -63,7 +63,7 @@ def _run_one_config(config_index, config: Config, args: argparse.Namespace, enab
     if enable_ctrl_dist:
         dist.barrier()
 
-    with _with_server(server_args) as launch_server_id:
+    with _with_server(server_args, await_startup=args.node_rank == 0) as launch_server_id:
         if enable_ctrl_dist:
             dist.barrier()
 
@@ -90,10 +90,10 @@ def _run_one_config(config_index, config: Config, args: argparse.Namespace, enab
 
 
 @contextmanager
-def _with_server(server_args: ServerArgs):
+def _with_server(server_args: ServerArgs, await_startup: bool):
     launch_server_id = uuid.uuid4().hex
     _log(f"launch_server_process start {launch_server_id=}")
-    proc, base_url = launch_server_process(server_args)
+    proc, base_url = launch_server_process(server_args, await_startup=await_startup)
     try:
         yield launch_server_id
     finally:
