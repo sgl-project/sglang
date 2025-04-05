@@ -114,4 +114,4 @@ _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS = ["generated_texts", "errors"]
 
 
 def _log(message):
-    print(message, flush=True)
+    print(f"[CTRL] {message}", flush=True)
