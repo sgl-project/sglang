@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.managers.schedule_batch import BaseFinishReason, ReqMetrics
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -438,6 +438,9 @@ class BatchTokenIDOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # req metrics
+    metrics: List[ReqMetrics]
+
 
 @dataclass
 class BatchMultimodalDecodeReq:
@@ -484,6 +487,9 @@ class BatchStrOut:
 
     # Hidden states
     output_hidden_states: List[List[float]]
+
+    # req metrics
+    metrics: List[ReqMetrics]
 
 
 @dataclass

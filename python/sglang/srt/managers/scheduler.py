@@ -828,7 +828,7 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
-
+            req.metrics.add_queue_time = time.time()
             if (
                 recv_req.session_params is not None
                 and recv_req.session_params.id is not None
@@ -842,6 +842,7 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            req.metrics.add_queue_time = time.time()
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -985,6 +986,7 @@ class Scheduler(
                 req.finished_reason = FINISH_ABORT(
                     error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
                 )
+                req.metrics.add_queue_time = time.time()
                 self.waiting_queue.append(req)
                 return
 
@@ -1021,9 +1023,10 @@ class Scheduler(
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        num_new_seq = len(can_run_list)
         f = (
             f"Prefill batch. "
-            f"#new-seq: {len(can_run_list)}, "
+            f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -1041,6 +1044,14 @@ class Scheduler(
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            total_queue_latency = 0
+            for req in can_run_list:
+                if req.metrics.add_queue_time is not None and req.metrics.first_scheduled_time is not None:
+                    total_queue_latency += req.metrics.first_scheduled_time - req.metrics.add_queue_time
+            if total_queue_latency > 0:
+                self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
+
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -1235,6 +1246,7 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            req.metrics.first_scheduled_time = time.time()
             if (
                 self.lora_paths
                 and len(

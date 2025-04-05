@@ -119,15 +119,38 @@ class ReqState:
     event: asyncio.Event
     obj: Any
 
-    # For metrics
+    #  Sometimes, We need to analyze why the time to first token is so long which including
+    #  the following parts:
+
+    #  input_process_time: Tokenize text prompt or multimodal url data download
+    #  time_in_queue: The time the request spent in the queue.
+    #  prefill_time:  The time for prefill
+    #
+    #
+    #   input_process_time   time_in_queue    prefill_time
+    #  |------------------|----------------|----------------|
+    #  ^                  ^                ^                ^
+    # created_time add_queue_time first_scheduled_time first_token_time
+    #
+    # The time when the request arrived
     created_time: float
+    # The time when the request was finished.
     finished_time: float = 0.0
+    # The time when the first token was generated.
     first_token_time: float = 0.0
+    # The time when the request was first scheduled.
+    first_scheduled_time: float = 0.0
+    # The time when the request was added in waiting queue.
+    add_queue_time: float = 0.0
+
     last_time: float = 0.0
     last_completion_tokens: int = 1
 
     # For streaming output
     last_output_offset: int = 0
+
+    # Whether the first token metrics has been collected
+    has_first_token_collected: bool = False
 
 
 class TokenizerManager:
@@ -976,12 +999,20 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
 
+            if self.enable_metrics or self.log_requests:
+                if state.first_token_time == 0.0:
+                    self.update_prefill_metrics(state, recv_obj, i)
+
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                if self.log_requests:
+                    meta_info['time_to_first_token'] = state.first_token_time - state.created_time
+                    meta_info['time_in_queue'] = state.first_scheduled_time - state.add_queue_time
+                    meta_info['time_for_input_process'] = state.add_queue_time - state.created_time
 
             state.out_list.append(out_dict)
             state.event.set()
@@ -991,6 +1022,14 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+
+    def update_prefill_metrics(self, state, recv_obj, i):
+        if state.add_queue_time == 0.0:
+            state.add_queue_time = recv_obj.metrics[i].add_queue_time
+        if state.first_scheduled_time == 0.0:
+            state.first_scheduled_time = recv_obj.metrics[i].first_scheduled_time
+        if state.first_token_time == 0.0:
+            state.first_token_time = state.last_time = time.time()
 
     def convert_logprob_style(
         self,
@@ -1081,12 +1120,12 @@ class TokenizerManager:
             else 0
         )
 
-        if state.first_token_time == 0.0:
-            state.first_token_time = state.last_time = time.time()
+        if not state.has_first_token_collected:
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
                 state.first_token_time - state.created_time
             )
+            state.has_first_token_collected = True
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
