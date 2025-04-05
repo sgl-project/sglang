@@ -50,8 +50,7 @@ __global__ void moe_align_block_size_kernel(
     int32_t experts_per_warp,
     int32_t block_size,
     size_t numel,
-    int32_t* __restrict__ cumsum,
-    bool small_batch_mode) {
+    int32_t* __restrict__ cumsum) {
   extern __shared__ int32_t shared_counts[];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -95,14 +94,6 @@ __global__ void moe_align_block_size_kernel(
   if (threadIdx.x < num_experts) {
     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
       expert_ids[i / block_size] = threadIdx.x;
-    }
-  }
-  
-  if (small_batch_mode) {
-    for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
-      int32_t expert_id = topk_ids[i];
-      int32_t rank_post_pad = atomicAdd(&cumsum[expert_id], 1);
-      sorted_token_ids[rank_post_pad] = i;
     }
   }
 }
@@ -224,8 +215,7 @@ void moe_align_block_size(
           experts_per_warp,
           block_size,
           topk_ids.numel(),
-          cumsum_buffer.data_ptr<int32_t>(),
-          false);
+          cumsum_buffer.data_ptr<int32_t>());
 
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
