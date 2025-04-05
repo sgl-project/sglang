@@ -10,7 +10,6 @@ from typing import Any, Dict, List
 
 import torch.cuda
 import torch.distributed as dist
-
 from sglang import bench_serving
 from sglang.srt.misc.bench_multi import presets
 from sglang.srt.misc.bench_multi.configs import Config
@@ -41,7 +40,7 @@ def _init_process_group(args):
         f"tcp://{args.ctrl_dist_init_addr}" if args.ctrl_dist_init_addr else None
     )
     assert (
-        args.nnodes == 1 or init_method is not None
+            args.nnodes == 1 or init_method is not None
     ), "When multi-node, ctrl_dist_init_addr should be provided"
     _log(f"init_process_group start {init_method=}")
     torch.distributed.init_process_group(
@@ -71,7 +70,7 @@ def _run_one_config(config: Config, args: argparse.Namespace, enable_ctrl_dist: 
             for bench_serving_args in config.bench_serving_args_list:
                 _log(f"run_benchmark start {bench_serving_args=}")
                 bench_serving_args = get_benchmark_args(
-                    **bench_serving_args, host=server_args.host, port=server_args.port
+                    **bench_serving_args, host=server_args.host, port=server_args.port, tokenizer=None,
                 )
                 bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
                 _write_output(
@@ -102,12 +101,12 @@ def _with_server(server_args: ServerArgs):
 
 
 def _write_output(
-    dir_output: Path,
-    script_args,
-    server_args: ServerArgs,
-    bench_serving_args,
-    bench_serving_output: Dict[str, Any],
-    launch_server_id: str,
+        dir_output: Path,
+        script_args,
+        server_args: ServerArgs,
+        bench_serving_args,
+        bench_serving_output: Dict[str, Any],
+        launch_server_id: str,
 ):
     content = dict(
         script_args=vars(script_args),
@@ -129,8 +128,8 @@ def _write_output(
     )
 
     path = (
-        dir_output
-        / f"bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json"
+            dir_output
+            / f"bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json"
     )
     path.write_text(json.dumps(content))
 
