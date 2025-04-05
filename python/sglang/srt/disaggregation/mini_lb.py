@@ -239,7 +239,7 @@ async def handle_generate_request(request_data: dict):
         )
 
     # Non-streaming case
-    result = await load_balancer.generate_request(request_data)
+    result = await load_balancer.generate_request(modified_request)
     return ORJSONResponse(content=result)
 
 

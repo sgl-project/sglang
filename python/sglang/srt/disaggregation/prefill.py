@@ -76,26 +76,10 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> KVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
-
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
-
-        # Define req -> input ids buffer
-        kv_args.aux_data_ptrs = [
-            metadata_buffer.data_ptr() for metadata_buffer in self.metadata_buffers
-        ]
-        kv_args.aux_data_lens = [
-            metadata_buffer.nbytes for metadata_buffer in self.metadata_buffers
-        ]
-        kv_args.aux_item_lens = [
-            metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
-        ]
+        kv_args.kv_tensors = [self.token_to_kv_pool.get_key_buffer(i) for i in range(self.token_to_kv_pool.layer_num)]
+        kv_args.aux_tensors = self.metadata_buffers
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_manager = KVManager(kv_args, mode="prefill")
         return kv_manager
 
     def add(self, req: Req) -> None:

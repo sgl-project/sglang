@@ -828,6 +828,8 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
+            req.bootstrap_host = recv_req.bootstrap_host
+            req.bootstrap_room = recv_req.bootstrap_room
 
             if (
                 recv_req.session_params is not None
