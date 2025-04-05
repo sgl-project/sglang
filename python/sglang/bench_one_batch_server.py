@@ -63,15 +63,6 @@ class BenchArgs:
         )
 
 
-def _launch_server_process_internal(server_args):
-    try:
-        launch_server(server_args)
-    except Exception as e:
-        raise e
-    finally:
-        kill_process_tree(os.getpid(), include_parent=False)
-
-
 def launch_server_process(server_args: ServerArgs):
     proc = multiprocessing.Process(target=_launch_server_process_internal, args=(server_args,))
     proc.start()
@@ -91,6 +82,15 @@ def launch_server_process(server_args: ServerArgs):
             pass
         time.sleep(10)
     raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def _launch_server_process_internal(server_args):
+    try:
+        launch_server(server_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
 
 
 def run_one_case(
