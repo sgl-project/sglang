@@ -48,6 +48,7 @@ class XGrammarGrammar(BaseGrammarObject):
         ctx: CompiledGrammar,
         override_stop_tokens: Optional[Union[List[int], int]],
     ) -> None:
+        super().__init__()
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx

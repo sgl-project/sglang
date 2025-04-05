@@ -30,6 +30,7 @@ The core features include:
    backend/server_arguments.md
    backend/sampling_params.md
    backend/hyperparameter_tuning.md
+   backed/disabling_grammar_restrictions_in_reasoning_sections.ipynb
 
 .. toctree::
    :maxdepth: 1
