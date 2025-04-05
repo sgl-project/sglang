@@ -135,7 +135,6 @@ class LlavaBaseForCausalLM(nn.Module):
         """
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
-
         selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
@@ -146,7 +145,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
             )
         image_features = self.multi_modal_projector(selected_image_feature)
-
         return image_features
 
     @torch.no_grad()
