@@ -92,8 +92,6 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_decode():
-            return False
         is_bs_supported = (
             forward_batch.batch_size in self.graphs
             if self.disable_padding
@@ -172,10 +170,6 @@ class EAGLEDraftCudaGraphRunner:
         ):
             out = run_once()
 
-        print("xxxxxxxxxxxxxxxx")
-        print(graph)
-        print(self.model_runner.tp_group)
-        print("xxxxxxxxxxxxxxxx")
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 

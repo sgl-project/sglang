@@ -353,10 +353,6 @@ class CudaGraphRunner:
                         output_buffers,
                     ) = self.capture_one_batch_size(bs, forward)
                     self.graphs[bs] = graph
-                    print("================")
-                    print(bs, graph)
-                    print(self.model_runner.tp_group)
-                    print("================")
                     self.output_buffers[bs] = output_buffers
 
                 # Save gemlite cache after each capture
