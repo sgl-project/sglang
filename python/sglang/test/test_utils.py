@@ -9,7 +9,6 @@ import random
 import subprocess
 import threading
 import time
-import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -21,7 +20,6 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
-
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
@@ -119,9 +117,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -141,9 +139,9 @@ def call_generate_outlines(
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["text"][0][len(prompt):]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [x[len(prompt):] for x in res.json()["text"]]
     return pred
 
 
@@ -177,12 +175,12 @@ def call_generate_guidance(
             model
             + prompt
             + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
+            name="answer",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            regex=regex,
+        )
         )
         rets.append(out["answer"])
     return rets if n > 1 else rets[0]
@@ -554,12 +552,13 @@ def get_benchmark_args(
     pd_seperated: bool = False,
     flush_cache: bool = False,
     max_concurrency=None,
+    host=None,
     port=None,
 ):
     return SimpleNamespace(
         backend="sglang",
         base_url=base_url,
-        host=None,
+        host=host,
         port=port,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
@@ -1012,8 +1011,8 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
                             if (
                                 res["meta_info"]["output_top_logprobs"][i][rank][0]
                                 == res["meta_info"]["output_top_logprobs"][i][rank + 1][
-                                    0
-                                ]
+                                0
+                            ]
                             ):
                                 rank += 1
                             else:
