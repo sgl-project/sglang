@@ -194,9 +194,11 @@ class Idefics2EncoderLayer(nn.Module):
             embed_dim=config.hidden_size,
             num_heads=self.num_heads,
             projection_size=config.intermediate_size,
+            qkv_backend="sdpa",
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=config.attention_dropout,
+            rotary_embed=None,
             use_context_forward=False,
             softmax_in_single_precision=True,
             flatten_batch=False,
@@ -1142,8 +1144,12 @@ class MiniCPMV:
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
-            # adapt to VisionAttention
-            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+            if "vpm" in name and "out_proj" in name:
+                name = name.replace(r"attn.out_proj", r"attn.proj")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
 
             if "sampler" in name:
                 param = params_dict[name]

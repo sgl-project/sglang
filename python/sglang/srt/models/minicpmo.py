@@ -1519,12 +1519,15 @@ class MiniCPMO(MiniCPMBaseModel):
         slice_start_id: int = mm_input.slice_start_id
         slice_end_id: int = mm_input.slice_end_id
 
-        media_token_pairs = [
+        data_token_pairs = [
             (im_start_id, im_end_id),
             (slice_start_id, slice_end_id),
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        data_start_token_ids = [im_start_id, mm_input.audio_start_id]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
+        )
 
         return pattern.pad_input_tokens(input_ids, mm_input)
 
@@ -1552,11 +1555,11 @@ class MiniCPMO(MiniCPMBaseModel):
             List[List[torch.Tensor]]: audio embeddings
         """
         wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
+            [item.audio_feature for item in items if item.audio_feature]
         )
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
-            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+            [item.audio_feature_len for item in items if item.audio_feature_len]
         )
 
         # exist audio
@@ -1659,11 +1662,11 @@ class MiniCPMO(MiniCPMBaseModel):
         """
         # (bs, 80, frames) or [], multi audios need filled in advance
         wavforms = flatten_nested_list(
-            [item.audio_features for item in items if item.audio_features]
+            [item.audio_feature for item in items if item.audio_feature]
         )
         # list, [[x1, x2], [y1], [z1]]
         audio_feature_lens_raw = flatten_nested_list(
-            [item.audio_feature_lens for item in items if item.audio_feature_lens]
+            [item.audio_feature_len for item in items if item.audio_feature_len]
         )
 
         final_audio_embeds = []
@@ -1823,10 +1826,8 @@ class MiniCPMO(MiniCPMBaseModel):
     ) -> torch.Tensor:
 
         mm_input = forward_batch.merge_mm_inputs()
-        placeholder_token_ids = (
-            ([mm_input.im_token_id] + [item.pad_value for item in mm_input.mm_items])
-            if forward_batch.contains_mm_inputs()
-            else []
+        placeholder_token_id = (
+            mm_input.im_token_id if forward_batch.contains_mm_inputs() else None
         )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -1834,7 +1835,10 @@ class MiniCPMO(MiniCPMBaseModel):
             language_model=self.llm,
             image_data_embedding_func=self.get_image_feature,
             audio_data_embedding_func=self.get_audio_feature,
-            placeholder_token_ids=placeholder_token_ids,
+            # placeholder_tokens={
+            #     Modality.IMAGE: placeholder_token_id,
+            #     Modality.AUDIO: placeholder_token_id
+            # },
             positions=positions,
         )
         return hidden_states
@@ -1866,8 +1870,12 @@ class MiniCPMO(MiniCPMBaseModel):
                 name = name.replace(".weight.original1", ".weight_v")
 
             # adapt to VisionAttention
-            if "vpm" in name:
-                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+            if "vpm" in name and "out_proj" in name:
+                name = name.replace(r"attn.out_proj", r"attn.proj")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                continue
 
             if not self.config.init_tts and "tts" in name:
                 continue

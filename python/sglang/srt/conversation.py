@@ -73,6 +73,7 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
+    video_token: str = "<video>"
     audio_token: str = "<audio>"
 
     image_data: Optional[List[str]] = None
@@ -470,6 +471,7 @@ def generate_chat_conv(
         audio_data=[],
         modalities=[],
         image_token=conv.image_token,
+        video_token=conv.video_token,
         audio_token=conv.audio_token,
     )
 
@@ -504,9 +506,9 @@ def generate_chat_conv(
                     image_token = conv.image_token
                 else:
                     image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
+                        conv.image_token
+                        if "qwen2" in conv.name
+                        else conv.image_token + "\n"
                     )
                 audio_token = conv.audio_token
                 for content in message.content:
@@ -643,6 +645,22 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_conv_template(
+    Conversation(
+        name="qwen2-5-o",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_bos|><|IMAGE|><|vision_eos|>",
+        video_token="<|vision_bos|><|VIDEO|><|vision_eos|>",
+        audio_token="<|audio_bos|><|AUDIO|><|audio_eos|>",
     )
 )
 
