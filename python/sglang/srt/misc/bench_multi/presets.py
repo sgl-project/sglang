@@ -15,7 +15,14 @@ def get_configs_debug():
 
 
 def get_configs_scan_DeepSeekV3_8xH200():
-    return TODO
+    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
+    return [
+        compute(server_args=dict(tp_size=8)),
+        compute(server_args=dict(tp_size=8, dp_size=8, enable_dp_attention=True)),
+        compute(server_args=dict(tp_size=8, enable_ep_moe=True)),
+        compute(server_args=dict(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True)),
+        # TODO
+    ]
 
 
 def get_configs_scan_DeepSeekV3_2x8xH100():
@@ -25,11 +32,19 @@ def get_configs_scan_DeepSeekV3_2x8xH100():
         compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True)),
         compute(server_args=dict(tp_size=16, enable_ep_moe=True)),
         compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True)),
+        # TODO
     ]
 
 
 def get_configs_scan_DeepSeekV3_4x8xH100():
-    return TODO
+    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
+    return [
+        compute(server_args=dict(tp_size=32)),
+        compute(server_args=dict(tp_size=32, dp_size=32, enable_dp_attention=True)),
+        compute(server_args=dict(tp_size=32, enable_ep_moe=True)),
+        compute(server_args=dict(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True)),
+        # TODO
+    ]
 
 
 _SCAN_INPUT_LENS = [100, 1000, 10000, 100000]
