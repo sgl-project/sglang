@@ -5,11 +5,7 @@ PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
 DOCKER_IMAGE="pytorch/manylinux2_28-builder:cuda${CUDA_VERSION}"
-if (( ${CUDA_VERSION%.*} >= 12 )); then
-    ENABLE_SM90A="ON"
-else
-    ENABLE_SM90A="OFF"
-fi
+ENABLE_SM90A=$( (( ${CUDA_VERSION%.*} >= 12 )) && echo "ON" || echo "OFF" )
 
 if [ "${CUDA_VERSION}" = "12.8" ]; then
    TORCH_INSTALL="pip install --no-cache-dir --pre torch --index-url https://download.pytorch.org/whl/nightly/cu${CUDA_VERSION//.}"
