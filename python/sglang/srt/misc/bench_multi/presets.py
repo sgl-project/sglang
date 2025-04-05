@@ -1,4 +1,3 @@
-from functools import partial
 from typing import List
 
 from sglang.srt.misc.bench_multi.configs import Config
@@ -12,42 +11,41 @@ def get_configs_debug():
 
 
 def get_configs_scan_DeepSeekV3_8xH200():
-    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(tp_size=8),
-        compute(tp_size=8, dp_size=8, enable_dp_attention=True),
-        compute(tp_size=8, enable_ep_moe=True),
-        compute(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=8),
+        _compute_deepseekv3_scan_config(tp_size=8, dp_size=8, enable_dp_attention=True),
+        _compute_deepseekv3_scan_config(tp_size=8, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
 
 def get_configs_scan_DeepSeekV3_2x8xH100():
-    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(tp_size=16),
-        compute(tp_size=16, dp_size=16, enable_dp_attention=True),
-        compute(tp_size=16, enable_ep_moe=True),
-        compute(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=16),
+        _compute_deepseekv3_scan_config(tp_size=16, dp_size=16, enable_dp_attention=True),
+        _compute_deepseekv3_scan_config(tp_size=16, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
 
 def get_configs_scan_DeepSeekV3_4x8xH100():
-    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(tp_size=32),
-        compute(tp_size=32, dp_size=32, enable_dp_attention=True),
-        compute(tp_size=32, enable_ep_moe=True),
-        compute(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=32),
+        _compute_deepseekv3_scan_config(tp_size=32, dp_size=32, enable_dp_attention=True),
+        _compute_deepseekv3_scan_config(tp_size=32, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
 
-def _compute_deepseekv3_scan_config():
+def _compute_deepseekv3_scan_config(**kwargs):
     return _compute_scan_config(
+        model_path="deepseek-ai/DeepSeek-V3-0324",
         random_input_lens=[100, 1000, 10000, 100000],
         random_output_lens=[100, 1000, 10000],  # TODO
+        **kwargs,
     )
 
 
