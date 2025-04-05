@@ -13,6 +13,7 @@ def _parse_args():
     parser.add_argument("--dir-output", type=str, default="/tmp")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=1000000)
+    parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
     parser.add_argument("--dist-init-addr", type=str, default=None)

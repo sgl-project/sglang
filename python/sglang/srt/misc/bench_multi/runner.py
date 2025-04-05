@@ -57,6 +57,7 @@ def _run_one_config(config_index, config: Config, args: argparse.Namespace, enab
     _log(f"_run_one_config start {config_index=} {config=}")
     server_args = ServerArgs(
         **config.server_args, nnodes=args.nnodes, node_rank=args.node_rank, dist_init_addr=args.dist_init_addr,
+        port=args.port,
     )
 
     if enable_ctrl_dist:
