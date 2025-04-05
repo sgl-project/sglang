@@ -1661,6 +1661,11 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     if len(all_requests) == 1:
         prompt = prompts[0]
         if isinstance(prompt, str) or isinstance(prompt[0], str):
+            # Handle empty string inputs
+            if isinstance(prompt, str) and prompt == "":
+                prompt = " "  # Replace empty string with a space character
+            elif isinstance(prompt, list):
+                prompt = [p if p != "" else " " for p in prompt]
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list) and isinstance(
             prompt[0], MultimodalEmbeddingInput
@@ -1686,6 +1691,14 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             prompt_kwargs = {"input_ids": prompt}
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
+            # Handle empty strings in multiple requests
+            if isinstance(prompts[0], str):
+                prompts = [p if p != "" else " " for p in prompts]
+            else:
+                prompts = [
+                    [p if p != "" else " " for p in prompt_list]
+                    for prompt_list in prompts
+                ]
             prompt_kwargs = {"text": prompts}
         elif isinstance(prompts[0], list) and isinstance(
             prompts[0][0], MultimodalEmbeddingInput
@@ -1730,21 +1743,49 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
-    all_requests = [EmbeddingRequest(**request_json)]
-    adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+    original_input = request_json.get("input", "")
 
-    try:
-        ret = await tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
-    except ValueError as e:
-        return create_error_response(str(e))
+    is_batch = isinstance(original_input, list)
 
-    if not isinstance(ret, list):
-        ret = [ret]
+    if is_batch:
+        batch_inputs = original_input
+
+        all_results = []
+        for i, single_input in enumerate(batch_inputs):
+            single_request_json = request_json.copy()
+            single_request_json["input"] = single_input
+
+            single_request = EmbeddingRequest(**single_request_json)
+            all_requests = [single_request]
+            adapted_request, _ = v1_embedding_request(all_requests, tokenizer_manager)
+
+            try:
+                single_ret = await tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                ).__anext__()
+
+                if not isinstance(single_ret, list):
+                    single_ret = [single_ret]
+                all_results.extend(single_ret)
+            except ValueError as e:
+                return create_error_response(str(e))
+
+        ret = all_results
+    else:
+        all_requests = [EmbeddingRequest(**request_json)]
+        adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
+
+        try:
+            ret = await tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+
+            if not isinstance(ret, list):
+                ret = [ret]
+        except ValueError as e:
+            return create_error_response(str(e))
 
     response = v1_embedding_response(ret, tokenizer_manager.model_path)
-
     return response
 
 
