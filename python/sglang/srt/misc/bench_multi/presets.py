@@ -19,6 +19,10 @@ def get_configs_scan_DeepSeekV3_4x8xH100():
     return TODO
 
 
+_SCAN_INPUT_LENS = [100, 1000, 10000, 100000]
+_SCAN_OUTPUT_LENS = [100, 1000, 10000]  # TODO
+
+
 def _compute_scan_config(
     server_args: Dict[str, Any],
     random_input_lens: List[int],
