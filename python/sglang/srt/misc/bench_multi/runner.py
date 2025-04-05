@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import json
+import multiprocessing as mp
 import random
 import time
 import uuid
@@ -19,6 +20,8 @@ from sglang.test.test_utils import get_benchmark_args, launch_server_process
 
 
 def run_bench_multi(args: argparse.Namespace):
+    mp.set_start_method("spawn", force=True)
+
     _log(f"run_bench_multi start {args=}")
 
     enable_ctrl_dist = args.nnodes > 1
