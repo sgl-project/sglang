@@ -455,7 +455,7 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
-        input_tokens = req.extend_input_len
+        input_tokens = -(-req.extend_input_len // self.page_size) * self.page_size
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
@@ -477,7 +477,9 @@ class PrefillAdder:
                     req.last_node_global, req.prefix_indices
                 )
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                input_tokens = req.extend_input_len
+                input_tokens = (
+                    -(-req.extend_input_len // self.page_size) * self.page_size
+                )
                 prefix_len = len(req.prefix_indices)
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
