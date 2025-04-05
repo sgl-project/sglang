@@ -1,23 +1,23 @@
 from functools import partial
-from typing import List, Any, Dict
+from typing import List
 
 from sglang.srt.misc.bench_multi.configs import Config
 
 
 def get_configs_debug():
     return [
-        _compute_scan_config(server_args=dict(tp_size=1), random_input_lens=[100, 1000], random_output_lens=[10]),
-        _compute_scan_config(server_args=dict(tp_size=2), random_input_lens=[1000], random_output_lens=[10, 100]),
+        _compute_scan_config(tp_size=1, random_input_lens=[100, 1000], random_output_lens=[10]),
+        _compute_scan_config(tp_size=2, random_input_lens=[1000], random_output_lens=[10, 100]),
     ]
 
 
 def get_configs_scan_DeepSeekV3_8xH200():
     compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(server_args=dict(tp_size=8)),
-        compute(server_args=dict(tp_size=8, dp_size=8, enable_dp_attention=True)),
-        compute(server_args=dict(tp_size=8, enable_ep_moe=True)),
-        compute(server_args=dict(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True)),
+        compute(tp_size=8),
+        compute(tp_size=8, dp_size=8, enable_dp_attention=True),
+        compute(tp_size=8, enable_ep_moe=True),
+        compute(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
@@ -25,10 +25,10 @@ def get_configs_scan_DeepSeekV3_8xH200():
 def get_configs_scan_DeepSeekV3_2x8xH100():
     compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(server_args=dict(tp_size=16)),
-        compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True)),
-        compute(server_args=dict(tp_size=16, enable_ep_moe=True)),
-        compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True)),
+        compute(tp_size=16),
+        compute(tp_size=16, dp_size=16, enable_dp_attention=True),
+        compute(tp_size=16, enable_ep_moe=True),
+        compute(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
@@ -36,10 +36,10 @@ def get_configs_scan_DeepSeekV3_2x8xH100():
 def get_configs_scan_DeepSeekV3_4x8xH100():
     compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
     return [
-        compute(server_args=dict(tp_size=32)),
-        compute(server_args=dict(tp_size=32, dp_size=32, enable_dp_attention=True)),
-        compute(server_args=dict(tp_size=32, enable_ep_moe=True)),
-        compute(server_args=dict(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True)),
+        compute(tp_size=32),
+        compute(tp_size=32, dp_size=32, enable_dp_attention=True),
+        compute(tp_size=32, enable_ep_moe=True),
+        compute(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True),
         # TODO
     ]
 
@@ -49,16 +49,16 @@ _SCAN_OUTPUT_LENS = [100, 1000, 10000]  # TODO
 
 
 def _compute_scan_config(
-    server_args: Dict[str, Any],
     random_input_lens: List[int],
     random_output_lens: List[int],
     num_repeat: int = 2,
+    **kwargs,
 ):
     return Config(
         server_args=dict(
             stream_output=True,
             disable_radix_cache=True,
-            **server_args,
+            **kwargs,
             # TODO attn backend
             # TODO blockwise fp8
         ),
