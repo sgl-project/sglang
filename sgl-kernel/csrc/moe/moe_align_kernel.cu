@@ -50,7 +50,8 @@ __global__ void moe_align_block_size_kernel(
     int32_t experts_per_warp,
     int32_t block_size,
     size_t numel,
-    int32_t* __restrict__ cumsum) {
+    int32_t* __restrict__ cumsum,
+    bool small_batch_mode) {
   extern __shared__ int32_t shared_counts[];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -96,6 +97,76 @@ __global__ void moe_align_block_size_kernel(
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
+  
+  if (small_batch_mode) {
+    for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+      int32_t expert_id = topk_ids[i];
+      int32_t rank_post_pad = atomicAdd(&cumsum[expert_id], 1);
+      sorted_token_ids[rank_post_pad] = i;
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void moe_align_block_size_small_batch_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t padded_num_experts,
+    int32_t experts_per_warp,
+    int32_t block_size,
+    size_t numel) {
+  extern __shared__ int32_t shared_mem[];
+  int32_t* expert_counts = shared_mem;
+  int32_t* expert_cumsum = &expert_counts[padded_num_experts];
+  
+  const int tid = threadIdx.x;
+  const int num_threads = blockDim.x;
+  
+  for (int i = tid; i < padded_num_experts; i += num_threads) {
+    expert_counts[i] = 0;
+  }
+  
+  __syncthreads();
+  
+  for (int i = tid; i < numel; i += num_threads) {
+    int32_t expert_id = topk_ids[i];
+    atomicAdd(&expert_counts[expert_id], 1);
+  }
+  
+  __syncthreads();
+  
+  if (tid == 0) {
+    expert_cumsum[0] = 0;
+    for (int i = 1; i <= num_experts; ++i) {
+      expert_cumsum[i] = expert_cumsum[i - 1] + CEILDIV(expert_counts[i - 1], block_size) * block_size;
+    }
+    *total_tokens_post_pad = expert_cumsum[num_experts];
+  }
+  
+  __syncthreads();
+  
+  if (tid < num_experts) {
+    for (int i = expert_cumsum[tid]; i < expert_cumsum[tid + 1]; i += block_size) {
+      expert_ids[i / block_size] = tid;
+    }
+  }
+  
+  if (tid == 0) {
+    for (int i = 0; i < num_experts; ++i) {
+      expert_cumsum[i] = 0;
+    }
+  }
+  
+  __syncthreads();
+  
+  for (int i = tid; i < numel; i += num_threads) {
+    int32_t expert_id = topk_ids[i];
+    int32_t rank_post_pad = atomicAdd(&expert_cumsum[expert_id], 1);
+    sorted_token_ids[rank_post_pad] = i;
+  }
 }
 
 void moe_align_block_size(
@@ -111,50 +182,62 @@ void moe_align_block_size(
 
   int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
-  int experts_per_warp;
-  int threads;
-
-  if (num_experts <= 8) {
-    experts_per_warp = 8;
-    threads = 256;
-  } else if (num_experts <= 16) {
-    experts_per_warp = 16;
-    threads = 512;
-  } else {
-    experts_per_warp = WARP_SIZE;
-    threads = 1024;
-  }
+  int experts_per_warp = WARP_SIZE;
+  int threads = 1024;
 
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-    auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+    bool small_batch_mode = topk_ids.numel() < 2048;
+    
+    if (small_batch_mode) {
+      threads = max((int)num_experts, WARP_SIZE);
+      
+      size_t shared_mem_size = 2 * padded_num_experts * sizeof(int32_t);
+      
+      auto small_batch_kernel = moe_align_block_size_small_batch_kernel<scalar_t>;
+      small_batch_kernel<<<1, threads, shared_mem_size, stream>>>(
+          topk_ids.data_ptr<scalar_t>(),
+          sorted_token_ids.data_ptr<int32_t>(),
+          experts_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          num_experts,
+          padded_num_experts,
+          experts_per_warp,
+          block_size,
+          topk_ids.numel());
+    } else {
+      auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
-    size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
-    size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
+      size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
+      size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
+      
+      cumsum_buffer.zero_();
+      
+      align_kernel<<<1, threads, shared_mem_size, stream>>>(
+          topk_ids.data_ptr<scalar_t>(),
+          sorted_token_ids.data_ptr<int32_t>(),
+          experts_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(),
+          num_experts,
+          padded_num_experts,
+          experts_per_warp,
+          block_size,
+          topk_ids.numel(),
+          cumsum_buffer.data_ptr<int32_t>(),
+          false);
 
-    align_kernel<<<1, threads, shared_mem_size, stream>>>(
-        topk_ids.data_ptr<scalar_t>(),
-        sorted_token_ids.data_ptr<int32_t>(),
-        experts_ids.data_ptr<int32_t>(),
-        num_tokens_post_pad.data_ptr<int32_t>(),
-        num_experts,
-        padded_num_experts,
-        experts_per_warp,
-        block_size,
-        topk_ids.numel(),
-        cumsum_buffer.data_ptr<int32_t>());
+      const int block_threads = std::min(256, (int)threads);
+      const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
+      const int max_blocks = 65535;
+      const int actual_blocks = std::min(num_blocks, max_blocks);
 
-    const int block_threads = std::min(256, (int)threads);
-    const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
-    const int max_blocks = 65535;
-    const int actual_blocks = std::min(num_blocks, max_blocks);
-
-    auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
-    sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-        topk_ids.data_ptr<scalar_t>(),
-        sorted_token_ids.data_ptr<int32_t>(),
-        cumsum_buffer.data_ptr<int32_t>(),
-        topk_ids.numel());
+      auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
+      sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
+          topk_ids.data_ptr<scalar_t>(),
+          sorted_token_ids.data_ptr<int32_t>(),
+          cumsum_buffer.data_ptr<int32_t>(),
+          topk_ids.numel());
+    }
   });
 }
