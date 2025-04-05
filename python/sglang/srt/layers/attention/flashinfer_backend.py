@@ -186,7 +186,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self.layer = 0
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -393,9 +392,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        self.layer = self.layer + 1
         print(
-            f"layer {self.layer}, q_size {q.size()}, ragged {self.forward_metadata.use_ragged}, no prefix {self.forward_metadata.extend_no_prefix}"
+            f"layer {layer.layer_id}, q_size {q.size()}, ragged {self.forward_metadata.use_ragged}, no prefix {self.forward_metadata.extend_no_prefix}"
         )
 
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
@@ -459,7 +457,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             cos_sim = torch.cosine_similarity(otest.view_as(q), o1.view_as(q), dim=-1)
-            print(f"layer {self.layer} min cos_sim = {cos_sim.min().item()}")
+            print(f"layer {layer.layer_id} min cos_sim = {cos_sim.min().item()}")
 
             # error occurred in prefill_wrapper_ragged's o, but lse seems correct
             if not torch.all(cos_sim >= torch.full_like(cos_sim, 0.999)):
@@ -504,7 +502,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 cos_sim2 = torch.cosine_similarity(
                     otest2.view_as(q), o.view_as(q), dim=-1
                 )
-                print(f"layer {self.layer} min cos_sim2 = {cos_sim2.min().item()}")
+                print(f"layer {layer.layer_id} min cos_sim2 = {cos_sim2.min().item()}")
 
                 # no error occurred in prefill_wrapper_paged's o and lse
                 if not torch.all(cos_sim2 >= torch.full_like(cos_sim2, 0.999)):
