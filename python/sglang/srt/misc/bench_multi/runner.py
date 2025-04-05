@@ -40,11 +40,11 @@ def run_bench_multi(args: argparse.Namespace):
 
 def _init_process_group(args):
     init_method = (
-        f"tcp://{args.ctrl_dist_init_addr}" if args.ctrl_dist_init_addr else None
+        f"tcp://{args.dist_init_addr}" if args.dist_init_addr else None
     )
     assert (
             args.nnodes == 1 or init_method is not None
-    ), "When multi-node, ctrl_dist_init_addr should be provided"
+    ), "When multi-node, dist_init_addr should be provided"
     _log(f"init_process_group start {init_method=}")
     torch.distributed.init_process_group(
         rank=args.node_rank, world_size=args.nnodes, init_method=init_method
@@ -59,7 +59,7 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
 def _run_one_config(config_index, config: Config, args: argparse.Namespace, enable_ctrl_dist: bool):
     _log(f"_run_one_config start {config_index=} {config=}")
     server_args = ServerArgs(
-        **config.server_args, nnodes=args.nnodes, node_rank=args.node_rank
+        **config.server_args, nnodes=args.nnodes, node_rank=args.node_rank, dist_init_addr=args.dist_init_addr,
     )
 
     if enable_ctrl_dist:
