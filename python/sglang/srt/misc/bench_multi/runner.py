@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Any, Dict
 
+import torch.cuda
 from sglang import bench_serving
 from sglang.srt.misc.bench_multi.configs import Config
 from sglang.srt.server_args import ServerArgs
@@ -52,7 +53,10 @@ def _write_output(
         server_args=dataclasses.asdict(server_args),
         bench_serving_args=vars(bench_serving_args),
         bench_serving_output={k: v for k, v in bench_serving_output if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS},
-        timestamp=time.time(),
+        metadata=dict(
+            timestamp=time.time(),
+            device_names=[torch.cuda.get_device_name(device) for device in torch.cuda.device_count()],
+        )
     )
 
     path = dir_output / f'bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json'
