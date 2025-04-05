@@ -7,7 +7,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import DisposibleBox, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -655,7 +655,12 @@ def grouped_gemm_triton(
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
         if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
+            if isinstance(a, DisposibleBox):
+                a_box = a
+                a, scale_a = sglang_per_token_group_quant_fp8(a.value, block_k)
+                a_box.dispose()
+            else:
+                a, scale_a = sglang_per_token_group_quant_fp8(a, block_k)
         else:
             a, scale_a = per_token_group_quant_fp8(a, block_k)
 
@@ -675,6 +680,9 @@ def grouped_gemm_triton(
     compute_m_num_tiles_indptr[(1,)](
         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
     )
+
+    if not isinstance(c, torch.Tensor):
+        c = c()
 
     grid = lambda META: (
         triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
