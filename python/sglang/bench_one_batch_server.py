@@ -19,9 +19,9 @@ from typing import Tuple
 
 import numpy as np
 import requests
-from sglang.srt.entrypoints.http_server import launch_server_process
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import launch_server_process
 
 
 @dataclasses.dataclass
