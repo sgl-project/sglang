@@ -31,7 +31,14 @@ def _run_one_config(config: Config):
         for bench_serving_args in config.bench_serving_args_list:
             bench_serving_args = get_benchmark_args(*bench_serving_args)
             bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
-            _write_output()
+            _write_output(
+                dir_output=TODO,
+                script_args=TODO,
+                server_args=server_args,
+                bench_serving_args=bench_serving_args,
+                bench_serving_output=bench_serving_output,
+                launch_server_id=launch_server_id,
+            )
 
 
 @contextmanager
