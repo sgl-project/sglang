@@ -21,7 +21,6 @@ from typing import Tuple
 
 import numpy as np
 import requests
-
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -64,7 +63,7 @@ class BenchArgs:
         )
 
 
-def launch_server_internal(server_args):
+def _launch_server_process_internal(server_args):
     try:
         launch_server(server_args)
     except Exception as e:
@@ -74,7 +73,7 @@ def launch_server_internal(server_args):
 
 
 def launch_server_process(server_args: ServerArgs):
-    proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
+    proc = multiprocessing.Process(target=_launch_server_process_internal, args=(server_args,))
     proc.start()
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = 600
