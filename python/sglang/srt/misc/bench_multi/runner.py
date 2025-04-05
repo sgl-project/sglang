@@ -1,4 +1,7 @@
+import random
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List
 
 from sglang import bench_serving
@@ -34,5 +37,6 @@ def _with_server(server_args: ServerArgs):
         kill_process_tree(proc.pid)
 
 
-def _write_output():
+def _write_output(dir_output: Path):
+    path = dir_output / f'bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json'
     TODO
