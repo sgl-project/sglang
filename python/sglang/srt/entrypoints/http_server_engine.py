@@ -73,6 +73,12 @@ class HttpServerEngineAdapter:
         load_format: Optional[str] = None,
         flush_cache: bool = False,
     ):
+        """
+        Update model weights from tensor data.
+        
+        Note: The model should be on GPUs rather than CPU for this functionality to work properly.
+        If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
+        """
 
         print(f"update_weights_from_tensor of HttpServerEngineAdapter")
         serialized_named_tensors = HttpSerializer.serialize(
