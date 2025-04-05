@@ -44,8 +44,11 @@ def get_configs_scan_DeepSeekV3_4x8xH100():
     ]
 
 
-_SCAN_INPUT_LENS = [100, 1000, 10000, 100000]
-_SCAN_OUTPUT_LENS = [100, 1000, 10000]  # TODO
+def _compute_deepseekv3_scan_config():
+    return _compute_scan_config(
+        random_input_lens=[100, 1000, 10000, 100000],
+        random_output_lens=[100, 1000, 10000],  # TODO
+    )
 
 
 def _compute_scan_config(
