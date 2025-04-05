@@ -1376,7 +1376,7 @@ class Scheduler(
             self.profiler_target_forward_ct
             and self.profiler_target_forward_ct <= self.forward_ct
         ):
-            self.stop_profile()
+            self.send_to_tokenizer.send_pyobj(self.stop_profile())
 
         # Run forward
         if self.is_generation:
@@ -1873,7 +1873,10 @@ class Scheduler(
 
     def stop_profile(self) -> None:
         if self.profiler_activities is None:
-            return
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already not in progress. Call /start_profile first.",
+            )
 
         logger.info("Stop profiling...")
         if self.torch_profiler is not None:
@@ -1904,10 +1907,7 @@ class Scheduler(
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
 
-        if self.profiler_target_forward_ct:
-            self.send_to_tokenizer.send_pyobj(
-                ProfileReqOutput(success=True, message="Succeeded.")
-            )
+        return ProfileReqOutput(success=True, message="Succeeded")
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
