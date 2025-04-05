@@ -30,13 +30,14 @@ def _compute_scan_config(
         ),
         bench_serving_args_list=[
             dict(
-                dataset_name="random",  # TODO
+                random_input_len=random_input_len,
+                random_output_len=random_output_len,
                 flush_cache=True,
+                dataset_name="random",  # TODO
                 random_range_ratio=0.0,  # TODO
                 max_concurrency=128,  # TODO
                 num_prompts=512,  # TODO
-                random_input_len=random_input_len,
-                random_output_len=random_output_len,
+                request_rate=float("inf"),  # TODO
             )
             for random_input_len in random_input_lens
             for random_output_len in random_output_lens
