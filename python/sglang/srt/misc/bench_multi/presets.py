@@ -15,9 +15,13 @@ def get_configs(preset_name: str) -> List[Config]:
 
 def _compute_scan_config():
     return Config(
-        server_args=TODO,
+        server_args=dict(
+            TODO=TODO,
+        ),
         bench_serving_args_list=[
-            TODO
+            dict(
+                TODO=TODO,
+            )
             for what in TODO
         ],
     )
