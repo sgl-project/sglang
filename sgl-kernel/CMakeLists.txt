@@ -5,8 +5,6 @@ cmake_policy(SET CMP0169 OLD)
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
-set(BUILD_FA3, OFF)
-
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 enable_language(CUDA)
@@ -112,6 +110,7 @@ option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
 option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
 option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
 option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
+option(BUILD_FA3   "Enable FA3"   OFF)
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -190,7 +189,7 @@ set(SOURCES
 
 # set flash-attention sources file
 # BF16 source files
-if (BUILD_FA3)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.3" AND BUILD_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
