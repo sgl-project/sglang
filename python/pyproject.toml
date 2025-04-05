@@ -38,7 +38,7 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "torchao>=0.7.0",
-    "transformers==4.50.0",
+    "transformers==4.51.0",
     "uvicorn",
     "uvloop",
     "compressed-tensors",

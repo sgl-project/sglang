@@ -27,7 +27,7 @@ pip install -e "python[all]" --find-links ${FLASHINFER_REPO}
 
 # Install additional dependencies
 pip install torch_memory_saver
-pip install transformers==4.50.0 sentence_transformers accelerate==1.4.0 peft pandas datasets timm torchaudio
+pip install transformers==4.51.0 sentence_transformers accelerate==1.4.0 peft pandas datasets timm torchaudio
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12

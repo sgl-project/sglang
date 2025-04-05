@@ -157,8 +157,7 @@ string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 set(SOURCES
-    "csrc/allreduce/trt_reduce_internal.cu"
-    "csrc/allreduce/trt_reduce_kernel.cu"
+    "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
