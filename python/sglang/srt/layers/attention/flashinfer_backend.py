@@ -15,10 +15,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import torch._dynamo
-<<<<<<< HEAD
 torch._dynamo.config.suppress_errors = True
-=======
->>>>>>> 6b1c019d (wraps the FlashInfer custom kernel calls with dynamo)
+
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1263,29 +1261,29 @@ def fast_decode_plan(
                 head_dim,
                 False,  # causal
             )
-        except TypeError:
-            # If that fails, try with the stream parameter
-            stream = torch.cuda.current_stream().cuda_stream
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                indptr_host,
-                kv_lens_arr_host,
-                batch_size,  # total_num_rows
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim,
-                head_dim,
-                False,  # causal
-                stream,
-            )
+        except (TypeError, RuntimeError) as e:
+            # If the error indicates too many arguments, try with fewer
+            if "expected at most 15 argument(s)" in str(e):
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                )
+            else:
+                # Re-raise if it's a different error
+                raise
     else:
-        # For non-tensor core version, also handle potential API differences
         try:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1335,12 +1333,6 @@ def fast_decode_plan(
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
 
-
-<<<<<<< HEAD
-# Add a decorator similar to the one in flashinfer_mla_backend.py
-=======
-# Add this function to make custom ops opaque to torch.compile/dynamo
->>>>>>> 6b1c019d (wraps the FlashInfer custom kernel calls with dynamo)
 def make_custom_op_dynamo_safe(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
