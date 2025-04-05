@@ -25,6 +25,7 @@ TOOLS_TAG_LIST = [
     "<tool_call>",
     "<|python_tag|>",
     "[TOOL_CALLS]",
+    "<｜tool▁calls▁begin｜>",
 ]
 
 
@@ -477,6 +478,71 @@ class Llama32Detector(BaseFormatDetector):
         )
 
 
+class DeepSeekV3Detector(BaseFormatDetector):
+    """
+    Detector for DeepSeek models.
+    Assumes function call format:
+      '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token_full = "<｜tool▁calls▁begin｜>"
+        self.bot_token_single = "<｜tool▁call▁begin｜>"
+        self.eot_token_single = "<｜tool▁calls▁end｜>"
+        self.bop_token = "```json"
+        self.eop_token = "```"
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a deepseek format tool call."""
+        return self.bot_token_full in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        """
+        idx = text.find(self.bot_token_full)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if self.bot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+        pattern = rf"{self.bot_token_single}(.*?){self.eot_token_single}"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        calls = []
+        try:
+            for match_result in match_result_list:
+                # Get function name
+                func_name = (
+                    match_result.split("<｜tool▁sep｜>")[1]
+                    .split(self.bop_token)[0]
+                    .strip()
+                )
+                func_args = re.search(
+                    f"{self.bop_token}\n(.*?)\n{self.eop_token}", match_result
+                ).group(1)
+                func_args = json.loads(func_args)
+                # construct match_result for parse_base_json
+                match_result = {"name": func_name, "parameters": func_args}
+                calls.extend(self.parse_base_json(match_result, tools))
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            # return the normal text if parsing fails
+            return StreamingParseResult(normal_text=text)
+
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin="<｜tool▁calls▁begin｜>｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            + name
+            + "\n```json\n",
+            end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            trigger="<｜tool▁calls▁begin｜>",
+        )
+
+
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
         """
@@ -543,6 +609,7 @@ class FunctionCallParser:
         "llama3": Llama32Detector,
         "qwen25": Qwen25Detector,
         "mistral": MistralDetector,
+        "deepseekv3": DeepSeekV3Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
