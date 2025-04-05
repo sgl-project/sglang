@@ -24,8 +24,9 @@ from transformers import LlamaConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.sampler import Sampler  # SamplerOutput, get_sampler
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -45,7 +46,6 @@ from sglang.srt.utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
-    make_layers_startend,
 )
 
 
@@ -127,7 +127,6 @@ class DeciLMDecoderLayer(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                # bias=getattr(config, "mlp_bias", False),
                 prefix=add_prefix("mlp", prefix),
             )
             self.post_attention_layernorm = RMSNorm(
@@ -201,11 +200,9 @@ class DeciModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         def get_layer(idx: int, prefix: str):
-            layer_idx = int(prefix.rsplit(".", 1)[1])
             return layer_type(
                 config,
                 layer_idx=idx,
-                # cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
             )
@@ -329,7 +326,7 @@ class DeciModel(nn.Module):
         return loaded_params
 
 
-class DeciLMForCausalLM(nn.Module):  # , SupportsLoRA, SupportsPP, HasNoOps):
+class DeciLMForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -407,15 +404,12 @@ class DeciLMForCausalLM(nn.Module):  # , SupportsLoRA, SupportsPP, HasNoOps):
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
-            logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(config)
-            # self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
-            #                                        config.vocab_size,
-            #                                        logit_scale)
+            self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         else:
             self.lm_head = PPMissingLayer()
 
-        self.sampler = Sampler()  # get_sampler()
+        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -432,22 +426,27 @@ class DeciLMForCausalLM(nn.Module):  # , SupportsLoRA, SupportsPP, HasNoOps):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
+        get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata,  #: SamplingMetadata,
+        sampling_metadata,
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(
             input_ids=None,
@@ -460,7 +459,7 @@ class DeciLMForCausalLM(nn.Module):  # , SupportsLoRA, SupportsPP, HasNoOps):
     def _preprocess_logits(
         self,
         logits_output: LogitsProcessorOutput,
-        sampling_info,  #: SamplingBatchInfo
+        sampling_info,
     ):
         # Apply logit bias
         if sampling_info.sampling_info_done:
