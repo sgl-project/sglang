@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -11,7 +12,13 @@ from sglang.test.test_utils import CustomTestCase
 
 class MockModelRunner:
     model_config = type(
-        "ModelConfig", (), {"context_len": 2048, "is_multimodal": False}
+        "ModelConfig",
+        (),
+        {
+            "context_len": 2048,
+            "is_multimodal": False,
+            "attention_arch": AttentionArch.MHA,
+        },
     )
     sliding_window_size = None
 
@@ -28,6 +35,7 @@ class MockModelRunner:
                 ),  # Add req_to_token attribute
             },
         )
+        self.page_size = 1
 
 
 class MockReqToTokenPool:
@@ -141,6 +149,8 @@ class TestFlashAttentionBackend(CustomTestCase):
             extend_prefix_lens=torch.tensor([0] * self.batch_size, device=self.device),
             extend_seq_lens=torch.tensor([4] * self.batch_size, device=self.device),
             attn_backend=self.backend,
+            seq_lens_cpu=torch.tensor([self.seq_len] * self.batch_size, device="cpu"),
+            extend_prefix_lens_cpu=torch.tensor([0] * self.batch_size, device="cpu"),
         )
 
         # Add token pool and KV cache
@@ -192,6 +202,7 @@ class TestFlashAttentionBackend(CustomTestCase):
             req_pool_indices=torch.arange(self.batch_size, device=self.device),
             seq_lens=torch.tensor([curr_seq_len] * self.batch_size, device=self.device),
             attn_backend=self.backend,
+            seq_lens_cpu=torch.tensor([curr_seq_len] * self.batch_size, device="cpu"),
         )
 
         # Add token pool and KV cache
@@ -258,6 +269,13 @@ class TestFlashAttentionBackend(CustomTestCase):
                 [extend_len] * self.batch_size, device=self.device
             ),
             attn_backend=self.backend,
+            seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
+            extend_prefix_lens_cpu=torch.tensor(
+                [prefix_len] * self.batch_size, device="cpu"
+            ),
+            extend_seq_lens_cpu=torch.tensor(
+                [extend_len] * self.batch_size, device="cpu"
+            ),
         )
 
         # Add token pool and KV cache
