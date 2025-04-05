@@ -84,7 +84,7 @@ class ServerArgs:
     stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
-    watchdog_timeout: float = 300
+    watchdog_timeout: float = 30000
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
