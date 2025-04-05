@@ -21,7 +21,7 @@ def _get_configs() -> List[Config]:
 def _run_one_config(config: Config):
     with _with_server(server_args):
         for _ in range(TODO):
-            bench_serving_output = _run_bench_serving()
+            bench_serving_output = bench_serving.run_benchmark(TODO)
             _write_output()
 
 
@@ -32,10 +32,6 @@ def _with_server(server_args: ServerArgs):
         yield
     finally:
         kill_process_tree(proc.pid)
-
-
-def _run_bench_serving():
-    return bench_serving.run_benchmark(TODO)
 
 
 def _write_output():
