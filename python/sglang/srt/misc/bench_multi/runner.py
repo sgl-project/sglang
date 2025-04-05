@@ -55,7 +55,7 @@ def _write_output(
         bench_serving_output={k: v for k, v in bench_serving_output if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS},
         metadata=dict(
             timestamp=time.time(),
-            device_names=[torch.cuda.get_device_name(device) for device in torch.cuda.device_count()],
+            device_names=[torch.cuda.get_device_name(device) for device in range(torch.cuda.device_count())],
         )
     )
 
