@@ -313,7 +313,7 @@ async def flush_cache():
     _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -637,10 +637,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -815,3 +815,35 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def launch_server_process(server_args: ServerArgs):
+    """launch_server, but in a subprocess"""
+
+    proc = multiprocessing.Process(target=_launch_server_process_internal, args=(server_args,))
+    proc.start()
+    base_url = f"http://{server_args.host}:{server_args.port}"
+    timeout = 600
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            headers = {
+                "Content-Type": "application/json; charset=utf-8",
+            }
+            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            if response.status_code == 200:
+                return proc, base_url
+        except requests.RequestException:
+            pass
+        time.sleep(10)
+    raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def _launch_server_process_internal(server_args):
+    try:
+        launch_server(server_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
