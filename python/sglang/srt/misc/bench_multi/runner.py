@@ -114,7 +114,7 @@ def _write_output(
         bench_serving_args=vars(bench_serving_args),
         bench_serving_output={
             k: v
-            for k, v in bench_serving_output
+            for k, v in bench_serving_output.items()
             if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS
         },
         metadata=dict(
