@@ -267,7 +267,7 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = 160
 
-        # Choose kernel backends
+        # Set kernel backends for hpu device
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"

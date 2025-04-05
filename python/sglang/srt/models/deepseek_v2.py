@@ -693,7 +693,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.attention_backend == "flashinfer_mla":
+        if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             return (
                 not self.flashinfer_mla_disable_ragged
