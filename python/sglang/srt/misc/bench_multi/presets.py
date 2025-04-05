@@ -23,6 +23,7 @@ def _compute_scan_config():
             dict(
                 dataset_name="random",
                 flush_cache=True,
+                random_range_ratio=0.0,
             )
             for what in TODO
         ],
