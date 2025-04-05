@@ -26,7 +26,8 @@ def _get_configs() -> List[Config]:
 def _run_one_config(config: Config):
     with _with_server(server_args):
         for _ in range(TODO):
-            bench_serving_output = bench_serving.run_benchmark(TODO)
+            bench_serving_args = TODO
+            bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
             _write_output()
 
 
@@ -42,12 +43,13 @@ def _with_server(server_args: ServerArgs):
 def _write_output(
     dir_output: Path,
     server_args: ServerArgs,
+    bench_serving_args,
     bench_serving_output: Dict[str, Any],
 ):
     content = dict(
         script_args=TODO,
         server_args=dataclasses.asdict(server_args),
-        bench_serving_args=TODO,
+        bench_serving_args=vars(bench_serving_args),
         bench_serving_output=bench_serving_output,
         timestamp=time.time(),
     )
