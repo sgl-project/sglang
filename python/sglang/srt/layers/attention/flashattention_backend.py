@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-
-"""
-Support different attention backends.
-Now there are three backends: FlashInfer, Triton and FlashAttention.
-Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
-"""
-
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -17,6 +9,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -28,22 +21,25 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
-    each layer's forward pass can reuse the metadata."""
+    each layer's forward pass can reuse the metadata.
 
-    # Cumulative sequence lengths for query
-    cu_seqlens_q: torch.Tensor = None
-    # Cumulative sequence lengths for key
-    cu_seqlens_k: torch.Tensor = None
+    For each init metadata function, we will try set up them in below order
+    """
+
+    # Sequence lengths for the forward batch
+    cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
     max_seq_len_q: int = 0
     # Maximum sequence length for key
     max_seq_len_k: int = 0
+    # Cumulative sequence lengths for query
+    cu_seqlens_q: torch.Tensor = None
+    # Cumulative sequence lengths for key
+    cu_seqlens_k: torch.Tensor = None
     # Window size (typically used by Gemma)
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
-    # Sequence lengths for the forward batch
-    cache_seqlens_int32: torch.Tensor = None
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -91,18 +87,11 @@ class FlashAttentionBackend(AttentionBackend):
         ) and (not global_server_args_dict["disable_mla"])
         self.skip_prefill = skip_prefill
 
-        # These Spec Decode configs are the same for all FlashAttentionBackend instances
-        # They are configured by server args
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-
-        # num_draft_tokens will be need for Target Verify which will be ran on the Target Worker
-        # hence we need to get it from server args instead of FlashAttentionMultiStepBackend
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-
-        # Passed in from FlashAttentionMultiStepBackend, would be [0, 1, ... num_steps - 1]
         self.speculative_step_id = speculative_step_id
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -111,57 +100,42 @@ class FlashAttentionBackend(AttentionBackend):
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = len(seqlens_in_batch)
         device = seqlens_in_batch.device
+
         if forward_batch.forward_mode.is_decode():
-            # Skip Prefill or Draft Decode
-            # Note: Draft Decode will be ran on the Draft Worker
+            # Draft Decode
             if forward_batch.spec_info is not None:
+                metadata.cache_seqlens_int32 = (
+                    seqlens_in_batch + (self.speculative_step_id + 1)
+                ).to(torch.int32)
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                    self.speculative_step_id + 1
+                )
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-                seq_lens_with_decode = seqlens_in_batch + (self.speculative_step_id + 1)
-                metadata.cache_seqlens_int32 = seq_lens_with_decode.to(torch.int32)
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
                     ),
                     (1, 0),
                 )
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
-                )
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
-                cache_loc = forward_batch.out_cache_loc.view(
-                    self.speculative_num_steps, -1
-                ).T
-
-                for idx, single_seq_len in enumerate(seq_lens_with_decode):
-                    real_bsz_start_idx = idx
-                    real_bsz_end_idx = idx + 1
-                    metadata.page_table[
-                        real_bsz_start_idx:real_bsz_end_idx,
-                        (
-                            single_seq_len - (self.speculative_step_id + 1)
-                        ) : single_seq_len,
-                    ] = cache_loc[
-                        real_bsz_start_idx:real_bsz_end_idx,
-                        : (self.speculative_step_id + 1),
-                    ]
-            else:  # Normal Decode without Spec Decoding
+            else:
+                # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-                )
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
         elif forward_batch.forward_mode.is_target_verify():
-            # Note: Target Verify will be ran on the Target Worker
             metadata.cache_seqlens_int32 = (
                 forward_batch.seq_lens + self.speculative_num_draft_tokens
             ).to(torch.int32)
@@ -186,32 +160,28 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend():
-            # Normal or Draft Extend (Both of them will be ran on the Target Worker)
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
-            # Precompute maximum sequence length
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            # Precompute page table
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-            # Precompute cumulative sequence lengths
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
                 extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
             else:
-                metadata.cu_seqlens_q = metadata.cu_seqlens_k
                 metadata.max_seq_len_q = metadata.max_seq_len_k
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        # Precompute strided indices
+        # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
