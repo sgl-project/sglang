@@ -51,9 +51,12 @@ def _write_output(
         script_args=vars(script_args),
         server_args=dataclasses.asdict(server_args),
         bench_serving_args=vars(bench_serving_args),
-        bench_serving_output=bench_serving_output,
+        bench_serving_output={k: v for k, v in bench_serving_output if k not in _BENCH_SERVING_OUTPUT_BLACKLIST_KEYS},
         timestamp=time.time(),
     )
 
     path = dir_output / f'bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json'
     path.write_text(json.dumps(content))
+
+
+_BENCH_SERVING_OUTPUT_BLACKLIST_KEYS = ["generated_texts", "errors"]
