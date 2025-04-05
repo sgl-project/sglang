@@ -11,8 +11,8 @@ import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.entrypoints.base_engine import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
-from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     HttpSerializer,
@@ -56,7 +56,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-class HttpServerEngineAdapter:
+class HttpServerEngineAdapter(EngineBase):
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
         # self.server_args = copy.deepcopy(server_args)
@@ -75,7 +75,7 @@ class HttpServerEngineAdapter:
     ):
         """
         Update model weights from tensor data.
-        
+
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
