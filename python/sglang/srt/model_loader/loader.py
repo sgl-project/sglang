@@ -1282,6 +1282,7 @@ class RemoteModelLoader(BaseModelLoader):
                         ".bin",
                         ".pt",
                         ".safetensors",
+                        ".jpg",  # ignore jpg file
                     ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
@@ -1363,7 +1364,9 @@ class RemoteModelLoader(BaseModelLoader):
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
 
-            with create_remote_connector(model_weights, device_config.device) as client:
+            with create_remote_connector(
+                model_weights, device=device_config.device
+            ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
                     self._load_model_from_remote_kv(model, client)
