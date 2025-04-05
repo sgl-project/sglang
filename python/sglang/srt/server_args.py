@@ -179,11 +179,11 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
-    enable_flashinfer_mla: bool = False
+    enable_flashinfer_mla: bool = False  # TODO: remove this argument
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
-    n_share_experts_fusion: Optional[int] = None
+    n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
@@ -267,15 +267,11 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = 160
 
-        # Choose kernel backends
+        # Set kernel backends for hpu device
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
-        if self.attention_backend is None:
-            self.attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -842,7 +838,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-flashinfer-mla",
             action="store_true",
-            help="Enable FlashInfer MLA optimization",
+            help="Enable FlashInfer MLA optimization. This argument will be deprecated soon! Please use '--attention-backend flashinfer' instead for switching on flashfiner mla!",
         )
         parser.add_argument(
             "--enable-flashmla",
@@ -1110,7 +1106,7 @@ class ServerArgs:
         parser.add_argument(
             "--n-share-experts-fusion",
             type=int,
-            default=None,
+            default=0,
             help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
             "we use tp_size by default.",
         )
