@@ -297,6 +297,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl":
+
         def sgl_moe_align_block_size_with_zeros(
             topk_ids,
             num_experts,
@@ -306,7 +307,9 @@ def benchmark(num_tokens, num_experts, topk, provider):
             num_tokens_post_pad,
         ):
             token_cnts_buffer = torch.empty(
-                (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
+                (num_experts + 1) * num_experts,
+                dtype=torch.int32,
+                device=topk_ids.device,
             )
             cumsum_buffer = torch.empty(
                 num_experts + 1, dtype=torch.int32, device=topk_ids.device
