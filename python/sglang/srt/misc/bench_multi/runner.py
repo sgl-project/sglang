@@ -39,12 +39,9 @@ def run_bench_multi(args: argparse.Namespace):
 
 
 def _init_process_group(args):
-    init_method = (
-        f"tcp://{args.dist_init_addr}" if args.dist_init_addr else None
-    )
-    assert (
-            args.nnodes == 1 or init_method is not None
-    ), "When multi-node, dist_init_addr should be provided"
+    dist_init_host, dist_init_port = args.dist_init_addr.split(":")
+    ctrl_dist_init_port = int(dist_init_port) - 10
+    init_method = f"tcp://{dist_init_host}:{ctrl_dist_init_port}"
     _log(f"init_process_group start {init_method=}")
     torch.distributed.init_process_group(
         rank=args.node_rank, world_size=args.nnodes, init_method=init_method
