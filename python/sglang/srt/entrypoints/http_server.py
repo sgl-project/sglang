@@ -730,7 +730,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
 ):
     headers = {}
-    url = server_args.url()
+    url = server_args.url_or_local()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
