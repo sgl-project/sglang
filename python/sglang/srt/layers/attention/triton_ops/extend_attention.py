@@ -74,6 +74,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
 ):
@@ -129,6 +130,7 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+
         offs_kv_loc = tl.load(
             kv_indices + cur_seq_kv_start_idx + start_n + offs_n, mask=mask_n, other=0
         )
@@ -196,7 +198,11 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
-    cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    cur_block_m_end = (
+        cur_seq_len_extend
+        if not IS_CAUSAL
+        else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+    )
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
@@ -243,12 +249,15 @@ def _fwd_kernel(
             )
             custom_mask &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
+        elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             qk = tl.where(mask_causual, qk, float("-inf"))
+        else:
+            mask_non_causal = mask_m[:, None] & mask_n[None, :]
+            qk = tl.where(mask_non_causal, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -299,6 +308,7 @@ def extend_attention_fwd(
     kv_indptr,
     kv_indices,
     custom_mask,
+    is_causal,
     mask_indptr,
     max_len_extend,
     sm_scale=None,
@@ -411,6 +421,7 @@ def extend_attention_fwd(
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
