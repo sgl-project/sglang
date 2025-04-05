@@ -437,20 +437,19 @@ class FlashAttentionBackend(AttentionBackend):
         }
 
         self.target_verify_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
                 (self.max_context_len + self.page_size - 1) // self.page_size,
                 dtype=torch.int32,
                 device=self.device,
             ),
-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.zeros(
-                max_bs + 128, dtype=torch.int32, device=self.device
-            ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 128, dtype=torch.int32, device=self.device
-            ),
-            "max_seqlen_q": 0,
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
             ),
@@ -528,25 +527,18 @@ class FlashAttentionBackend(AttentionBackend):
                 seq_lens.max().item() + self.speculative_num_draft_tokens
             )
 
-            metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
-                torch.arange(
-                    0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-            ]
-            cu_k = self.target_verify_metadata["cu_seqlens_k"][: (bs + 1)]
-            cu_k.copy_(
-                torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * self.speculative_num_draft_tokens + 1,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
             )
-            metadata.cu_seqlens_k = cu_k
+
+            metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
+                : (bs + 1)
+            ]
+
             metadata.page_table = self.target_verify_metadata["page_table"][
                 req_pool_indices, :
             ]
@@ -625,16 +617,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             metadata = self.target_verify_metadata[bs]
-
-            metadata.cu_seqlens_q.copy_(
-                torch.arange(
-                    0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-            )
             metadata.cache_seqlens_int32.copy_(
                 (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
             )
