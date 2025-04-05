@@ -554,12 +554,13 @@ def get_benchmark_args(
     pd_seperated: bool = False,
     flush_cache: bool = False,
     max_concurrency=None,
+    port=None,
 ):
     return SimpleNamespace(
         backend="sglang",
         base_url=base_url,
         host=None,
-        port=None,
+        port=port,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
         model=None,
