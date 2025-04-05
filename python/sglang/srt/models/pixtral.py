@@ -11,20 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
 """
-Inference-only Pixtral HF Vision model compatible with HuggingFace Transformers (Llava Architecture).
 Using mistral-community/pixtral-12b as reference.
-TODO: add support for mistral format (mistralai/Pixtral-12B as a reference)
 """
 
+import logging
 import math
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PixtralVisionConfig
+from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
@@ -34,64 +33,125 @@ from transformers.models.pixtral.modeling_pixtral import (
     position_ids_in_meshgrid,
 )
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed import utils as dist_utils
+from python.sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
+from python.sglang.srt.models.llava import LlavaForConditionalGeneration
+from python.sglang.srt.utils import flatten_nested_list
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
-class PixtralHFEncoderInfo:
-    """Information about the Pixtral Vision Encoder configuration."""
+class PixtralHFInputPatcher:
+    """
+    TODO: refactor as multimodal data padding for Mistral's models.
 
-    def __init__(self, vision_config: PixtralVisionConfig):
+    Pad input_ids with Mistral-exclusive formats.
+    The multimodal special tokens:
+    [IMG]: placeholder token, one per patch_size x patch_size grid
+    [IMG_BREAK]: mark a "row" of pixels (or patch grid)'s ending; new line
+    [IMG_END]: mark the end of the image
+
+    Let's say we have patch_size = 16, and image_size = 40x30.
+    Then we have ceil(40/16) x ceil(30/16) = 3 x 2 patch grids.
+    For this prompt:
+        "<s>[INST]what's that?\n[IMG][/INST]"
+    The padded version will be
+        "<s>[INST]what's that?\n[IMG][IMG][IMG][IMG_BREAK][IMG][IMG][IMG][IMG_BREAK][IMG_END][/INST]"
+    """
+
+    IMG_TOKEN_ID = 10
+    IMG_BREAK_TOKEN_ID = 12
+    IMG_END_TOKEN_ID = 13
+
+    def __init__(self, vision_config: PretrainedConfig):
         self.vision_config = vision_config
 
-    def get_num_image_tokens(
+    def pad_input_ids(
+        self, input_ids: List[int], image_inputs: MultimodalInputs
+    ) -> List[int]:
+        """
+        Args:
+            input_ids: List[int]
+            image_inputs: MultimodalInputs
+
+        Returns:
+            List[int]: padded input_ids
+        """
+        images_sizes = flatten_nested_list(
+            [item.image_sizes for item in image_inputs.mm_items]
+        )
+        if any(
+            item.modality in (Modality.VIDEO, Modality.AUDIO)
+            for item in image_inputs.mm_items
+        ):
+            raise NotImplementedError(
+                f"Video and audio are not supported by {self.__class__.__name__}"
+            )
+
+        img_token_idxs = [i for i, t in enumerate(input_ids) if t == self.IMG_TOKEN_ID]
+        if len(img_token_idxs) != len(images_sizes):
+            raise ValueError(
+                f"Got {len(images_sizes)} images inputs, but {len(img_token_idxs)} image tokens in input_ids"
+            )
+
+        padded_input_ids = []
+        offsets, pad_lens = [], []
+        prev_img_offset = 0
+        for i, (h, w) in enumerate(images_sizes):
+            img_offset = img_token_idxs[i]
+            padding = self.get_padding_tokens(
+                image_width=w,
+                image_height=h,
+            )
+            padded_input_ids += input_ids[prev_img_offset:img_offset]
+            padded_input_ids += padding
+            prev_img_offset = img_offset + 1
+            offsets.append(img_offset)
+            pad_lens.append(len(padding))
+
+        padded_input_ids += input_ids[prev_img_offset:]
+        image_inputs.image_pad_len = pad_lens
+        image_inputs.image_offsets = offsets
+        return padded_input_ids
+
+    def get_padding_tokens(
         self,
         *,
         image_width: int,
         image_height: int,
-    ) -> int:
+    ) -> List[int]:
         ncols, nrows = self.get_patch_grid_size(
             image_width=image_width,
             image_height=image_height,
         )
 
-        tokens = (ncols + 1) * nrows
-        # Consider the image_break_token
-        return tokens
+        pad_len = (ncols + 1) * nrows  # (nrows-1) image breaks + image_end_token
+        padding = [self.IMG_TOKEN_ID] * pad_len
+        padding[ncols : -1 : ncols + 1] = (self.IMG_BREAK_TOKEN_ID,) * (nrows - 1)
+        padding[-1] = self.IMG_END_TOKEN_ID
+        return padding
 
-    def get_max_image_tokens(self) -> int:
-        image_size = self.get_image_size()
-        tokens = self.get_num_image_tokens(
-            image_width=image_size,
-            image_height=image_size,
-        )
-        return tokens
+    @property
+    def max_image_tokens_num(self) -> int:
+        return self.num_patches_per_side**2
 
-    def get_image_size(self) -> int:
+    @property
+    def image_size(self) -> int:
         return self.vision_config.image_size
 
-    def get_patch_size(self) -> int:
+    @property
+    def patch_size(self) -> int:
         patch_size = (
             self.vision_config.patch_size * self.vision_config.spatial_merge_size
         )
         return patch_size
 
-    def get_patch_grid_length(self) -> int:
-        image_size, patch_size = self.get_image_size(), self.get_patch_size()
-        grid_length = image_size // patch_size
-        # Since interpolation is applied, the image size need not be divisible
-        return grid_length
+    @property
+    def num_patches_per_side(self) -> int:
+        return self.image_size // self.patch_size
 
     def get_patch_grid_size(
         self,
@@ -99,12 +159,11 @@ class PixtralHFEncoderInfo:
         image_width: int,
         image_height: int,
     ) -> tuple[int, int]:
-        max_width = max_height = self.get_image_size()
-        patch_width = patch_height = self.get_patch_size()
+        max_width = max_height = self.image_size
+        patch_width = patch_height = self.patch_size
 
         ratio = max(image_width / max_width, image_height / max_height)
 
-        orig_width, orig_height = image_width, image_height
         if ratio > 1:
             image_width = int(math.floor(image_width / ratio))
             image_height = int(math.floor(image_height / ratio))
@@ -122,7 +181,7 @@ class PixtralHFMLP(nn.Module):
 
     def __init__(
         self,
-        config: PixtralVisionConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         *,
         prefix: str = "",
@@ -166,7 +225,7 @@ class PixtralHFTransformerBlock(nn.Module):
 
     def __init__(
         self,
-        config: PixtralVisionConfig,
+        config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         *,
@@ -374,6 +433,11 @@ class PixtralHFVisionModel(nn.Module):
             prefix=f"{prefix}.transformer",
         )
 
+        self.input_patcher = PixtralHFInputPatcher(config)
+
+        if not hasattr(config, "spatial_merge_size"):
+            config.spatial_merge_size = 1
+
         # Check that num_hidden_layers is valid
         num_hidden_layers = config.num_hidden_layers
         if len(self.transformer.layers) > config.num_hidden_layers:
@@ -396,6 +460,11 @@ class PixtralHFVisionModel(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def pad_input_ids(
+        self, input_ids: List[int], image_inputs: MultimodalInputs
+    ) -> List[int]:
+        return self.input_patcher.pad_input_ids(input_ids, image_inputs)
 
     def forward(
         self,
@@ -518,11 +587,9 @@ class PixtralHFVisionModel(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         """Load weights from a HuggingFace checkpoint with proper parameter mapping."""
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
-        # Define mappings for stacked parameters
+        # for (param, weight, shard_id): load weight into param as param's shard_id part
         stacked_params_mapping = [
-            # (param_name, weight_name, shard_id)
             (".attention.qkv_proj", ".attention.q_proj", "q"),
             (".attention.qkv_proj", ".attention.k_proj", "k"),
             (".attention.qkv_proj", ".attention.v_proj", "v"),
@@ -531,39 +598,34 @@ class PixtralHFVisionModel(nn.Module):
         ]
 
         # Process each weight
-        processed_count = 0
-        stacked_count = 0
         for name, loaded_weight in weights:
-            # Check if this is a stacked parameter (q_proj/k_proj/v_proj or gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
                     # Replace the weight name part with the combined parameter name
                     transformed_name = name.replace(weight_name, param_name)
                     if transformed_name in params_dict:
                         param = params_dict[transformed_name]
-                        # Use the weight_loader method with shard_id to load into the correct portion
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight, shard_id)
-                        loaded_params.add(transformed_name)
-                        stacked_count += 1
                         break
             else:
-                # Handle regular parameters (not stacked ones)
-                # For attention.proj => attention.o_proj mapping
                 if ".attention.o_proj" in name:
-                    name = name.replace(".attention.o_proj", ".attention.proj")
-
+                    alt_name = name.replace(".attention.o_proj", ".attention.proj")
+                    if alt_name in params_dict:
+                        name = alt_name
                 if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
 
-        return loaded_params
+
+class PixtralForConditionalGeneration(LlavaForConditionalGeneration):
+    # TODO: wait for mistralai/Pixtral-12B to switch to HF config format
+    pass
 
 
 # Register the model classes for external access

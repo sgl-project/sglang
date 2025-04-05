@@ -32,7 +32,12 @@ from transformers import (
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
@@ -117,7 +122,6 @@ class LlavaBaseForCausalLM(nn.Module):
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-
         selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
 
         if self.vision_feature_select_strategy in ["default", "patch"]:
@@ -368,7 +372,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
                 extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -615,6 +618,12 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         # "pixtral": PixtralVisionConfig,
     }
 
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+        if hasattr(self.vision_tower, "pad_input_ids"):
+            return self.vision_tower.pad_input_ids(input_ids, image_inputs)
+        else:
+            return super().pad_input_ids(input_ids, image_inputs)
+
     def __init__(
         self,
         config: LlavaConfig,
@@ -686,6 +695,57 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Extract features from image inputs.
+
+        Args:
+            items: List of MultimodalDataItem objects containing image data
+
+        Returns:
+            torch.Tensor: Extracted image features
+        """
+        # Collect pixel values from items
+        pixel_values = [item.pixel_values for item in items]
+
+        if (
+            pixel_values[0].ndim == 4
+        ):  # For multi-patch images like llava-hd: [num_patch, C, H, W]
+            pixel_values_concat = np.concatenate(pixel_values, axis=0)
+            concat_images = torch.tensor(
+                pixel_values_concat, device=self.vision_tower.device
+            )
+            image_features = self.encode_images(concat_images)
+            split_sizes = [image.shape[0] for image in pixel_values]
+            return torch.split(image_features, split_sizes, dim=0)
+        else:  # For standard images: [C, H, W]
+            pixel_values_concat = torch.tensor(
+                np.array(pixel_values), device=self.vision_tower.device
+            )
+            return self.encode_images(pixel_values_concat)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+    ):
+
+        if get_embedding:
+            raise NotImplementedError()
+
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            get_embedding=get_embedding,
+            language_model=self.language_model,
+            image_data_embedding_func=self.get_image_feature,
+            placeholder_token_ids=[self.config.image_token_index],
+            positions=positions,
+        )
+
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for LlavaForConditionalGeneration.
