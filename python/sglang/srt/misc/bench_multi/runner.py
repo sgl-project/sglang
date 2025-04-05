@@ -18,7 +18,7 @@ from sglang.test.test_utils import launch_server_process, get_benchmark_args
 
 
 def run_bench_multi(args: argparse.Namespace):
-    configs = _get_configs()
+    configs = _get_configs(preset_name=args.preset_name, start_index=args.start_index, end_index=args.end_index)
     for config in configs:
         _run_one_config(config)
 
