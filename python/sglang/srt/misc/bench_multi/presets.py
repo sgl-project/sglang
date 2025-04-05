@@ -47,6 +47,8 @@ def _compute_scan_config(
             stream_output=True,
             disable_radix_cache=True,
             **server_args,
+            # TODO attn backend
+            # TODO blockwise fp8
         ),
         bench_serving_args_list=[
             dict(
