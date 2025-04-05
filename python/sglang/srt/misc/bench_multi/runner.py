@@ -20,7 +20,13 @@ from sglang.test.test_utils import launch_server_process, get_benchmark_args
 
 def run_bench_multi(args: argparse.Namespace):
     _log(f"run_bench_multi start {args=}")
-    torch.distributed.init_process_group(rank=args.node_rank, world_size=args.nnodes)
+
+    torch.distributed.init_process_group(
+        rank=args.node_rank,
+        world_size=args.nnodes,
+        init_method=f"tcp://{TODO}",
+    )
+
     configs = _get_configs(preset_name=args.preset_name, start_index=args.start_index, end_index=args.end_index)
     for config in configs:
         _run_one_config(config, args)
