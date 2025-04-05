@@ -10,3 +10,4 @@ def get_configs(preset_name: str) -> List[Config]:
         return TODO
     if preset_name == "scan_4x8xH100":
         return TODO
+    raise NotImplementedError(f"Unknown {preset_name=}")
