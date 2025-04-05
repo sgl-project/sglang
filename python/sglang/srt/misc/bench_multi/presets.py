@@ -5,10 +5,18 @@ from sglang.srt.misc.bench_multi.configs import Config
 
 def get_configs_debug():
     return [
-        _compute_scan_config(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=1, random_input_lens=[100, 1000],
-                             random_output_lens=[10]),
-        _compute_scan_config(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=2, random_input_lens=[1000],
-                             random_output_lens=[10, 100]),
+        _compute_scan_config(
+            model_path="Qwen/Qwen1.5-MoE-A2.7B",
+            tp_size=1,
+            random_input_lens=[100, 1000],
+            random_output_lens=[10],
+        ),
+        _compute_scan_config(
+            model_path="Qwen/Qwen1.5-MoE-A2.7B",
+            tp_size=2,
+            random_input_lens=[1000],
+            random_output_lens=[10, 100],
+        ),
     ]
 
 
@@ -17,7 +25,9 @@ def get_configs_scan_DeepSeekV3_8xH200():
         _compute_deepseekv3_scan_config(tp_size=8),
         _compute_deepseekv3_scan_config(tp_size=8, dp_size=8, enable_dp_attention=True),
         _compute_deepseekv3_scan_config(tp_size=8, enable_ep_moe=True),
-        _compute_deepseekv3_scan_config(tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(
+            tp_size=8, dp_size=8, enable_dp_attention=True, enable_ep_moe=True
+        ),
         # TODO
     ]
 
@@ -25,9 +35,13 @@ def get_configs_scan_DeepSeekV3_8xH200():
 def get_configs_scan_DeepSeekV3_2x8xH100():
     return [
         _compute_deepseekv3_scan_config(tp_size=16),
-        _compute_deepseekv3_scan_config(tp_size=16, dp_size=16, enable_dp_attention=True),
+        _compute_deepseekv3_scan_config(
+            tp_size=16, dp_size=16, enable_dp_attention=True
+        ),
         _compute_deepseekv3_scan_config(tp_size=16, enable_ep_moe=True),
-        _compute_deepseekv3_scan_config(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(
+            tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True
+        ),
         # TODO
     ]
 
@@ -35,9 +49,13 @@ def get_configs_scan_DeepSeekV3_2x8xH100():
 def get_configs_scan_DeepSeekV3_4x8xH100():
     return [
         _compute_deepseekv3_scan_config(tp_size=32),
-        _compute_deepseekv3_scan_config(tp_size=32, dp_size=32, enable_dp_attention=True),
+        _compute_deepseekv3_scan_config(
+            tp_size=32, dp_size=32, enable_dp_attention=True
+        ),
         _compute_deepseekv3_scan_config(tp_size=32, enable_ep_moe=True),
-        _compute_deepseekv3_scan_config(tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True),
+        _compute_deepseekv3_scan_config(
+            tp_size=32, dp_size=32, enable_dp_attention=True, enable_ep_moe=True
+        ),
         # TODO
     ]
 
