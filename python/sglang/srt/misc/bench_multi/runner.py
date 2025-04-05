@@ -30,18 +30,25 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
 
 def _run_one_config(config: Config, args: argparse.Namespace):
     server_args = ServerArgs(**config.server_args, nnodes=args.nnodes, node_rank=args.node_rank)
+
+    TODO_barrier
     with _with_server(server_args) as launch_server_id:
-        for bench_serving_args in config.bench_serving_args_list:
-            bench_serving_args = get_benchmark_args(*bench_serving_args)
-            bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
-            _write_output(
-                dir_output=Path(args.dir_output),
-                script_args=args,
-                server_args=server_args,
-                bench_serving_args=bench_serving_args,
-                bench_serving_output=bench_serving_output,
-                launch_server_id=launch_server_id,
-            )
+        TODO_barrier
+        if args.node_rank == 0:
+            for bench_serving_args in config.bench_serving_args_list:
+                bench_serving_args = get_benchmark_args(*bench_serving_args)
+                bench_serving_output = bench_serving.run_benchmark(bench_serving_args)
+                _write_output(
+                    dir_output=Path(args.dir_output),
+                    script_args=args,
+                    server_args=server_args,
+                    bench_serving_args=bench_serving_args,
+                    bench_serving_output=bench_serving_output,
+                    launch_server_id=launch_server_id,
+                )
+        else:
+            TODO
+        TODO_barrier
 
 
 @contextmanager
