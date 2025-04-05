@@ -4,7 +4,7 @@ import random
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List
+from typing import List, Any, Dict
 
 from sglang import bench_serving
 from sglang.srt.misc.bench_multi.configs import Config
@@ -42,12 +42,13 @@ def _with_server(server_args: ServerArgs):
 def _write_output(
     dir_output: Path,
     server_args: ServerArgs,
+    bench_serving_output: Dict[str, Any],
 ):
     content = dict(
         script_args=TODO,
         server_args=dataclasses.asdict(server_args),
         bench_serving_args=TODO,
-        bench_serving_output=TODO,
+        bench_serving_output=bench_serving_output,
         timestamp=time.time(),
     )
 
