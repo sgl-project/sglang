@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Any, Dict
 
 from sglang.srt.misc.bench_multi.configs import Config
 
@@ -17,11 +17,16 @@ def get_configs(preset_name: str) -> List[Config]:
     raise NotImplementedError(f"Unknown {preset_name=}")
 
 
-def _compute_scan_config():
+def _compute_scan_config(
+    server_args: Dict[str, Any],
+    random_input_lens: List[int],
+    random_output_lens: List[int],
+):
     return Config(
         server_args=dict(
             stream_output=True,
             disable_radix_cache=True,
+            **server_args,
         ),
         bench_serving_args_list=[
             dict(
