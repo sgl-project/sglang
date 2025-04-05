@@ -331,7 +331,7 @@ class ModelRunner:
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
-            server_args.chunked_prefill_size = -1
+            self.chunked_prefill_size = -1
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
