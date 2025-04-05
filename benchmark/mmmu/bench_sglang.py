@@ -156,6 +156,7 @@ async def eval_mmmu(args) -> None:
 def parse_args():
     parser = argparse.ArgumentParser()
     EvalArgs.add_cli_args(parser)
+    EvalArgs.add_cli_args(parser)
     args = add_common_sglang_args_and_parse(parser)
     return args
 

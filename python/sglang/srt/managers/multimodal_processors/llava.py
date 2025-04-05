@@ -146,7 +146,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     data_hashes.append(image_h)
                     image_sizes.append(image_s)
 
-                if isinstance(pixel_values[0], np.ndarray):
+                if (
+                    isinstance(pixel_values[0], np.ndarray)
+                    and len(set(image_sizes)) == 1
+                ):
                     pixel_values = np.stack(pixel_values, axis=0)
             else:
                 # A single image

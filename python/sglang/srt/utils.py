@@ -1971,7 +1971,7 @@ def retry(
             time.sleep(delay)
 
 
-def flatten_nested_list(nested_list):
+def flatten_nested_list(nested_list) -> List:
     if isinstance(nested_list, list):
         return [
             item for sublist in nested_list for item in flatten_nested_list(sublist)
