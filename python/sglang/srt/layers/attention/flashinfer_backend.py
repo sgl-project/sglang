@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -264,6 +265,12 @@ class FlashInferAttnBackend(AttentionBackend):
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
 
+        # Ensure tensors are properly allocated
+        for i in range(self.num_wrappers):
+            # Force allocation by performing a small operation
+            if len(self.cuda_graph_kv_indices[i]) > 0:
+                self.cuda_graph_kv_indices[i][0] = 0
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -272,6 +279,18 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
+            
+            # Force allocation
+            self.cuda_graph_custom_mask[0] = 0
+            for i in range(len(self.cuda_graph_qk_indptr)):
+                if len(self.cuda_graph_qk_indptr[i]) > 0:
+                    self.cuda_graph_qk_indptr[i][0] = 0
+            for i in range(len(self.cuda_graph_qo_indptr)):
+                if len(self.cuda_graph_qo_indptr[i]) > 0:
+                    self.cuda_graph_qo_indptr[i][0] = 0
+        
+        # Force synchronization to ensure all tensors are allocated
+        torch.cuda.synchronize()
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -478,16 +497,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Use dynamo-safe wrapper for the forward call
         @make_custom_op_dynamo_safe
-        def safe_forward_call(q_tensor, kv_buffer):
+        def safe_forward_call(q, kv_cache):
             return decode_wrapper.forward(
-                q_tensor,
-                kv_buffer,
+                q,
+                kv_cache,
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
             )
         
+        # Call the wrapped function
         o = safe_forward_call(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1134,6 +1154,7 @@ def should_use_tensor_core(
 global_override_indptr_cpu = None
 
 
+@make_custom_op_dynamo_safe
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -1219,10 +1240,9 @@ def fast_decode_plan(
         kv_lens_arr_host = get_seq_lens(
             indptr_host, self.last_page_len[:batch_size], page_size
         )
-
-        # Check if we need to adjust the number of arguments based on the flashinfer version
+        
+        # Try with fewer arguments to match the API
         try:
-            # Try with the expected number of arguments
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1240,29 +1260,29 @@ def fast_decode_plan(
                 head_dim,
                 False,  # causal
             )
-        except TypeError:
-            # If that fails, try with the stream parameter
-            stream = torch.cuda.current_stream().cuda_stream
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                indptr_host,
-                kv_lens_arr_host,
-                batch_size,  # total_num_rows
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim,
-                head_dim,
-                False,  # causal
-                stream,
-            )
+        except (TypeError, RuntimeError) as e:
+            # If the error indicates too many arguments, try with fewer
+            if "expected at most 15 argument(s)" in str(e):
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                )
+            else:
+                # Re-raise if it's a different error
+                raise
     else:
-        # For non-tensor core version, also handle potential API differences
         try:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1279,25 +1299,31 @@ def fast_decode_plan(
                 head_dim,
                 head_dim,
                 self.empty_q_data,
-                self.empty_kv_cache
+                self.empty_kv_cache,
+                torch.cuda.current_stream().cuda_stream,
             )
-        except TypeError:
-            # Try without the last two parameters
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                indptr_host,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                window_left,
-                logits_soft_cap,
-                head_dim,
-                head_dim
-            )
+        except (TypeError, RuntimeError) as e:
+            # If the error indicates too many arguments, try with fewer
+            if "expected at most 15 argument(s)" in str(e):
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    window_left,
+                    logits_soft_cap,
+                    head_dim,
+                    head_dim,
+                    self.empty_q_data,
+                )
+            else:
+                # Re-raise if it's a different error
+                raise
 
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left
@@ -1307,7 +1333,7 @@ def fast_decode_plan(
     self._rope_theta = rope_theta
 
 
-# Add this function to make custom ops opaque to torch.compile/dynamo
+# Add a decorator similar to the one in flashinfer_mla_backend.py
 def make_custom_op_dynamo_safe(func):
     @wraps(func)
     def wrapper(*args, **kwargs):

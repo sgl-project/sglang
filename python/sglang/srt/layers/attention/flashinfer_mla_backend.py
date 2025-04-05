@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import triton
 import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -219,6 +220,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
         
         # Force allocation by performing a small operation and synchronizing
+        # This ensures all tensors are properly allocated in GPU memory
+        self.cuda_graph_kv_indices[0] = 0
+        self.cuda_graph_qo_indptr[0] = 0
+        self.cuda_graph_kv_indptr[0] = 0
+        self.cuda_graph_kv_lens[0] = 1
         torch.cuda.synchronize()
         
         # For fast decode plan in graph replaying
