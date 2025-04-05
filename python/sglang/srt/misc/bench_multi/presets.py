@@ -3,7 +3,7 @@ from typing import List
 from sglang.srt.misc.bench_multi.configs import Config
 
 
-def get_configs_debug():
+def get_configs_debug_2xH100():
     return [
         _compute_scan_config(
             model_path="Qwen/Qwen1.5-MoE-A2.7B",
@@ -14,6 +14,23 @@ def get_configs_debug():
         _compute_scan_config(
             model_path="Qwen/Qwen1.5-MoE-A2.7B",
             tp_size=2,
+            random_input_lens=[1000],
+            random_output_lens=[10, 100],
+        ),
+    ]
+
+
+def get_configs_debug_2x2xH100():
+    return [
+        _compute_scan_config(
+            model_path="Qwen/Qwen1.5-MoE-A2.7B",
+            tp_size=2,
+            random_input_lens=[100, 1000],
+            random_output_lens=[10],
+        ),
+        _compute_scan_config(
+            model_path="Qwen/Qwen1.5-MoE-A2.7B",
+            tp_size=4,
             random_input_lens=[1000],
             random_output_lens=[10, 100],
         ),
