@@ -29,7 +29,7 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
 
 
 def _run_one_config(config: Config, args: argparse.Namespace):
-    server_args = ServerArgs(**config.server_args)
+    server_args = ServerArgs(**config.server_args, nnodes=args.nnodes, node_rank=args.node_rank)
     with _with_server(server_args) as launch_server_id:
         for bench_serving_args in config.bench_serving_args_list:
             bench_serving_args = get_benchmark_args(*bench_serving_args)
