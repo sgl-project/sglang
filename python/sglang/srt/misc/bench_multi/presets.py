@@ -21,9 +21,9 @@ def _compute_scan_config():
         ),
         bench_serving_args_list=[
             dict(
-                dataset_name="random",
+                dataset_name="random",  # TODO
                 flush_cache=True,
-                random_range_ratio=0.0,
+                random_range_ratio=0.0,  # TODO
             )
             for what in TODO
         ],
