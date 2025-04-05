@@ -4,12 +4,16 @@ from sglang.srt.misc.bench_multi.configs import Config
 
 
 def get_configs(preset_name: str) -> List[Config]:
-    if preset_name == "scan_8xH200":
+    if preset_name == "scan_DeepSeekV3_8xH200":
         return TODO
-    if preset_name == "scan_2x8xH100":
+    if preset_name == "scan_DeepSeekV3_2x8xH100":
         return TODO
-    if preset_name == "scan_4x8xH100":
+    if preset_name == "scan_DeepSeekV3_4x8xH100":
         return TODO
+
+    if preset_name == "debug":
+        return TODO
+
     raise NotImplementedError(f"Unknown {preset_name=}")
 
 
