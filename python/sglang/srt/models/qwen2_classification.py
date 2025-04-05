@@ -38,7 +38,7 @@ class Qwen2ForSequenceClassification(nn.Module):
         self.model = Qwen2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
         self.eos_token_id = config.eos_token_id
@@ -57,10 +57,10 @@ class Qwen2ForSequenceClassification(nn.Module):
         ), "Qwen2ForSequenceClassification is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        logits = self.score(hidden_states)
-        pooled_logits = self.pooler(logits, forward_batch).embeddings
+        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+        scores = self.score(last_token_hidden)
 
-        return EmbeddingPoolerOutput(pooled_logits)
+        return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Filter out lm_head weights of Qwen2ForCausalLM
