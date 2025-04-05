@@ -588,6 +588,24 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
             )
         else:
+            # q,k,v: passed from deepseek_v2.py
+            # cu_seqlens_q/max_seqlen_q: fetch from metadata
+            # cu_seqlens_k/max_seqlens_k: fetch from forward_batch
+            # return_softmax_lse: fetch from forward_batch
+
+            # output = self.flash_attn_varlen_func(
+            #     q=q,
+            #     k=k,
+            #     v=v_padded,
+                # cu_seqlens_q=prefill_metadata.query_start_loc,
+                # cu_seqlens_k=prefill_metadata.context_chunk_cu_seq_lens[i],
+                # max_seqlen_q=prefill_metadata.max_query_len,
+                # max_seqlen_k=prefill_metadata.context_chunk_max_seq_lens[i],
+                # softmax_scale=layer.scaling,
+                # causal=False,  # Context is unmasked
+                # return_softmax_lse=True,
+            # )
+
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             k_rope = kv_cache[:, :, layer.v_head_dim :]
