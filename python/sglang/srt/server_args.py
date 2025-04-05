@@ -157,6 +157,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
     disable_overlap_schedule: bool = False
+    disable_deepgemm_warmup: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_ep_moe: bool = False
@@ -977,6 +978,11 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-deepgemm-warmup",
+            action="store_true",
+            help="Disable the warmup (JIT compilation) of DeepGEMM kernels.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
