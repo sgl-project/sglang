@@ -10,6 +10,7 @@ def _run():
 def _parse_args():
     parser = ArgumentParser(description="Benchmark multiple configurations.")
     parser.add_argument("--preset-name", type=str, required=True)
+    parser.add_argument("--dir-output", type=str, default="/tmp")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=1000000)
     return parser.parse_args()
