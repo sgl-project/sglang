@@ -5,8 +5,10 @@ from sglang.srt.misc.bench_multi.configs import Config
 
 def get_configs_debug():
     return [
-        _compute_scan_config(model_path=TODO, tp_size=1, random_input_lens=[100, 1000], random_output_lens=[10]),
-        _compute_scan_config(model_path=TODO, tp_size=2, random_input_lens=[1000], random_output_lens=[10, 100]),
+        _compute_scan_config(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=1, random_input_lens=[100, 1000],
+                             random_output_lens=[10]),
+        _compute_scan_config(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=2, random_input_lens=[1000],
+                             random_output_lens=[10, 100]),
     ]
 
 
