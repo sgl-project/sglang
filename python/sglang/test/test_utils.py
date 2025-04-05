@@ -553,6 +553,7 @@ def get_benchmark_args(
     seed: int = 0,
     pd_seperated: bool = False,
     flush_cache: bool = False,
+    max_concurrency=None,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -584,6 +585,7 @@ def get_benchmark_args(
         prompt_suffix="",
         pd_seperated=pd_seperated,
         flush_cache=flush_cache,
+        max_concurrency=max_concurrency,
     )
 
 

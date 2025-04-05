@@ -24,6 +24,7 @@ def _compute_scan_config():
                 dataset_name="random",  # TODO
                 flush_cache=True,
                 random_range_ratio=0.0,  # TODO
+                max_concurrency=128,  # TODO
             )
             for what in TODO
         ],
