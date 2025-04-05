@@ -20,7 +20,7 @@ def _compute_scan_config():
         ),
         bench_serving_args_list=[
             dict(
-                TODO=TODO,
+                flush_cache=True,
             )
             for what in TODO
         ],

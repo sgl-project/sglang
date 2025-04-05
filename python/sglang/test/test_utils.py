@@ -551,6 +551,7 @@ def get_benchmark_args(
     disable_ignore_eos=False,
     seed: int = 0,
     pd_seperated: bool = False,
+    flush_cache: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -581,6 +582,7 @@ def get_benchmark_args(
         lora_name=None,
         prompt_suffix="",
         pd_seperated=pd_seperated,
+        flush_cache=flush_cache,
     )
 
 
