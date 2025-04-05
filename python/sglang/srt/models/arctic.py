@@ -36,11 +36,13 @@
 
 """Inference-only Snowflake Arctic model."""
 
+import logging
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 
+from sglang.srt.configs.arctic import ArcticConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -60,15 +62,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.utils import set_weight_attrs
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.configs.arctic import ArcticConfig
 
 from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
@@ -78,8 +79,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 

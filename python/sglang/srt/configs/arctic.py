@@ -2,7 +2,7 @@
 
 """Arctic model configuration"""
 
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
