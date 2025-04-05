@@ -10,11 +10,12 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
+import torch._dynamo
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -37,6 +38,15 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
+
+# Add this function to make custom ops opaque to torch.compile/dynamo
+def make_custom_op_dynamo_safe(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Disable tracing for this function
+        with torch._dynamo.disable():
+            return func(*args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -200,13 +210,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
+        # Ensure tensors are properly allocated by forcing a synchronization
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
         self.cuda_graph_kv_lens = torch.ones(
             (max_bs,), dtype=torch.int32, device=self.device
         )
-
+        
+        # Force allocation by performing a small operation and synchronizing
+        torch.cuda.synchronize()
+        
         # For fast decode plan in graph replaying
         self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
         self.cuda_graph_kv_indptr_cpu = self.cuda_graph_kv_indptr.to("cpu")
@@ -388,15 +402,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     k,
                     v,
                 )
+        
+        # Use dynamo-safe wrapper for the run call
+        @make_custom_op_dynamo_safe
+        def safe_run_call(reshaped_q, k_buffer):
+            return decode_wrapper.run(
+                reshaped_q[:, :, : layer.v_head_dim],
+                reshaped_q[:, :, layer.v_head_dim :],
+                k_buffer[:, :, : layer.v_head_dim],
+                k_buffer[:, :, layer.v_head_dim :],
+            )
+        
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
-        o = decode_wrapper.run(
-            reshaped_q[:, :, : layer.v_head_dim],
-            reshaped_q[:, :, layer.v_head_dim :],
-            reshaped_k[:, :, : layer.v_head_dim],
-            reshaped_k[:, :, layer.v_head_dim :],
-        )
+        
+        o = safe_run_call(reshaped_q, k_buffer)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -825,16 +846,49 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     with self.device as device:
+        # The CUDA stream is actually needed for proper synchronization
         stream = torch.cuda.current_stream(device).cuda_stream
-        self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            kv_len_arr_cpu,
-            num_heads,
-            head_dim_ckv,
-            causal,
-            stream,
-        )
+        
+        # Try with different argument combinations to support different FlashInfer versions
+        try:
+            # Try without the stream parameter first (newer API)
+            self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                kv_len_arr_cpu,
+                num_heads,
+                head_dim_ckv,
+                causal,
+            )
+        except (TypeError, RuntimeError) as e:
+            # If the error message indicates too many arguments
+            if "expected at most 15 argument(s)" in str(e):
+                # Try with 14 arguments (the standard documented API without use_profiler)
+                self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_cpu,
+                    kv_indptr_cpu,
+                    kv_len_arr_cpu,
+                    num_heads,
+                    head_dim_ckv,
+                    causal,
+                )
+            else:
+                # Try with the stream parameter (older API)
+                self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_cpu,
+                    kv_indptr_cpu,
+                    kv_len_arr_cpu,
+                    num_heads,
+                    head_dim_ckv,
+                    causal,
+                    stream,
+                )

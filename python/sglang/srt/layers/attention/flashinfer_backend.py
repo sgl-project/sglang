@@ -10,10 +10,11 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import torch._dynamo
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -475,13 +476,21 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        o = decode_wrapper.forward(
+        # Use dynamo-safe wrapper for the forward call
+        @make_custom_op_dynamo_safe
+        def safe_forward_call(q_tensor, kv_buffer):
+            return decode_wrapper.forward(
+                q_tensor,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
+        
+        o = safe_forward_call(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1211,43 +1220,84 @@ def fast_decode_plan(
             indptr_host, self.last_page_len[:batch_size], page_size
         )
 
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            indptr_host,
-            kv_lens_arr_host,
-            batch_size,  # total_num_rows
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim,
-            head_dim,
-            False,  # causal
-            torch.cuda.current_stream().cuda_stream,
-        )
+        # Check if we need to adjust the number of arguments based on the flashinfer version
+        try:
+            # Try with the expected number of arguments
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                batch_size,  # total_num_rows
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                False,  # causal
+            )
+        except TypeError:
+            # If that fails, try with the stream parameter
+            stream = torch.cuda.current_stream().cuda_stream
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                batch_size,  # total_num_rows
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                False,  # causal
+                stream,
+            )
     else:
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            indptr_host,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            window_left,
-            logits_soft_cap,
-            head_dim,
-            head_dim,
-            self.empty_q_data,
-            self.empty_kv_cache,
-            torch.cuda.current_stream().cuda_stream,
-        )
+        # For non-tensor core version, also handle potential API differences
+        try:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                indptr_host,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim,
+                self.empty_q_data,
+                self.empty_kv_cache
+            )
+        except TypeError:
+            # Try without the last two parameters
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                indptr_host,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim
+            )
 
     self._pos_encoding_mode = pos_encoding_mode
     self._window_left = window_left
@@ -1255,3 +1305,13 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+
+
+# Add this function to make custom ops opaque to torch.compile/dynamo
+def make_custom_op_dynamo_safe(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Disable tracing for this function
+        with torch._dynamo.disable():
+            return func(*args, **kwargs)
+    return wrapper
