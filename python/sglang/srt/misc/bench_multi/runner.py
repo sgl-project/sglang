@@ -1,3 +1,4 @@
+import json
 import random
 import time
 from contextlib import contextmanager
@@ -38,5 +39,9 @@ def _with_server(server_args: ServerArgs):
 
 
 def _write_output(dir_output: Path):
+    content = dict(
+
+    )
+
     path = dir_output / f'bench_multi_{time.time_ns() // 1_000_000}_{random.randrange(0, 1000000):06d}.json'
-    TODO
+    path.write_text(json.dumps(content))
