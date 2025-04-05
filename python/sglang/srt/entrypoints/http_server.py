@@ -419,6 +419,10 @@ async def init_weights_update_group(
 async def update_weights_from_tensor(
     obj: Union[UpdateWeightsFromTensorReqInput, str], request: Request
 ):
+    """Update the weights from tensor inplace without re-launching the server.
+    Notes:
+    Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
+    """
     if isinstance(obj, str):
         try:
             obj = HttpSerializer.deserialize(obj)
