@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Any, Dict
 
 import torch.cuda
+import torch.distributed as dist
 from sglang import bench_serving
 from sglang.srt.misc.bench_multi import presets
 from sglang.srt.misc.bench_multi.configs import Config
@@ -30,10 +31,9 @@ def _get_configs(preset_name: str, start_index: int, end_index: int) -> List[Con
 
 def _run_one_config(config: Config, args: argparse.Namespace):
     server_args = ServerArgs(**config.server_args, nnodes=args.nnodes, node_rank=args.node_rank)
-
-    TODO_barrier
+    dist.barrier()
     with _with_server(server_args) as launch_server_id:
-        TODO_barrier
+        dist.barrier()
         if args.node_rank == 0:
             for bench_serving_args in config.bench_serving_args_list:
                 bench_serving_args = get_benchmark_args(*bench_serving_args)
@@ -48,7 +48,7 @@ def _run_one_config(config: Config, args: argparse.Namespace):
                 )
         else:
             TODO
-        TODO_barrier
+        dist.barrier()
 
 
 @contextmanager
