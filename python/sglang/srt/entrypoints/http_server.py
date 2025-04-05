@@ -26,11 +26,13 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import AsyncIterator, Callable, Dict, Optional, Union
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import base64
+import pickle
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -60,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -80,6 +83,7 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    HttpSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -409,6 +413,36 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_tensor")
+async def update_weights_from_tensor(
+    obj: Union[UpdateWeightsFromTensorReqInput, str], request: Request
+):
+    """Update the weights from tensor inplace without re-launching the server.
+    Notes:
+    Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
+    """
+    if isinstance(obj, str):
+        try:
+            obj = HttpSerializer.deserialize(obj)
+        except Exception as e:
+            return ORJSONResponse(
+                {"success": False, "message": f"Failed to decode input: {str(e)}"},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+    else:
+        obj.serialized_named_tensors = [
+            HttpSerializer.deserialize(item) for item in obj.serialized_named_tensors
+        ]
+
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_distributed")
