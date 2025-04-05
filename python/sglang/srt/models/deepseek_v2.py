@@ -337,7 +337,6 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                self.num_experts,  # num_max_dispatch_tokens_per_rank=128,
                 forward_mode=forward_mode,
             )
         final_hidden_states = (
