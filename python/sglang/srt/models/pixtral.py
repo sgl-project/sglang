@@ -25,15 +25,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PixtralVisionConfig
-from transformers.models.pixtral.image_processing_pixtral import _num_image_tokens as _get_pixtral_hf_num_image_tokens
-from transformers.models.pixtral.modeling_pixtral import PixtralRotaryEmbedding, apply_rotary_pos_emb, position_ids_in_meshgrid
+from transformers.models.pixtral.image_processing_pixtral import (
+    _num_image_tokens as _get_pixtral_hf_num_image_tokens,
+)
+from transformers.models.pixtral.modeling_pixtral import (
+    PixtralRotaryEmbedding,
+    apply_rotary_pos_emb,
+    position_ids_in_meshgrid,
+)
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed import utils as dist_utils
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear, QKVParallelLinear, MergedColumnParallelLinear
-from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -54,7 +65,7 @@ class PixtralHFEncoderInfo:
             image_width=image_width,
             image_height=image_height,
         )
-        
+
         tokens = (ncols + 1) * nrows
         # Consider the image_break_token
         return tokens
@@ -71,8 +82,9 @@ class PixtralHFEncoderInfo:
         return self.vision_config.image_size
 
     def get_patch_size(self) -> int:
-        patch_size = (self.vision_config.patch_size *
-                self.vision_config.spatial_merge_size)
+        patch_size = (
+            self.vision_config.patch_size * self.vision_config.spatial_merge_size
+        )
         return patch_size
 
     def get_patch_grid_length(self) -> int:
@@ -91,7 +103,7 @@ class PixtralHFEncoderInfo:
         patch_width = patch_height = self.get_patch_size()
 
         ratio = max(image_width / max_width, image_height / max_height)
-        
+
         orig_width, orig_height = image_width, image_height
         if ratio > 1:
             image_width = int(math.floor(image_width / ratio))
@@ -118,32 +130,32 @@ class PixtralHFMLP(nn.Module):
         super().__init__()
 
         assert config.intermediate_size is not None
-        
+
         # Use MergedColumnParallelLinear for gate_up_proj to handle combined weights
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
             output_sizes=[config.intermediate_size, config.intermediate_size],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj"
+            prefix=f"{prefix}.gate_up_proj",
         )
-        
+
         self.down_proj = RowParallelLinear(
             input_size=config.intermediate_size,
             output_size=config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj"
+            prefix=f"{prefix}.down_proj",
         )
-        
+
         self.act_fn = SiluAndMul()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up_output, _ = self.gate_up_proj(x)
-        
+
         # Apply SiLU activation and multiply
         gate_up = self.act_fn(gate_up_output)
-        
+
         # Project back to hidden size
         out, _ = self.down_proj(gate_up)
         return out
@@ -164,7 +176,7 @@ class PixtralHFTransformerBlock(nn.Module):
 
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(config.hidden_size, eps=1e-5)
-        
+
         # Use SGLang's VisionAttention instead of vLLM's PixtralHFAttention
         self.attention = VisionAttention(
             embed_dim=config.hidden_size,
@@ -179,13 +191,11 @@ class PixtralHFTransformerBlock(nn.Module):
             flatten_batch=False,
             prefix=f"{prefix}.attention",
         )
-        
+
         self.feed_forward = PixtralHFMLP(
-            config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.feed_forward"
+            config, quant_config=quant_config, prefix=f"{prefix}.feed_forward"
         )
-        
+
         self.ffn_norm = RMSNorm(config.hidden_size, eps=1e-5)
 
     def forward(
@@ -196,31 +206,35 @@ class PixtralHFTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         # Ensure hidden_states has the batch dimension [batch, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        
+
         # Apply attention norm - normalize along the last dimension
-        attn_normalized = self.attention_norm(hidden_states.view(-1, hidden_dim)).view(batch_size, seq_len, hidden_dim)
-        
+        attn_normalized = self.attention_norm(hidden_states.view(-1, hidden_dim)).view(
+            batch_size, seq_len, hidden_dim
+        )
+
         # Pass through attention layer
         attention_output = self.attention(
-            attn_normalized, 
+            attn_normalized,
             attention_mask=attention_mask,
             cu_seqlens=None,
-            position_embeddings=position_embeddings
+            position_embeddings=position_embeddings,
         )
-        
+
         # Apply first residual connection
         hidden_states = hidden_states + attention_output
-        
+
         # Apply feed-forward norm - normalize along the last dimension
-        ffn_normalized = self.ffn_norm(hidden_states.view(-1, hidden_dim)).view(batch_size, seq_len, hidden_dim)
-        
+        ffn_normalized = self.ffn_norm(hidden_states.view(-1, hidden_dim)).view(
+            batch_size, seq_len, hidden_dim
+        )
+
         # Pass through feed-forward layer
         # First reshape to 2D for the feed-forward network, then reshape back
         ffn_output = self.feed_forward(ffn_normalized)
-        
+
         # Apply second residual connection
         output = hidden_states + ffn_output
-        
+
         return output
 
 
@@ -241,15 +255,17 @@ class PixtralHFTransformer(nn.Module):
         if num_hidden_layers_override is not None:
             num_hidden_layers = num_hidden_layers_override
 
-        self.layers = nn.ModuleList([
-            PixtralHFTransformerBlock(
-                config=config,
-                layer_id=layer_idx,
-                quant_config=quant_config,
-                prefix=f"{prefix}.layers.{layer_idx}"
-            )
-            for layer_idx in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                PixtralHFTransformerBlock(
+                    config=config,
+                    layer_id=layer_idx,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{layer_idx}",
+                )
+                for layer_idx in range(num_hidden_layers)
+            ]
+        )
 
     def forward(
         self,
@@ -259,13 +275,13 @@ class PixtralHFTransformer(nn.Module):
         return_all_hidden_states: bool = False,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Forward pass through transformer layers.
-        
+
         Args:
             x: Input tensor
             attention_mask: Optional attention mask
             position_embeddings: Optional position embeddings for rotary attention
             return_all_hidden_states: Whether to return all hidden states
-            
+
         Returns:
             Either the final hidden state, or a list of all hidden states if
             return_all_hidden_states is True
@@ -298,13 +314,13 @@ def resolve_visual_encoder_outputs(
         if post_norm is not None:
             outputs = post_norm(outputs)
         return outputs
-    
+
     # Handle the case where we want to use specific layers
     if not isinstance(outputs, list):
         raise ValueError(
             "Expected outputs to be a list when feature_sample_layers is provided"
         )
-    
+
     # Validate layer indices
     for layer_idx in feature_sample_layers:
         if layer_idx < 0 or layer_idx > num_hidden_layers:
@@ -312,16 +328,16 @@ def resolve_visual_encoder_outputs(
                 f"Feature sample layer index {layer_idx} is out of range "
                 f"[0, {num_hidden_layers}]"
             )
-    
+
     # Collect outputs from specified layers
     selected_outputs = [outputs[layer_idx] for layer_idx in feature_sample_layers]
-    
+
     # Combine the outputs
     combined_outputs = torch.cat(selected_outputs, dim=-1)
-    
+
     if post_norm is not None:
         combined_outputs = post_norm(combined_outputs)
-    
+
     return combined_outputs
 
 
@@ -348,9 +364,9 @@ class PixtralHFVisionModel(nn.Module):
             stride=config.patch_size,
             bias=False,
         )
-        
+
         self.ln_pre = RMSNorm(config.hidden_size, eps=1e-5)
-        
+
         self.transformer = PixtralHFTransformer(
             config,
             quant_config,
@@ -372,11 +388,11 @@ class PixtralHFVisionModel(nn.Module):
 
         # Initialize patch position embedding
         self.patch_positional_embedding = PixtralRotaryEmbedding(config)
-    
+
     @property
     def dtype(self):
         return next(self.parameters()).dtype
-    
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -390,8 +406,8 @@ class PixtralHFVisionModel(nn.Module):
         """
         Args:
             pixel_values: Each image to be processed will be a separate tensor
-                in pixel_values. This is a list of tensors because multiple 
-                requests batched can have multiple images, each with their 
+                in pixel_values. This is a list of tensors because multiple
+                requests batched can have multiple images, each with their
                 own shape potentially.
             output_hidden_states: Whether to return all hidden states.
             feature_sample_layers: Layer indices whose features should be
@@ -405,49 +421,46 @@ class PixtralHFVisionModel(nn.Module):
         """
         # Process images through initial convolution independently
         patch_embeds_list = [
-            self.patch_conv(img.unsqueeze(0).to(self.dtype))
-            for img in pixel_values
+            self.patch_conv(img.unsqueeze(0).to(self.dtype)) for img in pixel_values
         ]
 
         # Reshape patches to token sequences
-        patch_embeds = [
-            p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list
-        ]
+        patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
         embed_sizes = [p.shape[1] for p in patch_embeds]
 
         # Combine all patches into a single sequence
         patch_embeds = torch.cat(patch_embeds, dim=1)
-        
+
         # Apply pre-layer norm
         # RMSNorm expects 2D input, so reshape, apply norm, and reshape back
         batch_size, seq_len, hidden_dim = patch_embeds.shape
-        patch_embeds = self.ln_pre(patch_embeds.view(-1, hidden_dim)).view(batch_size, seq_len, hidden_dim)
+        patch_embeds = self.ln_pre(patch_embeds.view(-1, hidden_dim)).view(
+            batch_size, seq_len, hidden_dim
+        )
 
         # Compute positional embeddings
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
-            max_width=self.config.image_size // self.config.patch_size
+            max_width=self.config.image_size // self.config.patch_size,
         ).to(self.device)
-        
+
         # The original PixtralRotaryEmbedding expects 2D input but returns a tuple of tensors (cos, sin)
         # These tensors are used by apply_rotary_pos_emb in the transformer blocks
-        position_embedding = self.patch_positional_embedding(
-            patch_embeds, position_ids
-        )
-        
+        position_embedding = self.patch_positional_embedding(patch_embeds, position_ids)
+
         # Create attention mask for each image (block diagonal)
         # We'll use a simple mask approach instead of xformers
         batch_size = len(patch_embeds_list)
         seq_lengths = [p.shape[-2] * p.shape[-1] for p in patch_embeds_list]
         max_seq_len = max(seq_lengths)
-        
+
         # Create a block diagonal mask
         attention_mask = torch.zeros(
             (batch_size, 1, max_seq_len, max_seq_len),
             device=self.device,
             dtype=torch.bool,
         )
-        
+
         # Fill in the blocks
         start_idx = 0
         for i, seq_len in enumerate(seq_lengths):
@@ -456,12 +469,14 @@ class PixtralHFVisionModel(nn.Module):
             start_idx = end_idx
 
         # Process through transformer
-        return_all_hidden_states = output_hidden_states or feature_sample_layers is not None
+        return_all_hidden_states = (
+            output_hidden_states or feature_sample_layers is not None
+        )
         transformer_outputs = self.transformer(
             patch_embeds,  # Already has shape [batch_size, seq_len, hidden_dim]
             attention_mask,
             position_embedding,
-            return_all_hidden_states=return_all_hidden_states
+            return_all_hidden_states=return_all_hidden_states,
         )
 
         # Store all hidden states if requested
@@ -474,23 +489,29 @@ class PixtralHFVisionModel(nn.Module):
             else:
                 # Resolve outputs based on feature sample layers
                 out = resolve_visual_encoder_outputs(
-                    transformer_outputs, 
-                    feature_sample_layers, 
+                    transformer_outputs,
+                    feature_sample_layers,
                     None,
-                    self.config.num_hidden_layers
+                    self.config.num_hidden_layers,
                 )
         else:
             out = transformer_outputs
 
         # Split back into separate tensors for each image
-        final_outputs = torch.split(out.squeeze(0) if out.size(0) == 1 else out, embed_sizes)
-        
+        final_outputs = torch.split(
+            out.squeeze(0) if out.size(0) == 1 else out, embed_sizes
+        )
+
         # Format return to be compatible with HuggingFace vision models
         if output_hidden_states:
-            return type('VisualOutput', (), {
-                'last_hidden_state': final_outputs,
-                'hidden_states': all_hidden_states
-            })
+            return type(
+                "VisualOutput",
+                (),
+                {
+                    "last_hidden_state": final_outputs,
+                    "hidden_states": all_hidden_states,
+                },
+            )
         else:
             return final_outputs
 
@@ -498,7 +519,7 @@ class PixtralHFVisionModel(nn.Module):
         """Load weights from a HuggingFace checkpoint with proper parameter mapping."""
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        
+
         # Define mappings for stacked parameters
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
@@ -508,11 +529,11 @@ class PixtralHFVisionModel(nn.Module):
             (".feed_forward.gate_up_proj", ".feed_forward.gate_proj", 0),
             (".feed_forward.gate_up_proj", ".feed_forward.up_proj", 1),
         ]
-        
+
         # Process each weight
         processed_count = 0
         stacked_count = 0
-        for name, loaded_weight in weights:            
+        for name, loaded_weight in weights:
             # Check if this is a stacked parameter (q_proj/k_proj/v_proj or gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
@@ -521,7 +542,9 @@ class PixtralHFVisionModel(nn.Module):
                     if transformed_name in params_dict:
                         param = params_dict[transformed_name]
                         # Use the weight_loader method with shard_id to load into the correct portion
-                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight, shard_id)
                         loaded_params.add(transformed_name)
                         stacked_count += 1
@@ -531,13 +554,15 @@ class PixtralHFVisionModel(nn.Module):
                 # For attention.proj => attention.o_proj mapping
                 if ".attention.o_proj" in name:
                     name = name.replace(".attention.o_proj", ".attention.proj")
-                
+
                 if name in params_dict:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
-        
+
         return loaded_params
 
 
