@@ -407,17 +407,16 @@ class DeepseekV2MoE(nn.Module):
         expected_m,
         forward_mode,
     ):
-        return (
-            self.experts(
-                hidden_states=hidden_states,
-                reorder_topk_ids=reorder_topk_ids,
-                seg_indptr=seg_indptr,
-                masked_m=masked_m,
-                expected_m=expected_m,
-                forward_mode=forward_mode,
-            )
-            * self.routed_scaling_factor
+        output = self.experts(
+            hidden_states=hidden_states,
+            reorder_topk_ids=reorder_topk_ids,
+            seg_indptr=seg_indptr,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            forward_mode=forward_mode,
         )
+        output *= self.routed_scaling_factor
+        return output
 
     # ----------------------------------------- TBO-related --------------------------------------------
 

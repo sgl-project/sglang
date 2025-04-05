@@ -1,4 +1,4 @@
-from sglang.srt.utils import DeepEPMode
+from sglang.srt.utils import DeepEPMode, DisposibleBox
 
 try:
     from deep_ep import Buffer
@@ -183,6 +183,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             seg_indptr = torch.zeros(
                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
             )
+            hidden_states = DisposibleBox(hidden_states)
 
         masked_m = expected_m = None
 
@@ -285,7 +286,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
-        return reorder_topk_ids, seg_indptr, gateup_input
+        return reorder_topk_ids, seg_indptr, DisposibleBox(gateup_input)
 
     def combine_a(
         self,

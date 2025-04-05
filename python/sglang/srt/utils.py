@@ -1910,3 +1910,17 @@ def configure_deep_gemm_num_sms(num_sms):
         yield
     finally:
         deep_gemm.set_num_sms(original_num_sms)
+
+
+class DisposibleBox:
+    def __init__(self, value):
+        self._value = value
+
+    @property
+    def value(self):
+        assert self._value is not None
+        return self._value
+
+    def dispose(self):
+        assert self._value is not None
+        self._value = None

@@ -290,17 +290,17 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                 ).raise_for_status()
             if bench_args.profile and index == bench_args.profile_skip_cases:
                 # TODO extract to PR
-                print("bench script call cudaProfilerStart")
-                torch.cuda.cudart().cudaProfilerStart()
-                # print("Execute start_profile")
-                # requests.post(
-                #     base_url + "/start_profile",
-                #     json={
-                #         "activities": bench_args.profile_activities,
-                #         "with_stack": bench_args.profile_with_stack,
-                #         "record_shapes": bench_args.profile_record_shapes,
-                #     },
-                # ).raise_for_status()
+                # print("bench script call cudaProfilerStart")
+                # torch.cuda.cudart().cudaProfilerStart()
+                print("Execute start_profile")
+                requests.post(
+                    base_url + "/start_profile",
+                    json={
+                        "activities": bench_args.profile_activities,
+                        "with_stack": bench_args.profile_with_stack,
+                        "record_shapes": bench_args.profile_record_shapes,
+                    },
+                ).raise_for_status()
             run_one_case(
                 base_url,
                 bs,
@@ -318,10 +318,10 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             )
         if bench_args.profile:
             # TODO extract to PR
-            print("bench script call cudaProfilerStop")
-            torch.cuda.cudart().cudaProfilerStop()
-            # print("Execute stop_profile")
-            # requests.post(base_url + "/stop_profile").raise_for_status()
+            # print("bench script call cudaProfilerStop")
+            # torch.cuda.cudart().cudaProfilerStop()
+            print("Execute stop_profile")
+            requests.post(base_url + "/stop_profile").raise_for_status()
     finally:
         if proc:
             kill_process_tree(proc.pid)
