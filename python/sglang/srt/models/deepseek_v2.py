@@ -709,8 +709,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.attention_backend = global_server_args_dict["attention_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
-    def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.attention_backend == "flashinfer":
+    def dispatch_attn_forward_method(self, forward_batch: ForwardBatch) -> AttnForwardMethod:
+        if self.enable_flashinfer_mla:
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
                 not self.flashinfer_mla_disable_ragged
@@ -756,7 +756,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states
 
-        attn_forward_method = self.get_attn_forward_method(forward_batch)
+        attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
 
         if attn_forward_method == AttnForwardMethod.MHA:
             return self.forward_normal(positions, hidden_states, forward_batch)
