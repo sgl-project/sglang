@@ -1,10 +1,17 @@
+from functools import partial
 from typing import List, Any, Dict
 
 from sglang.srt.misc.bench_multi.configs import Config
 
 
 def get_configs_debug():
-    return TODO
+    return [
+        _compute_scan_config(
+            server_args=dict(tp_size=2),
+            random_input_lens=[1000],
+            random_output_lens=[10],
+        ),
+    ]
 
 
 def get_configs_scan_DeepSeekV3_8xH200():
@@ -12,7 +19,13 @@ def get_configs_scan_DeepSeekV3_8xH200():
 
 
 def get_configs_scan_DeepSeekV3_2x8xH100():
-    return TODO
+    compute = partial(_compute_scan_config, random_input_lens=_SCAN_INPUT_LENS, random_output_lens=_SCAN_OUTPUT_LENS)
+    return [
+        compute(server_args=dict(tp_size=16)),
+        compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True)),
+        compute(server_args=dict(tp_size=16, enable_ep_moe=True)),
+        compute(server_args=dict(tp_size=16, dp_size=16, enable_dp_attention=True, enable_ep_moe=True)),
+    ]
 
 
 def get_configs_scan_DeepSeekV3_4x8xH100():
@@ -27,6 +40,7 @@ def _compute_scan_config(
     server_args: Dict[str, Any],
     random_input_lens: List[int],
     random_output_lens: List[int],
+    num_repeat: int = 2,
 ):
     return Config(
         server_args=dict(
@@ -45,6 +59,7 @@ def _compute_scan_config(
                 num_prompts=512,  # TODO
                 request_rate=float("inf"),  # TODO
             )
+            for _ in range(num_repeat)
             for random_input_len in random_input_lens
             for random_output_len in random_output_lens
         ],
