@@ -13,6 +13,8 @@
 # ==============================================================================
 """Inference-only Mistral model."""
 
+from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
+
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -20,4 +22,27 @@ class MistralForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = MistralForCausalLM
+class Mistral3ForConditionalGeneration:
+    MULTIMODAL_PROJECTOR_TYPE = Mistral3MultiModalProjector
+
+    def __init__(self, **kwargs):
+        # lazy load inner class
+        # to bypass circular import
+        from sglang.srt.models.llava import LlavaForConditionalGeneration
+
+        self.inner = LlavaForConditionalGeneration(**kwargs)
+        self.inner.multi_modal_projector = self.MULTIMODAL_PROJECTOR_TYPE(
+            kwargs["config"]
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def __hasattr__(self, name):
+        return hasattr(self.inner, name)
+
+    def __call__(self, *args, **kwargs):
+        return self.inner(*args, **kwargs)
+
+
+EntryClass = [MistralForCausalLM, Mistral3ForConditionalGeneration]

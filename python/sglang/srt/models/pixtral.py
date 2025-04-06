@@ -62,12 +62,16 @@ class PixtralHFInputPatcher:
         "<s>[INST]what's that?\n[IMG][IMG][IMG][IMG_BREAK][IMG][IMG][IMG][IMG_BREAK][IMG_END][/INST]"
     """
 
-    IMG_TOKEN_ID = 10
+    DEFAULT_IMG_TOKEN_ID = 10
     IMG_BREAK_TOKEN_ID = 12
     IMG_END_TOKEN_ID = 13
 
     def __init__(self, vision_config: PretrainedConfig):
         self.vision_config = vision_config
+        self.img_token_id = getattr(
+            vision_config, "image_token_index", self.DEFAULT_IMG_TOKEN_ID
+        )
+        assert self.img_token_id not in (self.IMG_BREAK_TOKEN_ID, self.IMG_END_TOKEN_ID)
 
     def pad_input_ids(
         self, input_ids: List[int], image_inputs: MultimodalInputs
@@ -80,31 +84,25 @@ class PixtralHFInputPatcher:
         Returns:
             List[int]: padded input_ids
         """
-        images_sizes = flatten_nested_list(
-            [item.image_sizes for item in image_inputs.mm_items]
+        padding_specs = flatten_nested_list(
+            [
+                (w, h, item.pad_value)
+                for item in image_inputs.mm_items
+                for w, h in item.image_sizes
+            ]
         )
-        if any(
-            item.modality in (Modality.VIDEO, Modality.AUDIO)
-            for item in image_inputs.mm_items
-        ):
-            raise NotImplementedError(
-                f"Video and audio are not supported by {self.__class__.__name__}"
-            )
 
-        img_token_idxs = [i for i, t in enumerate(input_ids) if t == self.IMG_TOKEN_ID]
-        if len(img_token_idxs) != len(images_sizes):
-            raise ValueError(
-                f"Got {len(images_sizes)} images inputs, but {len(img_token_idxs)} image tokens in input_ids"
-            )
+        img_token_idxs = [i for i, t in enumerate(input_ids) if t == self.img_token_id]
 
         padded_input_ids = []
         offsets, pad_lens = [], []
         prev_img_offset = 0
-        for i, (h, w) in enumerate(images_sizes):
+        for i, (h, w, pad_value) in enumerate(padding_specs):
             img_offset = img_token_idxs[i]
             padding = self.get_padding_tokens(
                 image_width=w,
                 image_height=h,
+                pad_value=pad_value,
             )
             padded_input_ids += input_ids[prev_img_offset:img_offset]
             padded_input_ids += padding
@@ -122,6 +120,7 @@ class PixtralHFInputPatcher:
         *,
         image_width: int,
         image_height: int,
+        pad_value: int = None,
     ) -> List[int]:
         ncols, nrows = self.get_patch_grid_size(
             image_width=image_width,
@@ -129,7 +128,7 @@ class PixtralHFInputPatcher:
         )
 
         pad_len = (ncols + 1) * nrows  # (nrows-1) image breaks + image_end_token
-        padding = [self.IMG_TOKEN_ID] * pad_len
+        padding = [pad_value or self.img_token_id] * pad_len
         padding[ncols : -1 : ncols + 1] = (self.IMG_BREAK_TOKEN_ID,) * (nrows - 1)
         padding[-1] = self.IMG_END_TOKEN_ID
         return padding
@@ -265,20 +264,44 @@ class PixtralHFTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         # Ensure hidden_states has the batch dimension [batch, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = hidden_states.shape
-
+        print(
+            f"PixtralHFTransformerBlock.forward: hidden_states has shape: batch_size={batch_size}, seq_len={seq_len}, hidden_dim={hidden_dim}"
+        )
         # Apply attention norm - normalize along the last dimension
         attn_normalized = self.attention_norm(hidden_states.view(-1, hidden_dim)).view(
             batch_size, seq_len, hidden_dim
         )
 
         # Pass through attention layer
-        attention_output = self.attention(
-            attn_normalized,
-            attention_mask=attention_mask,
-            cu_seqlens=None,
-            position_embeddings=position_embeddings,
-        )
-
+        try:
+            attention_output = self.attention(
+                attn_normalized,
+                attention_mask=attention_mask,
+                cu_seqlens=None,
+                position_embeddings=position_embeddings,
+            )
+        except Exception as e:
+            print(f"Error in attention layer: {e}")
+            print(f"attn_normalized.shape: {attn_normalized.shape}")
+            print(f"attention_mask.shape: {attention_mask.shape}")
+            print(f"position_embeddings: {position_embeddings}")
+            print(f"hidden_states.shape: {hidden_states.shape}")
+            print(
+                f"batch_size: {batch_size}, seq_len: {seq_len}, hidden_dim: {hidden_dim}"
+            )
+            print(f"attention layer id: {self.layer_id}")
+            raise e
+        else:
+            print("-" * 100)
+            print(f"attn_normalized.shape: {attn_normalized.shape}")
+            print(f"attention_mask.shape: {attention_mask.shape}")
+            print(f"position_embeddings: {position_embeddings}")
+            print(f"hidden_states.shape: {hidden_states.shape}")
+            print(
+                f"batch_size: {batch_size}, seq_len: {seq_len}, hidden_dim: {hidden_dim}"
+            )
+            print(f"attention layer id: {self.layer_id}")
+            print("-" * 100)
         # Apply first residual connection
         hidden_states = hidden_states + attention_output
 
@@ -492,13 +515,18 @@ class PixtralHFVisionModel(nn.Module):
         patch_embeds_list = [
             self.patch_conv(img.unsqueeze(0).to(self.dtype)) for img in pixel_values
         ]
+        print(
+            "PixtralHFVisionModel.forward: patch_embeds_list has {} elements".format(
+                len(patch_embeds_list)
+            )
+        )
 
         # Reshape patches to token sequences
         patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
         embed_sizes = [p.shape[1] for p in patch_embeds]
 
-        # Combine all patches into a single sequence
-        patch_embeds = torch.cat(patch_embeds, dim=1)
+        # cat along the batch_size dimension
+        patch_embeds = torch.cat(patch_embeds, dim=0)
 
         # Apply pre-layer norm
         # RMSNorm expects 2D input, so reshape, apply norm, and reshape back
@@ -506,7 +534,11 @@ class PixtralHFVisionModel(nn.Module):
         patch_embeds = self.ln_pre(patch_embeds.view(-1, hidden_dim)).view(
             batch_size, seq_len, hidden_dim
         )
-
+        print(
+            "PixtralHFVisionModel.forward: patch_embeds has shape {}".format(
+                patch_embeds.shape
+            )
+        )
         # Compute positional embeddings
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
@@ -518,11 +550,12 @@ class PixtralHFVisionModel(nn.Module):
         position_embedding = self.patch_positional_embedding(patch_embeds, position_ids)
 
         # Create attention mask for each image (block diagonal)
-        # We'll use a simple mask approach instead of xformers
         batch_size = len(patch_embeds_list)
         seq_lengths = [p.shape[-2] * p.shape[-1] for p in patch_embeds_list]
         max_seq_len = max(seq_lengths)
-
+        print(
+            f"batch_size: {batch_size}, seq_lengths: {seq_lengths}, max_seq_len: {max_seq_len}"
+        )
         # Create a block diagonal mask
         attention_mask = torch.zeros(
             (batch_size, 1, max_seq_len, max_seq_len),
@@ -540,6 +573,10 @@ class PixtralHFVisionModel(nn.Module):
         # Process through transformer
         return_all_hidden_states = (
             output_hidden_states or feature_sample_layers is not None
+        )
+
+        print(
+            f"All dimensions: patch_embeds.shape = {patch_embeds.shape}, attention_mask.shape = {attention_mask.shape}"
         )
         transformer_outputs = self.transformer(
             patch_embeds,  # Already has shape [batch_size, seq_len, hidden_dim]
@@ -567,9 +604,11 @@ class PixtralHFVisionModel(nn.Module):
             out = transformer_outputs
 
         # Split back into separate tensors for each image
-        final_outputs = torch.split(
-            out.squeeze(0) if out.size(0) == 1 else out, embed_sizes
-        )
+        print(f"PixtralHFVisionModel.forward: out has shape {out.shape}")
+        print(f"PixtralHFVisionModel.forward: embed_sizes = {embed_sizes}")
+        print(f"Expected final output shape?")
+
+        final_outputs = out
 
         # Format return to be compatible with HuggingFace vision models
         if output_hidden_states:
@@ -623,10 +662,9 @@ class PixtralHFVisionModel(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-class PixtralForConditionalGeneration(LlavaForConditionalGeneration):
-    # TODO: wait for mistralai/Pixtral-12B to switch to HF config format
+class PixtralVisionModel(PixtralHFVisionModel):
     pass
 
 
 # Register the model classes for external access
-EntityClass = [PixtralHFVisionModel]
+EntryClass = [PixtralVisionModel]
