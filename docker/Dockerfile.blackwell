@@ -21,7 +21,7 @@ RUN which python3 \
     && python3 -m pip --no-cache-dir install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 \
     && git clone --depth=1 --branch blackwell https://github.com/sgl-project/sglang.git \
     && cd sglang \
-    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" \
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]"
 
 # Build and install sgl-kernel, do not use uv since it depends on torch nightly
 WORKDIR /sgl-workspace
@@ -32,7 +32,7 @@ RUN which python3 \
     && python3 -m pip --no-cache-dir install -e sgl-kernel
 
 # For openbmb/MiniCPM models
-RUN python3 -m pip install datamodel_code_generator
+RUN python3 -m pip --no-cache-dir install datamodel_code_generator
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
