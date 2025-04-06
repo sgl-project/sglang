@@ -384,26 +384,23 @@ class Llama4DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Llama4Model(LlamaModel):
+class Llama4Model(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, quant_config, prefix)
-        self.num_experts = getattr(config, "num_local_experts", 0)
+        super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
         )
-
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Llama4DecoderLayer(
@@ -414,6 +411,36 @@ class Llama4Model(LlamaModel):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+        residual = None
+        aux_hidden_states = []
+        for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
