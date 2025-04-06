@@ -214,11 +214,16 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = metadata.max_seq_len_k
 
         if forward_batch.mm_inputs[0] is not None:
-            assert (len(forward_batch.mm_inputs) == 1), "Only batch size 1 is supported for now"
+            assert (
+                len(forward_batch.mm_inputs) == 1
+            ), "Only batch size 1 is supported for now"
 
-            metadata.encoder_lens_int32 = torch.tensor(forward_batch.encoder_lens, device=device, dtype=torch.int32)
+            metadata.encoder_lens_int32 = torch.tensor(
+                forward_batch.encoder_lens, device=device, dtype=torch.int32
+            )
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32), (1, 0)
+                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
+                (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
             metadata.encoder_cu_seqlens_q = metadata.cu_seqlens_q
@@ -228,7 +233,10 @@ class FlashAttentionBackend(AttentionBackend):
             ]
             ## TODO: support batch size > 1
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, metadata.encoder_max_seq_len_k : (metadata.encoder_max_seq_len_k + metadata.max_seq_len_k)
+                forward_batch.req_pool_indices,
+                metadata.encoder_max_seq_len_k : (
+                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
+                ),
             ]
         # Precompute strided indices
         if self.page_size > 1:
