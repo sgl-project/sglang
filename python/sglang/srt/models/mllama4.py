@@ -1,7 +1,6 @@
 # TODO: add Aapted from vllm/mllama4.py
 import logging
 from collections.abc import Iterable
-from itertools import tee
 from typing import Optional, Set, Tuple
 
 import torch
@@ -60,7 +59,8 @@ class Llama4ForConditionalGeneration(nn.Module):
                 "n_share_experts_fusion"
             ] = None
             logger.info("Shared experts fusion optimization is disabled.")
-        elif self.n_share_experts_fusion is None:
+            # TODO unify the behavior w/ deepseek_v2.py
+        elif self.n_share_experts_fusion is None or self.n_share_experts_fusion == 0:
             self.n_share_experts_fusion = global_server_args_dict[
                 "n_share_experts_fusion"
             ] = self.tp_size
