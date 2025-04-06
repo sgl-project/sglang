@@ -1040,9 +1040,7 @@ def v1_chat_generate_request(
                 request.response_format.json_schema.schema_
             )
         elif request.response_format and request.response_format.type == "json_object":
-            xgrammar = tokenizer_manager.server_args.grammar_backend == "xgrammar"
-            json_object_schema = "$$JSON_OBJECT$$" if xgrammar else '{"type": "object"}'
-            sampling_params["json_schema"] = json_object_schema
+            sampling_params["json_schema"] = '{"type": "object"}'
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):

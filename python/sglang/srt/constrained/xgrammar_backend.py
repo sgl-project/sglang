@@ -29,7 +29,6 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    JSON_OBJECT_GBNF,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
@@ -138,9 +137,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             if key_string == "$$ANY$$":
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
-            elif key_string == "$$JSON_OBJECT$$":
-                # Note: This grammar is specifically for JSON objects
-                ctx = self.grammar_compiler.compile_grammar(JSON_OBJECT_GBNF)
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
         except RuntimeError as e:
