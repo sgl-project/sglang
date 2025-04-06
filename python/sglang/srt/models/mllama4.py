@@ -20,10 +20,16 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from transformers import Llama4Config
+
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
+
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.managers.schedule_batch import MultimodalInputs, global_server_args_dict
@@ -159,9 +165,6 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         num_experts = self.config.text_config.num_local_experts
 
-        # for name, param in params_dict.items():
-        #     print(name)
-
         for name, loaded_weight in weights:
 
             if name.startswith("vision_model") or name.startswith(
@@ -179,36 +182,32 @@ class Llama4ForConditionalGeneration(nn.Module):
                 break
             else:
                 if ".experts" in name:
-                    if TODO:
-                        TODO
+                    TODO
+                    if ".gate_up_proj" in name:
+                        name_list = [
+                            name.replace(".experts.gate_up_proj", ".experts.w13_weight")
+                        ] * 2
+                        loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+                        shard_id_list = ["w1", "w3"]
                     else:
-                        if ".gate_up_proj" in name:
-                            name_list = [
-                                name.replace(
-                                    ".experts.gate_up_proj", ".experts.w13_weight"
-                                )
-                            ] * 2
-                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                            shard_id_list = ["w1", "w3"]
-                        else:
-                            name_list = [
-                                name.replace(".experts.down_proj", ".experts.w2_weight")
-                            ]
-                            shard_id_list = ["w2"]
-                            loaded_weight_list = [loaded_weight]
-                        for name, loaded_weight, shard_id in zip(
-                            name_list, loaded_weight_list, shard_id_list
-                        ):
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            for expert_id in range(num_experts):
-                                weight_loader(
-                                    param,
-                                    loaded_weight[expert_id].T,
-                                    name,
-                                    shard_id=shard_id,
-                                    expert_id=expert_id,
-                                )
+                        name_list = [
+                            name.replace(".experts.down_proj", ".experts.w2_weight")
+                        ]
+                        shard_id_list = ["w2"]
+                        loaded_weight_list = [loaded_weight]
+                    for name, loaded_weight, shard_id in zip(
+                        name_list, loaded_weight_list, shard_id_list
+                    ):
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        for expert_id in range(num_experts):
+                            weight_loader(
+                                param,
+                                loaded_weight[expert_id].T,
+                                name,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
