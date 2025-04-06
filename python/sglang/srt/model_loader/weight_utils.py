@@ -853,39 +853,41 @@ def compute_shared_experts_fusion_weights(
     n_share_experts_fusion: Optional[int],
     moe_layer_ids: Iterable[int],
 ):
-    if n_share_experts_fusion is not None and n_share_experts_fusion > 0:
-        weights_list = list(weights)
-        weights_dict = dict(weights_list)
-        suffix_list = [
-            "down_proj.weight",
-            "down_proj.weight_scale_inv",
-            "gate_proj.weight",
-            "gate_proj.weight_scale_inv",
-            "up_proj.weight",
-            "up_proj.weight_scale_inv",
-        ]
-        names_to_remove = []
-        for moe_layer in tqdm(
-            moe_layer_ids,
-            desc=f"Cloning {n_share_experts_fusion} "
-                 "replicas of the shared expert into MoE",
-        ):
-            for num_repeat in range(n_share_experts_fusion):
-                for suffix in suffix_list:
-                    shared_expert_weight_name = (
-                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+    if n_share_experts_fusion is None or n_share_experts_fusion == 0:
+        return weights
+
+    weights_list = list(weights)
+    weights_dict = dict(weights_list)
+    suffix_list = [
+        "down_proj.weight",
+        "down_proj.weight_scale_inv",
+        "gate_proj.weight",
+        "gate_proj.weight_scale_inv",
+        "up_proj.weight",
+        "up_proj.weight_scale_inv",
+    ]
+    names_to_remove = []
+    for moe_layer in tqdm(
+        moe_layer_ids,
+        desc=f"Cloning {n_share_experts_fusion} "
+             "replicas of the shared expert into MoE",
+    ):
+        for num_repeat in range(n_share_experts_fusion):
+            for suffix in suffix_list:
+                shared_expert_weight_name = (
+                    f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                )
+                weights_list.append(
+                    (
+                        f"model.layers.{moe_layer}."
+                        f"mlp.experts."
+                        f"{config.n_routed_experts + num_repeat}"
+                        f".{suffix}",
+                        weights_dict[shared_expert_weight_name].clone(),
                     )
-                    weights_list.append(
-                        (
-                            f"model.layers.{moe_layer}."
-                            f"mlp.experts."
-                            f"{config.n_routed_experts + num_repeat}"
-                            f".{suffix}",
-                            weights_dict[shared_expert_weight_name].clone(),
-                        )
-                    )
-                    names_to_remove += [shared_expert_weight_name]
-        weights = [w for w in weights_list if w[0] not in names_to_remove]
+                )
+                names_to_remove += [shared_expert_weight_name]
+    return [w for w in weights_list if w[0] not in names_to_remove]
 
 # TODO update deepseek v2 later using this
 def _how_deepseek_v2_should_call_it(self, weights):
