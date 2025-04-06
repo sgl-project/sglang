@@ -1420,7 +1420,7 @@ def fused_experts_impl(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
-        
+
         if apply_router_weight_on_input:
             curr_hidden_states *= curr_topk_weights
 
