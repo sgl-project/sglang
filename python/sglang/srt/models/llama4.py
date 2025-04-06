@@ -400,31 +400,5 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
-    def permute_qk_weight_for_rotary(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-    ) -> Tuple[str, torch.Tensor]:
-
-        def permute(w: torch.Tensor, n_heads: int):
-            attn_in = self.config.head_dim * n_heads
-            attn_out = self.config.hidden_size
-
-            return (
-                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
-                .transpose(1, 2)
-                .reshape(attn_in, attn_out)
-            )
-
-        modules = name.split(".")
-
-        # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(loaded_weight, self.config.num_key_value_heads)
-        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(loaded_weight, self.config.num_attention_heads)
-
-        return name, loaded_weight
-
 
 EntryClass = [Llama4ForCausalLM]
