@@ -26,6 +26,9 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
+from torch import nn
+from transformers import Llama4TextConfig
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -49,8 +52,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from sglang.srt.utils import add_prefix, make_layers
-from torch import nn
-from transformers import Llama4TextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,11 @@ class Llama4MoE(nn.Module):
 
     @staticmethod
     def custom_routing_function(
-            hidden_states: torch.Tensor,
-            gating_output: torch.Tensor,
-            topk: int,
-            renormalize: bool,
-            n_share_experts_fusion: int,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+        n_share_experts_fusion: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
         num_experts = router_scores_aK.shape[1]
@@ -76,10 +77,14 @@ class Llama4MoE(nn.Module):
                 dtype=router_indices_aK.dtype,
                 device=router_indices_aK.device,
             )
-            router_scores_aK[:, :-1] = torch.sigmoid(router_scores_aK[:, :-1].float()).to(hidden_states.dtype)
+            router_scores_aK[:, :-1] = torch.sigmoid(
+                router_scores_aK[:, :-1].float()
+            ).to(hidden_states.dtype)
             router_scores_aK[:, -1] = router_scores_aK[:, :-1].sum(dim=-1)
         else:
-            router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(hidden_states.dtype)
+            router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
+                hidden_states.dtype
+            )
 
         return (
             router_scores_aK.view(-1).reshape(router_scores_aK.shape),
@@ -87,10 +92,10 @@ class Llama4MoE(nn.Module):
         )
 
     def __init__(
-            self,
-            config: Llama4TextConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -160,19 +165,19 @@ class Llama4MoE(nn.Module):
 class Llama4Attention(nn.Module):
 
     def __init__(
-            self,
-            config: Llama4TextConfig,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            layer_id: int = 0,
-            rope_theta: float = 10000,
-            rope_scaling: Optional[Dict[str, Any]] = None,
-            max_position_embeddings: int = 8192,
-            quant_config: Optional[QuantizationConfig] = None,
-            bias: bool = False,
-            bias_o_proj: bool = False,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        bias: bool = False,
+        bias_o_proj: bool = False,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -197,9 +202,9 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attn_temperature_tuning = (
-                getattr(config, "attn_temperature_tuning", False) and self.nope
+            getattr(config, "attn_temperature_tuning", False) and self.nope
         )
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
@@ -273,10 +278,10 @@ class Llama4Attention(nn.Module):
         return attn_scale.unsqueeze(-1)
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -302,11 +307,11 @@ class Llama4Attention(nn.Module):
 
 class Llama4DecoderLayer(nn.Module):
     def __init__(
-            self,
-            config: Llama4TextConfig,
-            layer_id: int = 0,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -350,11 +355,11 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
-            residual: Optional[torch.Tensor],
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -376,10 +381,10 @@ class Llama4DecoderLayer(nn.Module):
 
 class Llama4Model(LlamaModel):
     def __init__(
-            self,
-            config: Llama4TextConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
         self.num_experts = getattr(config, "num_local_experts", 0)
@@ -406,13 +411,13 @@ class Llama4Model(LlamaModel):
         self.layers_to_capture = []
 
     def load_moe_expert_weights(
-            self,
-            name: str,
-            loaded_weight: torch.Tensor,
-            params_dict: Dict[str, nn.Parameter],
-            loaded_params: Set[str],
-            expert_params_mapping: List[Tuple[str, str, int, str]],
-            fused: bool = True,
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: Dict[str, nn.Parameter],
+        loaded_params: Set[str],
+        expert_params_mapping: List[Tuple[str, str, int, str]],
+        fused: bool = True,
     ) -> bool:
         expert_param_loaded = False
         if "experts.gate_up_proj" in name:
@@ -470,25 +475,25 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     }
 
     def __init__(
-            self,
-            config: Llama4TextConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
 
     def _init_model(
-            self,
-            config: Llama4TextConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Llama4TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
     def permute_qk_weight_for_rotary(
-            self,
-            name: str,
-            loaded_weight: torch.Tensor,
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
     ) -> Tuple[str, torch.Tensor]:
 
         def permute(w: torch.Tensor, n_heads: int):
