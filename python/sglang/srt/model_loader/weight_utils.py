@@ -854,6 +854,8 @@ def compute_shared_experts_fusion_weights(
     n_routed_experts: int,
     moe_layer_ids: Iterable[int],
     suffix_list: List[str],
+    shared_expert_name_template: str,
+    routed_expert_name_template: str,
 ):
     if n_share_experts_fusion is None or n_share_experts_fusion == 0:
         return weights
@@ -868,15 +870,11 @@ def compute_shared_experts_fusion_weights(
     ):
         for repeat_index in range(n_share_experts_fusion):
             for suffix in suffix_list:
-                shared_expert_weight_name = (
-                    f"model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}"
-                )
+                shared_expert_weight_name = shared_expert_name_template.format(moe_layer_id=moe_layer_id, suffix=suffix)
                 weights_list.append(
                     (
-                        f"model.layers.{moe_layer_id}."
-                        f"mlp.experts."
-                        f"{n_routed_experts + repeat_index}"
-                        f".{suffix}",
+                        routed_expert_name_template.format(moe_layer_id=moe_layer_id,
+                                                           expert_index=n_routed_experts + repeat_index, suffix=suffix),
                         weights_dict[shared_expert_weight_name].clone(),
                     )
                 )
@@ -903,4 +901,6 @@ def _how_deepseek_v2_should_call_it(self, weights):
             "up_proj.weight",
             "up_proj.weight_scale_inv",
         ],
+        shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
+        routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
     )
