@@ -33,7 +33,7 @@ The `hidden_states` folder contains examples on how to extract hidden states usi
 
 ## LLaVA-NeXT
 
-SGLang support LLaVA-OneVision with single-image, multi-image and video are supported. The folder `llava_onevision` shows how to do this.
+SGLang support LLaVA-OneVision with single-image, multi-image and video are supported. The folder `llava_onevision` shows how to do this. The llava architecture also provides multimodal supports for many other models, such as Qwen, Llama3, Pixtral, etc.
 
 ## Token In, Token Out
 
