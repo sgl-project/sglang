@@ -97,6 +97,7 @@ class Llama4MoE(nn.Module):
             reduce_results=False,
             renormalize=False,
             quant_config=quant_config,
+            apply_router_weight_on_input=True,
             prefix=add_prefix("experts", prefix),
         )
 
