@@ -104,11 +104,11 @@ class Llama4ForConditionalGeneration(nn.Module):
         weights = compute_shared_experts_fusion_weights(
             weights,
             n_share_experts_fusion=self.n_share_experts_fusion,
-            n_routed_experts=self.config.n_routed_experts,
+            n_routed_experts=self.config.num_local_experts,
             moe_layer_ids=range(
-                self.config.first_k_dense_replace,
+                1,
                 self.config.num_hidden_layers,
-                self.config.moe_layer_freq,
+                self.config.interleave_moe_layer_step,
             ),
             suffix_list=[
                 "down_proj.weight",
