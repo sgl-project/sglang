@@ -183,6 +183,8 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    n_share_experts_fusion: int = 0
+    disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -224,6 +226,9 @@ class ServerArgs:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
 
+        if is_hip():
+            self.disable_shared_experts_fusion = True
+
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             if self.tp_size >= 16:
@@ -262,15 +267,11 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = 160
 
-        # Choose kernel backends
+        # Set kernel backends for hpu device
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
-        if self.attention_backend is None:
-            self.attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -496,6 +497,7 @@ class ServerArgs:
                 "modelopt",
                 "w8a8_int8",
                 "w8a8_fp8",
+                "moe_wna16",
             ],
             help="The quantization method.",
         )
@@ -1099,6 +1101,19 @@ class ServerArgs:
             type=str,
             choices=["normal", "low_latency", "auto"],
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+
+        parser.add_argument(
+            "--n-share-experts-fusion",
+            type=int,
+            default=0,
+            help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
+            "we use tp_size by default.",
+        )
+        parser.add_argument(
+            "--disable-shared-experts-fusion",
+            action="store_true",
+            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
         )
 
         # Server warmups
