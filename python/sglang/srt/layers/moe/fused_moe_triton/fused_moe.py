@@ -1437,7 +1437,7 @@ def fused_experts_impl(
             expert_ids,
             num_tokens_post_padded,
             # TODO hack
-            True,
+            apply_router_weight_on_input,
             topk_ids.shape[1],
             config,
             compute_type=compute_type,
