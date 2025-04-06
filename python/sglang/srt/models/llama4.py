@@ -64,9 +64,9 @@ class Llama4MoE(nn.Module):
             topk: int,
             renormalize: bool,
             n_share_experts_fusion: int,
-            num_experts: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
+        num_experts = router_scores_aK.shape[1]
 
         if n_share_experts_fusion:
             router_indices_aK[:, -1] = torch.randint(
@@ -118,7 +118,6 @@ class Llama4MoE(nn.Module):
             custom_routing_function=partial(
                 Llama4MoE.custom_routing_function,
                 n_share_experts_fusion=self.n_share_experts_fusion,
-                num_experts=config.num_local_experts,
             ),
             intermediate_size=intermediate_size_moe,
             reduce_results=False,
