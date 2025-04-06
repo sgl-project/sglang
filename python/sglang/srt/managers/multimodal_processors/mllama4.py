@@ -1,10 +1,8 @@
-from typing import List, Mapping, Optional, Tuple, Union
+from typing import List, Union
 
 import torch
-from PIL import Image
-from transformers import Llama4Processor
 from transformers.image_utils import SizeDict
-from transformers.models.llama4.image_processing_llama4 import (
+from transformers.models.llama4.image_processing_llama4_fast import (
     find_supported_resolutions,
     get_best_fit,
 )
@@ -15,7 +13,6 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
-from sglang.srt.utils import load_image
 
 
 class Mllama4ImageProcessor(BaseMultimodalProcessor):
@@ -25,6 +22,9 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.vision_config = hf_config.vision_config
         self.text_config = hf_config.text_config
+        self.boi_token_index = hf_config.boi_token_index
+        self.eoi_token_index = hf_config.eoi_token_index
+        self.image_token_index = hf_config.image_token_index
         self.multimodal_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token
         )
@@ -54,9 +54,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         )
 
         # Process the images using the processor
-        processor = Llama4Processor.from_pretrained(
-            self.server_args.model_path, **kwargs
-        )
+        processor = self._processor
 
         # Process the prompt and images
         image_inputs = processor(
@@ -134,6 +132,12 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         # Convert to the format expected by SGLang
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
+        tokenizer = processor.tokenizer
+
+        image_inputs["im_start_id"] = self.boi_token_index
+        image_inputs["im_end_id"] = self.eoi_token_index
+        image_inputs["im_token_id"] = self.image_token_index
+
         # Add metadata for image processing
         image_inputs["mm_items"] = [
             MultimodalDataItem(
@@ -147,15 +151,3 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         ]
 
         return image_inputs
-
-    def get_patch_per_chunk(self):
-        """Calculate patches per chunk based on vision config"""
-        image_size = self.vision_config.image_size
-        patch_size = self.vision_config.patch_size
-
-        assert (
-            image_size % patch_size == 0
-        ), f"chunk size {image_size} should be multiple of patch_size {patch_size}"
-
-        ds_ratio = int(round(1.0 / (self.vision_config.pixel_shuffle_ratio**2)))
-        return (image_size // patch_size) ** 2 // ds_ratio

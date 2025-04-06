@@ -157,7 +157,7 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or other
+    A single multimodal data, from a single image/video/audio or others
     """
 
     modality: Modality
@@ -180,6 +180,9 @@ class MultimodalDataItem:
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
+    embed_is_patch: Optional[torch.Tensor] = None
+    aspect_ratios: Optional[torch.Tensor] = None
+    patches_per_image: Optional[torch.Tensor] = None
 
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
@@ -195,7 +198,7 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashign the data
+        Set the pad value after first hashing the data
         """
 
         def tensor_hash(f):
@@ -256,7 +259,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
-    im_token_id: Optional[torch.Tensor] = None
+    im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
