@@ -9,6 +9,8 @@ import ray
 import torch
 import triton
 from ray.experimental.tqdm_ray import tqdm
+from transformers import AutoConfig
+
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
@@ -17,7 +19,6 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_moe_configs,
 )
 from sglang.srt.utils import is_hip
-from transformers import AutoConfig
 
 _is_hip_ = is_hip()
 
@@ -382,7 +383,7 @@ def main(args: argparse.Namespace):
     print(args)
 
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    if getattr(config, "text_config", None):
+    if hasattr(config, "text_config"):
         config = config.text_config
 
     if config.architectures[0] == "DbrxForCausalLM":
