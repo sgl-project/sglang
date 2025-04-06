@@ -1,0 +1,36 @@
+FROM pytorch/manylinux2_28-builder:cuda12.8
+
+ARG BUILD_TYPE=dev_bwl
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_HOME=/opt/python/cp311-cp311
+ENV PATH=$PYTHON_HOME/bin:$PATH
+
+# Install packages for dev
+RUN which python3 \
+    && python3 -m pip--no-cache-dir install pytest black isort icdiff uv pre-commit
+
+# Install sglang
+WORKDIR /sgl-workspace
+RUN which python3 \
+    && python3 -m pip --no-cache-dir install --upgrade pip setuptools wheel html5lib six \
+    && python3 -m pip --no-cache-dir install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128 \
+    && git clone --depth=1 --branch blackwell https://github.com/Alcanderian/sglang.git \
+    && cd sglang \
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" \
+
+# Build and install sgl-kernel, do not use uv since it depends on torch nightly
+WORKDIR /sgl-workspace
+    which python3
+    && cd sglang \
+    && export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0 10.0 12.0+PTX' \
+    && export CUDA_VERSION=12.8 \
+    && python3 -m pip --no-cache-dir install -e sgl-kernel
+
+# For openbmb/MiniCPM models
+RUN python3 -m pip install datamodel_code_generator
+
+ENV DEBIAN_FRONTEND=interactive
+
+# Configure bash
+RUN echo "PATH=$PYTHON_HOME/bin:\$PATH" >> /root/.bashrc
+RUN echo "LD_LIBRARY_PATH=$PYTHON_HOME/lib/python3.11/site-packages/torch/lib:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> /root/.bashrc

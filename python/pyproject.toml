@@ -56,6 +56,14 @@ srt = [
     "einops",
 ]
 
+srt_bwl = [
+    "sglang[runtime_common]",
+    "cuda-python",
+    "outlines>=0.0.44,<=0.1.11",
+    "partial_json_parser",
+    "einops",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
@@ -91,12 +99,14 @@ test = [
     "peft",
 ]
 all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all_bwl = ["sglang[srt_bwl]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
 
 dev = ["sglang[all]", "sglang[test]"]
+dev_bwl = ["sglang[all_bwl]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_xpu = ["sglang[all_xpu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]

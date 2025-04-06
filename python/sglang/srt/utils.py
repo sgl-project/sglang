@@ -1702,8 +1702,9 @@ def create_checksum(directory: str):
 def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
+        arch_num = capability[0] * 10 + capability[1]
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch_num >= 90 else ''}"
 
 
 def next_power_of_2(n: int):
