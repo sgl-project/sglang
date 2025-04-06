@@ -23,7 +23,6 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 
-
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
@@ -1421,8 +1420,9 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        if apply_router_weight_on_input:
-            curr_hidden_states *= curr_topk_weights
+        # TODO hack
+        # if apply_router_weight_on_input:
+        #     curr_hidden_states *= curr_topk_weights
 
         invoke_fused_moe_kernel(
             curr_hidden_states,
@@ -1436,7 +1436,8 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            False,
+            # TODO hack
+            True,
             topk_ids.shape[1],
             config,
             compute_type=compute_type,
