@@ -410,9 +410,9 @@ def main(args: argparse.Namespace):
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] == "Llama4ForConditionalGeneration":
         n_share_fusion_experts = args.n_share_experts_fusion
-        E = config.num_local_experts + n_share_fusion_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
+        E = config.text_config.num_local_experts + n_share_fusion_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
