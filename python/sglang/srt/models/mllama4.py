@@ -197,7 +197,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                             )
                             break
                         else:
-                            raise Exception("expert not found")
+                            raise Exception(f"expert not found: {name=} {loaded_weight.shape=}")
                     else:
                         if ".gate_up_proj" in name:
                             name_list = [
