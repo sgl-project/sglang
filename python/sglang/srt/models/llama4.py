@@ -22,7 +22,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union, Type
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import torch
 from torch import nn
@@ -196,7 +196,7 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attn_temperature_tuning = (
             getattr(config, "attn_temperature_tuning", False) and self.nope
         )
@@ -480,11 +480,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         self,
         config: Llama4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
-        return Llama4Model(
-            config, quant_config=quant_config, prefix=prefix
-        )
+        return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
     def permute_qk_weight_for_rotary(
         self,

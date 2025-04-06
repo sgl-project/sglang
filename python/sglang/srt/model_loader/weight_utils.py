@@ -28,12 +28,13 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from tqdm.auto import tqdm
+
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
-from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -866,15 +867,20 @@ def compute_shared_experts_fusion_weights(
     for moe_layer_id in tqdm(
         moe_layer_ids,
         desc=f"Cloning {n_share_experts_fusion} "
-             "replicas of the shared expert into MoE",
+        "replicas of the shared expert into MoE",
     ):
         for repeat_index in range(n_share_experts_fusion):
             for suffix in suffix_list:
-                shared_expert_weight_name = shared_expert_name_template.format(moe_layer_id=moe_layer_id, suffix=suffix)
+                shared_expert_weight_name = shared_expert_name_template.format(
+                    moe_layer_id=moe_layer_id, suffix=suffix
+                )
                 weights_list.append(
                     (
-                        routed_expert_name_template.format(moe_layer_id=moe_layer_id,
-                                                           expert_index=n_routed_experts + repeat_index, suffix=suffix),
+                        routed_expert_name_template.format(
+                            moe_layer_id=moe_layer_id,
+                            expert_index=n_routed_experts + repeat_index,
+                            suffix=suffix,
+                        ),
                         weights_dict[shared_expert_weight_name].clone(),
                     )
                 )

@@ -5,6 +5,10 @@ from itertools import tee
 from typing import Optional, Set, Tuple
 
 import torch
+from torch import nn
+from transformers import Llama4Config, Llama4VisionConfig
+from transformers.image_utils import SizeDict
+
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -22,14 +26,13 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import MultimodalInputs, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader, compute_shared_experts_fusion_weights
+from sglang.srt.model_loader.weight_utils import (
+    compute_shared_experts_fusion_weights,
+    default_weight_loader,
+)
 from sglang.srt.utils import add_prefix
-from torch import nn
-from transformers import Llama4Config, Llama4VisionConfig
-from transformers.image_utils import SizeDict
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +55,14 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         # TODO refactor and probably move this
         if global_server_args_dict.get("disable_shared_experts_fusion", False):
-            self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] = None
+            self.n_share_experts_fusion = global_server_args_dict[
+                "n_share_experts_fusion"
+            ] = None
             logger.info("Shared experts fusion optimization is disabled.")
         elif self.n_share_experts_fusion is None:
-            self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+            self.n_share_experts_fusion = global_server_args_dict[
+                "n_share_experts_fusion"
+            ] = self.tp_size
             logger.info(
                 f"Shared experts fusion optimization is by default enabled, and n_share_experts_fusion is set to {self.tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
             )
@@ -132,11 +139,11 @@ class Llama4ForConditionalGeneration(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-                        + (
-                            self.n_share_experts_fusion
-                            if self.n_share_experts_fusion is not None
-                            else 0
-                        ),
+            + (
+                self.n_share_experts_fusion
+                if self.n_share_experts_fusion is not None
+                else 0
+            ),
         )
 
         stacked_params_mapping = [
@@ -157,7 +164,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         for name, loaded_weight in weights:
 
-            if name.startswith("vision_model") or name.startswith("multi_modal_projector"):
+            if name.startswith("vision_model") or name.startswith(
+                "multi_modal_projector"
+            ):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -174,14 +183,22 @@ class Llama4ForConditionalGeneration(nn.Module):
                         TODO
                     else:
                         if ".gate_up_proj" in name:
-                            name_list = [name.replace(".experts.gate_up_proj", ".experts.w13_weight")] * 2
+                            name_list = [
+                                name.replace(
+                                    ".experts.gate_up_proj", ".experts.w13_weight"
+                                )
+                            ] * 2
                             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                             shard_id_list = ["w1", "w3"]
                         else:
-                            name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
+                            name_list = [
+                                name.replace(".experts.down_proj", ".experts.w2_weight")
+                            ]
                             shard_id_list = ["w2"]
                             loaded_weight_list = [loaded_weight]
-                        for name, loaded_weight, shard_id in zip(name_list, loaded_weight_list, shard_id_list):
+                        for name, loaded_weight, shard_id in zip(
+                            name_list, loaded_weight_list, shard_id_list
+                        ):
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             for expert_id in range(num_experts):
