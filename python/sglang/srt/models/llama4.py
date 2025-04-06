@@ -23,7 +23,7 @@
 
 import logging
 from functools import partial
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -131,14 +131,15 @@ class Llama4MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        self.shared_expert = LlamaMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=intermediate_size_moe,
-            hidden_act="silu",
-            quant_config=quant_config,
-            prefix=add_prefix("shared_expert", prefix),
-            reduce_results=False,  # We need to do scatter before reduce
-        )
+        if self.n_share_experts_fusion == 0:
+            self.shared_expert = LlamaMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size_moe,
+                hidden_act="silu",
+                quant_config=quant_config,
+                prefix=add_prefix("shared_expert", prefix),
+                reduce_results=False,  # We need to do scatter before reduce
+            )
 
     def forward(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
