@@ -22,6 +22,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import torch
@@ -63,6 +64,8 @@ class Llama4MoE(nn.Module):
         gating_output: torch.Tensor,
         topk: int,
         renormalize: bool,
+        n_share_experts_fusion: int,
+        num_experts: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
 
@@ -113,7 +116,11 @@ class Llama4MoE(nn.Module):
             num_experts=config.num_local_experts + self.n_share_experts_fusion,
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
-            custom_routing_function=Llama4MoE.custom_routing_function,
+            custom_routing_function=partial(
+                Llama4MoE.custom_routing_function,
+                n_share_experts_fusion=TODO,
+                num_experts=TODO,
+            ),
             intermediate_size=intermediate_size_moe,
             reduce_results=False,
             renormalize=False,
