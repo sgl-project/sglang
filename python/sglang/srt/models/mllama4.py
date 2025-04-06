@@ -180,7 +180,23 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 if ".experts" in name:
                     if TODO:
-                        TODO
+                        for mapping in expert_params_mapping:
+                            param_name, weight_name, expert_id, shard_id = mapping
+                            if weight_name not in name:
+                                continue
+                            name = name.replace(weight_name, param_name)
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                            )
+                            break
+                        else:
+                            raise Exception("expert not found")
                     else:
                         if ".gate_up_proj" in name:
                             name_list = [
