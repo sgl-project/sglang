@@ -73,7 +73,7 @@ from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
+from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_flashinfer_available, is_hip
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1037,6 +1037,25 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
 
         return output
+    
+
+    def _chunked_prefix_attn_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+                
+        if is_flashinfer_available():
+            from flashinfer.cascade import merge_state
+
+        out, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        for i in range(forward_batch.num_prefix_chunks):
+            forward_batch.prefix_chunk_idx = i
+            # TODO: Fetch correct kv cache and turns it into multi-head form.
+            out, lse = self.attn_mha(q, k_cache, v_cache, forward_batch, save_kv_cache=False)
+
 
     def forward_normal_chunked_kv(
         self,
@@ -1050,8 +1069,48 @@ class DeepseekV2AttentionMLA(nn.Module):
         # The top comments in https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
         # will be helpful for understanding the purpose of this function.
 
-        # TODO: Implement the for loop here!
-        pass
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(hidden_states)[0]
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+        k = torch.empty_like(q)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+
+        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+
+        # Save latent cache
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        )
+
+        forward_batch.prepare_chunked_prefix_cache_info(self.runner)
+        if forward_batch.enable_chunked_prefix:
+            attn_output, _ = self._chunked_prefix_attn_mha(q, k, v, forward_batch)
+        else:
+            # If no sequence has prefix cache, then compute the normal mha forward.
+            attn_output, _ = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class DeepseekV2DecoderLayer(nn.Module):

@@ -181,6 +181,7 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     enable_chunked_prefix: bool = False
     num_prefix_chunks: Optional[int] = None # Number of prefix cache chunks
+    prefix_chunk_idx: Optional[int] = None # Index of current chunk, used by attention backend.
     prefix_chunk_len: Optional[int] = None  # Maximum number of tokens in each chunk per sequence. Computed from workspace size
     prefix_chunk_starts: Optional[torch.Tensor] = None # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_seq_lens: Optional[torch.Tensor] = None # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
@@ -477,6 +478,7 @@ class ForwardBatch:
 
         device = model_runner.device
         self.enable_chunked_prefix = True
+        self.prefix_chunk_idx = -1
         self.prefix_chunk_len = self.get_chunk_workspace_size() // self.batch_size
         
         # Here we suppose the length of each chunk is equal
