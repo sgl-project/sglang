@@ -5,10 +5,6 @@ from itertools import tee
 from typing import Optional, Set, Tuple
 
 import torch
-from torch import nn
-from transformers import Llama4Config, Llama4VisionConfig
-from transformers.image_utils import SizeDict
-
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -33,6 +29,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
 from sglang.srt.utils import add_prefix
+from torch import nn
+from transformers import Llama4Config, Llama4VisionConfig
+from transformers.image_utils import SizeDict
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +42,10 @@ class Llama4ForConditionalGeneration(nn.Module):
     }
 
     def __init__(
-        self,
-        config: Llama4Config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4Config,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -80,19 +79,19 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        **kwargs: object,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            **kwargs: object,
     ) -> torch.Tensor:
 
         return self.language_model(input_ids, positions, forward_batch)
 
     def _separate_weights(
-        self,
-        weights: Iterable[Tuple[str, torch.Tensor]],
-        prefix: str,
+            self,
+            weights: Iterable[Tuple[str, torch.Tensor]],
+            prefix: str,
     ) -> Tuple[Iterable[Tuple[str, torch.Tensor]], Iterable[Tuple[str, torch.Tensor]]]:
         weights1, weights2 = tee(weights, 2)
 
@@ -119,11 +118,11 @@ class Llama4ForConditionalGeneration(nn.Module):
                 self.config.text_config.interleave_moe_layer_step,
             ),
             suffix_list=[
-                "down_proj",
-                "gate_proj",
-                "up_proj",
+                "down_proj.weight",
+                "gate_proj.weight",
+                "up_proj.weight",
             ],
-            shared_expert_name_template="language_model.model.layers.{moe_layer_id}.feed_forward.shared_expert.{suffix}.weight",
+            shared_expert_name_template="language_model.model.layers.{moe_layer_id}.feed_forward.shared_expert.{suffix}",
             routed_expert_name_template="language_model.model.layers.{moe_layer_id}.feed_forward.experts.{expert_index}.{suffix}",
         )
 
@@ -140,11 +139,11 @@ class Llama4ForConditionalGeneration(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.text_config.num_local_experts
-            + (
-                self.n_share_experts_fusion
-                if self.n_share_experts_fusion is not None
-                else 0
-            ),
+                        + (
+                            self.n_share_experts_fusion
+                            if self.n_share_experts_fusion is not None
+                            else 0
+                        ),
         )
 
         stacked_params_mapping = [
@@ -163,7 +162,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
 
             if name.startswith("vision_model") or name.startswith(
-                "multi_modal_projector"
+                    "multi_modal_projector"
             ):
                 continue
 
@@ -201,10 +200,10 @@ class Llama4ForConditionalGeneration(nn.Module):
                     else:
                         if ".gate_up_proj" in name:
                             name_list = [
-                                name.replace(
-                                    ".experts.gate_up_proj", ".experts.w13_weight"
-                                )
-                            ] * 2
+                                            name.replace(
+                                                ".experts.gate_up_proj", ".experts.w13_weight"
+                                            )
+                                        ] * 2
                             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                             shard_id_list = ["w1", "w3"]
                         else:
@@ -214,7 +213,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                             shard_id_list = ["w2"]
                             loaded_weight_list = [loaded_weight]
                         for name, loaded_weight, shard_id in zip(
-                            name_list, loaded_weight_list, shard_id_list
+                                name_list, loaded_weight_list, shard_id_list
                         ):
                             param = params_dict[name]
                             weight_loader = param.weight_loader
