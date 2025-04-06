@@ -75,6 +75,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_hicache.py", 60),
         TestFile("test_hicache_mla.py", 90),
+        TestFile("test_fused_moe.py", 200),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 300),

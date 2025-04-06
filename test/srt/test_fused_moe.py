@@ -3,7 +3,6 @@ import unittest
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_vllm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
@@ -98,21 +97,10 @@ class TestFusedMOE(CustomTestCase):
                 a2_scale=a2_scale,
             )
 
-            vllm_output = fused_moe_vllm(
-                a,
-                w1,
-                w2,
-                score,
-                topk,
-                renormalize=False,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
+            torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
+            torch.testing.assert_close(
+                sglang_output, torch_output, rtol=rtol, atol=atol
             )
-
-            torch.testing.assert_close(sglang_output, vllm_output, rtol=rtol, atol=atol)
 
         else:
             a = self.create_random_cuda_tensor((m, k), dtype)
