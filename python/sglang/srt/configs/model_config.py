@@ -258,6 +258,7 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
