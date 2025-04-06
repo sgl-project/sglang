@@ -377,9 +377,7 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
@@ -403,6 +401,16 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
+    
+    def _init_model(
+        self,
+        config: LlamaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
+    ):
+        return LlamaModel(
+            config, quant_config=quant_config, prefix=prefix
+        )
 
     @torch.no_grad()
     def forward(

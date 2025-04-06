@@ -22,7 +22,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union, Type
 
 import torch
 from torch import nn
@@ -163,11 +163,8 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.no_rope_layer_interval = config.no_rope_layer_interval
-        self.nope = (
-            self.no_rope_layer_interval > 0
-            and (self.layer_id + 1) % self.no_rope_layer_interval == 0
-        )
+        self.no_rope_layers = config.no_rope_layers
+        self.nope = self.no_rope_layers[self.layer_id] == 0
         self.use_qk_norm = config.use_qk_norm and not self.nope
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -280,15 +277,16 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
         if self.q_norm is not None:
-            q = self.q_norm(q.float()).to(q.dtype)
+            # TODO: support float
+            q = self.q_norm(q.bfloat16().contiguous()).to(q.dtype)
         if self.k_norm is not None:
-            k = self.k_norm(k.float()).to(k.dtype)
+            k = self.k_norm(k.bfloat16().contiguous()).to(k.dtype)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class Llama4DecoderLayer(LlamaDecoderLayer):
+class Llama4DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -297,6 +295,7 @@ class Llama4DecoderLayer(LlamaDecoderLayer):
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
@@ -368,7 +367,7 @@ class Llama4Model(LlamaModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        super().__init__(config, quant_config, prefix)
         self.num_experts = getattr(config, "num_local_experts", 0)
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -401,7 +400,6 @@ class Llama4Model(LlamaModel):
         expert_params_mapping: List[Tuple[str, str, int, str]],
         fused: bool = True,
     ) -> bool:
-        return True
         expert_param_loaded = False
         if "experts.gate_up_proj" in name:
             loaded_weight = loaded_weight.chunk(2, dim=-1)
@@ -465,6 +463,16 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    def _init_model(
+        self,
+        config: Llama4TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
+    ):
+        return Llama4Model(
+            config, quant_config=quant_config, prefix=prefix
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         return

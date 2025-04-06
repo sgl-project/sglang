@@ -1112,7 +1112,7 @@ def fused_experts_impl(
             (
                 intermediate_cache3
                 if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx]
+                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
             ),
             a2_scale,
             w2_scale,
