@@ -150,25 +150,28 @@ class Llama4ForConditionalGeneration(nn.Module):
                 break
             else:
                 if ".experts" in name:
-                    if ".gate_up_proj" in name:
-                        name_list = [name.replace(".experts.gate_up_proj", ".experts.w13_weight")] * 2
-                        loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                        shard_id_list = ["w1", "w3"]
+                    if TODO:
+                        TODO
                     else:
-                        name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
-                        shard_id_list = ["w2"]
-                        loaded_weight_list = [loaded_weight]
-                    for name, loaded_weight, shard_id in zip(name_list, loaded_weight_list, shard_id_list):
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        for expert_id in range(num_experts):
-                            weight_loader(
-                                param,
-                                loaded_weight[expert_id].T,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                        if ".gate_up_proj" in name:
+                            name_list = [name.replace(".experts.gate_up_proj", ".experts.w13_weight")] * 2
+                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+                            shard_id_list = ["w1", "w3"]
+                        else:
+                            name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
+                            shard_id_list = ["w2"]
+                            loaded_weight_list = [loaded_weight]
+                        for name, loaded_weight, shard_id in zip(name_list, loaded_weight_list, shard_id_list):
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            for expert_id in range(num_experts):
+                                weight_loader(
+                                    param,
+                                    loaded_weight[expert_id].T,
+                                    name,
+                                    shard_id=shard_id,
+                                    expert_id=expert_id,
+                                )
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
