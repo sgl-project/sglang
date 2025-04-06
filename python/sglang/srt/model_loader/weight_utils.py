@@ -865,7 +865,7 @@ def compute_shared_experts_fusion_weights(
         desc=f"Cloning {n_share_experts_fusion} "
              "replicas of the shared expert into MoE",
     ):
-        for num_repeat in range(n_share_experts_fusion):
+        for repeat_index in range(n_share_experts_fusion):
             for suffix in suffix_list:
                 shared_expert_weight_name = (
                     f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
@@ -874,7 +874,7 @@ def compute_shared_experts_fusion_weights(
                     (
                         f"model.layers.{moe_layer}."
                         f"mlp.experts."
-                        f"{config.n_routed_experts + num_repeat}"
+                        f"{config.n_routed_experts + repeat_index}"
                         f".{suffix}",
                         weights_dict[shared_expert_weight_name].clone(),
                     )
