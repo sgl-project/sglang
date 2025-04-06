@@ -139,7 +139,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.text_config.n_routed_experts
+            num_experts=self.config.text_config.num_local_experts
             + (
                 self.n_share_experts_fusion
                 if self.n_share_experts_fusion is not None
