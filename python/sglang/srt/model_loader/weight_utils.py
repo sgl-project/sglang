@@ -852,20 +852,13 @@ def compute_shared_experts_fusion_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     n_share_experts_fusion: Optional[int],
     moe_layer_ids: Iterable[int],
+    suffix_list: List[str],
 ):
     if n_share_experts_fusion is None or n_share_experts_fusion == 0:
         return weights
 
     weights_list = list(weights)
     weights_dict = dict(weights_list)
-    suffix_list = [
-        "down_proj.weight",
-        "down_proj.weight_scale_inv",
-        "gate_proj.weight",
-        "gate_proj.weight_scale_inv",
-        "up_proj.weight",
-        "up_proj.weight_scale_inv",
-    ]
     names_to_remove = []
     for moe_layer in tqdm(
         moe_layer_ids,
@@ -899,4 +892,12 @@ def _how_deepseek_v2_should_call_it(self, weights):
             self.config.num_hidden_layers,
             self.config.moe_layer_freq,
         ),
+        suffix_list = [
+            "down_proj.weight",
+            "down_proj.weight_scale_inv",
+            "gate_proj.weight",
+            "gate_proj.weight_scale_inv",
+            "up_proj.weight",
+            "up_proj.weight_scale_inv",
+        ],
     )
