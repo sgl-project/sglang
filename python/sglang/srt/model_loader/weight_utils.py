@@ -848,8 +848,8 @@ def kv_cache_scales_loader(
     )
     return []
 
-def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Tensor]]):
-    if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
+def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Tensor]], n_share_experts_fusion: int):
+    if n_share_experts_fusion is not None and n_share_experts_fusion > 0:
         weights_list = list(weights)
         weights_dict = dict(weights_list)
         suffix_list = [
@@ -863,14 +863,14 @@ def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Ten
         names_to_remove = []
         for moe_layer in tqdm(
             range(
-                self.config.first_k_dense_replace,
-                self.config.num_hidden_layers,
-                self.config.moe_layer_freq,
+                config.first_k_dense_replace,
+                config.num_hidden_layers,
+                config.moe_layer_freq,
             ),
-            desc=f"Cloning {self.n_share_experts_fusion} "
+            desc=f"Cloning {n_share_experts_fusion} "
                  "replicas of the shared expert into MoE",
         ):
-            for num_repeat in range(self.n_share_experts_fusion):
+            for num_repeat in range(n_share_experts_fusion):
                 for suffix in suffix_list:
                     shared_expert_weight_name = (
                         f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
@@ -879,7 +879,7 @@ def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Ten
                         (
                             f"model.layers.{moe_layer}."
                             f"mlp.experts."
-                            f"{self.config.n_routed_experts + num_repeat}"
+                            f"{config.n_routed_experts + num_repeat}"
                             f".{suffix}",
                             weights_dict[shared_expert_weight_name].clone(),
                         )
@@ -888,7 +888,8 @@ def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Ten
         weights = [w for w in weights_list if w[0] not in names_to_remove]
 
 # TODO update deepseek v2 later using this
-def _how_deepseek_v2_should_call_it(weights):
+def _how_deepseek_v2_should_call_it(self, weights):
     weights = compute_shared_experts_fusion_weights(
         weights,
+        n_share_experts_fusion=self.n_share_experts_fusion,
     )
