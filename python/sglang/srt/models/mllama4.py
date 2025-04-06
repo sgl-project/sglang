@@ -114,7 +114,11 @@ class Llama4ForConditionalGeneration(nn.Module):
             n_share_experts_fusion=self.n_share_experts_fusion,
             n_routed_experts=self.config.text_config.num_local_experts,
             moe_layer_ids=range(
-                1,
+                (
+                    0
+                    if self.config.text_config.interleave_moe_layer_step == 1
+                    else (self.config.text_config.interleave_moe_layer_step - 1)
+                ),
                 self.config.text_config.num_hidden_layers,
                 self.config.text_config.interleave_moe_layer_step,
             ),
