@@ -169,8 +169,8 @@ class Llama4Attention(nn.Module):
         self.attn_temperature_tuning = (
             getattr(config, "attn_temperature_tuning", False) and self.nope
         )
-        self.floor_scale = getattr(config, "floor_scale", 8192.0)
-        self.attn_scale = getattr(config, "attn_scale", 0.1)
+        self.floor_scale = config.floor_scale
+        self.attn_scale = config.attn_scale
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.n_rep = self.num_heads // self.num_kv_heads
@@ -248,13 +248,6 @@ class Llama4Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # We are applying temperature tuning (https://arxiv.org/abs/2501.19399) to NoPE layers, where
-        # the inference-time temperature tuning function is customized to not affect short context
-        # while working at very long context
-        # https://arxiv.org/abs/2501.19399
-        if self.attn_temperature_tuning and self.nope:
-            attn_scale = self._get_attn_scale(positions)
-            q = (q * attn_scale).to(q.dtype)
 
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
@@ -263,6 +256,15 @@ class Llama4Attention(nn.Module):
             q = self.q_norm(q.bfloat16().contiguous()).to(q.dtype)
         if self.k_norm is not None:
             k = self.k_norm(k.bfloat16().contiguous()).to(k.dtype)
+
+        # We are applying temperature tuning (https://arxiv.org/abs/2501.19399) to NoPE layers, where
+        # the inference-time temperature tuning function is customized to not affect short context
+        # while working at very long context
+        # https://arxiv.org/abs/2501.19399
+        if self.attn_temperature_tuning and self.nope:
+            attn_scale = self._get_attn_scale(positions)
+            q = (q * attn_scale).to(q.dtype)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -372,63 +374,6 @@ class Llama4Model(LlamaModel):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
-
-    def load_moe_expert_weights(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: Dict[str, nn.Parameter],
-        loaded_params: Set[str],
-        expert_params_mapping: List[Tuple[str, str, int, str]],
-        fused: bool = True,
-    ) -> bool:
-        expert_param_loaded = False
-        if "experts.gate_up_proj" in name:
-            loaded_weight = loaded_weight.chunk(2, dim=-1)
-        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-            new_loaded_weight = loaded_weight
-            if fused:
-                e_str, _, proj_str, _ = weight_name.split(".")
-                weight_name = f"{e_str}.{proj_str}"
-                param_name = f"{param_name}weight"
-            if weight_name not in name:
-                continue
-            full_param_name = name.replace(weight_name, param_name)
-            if full_param_name not in params_dict:
-                continue
-            param = params_dict[full_param_name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if fused:
-                if "w13" in full_param_name:
-                    shard_idx = 0 if shard_id == "w1" else 1
-                    new_loaded_weight = new_loaded_weight[shard_idx]
-                new_loaded_weight = new_loaded_weight.transpose(-1, -2)
-                layer_idx = int(name.split(".")[2])
-                # EP mapping
-                expert_map = self.layers[layer_idx].feed_forward.experts.expert_map
-                if expert_map is not None:
-                    local_expert_indices = (
-                        (expert_map != -1)
-                        .nonzero()
-                        .flatten()
-                        .to(new_loaded_weight.device)
-                    )
-                    new_loaded_weight = new_loaded_weight[local_expert_indices]
-                    expert_id = local_expert_indices[0].item()
-            else:
-                # TODO: add EP support for non fused weights
-                pass
-            weight_loader(
-                param,
-                new_loaded_weight,
-                full_param_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-
-            loaded_params.add(full_param_name)
-            expert_param_loaded = True
-        return expert_param_loaded
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
