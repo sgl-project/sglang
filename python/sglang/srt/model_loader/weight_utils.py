@@ -28,13 +28,12 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-from tqdm.auto import tqdm
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -848,9 +847,11 @@ def kv_cache_scales_loader(
     )
     return []
 
+
 def compute_shared_experts_fusion_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     n_share_experts_fusion: Optional[int],
+    n_routed_experts: int,
     moe_layer_ids: Iterable[int],
     suffix_list: List[str],
 ):
@@ -874,7 +875,7 @@ def compute_shared_experts_fusion_weights(
                     (
                         f"model.layers.{moe_layer}."
                         f"mlp.experts."
-                        f"{config.n_routed_experts + repeat_index}"
+                        f"{n_routed_experts + repeat_index}"
                         f".{suffix}",
                         weights_dict[shared_expert_weight_name].clone(),
                     )
@@ -882,17 +883,19 @@ def compute_shared_experts_fusion_weights(
                 names_to_remove += [shared_expert_weight_name]
     return [w for w in weights_list if w[0] not in names_to_remove]
 
+
 # TODO update deepseek v2 later using this
 def _how_deepseek_v2_should_call_it(self, weights):
     weights = compute_shared_experts_fusion_weights(
         weights,
         n_share_experts_fusion=self.n_share_experts_fusion,
+        n_routed_experts=self.config.n_routed_experts,
         moe_layer_ids=range(
             self.config.first_k_dense_replace,
             self.config.num_hidden_layers,
             self.config.moe_layer_freq,
         ),
-        suffix_list = [
+        suffix_list=[
             "down_proj.weight",
             "down_proj.weight_scale_inv",
             "gate_proj.weight",
