@@ -181,7 +181,8 @@ class Llama4ForConditionalGeneration(nn.Module):
                 break
             else:
                 if ".experts" in name:
-                    if TODO:
+                    assert len(loaded_weight.shape) in {2, 3}
+                    if len(loaded_weight.shape) == 2:
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
