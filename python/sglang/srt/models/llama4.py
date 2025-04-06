@@ -65,6 +65,18 @@ class Llama4MoE(nn.Module):
         renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
+
+        if n_share_experts_fusion:
+            router_indices_aK[:, -1] = torch.randint(
+                low=num_experts,
+                high=num_experts + n_share_experts_fusion,
+                size=(router_indices_aK.size(0),),
+                dtype=router_indices_aK.dtype,
+                device=router_indices_aK.device,
+            )
+            router_scores_aK[:, -1] = router_scores_aK[:, :-1].sum(dim=-1)
+
+        TODO_only_sigmoid_on_non_last
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
             hidden_states.dtype
         )
