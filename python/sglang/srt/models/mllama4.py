@@ -112,11 +112,8 @@ class Llama4ForConditionalGeneration(nn.Module):
             ),
             suffix_list=[
                 "down_proj.weight",
-                "down_proj.weight_scale_inv",
                 "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
                 "up_proj.weight",
-                "up_proj.weight_scale_inv",
             ],
             shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
             routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
