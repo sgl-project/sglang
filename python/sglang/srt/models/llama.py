@@ -401,16 +401,14 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         self.capture_aux_hidden_states = False
-    
+
     def _init_model(
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
-        return LlamaModel(
-            config, quant_config=quant_config, prefix=prefix
-        )
+        return LlamaModel(config, quant_config=quant_config, prefix=prefix)
 
     @torch.no_grad()
     def forward(
