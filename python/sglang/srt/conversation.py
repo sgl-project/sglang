@@ -33,6 +33,7 @@ class SeparatorStyle(IntEnum):
     ADD_NEW_LINE_SINGLE = auto()
     LLAMA2 = auto()
     LLAMA3 = auto()
+    LLAMA4 = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -156,6 +157,9 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
+        elif self.sep_style == SeparatorStyle.LLAMA4:
+            # TODO
+            pass
         elif self.sep_style == SeparatorStyle.LLAMA3:
             ret = "<|begin_of_text|>"
             if self.system_message:

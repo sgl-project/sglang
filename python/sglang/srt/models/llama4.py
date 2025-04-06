@@ -401,6 +401,7 @@ class Llama4Model(LlamaModel):
         expert_params_mapping: List[Tuple[str, str, int, str]],
         fused: bool = True,
     ) -> bool:
+        return True
         expert_param_loaded = False
         if "experts.gate_up_proj" in name:
             loaded_weight = loaded_weight.chunk(2, dim=-1)
@@ -463,9 +464,10 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__()
+        super().__init__(config, quant_config, prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        return
         # Process weights for rotary embeddings
         processed_weights = []
         for name, loaded_weight in weights:
