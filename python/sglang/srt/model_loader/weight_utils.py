@@ -848,7 +848,11 @@ def kv_cache_scales_loader(
     )
     return []
 
-def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Tensor]], n_share_experts_fusion: int):
+def compute_shared_experts_fusion_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    n_share_experts_fusion: Optional[int],
+    moe_layer_ids: Iterable[int],
+):
     if n_share_experts_fusion is not None and n_share_experts_fusion > 0:
         weights_list = list(weights)
         weights_dict = dict(weights_list)
@@ -862,11 +866,7 @@ def compute_shared_experts_fusion_weights(weights: Iterable[Tuple[str, torch.Ten
         ]
         names_to_remove = []
         for moe_layer in tqdm(
-            range(
-                config.first_k_dense_replace,
-                config.num_hidden_layers,
-                config.moe_layer_freq,
-            ),
+            moe_layer_ids,
             desc=f"Cloning {n_share_experts_fusion} "
                  "replicas of the shared expert into MoE",
         ):
@@ -892,4 +892,9 @@ def _how_deepseek_v2_should_call_it(self, weights):
     weights = compute_shared_experts_fusion_weights(
         weights,
         n_share_experts_fusion=self.n_share_experts_fusion,
+        moe_layer_ids=range(
+            self.config.first_k_dense_replace,
+            self.config.num_hidden_layers,
+            self.config.moe_layer_freq,
+        ),
     )
