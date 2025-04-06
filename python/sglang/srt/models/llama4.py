@@ -51,6 +51,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -96,6 +97,11 @@ class Llama4MoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
+        self.n_share_experts_fusion = (
+            global_server_args_dict["n_share_experts_fusion"]
+            if global_server_args_dict["n_share_experts_fusion"] is not None
+            else 0
+        )
 
         intermediate_size_moe = config.intermediate_size
         self.router = ReplicatedLinear(
@@ -107,8 +113,8 @@ class Llama4MoE(nn.Module):
         )
 
         self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=config.num_local_experts + self.n_share_experts_fusion,
+            top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             custom_routing_function=Llama4MoE.custom_routing_function,
             intermediate_size=intermediate_size_moe,
@@ -130,12 +136,19 @@ class Llama4MoE(nn.Module):
     def forward(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states)
+
+        if self.n_share_experts_fusion == 0:
+            shared_out = self.shared_expert(hidden_states)
+
         routed_out = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        out_aD = routed_out + shared_out
+
+        if self.n_share_experts_fusion == 0:
+            out_aD = routed_out + shared_out
+        else:
+            out_aD = routed_out
 
         if self.tp_size > 1:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
@@ -183,7 +196,7 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attn_temperature_tuning = (
             getattr(config, "attn_temperature_tuning", False) and self.nope
         )
@@ -450,7 +463,6 @@ class Llama4Model(LlamaModel):
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
