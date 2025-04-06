@@ -1421,9 +1421,6 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        if apply_router_weight_on_input:
-            curr_hidden_states *= curr_topk_weights
-
         invoke_fused_moe_kernel(
             curr_hidden_states,
             w1,
@@ -1436,7 +1433,7 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            False,
+            apply_router_weight_on_input,
             topk_ids.shape[1],
             config,
             compute_type=compute_type,

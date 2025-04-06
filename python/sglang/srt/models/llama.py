@@ -283,7 +283,7 @@ class LlamaModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
             prefix="model.layers",
         )
