@@ -1,38 +1,18 @@
 # TODO: add Aapted from vllm/mllama4.py
-import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from itertools import tee
-from typing import List, Literal, Optional, Set, Tuple, TypedDict, Union
+from typing import Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import BatchFeature, Llama4Config, Llama4VisionConfig
-from transformers.image_utils import SizeDict
-from transformers.modeling_outputs import BaseModelOutput
+from transformers import Llama4Config
 
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.distributed import (
-    divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -90,7 +70,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         return get_prefix_weights(), get_other_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -101,15 +81,14 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        
+
         num_experts = self.config.text_config.num_local_experts
-        
-        # for name, param in params_dict.items():
-        #     print(name)
-        
+
         for name, loaded_weight in weights:
 
-            if name.startswith("vision_model") or name.startswith("multi_modal_projector"):
+            if name.startswith("vision_model") or name.startswith(
+                "multi_modal_projector"
+            ):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -123,14 +102,20 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 if ".experts" in name:
                     if ".gate_up_proj" in name:
-                        name_list = [name.replace(".experts.gate_up_proj", ".experts.w13_weight")] * 2
+                        name_list = [
+                            name.replace(".experts.gate_up_proj", ".experts.w13_weight")
+                        ] * 2
                         loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                         shard_id_list = ["w1", "w3"]
                     else:
-                        name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
+                        name_list = [
+                            name.replace(".experts.down_proj", ".experts.w2_weight")
+                        ]
                         shard_id_list = ["w2"]
                         loaded_weight_list = [loaded_weight]
-                    for name, loaded_weight, shard_id in zip(name_list, loaded_weight_list, shard_id_list):
+                    for name, loaded_weight, shard_id in zip(
+                        name_list, loaded_weight_list, shard_id_list
+                    ):
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         for expert_id in range(num_experts):
@@ -150,5 +135,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
 
 EntryClass = Llama4ForConditionalGeneration
