@@ -108,15 +108,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         #     print(name)
         
         for name, loaded_weight in weights:
+
             if name.startswith("vision_model") or name.startswith("multi_modal_projector"):
                 continue
-            if not name.startswith("language_model"):
-                print("!!! buggy " + name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # print("!!! initializing " + name)
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -133,7 +131,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                         shard_id_list = ["w2"]
                         loaded_weight_list = [loaded_weight]
                     for name, loaded_weight, shard_id in zip(name_list, loaded_weight_list, shard_id_list):
-                        # print("!!! initializing " + name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         for expert_id in range(num_experts):
@@ -148,7 +145,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    # print("!!! initializing " + name)
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
