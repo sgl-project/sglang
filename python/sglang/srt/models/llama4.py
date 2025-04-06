@@ -79,7 +79,7 @@ class Llama4MoE(nn.Module):
             router_scores_aK[:, :-1] = torch.sigmoid(
                 router_scores_aK[:, :-1].float()
             ).to(hidden_states.dtype)
-            router_scores_aK[:, -1] = router_scores_aK[:, :-1].sum(dim=-1)
+            router_scores_aK[:, -1] = 1.0
         else:
             router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
                 hidden_states.dtype
