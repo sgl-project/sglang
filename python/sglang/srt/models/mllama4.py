@@ -25,7 +25,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, compute_shared_experts_fusion_weights
 from sglang.srt.utils import add_prefix
 from torch import nn
 from transformers import Llama4Config, Llama4VisionConfig
@@ -101,6 +101,26 @@ class Llama4ForConditionalGeneration(nn.Module):
         return get_prefix_weights(), get_other_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        weights = compute_shared_experts_fusion_weights(
+            weights,
+            n_share_experts_fusion=self.n_share_experts_fusion,
+            n_routed_experts=self.config.n_routed_experts,
+            moe_layer_ids=range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers,
+                self.config.moe_layer_freq,
+            ),
+            suffix_list=[
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+                "gate_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight",
+                "up_proj.weight_scale_inv",
+            ],
+            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
+            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
+        )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
