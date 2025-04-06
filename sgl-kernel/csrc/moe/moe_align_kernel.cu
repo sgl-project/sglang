@@ -106,29 +106,28 @@ __global__ void moe_align_block_size_small_batch_kernel(
     int32_t* __restrict__ total_tokens_post_pad,
     int32_t num_experts,
     int32_t padded_num_experts,
-    int32_t experts_per_warp,
     int32_t block_size,
     size_t numel) {
   extern __shared__ int32_t shared_mem[];
   int32_t* expert_counts = shared_mem;
   int32_t* expert_cumsum = &expert_counts[padded_num_experts];
-
+  
   const int tid = threadIdx.x;
   const int num_threads = blockDim.x;
-
+  
   for (int i = tid; i < padded_num_experts; i += num_threads) {
     expert_counts[i] = 0;
   }
-
+  
   __syncthreads();
-
+  
   for (int i = tid; i < numel; i += num_threads) {
     int32_t expert_id = topk_ids[i];
     atomicAdd(&expert_counts[expert_id], 1);
   }
-
+  
   __syncthreads();
-
+  
   if (tid == 0) {
     expert_cumsum[0] = 0;
     for (int i = 1; i <= num_experts; ++i) {
@@ -136,23 +135,15 @@ __global__ void moe_align_block_size_small_batch_kernel(
     }
     *total_tokens_post_pad = expert_cumsum[num_experts];
   }
-
+  
   __syncthreads();
-
+  
   if (tid < num_experts) {
     for (int i = expert_cumsum[tid]; i < expert_cumsum[tid + 1]; i += block_size) {
       expert_ids[i / block_size] = tid;
     }
   }
-
-  if (tid == 0) {
-    for (int i = 0; i < num_experts; ++i) {
-      expert_cumsum[i] = 0;
-    }
-  }
-
-  __syncthreads();
-
+  
   for (int i = tid; i < numel; i += num_threads) {
     int32_t expert_id = topk_ids[i];
     int32_t rank_post_pad = atomicAdd(&expert_cumsum[expert_id], 1);
@@ -180,12 +171,12 @@ void moe_align_block_size(
 
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     bool small_batch_mode = topk_ids.numel() < 2048;
-
+    
     if (small_batch_mode) {
       threads = max((int)num_experts, WARP_SIZE);
-
+      
       size_t shared_mem_size = 2 * padded_num_experts * sizeof(int32_t);
-
+      
       auto small_batch_kernel = moe_align_block_size_small_batch_kernel<scalar_t>;
       small_batch_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
@@ -194,7 +185,6 @@ void moe_align_block_size(
           num_tokens_post_pad.data_ptr<int32_t>(),
           num_experts,
           padded_num_experts,
-          experts_per_warp,
           block_size,
           topk_ids.numel());
     } else {
@@ -202,9 +192,9 @@ void moe_align_block_size(
 
       size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
       size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
-
+      
       cumsum_buffer.zero_();
-
+      
       align_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
