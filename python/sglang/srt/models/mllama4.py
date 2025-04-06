@@ -89,6 +89,36 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return self.language_model(input_ids, positions, forward_batch)
 
+    def permute_qk_weight_for_rotary(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> Tuple[str, torch.Tensor]:
+
+        def permute(w: torch.Tensor, n_heads: int):
+            attn_in = self.language_model.config.head_dim * n_heads
+            attn_out = self.language_model.config.hidden_size
+
+            return (
+                w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
+                .transpose(1, 2)
+                .reshape(attn_in, attn_out)
+            )
+
+        modules = name.split(".")
+
+        # rotary embeds should be sliced
+        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
+            loaded_weight = permute(
+                loaded_weight, self.language_model.config.num_key_value_heads
+            )
+        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
+            loaded_weight = permute(
+                loaded_weight, self.language_model.config.num_attention_heads
+            )
+
+        return name, loaded_weight
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         weights = compute_shared_experts_fusion_weights(
             weights,
@@ -147,6 +177,8 @@ class Llama4ForConditionalGeneration(nn.Module):
                 "multi_modal_projector"
             ):
                 continue
+
+            name, loaded_weight = self.permute_qk_weight_for_rotary(name, loaded_weight)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
