@@ -861,7 +861,7 @@ def compute_shared_experts_fusion_weights(
     weights_list = list(weights)
     weights_dict = dict(weights_list)
     names_to_remove = []
-    for moe_layer in tqdm(
+    for moe_layer_id in tqdm(
         moe_layer_ids,
         desc=f"Cloning {n_share_experts_fusion} "
              "replicas of the shared expert into MoE",
@@ -869,11 +869,11 @@ def compute_shared_experts_fusion_weights(
         for repeat_index in range(n_share_experts_fusion):
             for suffix in suffix_list:
                 shared_expert_weight_name = (
-                    f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                    f"model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}"
                 )
                 weights_list.append(
                     (
-                        f"model.layers.{moe_layer}."
+                        f"model.layers.{moe_layer_id}."
                         f"mlp.experts."
                         f"{n_routed_experts + repeat_index}"
                         f".{suffix}",
