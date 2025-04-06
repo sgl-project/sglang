@@ -89,25 +89,6 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return self.language_model(input_ids, positions, forward_batch)
 
-    def _separate_weights(
-        self,
-        weights: Iterable[Tuple[str, torch.Tensor]],
-        prefix: str,
-    ) -> Tuple[Iterable[Tuple[str, torch.Tensor]], Iterable[Tuple[str, torch.Tensor]]]:
-        weights1, weights2 = tee(weights, 2)
-
-        def get_prefix_weights() -> Iterable[Tuple[str, torch.Tensor]]:
-            for name, data in weights1:
-                if name.startswith(prefix):
-                    yield (name, data)
-
-        def get_other_weights() -> Iterable[Tuple[str, torch.Tensor]]:
-            for name, data in weights2:
-                if not name.startswith(prefix):
-                    yield (name, data)
-
-        return get_prefix_weights(), get_other_weights()
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         weights = compute_shared_experts_fusion_weights(
             weights,
