@@ -54,6 +54,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         # TODO refactor and probably move this
+        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if global_server_args_dict.get("disable_shared_experts_fusion", False):
             self.n_share_experts_fusion = global_server_args_dict[
                 "n_share_experts_fusion"
