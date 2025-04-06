@@ -1,38 +1,38 @@
 # TODO: add Aapted from vllm/mllama4.py
-import math
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Iterable
 from itertools import tee
-from typing import List, Literal, Optional, Set, Tuple, TypedDict, Union
+from typing import Optional, Set, Tuple
 
 import torch
-from torch import nn
-from transformers import BatchFeature, Llama4Config, Llama4VisionConfig
-from transformers.image_utils import SizeDict
-from transformers.modeling_outputs import BaseModelOutput
-
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from torch import nn
+from transformers import Llama4Config, Llama4VisionConfig
+from transformers.image_utils import SizeDict
+
+logger = logging.getLogger(__name__)
+
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -48,6 +48,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+        # TODO refactor and probably move this
+        if global_server_args_dict.get("disable_shared_experts_fusion", False):
+            self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] = None
+            logger.info("Shared experts fusion optimization is disabled.")
+        elif self.n_share_experts_fusion is None:
+            self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+            logger.info(
+                f"Shared experts fusion optimization is by default enabled, and n_share_experts_fusion is set to {self.tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
+            )
 
         # Initialize the language model
         from sglang.srt.models.llama4 import Llama4ForCausalLM
@@ -90,7 +101,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         return get_prefix_weights(), get_other_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -101,12 +112,12 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        
+
         num_experts = self.config.text_config.num_local_experts
-        
+
         # for name, param in params_dict.items():
         #     print(name)
-        
+
         for name, loaded_weight in weights:
 
             if name.startswith("vision_model") or name.startswith("multi_modal_projector"):
@@ -150,5 +161,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
 
 EntryClass = Llama4ForConditionalGeneration
