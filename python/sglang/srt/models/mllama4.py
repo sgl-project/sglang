@@ -111,12 +111,12 @@ class Llama4ForConditionalGeneration(nn.Module):
                 self.config.interleave_moe_layer_step,
             ),
             suffix_list=[
-                "down_proj.weight",
-                "gate_proj.weight",
-                "up_proj.weight",
+                "down_proj",
+                "gate_proj",
+                "up_proj",
             ],
-            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
-            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
+            shared_expert_name_template="language_model.model.layers.{moe_layer_id}.feed_forward.shared_expert.{suffix}.weight",
+            routed_expert_name_template="language_model.model.layers.{moe_layer_id}.feed_forward.experts.{expert_index}.{suffix}",
         )
 
         stacked_params_mapping = [
