@@ -120,6 +120,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -127,7 +128,16 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return is_cuda()
+
+    has_flashinfer = False
+    try:
+        import flashinfer
+
+        has_flashinfer = True
+    except ImportError as e:
+        pass
+
+    return is_cuda() and has_flashinfer
 
 
 def is_cuda_available():
