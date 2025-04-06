@@ -136,20 +136,23 @@ class RdmaEndpoint(object):
         self.qp.post_send(wr)
         logger.debug(f"Sending metadata sent ...")
 
-    def add_to_sending_wrs(self, mrs_info, group_remote_mrs_info):
-        wrs = []
-        for group_id, remote_mrs_info in enumerate(group_remote_mrs_info):
-            for layer_id, item in enumerate(remote_mrs_info):
-                # 以下是连续的
+    def add_to_sending_wrs(self, group_mrs_info, group_remote_mrs_info):
+        # 默认decode分配的内存是连续的，
+        if len(group_remote_mrs_info) != 1:
+            raise Exception("decode allocate non-contiguous wrs")
+
+        for group_id, mrs_info in enumerate(group_mrs_info):
+            for layer_id, item in enumerate(mrs_info):
                 self.initial_wr_index += 1
-                local_sge = SGE(addr=mrs_info[group_id][layer_id]["address"],
-                                length=mrs_info[group_id][layer_id]["length"],
-                                lkey=mrs_info[group_id][layer_id]['lkey'])
+                local_sge = SGE(addr=item["address"],
+                                length=item["length"],
+                                lkey=item['lkey'])
                 wr = SendWR(wr_id=self.initial_wr_index, sg=[local_sge], num_sge=1, opcode=IBV_WR_RDMA_WRITE,
                             send_flags=IBV_SEND_SIGNALED)
-                wr.set_wr_rdma(addr=item['address'],
-                               rkey=item['rkey'])
+                wr.set_wr_rdma(addr=group_remote_mrs_info[0][layer_id]['address'],
+                               rkey=group_remote_mrs_info[0][layer_id]['rkey'])
                 self.wrs_to_send.append(wr)
+                group_remote_mrs_info[0][layer_id]["address"] += item["length"]
 
     def recv_metadata_mr(self, meta_ptr, meta_len, meta_lkey):
         recv_sge = SGE(addr=meta_ptr,
@@ -179,7 +182,6 @@ class RdmaEndpoint(object):
                 else:
                     self.metadata_mr_complete_num += 1
                     logger.debug(f"Metadata Received completed! Bytes: {wc.byte_len}, wr_id: {wc.wr_id}")
-
 
     def create_mr(self, address, length, access=0b111):
         """

@@ -235,10 +235,10 @@ class KVManager:
             # 每个token的KV数据大小
             token_kv_size = self.args.kv_item_lens[layer_id]
             # 计算偏移量
-            offset = token_kv_size * token_indices[0]
+            offset = token_kv_size * (token_indices[0])
             token_kv_layer_base_address = self.args.kv_data_ptrs[layer_id] + offset
             addresses_base_and_len.append((token_kv_layer_base_address,
-                                           token_kv_size * len(token_indices)))
+                                           token_kv_size * (len(token_indices))))
         return addresses_base_and_len
 
     def caculate_layer_kv_base_and_offsets(self, token_indices: list[int]):
