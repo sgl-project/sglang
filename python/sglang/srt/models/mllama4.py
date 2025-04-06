@@ -96,17 +96,19 @@ class Llama4ForConditionalGeneration(nn.Module):
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
             (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
             (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            (".shared_expert.gate_up_proj", ".shared_expert.gate_proj", 0),
+            (".shared_expert.gate_up_proj", ".shared_expert.up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
         
         num_experts = self.config.text_config.num_local_experts
         
-        for name, param in params_dict.items():
-            print(name)
+        # for name, param in params_dict.items():
+        #     print(name)
         
         for name, loaded_weight in weights:
-            if name.startswith("vision_model"):
+            if name.startswith("vision_model") or name.startswith("multi_modal_projector"):
                 continue
             if not name.startswith("language_model"):
                 print("!!! buggy " + name)
@@ -146,7 +148,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    print("!!! initializing " + name)
+                    # print("!!! initializing " + name)
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
