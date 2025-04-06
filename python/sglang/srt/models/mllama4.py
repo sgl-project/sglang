@@ -172,6 +172,8 @@ class Llama4ForConditionalGeneration(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                if ("feed_forward.experts." in name) and name not in params_dict:
+                    continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
