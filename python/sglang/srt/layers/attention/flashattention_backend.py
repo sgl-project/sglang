@@ -45,6 +45,16 @@ class FlashAttentionMetadata:
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
 
+    # Encoder metadata
+    # Cumulative sequence lengths for encoder key
+    encoder_cu_seqlens_k: torch.Tensor = None
+    # Maximum sequence length for encoder key
+    encoder_max_seq_len_k: int = 0
+    # Sequence lengths for the forward batch
+    encoder_lens_int32: torch.Tensor = None
+    # Page table for the encoder
+    encoder_page_table: torch.Tensor = None
+
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -203,6 +213,23 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
                 metadata.max_seq_len_q = metadata.max_seq_len_k
 
+        if forward_batch.mm_inputs[0] is not None:
+            assert (len(forward_batch.mm_inputs) == 1), "Only batch size 1 is supported for now"
+
+            metadata.encoder_lens_int32 = torch.tensor(forward_batch.encoder_lens, device=device, dtype=torch.int32)
+            metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
+            metadata.encoder_cu_seqlens_q = metadata.cu_seqlens_q
+            metadata.encoder_max_seq_len_q = metadata.max_seq_len_q
+            metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
+            ]
+            ## TODO: support batch size > 1
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, metadata.encoder_max_seq_len_k : (metadata.encoder_max_seq_len_k + metadata.max_seq_len_k)
+            ]
         # Precompute strided indices
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -250,11 +277,11 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and not layer.is_cross_attention
             else (-1, -1)
         )
 
-        page_table = metadata.page_table
+        causal = not layer.is_cross_attention
 
         # Use Flash Attention for prefill
         if not self.use_mla:
@@ -267,17 +294,26 @@ class FlashAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+            if layer.is_cross_attention:
+                page_table = metadata.encoder_page_table
+                cache_seqlens = metadata.encoder_lens_int32
+                cu_seqlens_k_new = metadata.encoder_cu_seqlens_k
+            else:
+                page_table = metadata.page_table
+                cache_seqlens = metadata.cache_seqlens_int32
+                cu_seqlens_k_new = metadata.cu_seqlens_k
+
             o = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
+                cache_seqlens=cache_seqlens,
                 cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                cu_seqlens_k_new=cu_seqlens_k_new,
                 max_seqlen_q=metadata.max_seq_len_q,
                 softmax_scale=layer.scaling,
-                causal=True,
+                causal=causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=layer.k_scale,
@@ -306,7 +342,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
@@ -359,10 +395,10 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and not layer.is_cross_attention
             else (-1, -1)
         )
-        page_table = metadata.page_table
+        causal = not layer.is_cross_attention
 
         if not self.use_mla:
             # Do multi-head attention
@@ -379,17 +415,26 @@ class FlashAttentionBackend(AttentionBackend):
 
             # Pre-reshape query tensor
             q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            if layer.is_cross_attention:
+                page_table = metadata.encoder_page_table
+                cache_seqlens = metadata.encoder_lens_int32
+                cu_seqlens_k_new = metadata.encoder_cu_seqlens_k
+            else:
+                page_table = metadata.page_table
+                cache_seqlens = metadata.cache_seqlens_int32
+                cu_seqlens_k_new = metadata.cu_seqlens_k
+
             o = flash_attn_with_kvcache(
                 q=q_reshaped,
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
+                cache_seqlens=cache_seqlens,
                 cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                cu_seqlens_k_new=cu_seqlens_k_new,
                 max_seqlen_q=1,
                 softmax_scale=layer.scaling,
-                causal=True,
+                causal=causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=layer.k_scale,
@@ -419,7 +464,7 @@ class FlashAttentionBackend(AttentionBackend):
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=page_table,
+                page_table=metadata.page_table,
                 cache_seqlens=metadata.cache_seqlens_int32,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
