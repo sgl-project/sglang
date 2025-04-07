@@ -860,7 +860,7 @@ class Fp8MoEMethod:
             layer.w13_weight_scale1[expert_id] *= max_w13_scales[expert_id]
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
-    def process_weights_hip_scale_padding(self, layer: Module, padding_size: int):
+    def process_weights_hip_scale_padding(self, layer: Module):
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             padding_size,  # Avoid circular import
         )
