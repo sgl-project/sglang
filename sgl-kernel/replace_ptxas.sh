@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# https://github.com/Dao-AILab/flash-attention/blob/7ff1b621112ba8b538e2fc6a316f2a6b6f22e518/hopper/setup.py#L404
 set -ex
 
 if [ -z "$1" ]; then
