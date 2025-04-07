@@ -852,12 +852,8 @@ def fast_mla_decode_plan(
     self._sm_scale = sm_scale
 
     with self.device as device:
-        # The CUDA stream is actually needed for proper synchronization
-        stream = torch.cuda.current_stream(device).cuda_stream
-        
-        # Try with different argument combinations to support different FlashInfer versions
         try:
-            # Try without the stream parameter first (newer API)
+            # Standard version with just the required arguments (no use_profiler)
             self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -869,32 +865,30 @@ def fast_mla_decode_plan(
                 head_dim_ckv,
                 causal,
             )
-        except (TypeError, RuntimeError) as e:
-            # If the error message indicates too many arguments
-            if "expected at most 15 argument(s)" in str(e):
-                # Try with 14 arguments (the standard documented API without use_profiler)
+        except Exception as e:
+            # Log error for debugging
+            import logging
+            logging.error(f"Error in MLA plan: {e}")
+            
+            # Try alternate version with more arguments if needed
+            try:
                 self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
                     self._pin_memory_int_workspace_buffer,
                     qo_indptr_cpu,
                     kv_indptr_cpu,
+                    kv_indices, # Include kv_indices which was missing
                     kv_len_arr_cpu,
                     num_heads,
                     head_dim_ckv,
+                    head_dim_kpe,
+                    page_size,
                     causal,
+                    sm_scale,
+                    q_data_type,
+                    kv_data_type,
                 )
-            else:
-                # Try with the stream parameter (older API)
-                self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_cpu,
-                    kv_indptr_cpu,
-                    kv_len_arr_cpu,
-                    num_heads,
-                    head_dim_ckv,
-                    causal,
-                    stream,
-                )
+            except Exception as e2:
+                logging.error(f"Error in alternate MLA plan: {e2}")
+                raise

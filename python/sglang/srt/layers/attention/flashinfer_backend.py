@@ -1248,8 +1248,18 @@ def fast_decode_plan(
         stream = torch.cuda.current_stream().cuda_stream
         
         if self.use_tensor_cores:
+
+            # Convert indptr to CPU, as the authors intended
+            if global_override_indptr_cpu is not None:
+                indptr_host = global_override_indptr_cpu
+            else:
+                indptr_host = indptr.cpu()
+
+            # ALSO convert last_page_len to CPU
+            last_page_len_host = last_page_len.cpu()
+
             kv_lens_arr_host = get_seq_lens(
-                indptr_host, last_page_len, page_size
+                indptr_host, last_page_len_host, page_size
             )
             
             try:
@@ -1308,5 +1318,4 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
-
 
