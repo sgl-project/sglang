@@ -421,7 +421,7 @@ async def update_weights_from_tensor(
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
-    1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors. 
+    1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
     2. HTTPS will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
     """
     if isinstance(obj, str):

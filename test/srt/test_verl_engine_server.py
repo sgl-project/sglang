@@ -14,14 +14,23 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.api import ShardedStateDictConfig, ShardingStrategy, StateDictType
+from torch.distributed.fsdp.api import (
+    ShardedStateDictConfig,
+    ShardingStrategy,
+    StateDictType,
+)
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_port_available
-from sglang.test.runners import HFRunner, SRTRunner, check_close_model_outputs, get_dtype_str
+from sglang.test.runners import (
+    HFRunner,
+    SRTRunner,
+    check_close_model_outputs,
+    get_dtype_str,
+)
 from sglang.test.test_utils import CustomTestCase, find_available_port, is_in_ci
 
 _MAX_NEW_TOKENS = 8
@@ -205,7 +214,7 @@ def _run_subprocess(
         # time.sleep(1)
         engine.resume_memory_occupation()
         print("Memory resumed")
-        
+
         # openai API test for reference
         torch.distributed.barrier()
         if tp_rank == 0:
@@ -242,7 +251,7 @@ def _run_subprocess(
     engine.shutdown()
     print(f"subprocess[{tp_rank=}] end", flush=True)
 
-            
+
 # Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
 def _get_fsdp_state_dict(hf_model, tp_size: int):
     device_mesh = init_device_mesh(
@@ -274,6 +283,7 @@ def _get_fsdp_state_dict(hf_model, tp_size: int):
     )
 
     return fsdp_model.state_dict()
+
 
 if __name__ == "__main__":
     unittest.main()
