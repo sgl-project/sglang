@@ -14,15 +14,18 @@
 """Constrained decoding with llguidance backend."""
 
 import json
-import os
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
-
-from llguidance import LLMatcher, grammar_from, StructTag, LLTokenizer
-from llguidance.torch import fill_next_token_bitmask, allocate_token_bitmask, apply_token_bitmask_inplace
+from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
 from llguidance.hf import from_tokenizer
+from llguidance.torch import (
+    allocate_token_bitmask,
+    apply_token_bitmask_inplace,
+    fill_next_token_bitmask,
+)
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -34,8 +37,7 @@ logger = logging.getLogger(__name__)
 
 class GuidanceGrammar(BaseGrammarObject):
 
-    def __init__(self, llguidance_tokenizer: LLTokenizer,
-                 serialized_grammar: str):
+    def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
 
@@ -54,12 +56,12 @@ class GuidanceGrammar(BaseGrammarObject):
         else:
             return None
 
-    def jump_forward_str_state(
-            self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
         return "", -1
 
-    def jump_and_retokenize(self, old_output_ids: List[int],
-                            new_output_ids: List[int], next_state: int):
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
         pass
 
     def accept_token(self, token: int):
@@ -73,12 +75,14 @@ class GuidanceGrammar(BaseGrammarObject):
 
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)
 
-    def allocate_vocab_mask(self, vocab_size: int, batch_size: int,
-                            device) -> torch.Tensor:
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
         if self.bitmask is None or self.bitmask.shape[0] < batch_size:
             # only create bitmask when batch gets larger
             self.bitmask = allocate_token_bitmask(
-                batch_size, self.llguidance_tokenizer.vocab_size)
+                batch_size, self.llguidance_tokenizer.vocab_size
+            )
             bitmask = self.bitmask
         else:
             bitmask = self.bitmask[:batch_size]
@@ -90,8 +94,7 @@ class GuidanceGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor,
-                         vocab_mask: torch.Tensor) -> None:
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
@@ -103,18 +106,19 @@ class GuidanceGrammar(BaseGrammarObject):
 
 class GuidanceBackend(BaseGrammarBackend):
 
-    def __init__(self,
-                 tokenizer,
-                 whitespace_pattern: Optional[str] = None,
-                 n_vocab: Optional[int] = None):
+    def __init__(
+        self,
+        tokenizer,
+        whitespace_pattern: Optional[str] = None,
+        n_vocab: Optional[int] = None,
+    ):
         super().__init__()
 
         self.tokenizer = tokenizer
         self.whitespace_pattern = whitespace_pattern
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
-    def _from_serialized(self,
-                         serialized_grammar) -> Optional[GuidanceGrammar]:
+    def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
         try:
             return GuidanceGrammar(
                 llguidance_tokenizer=self.llguidance_tokenizer,
@@ -129,7 +133,8 @@ class GuidanceBackend(BaseGrammarBackend):
             key_string,
             defaults={
                 "whitespace_pattern": self.whitespace_pattern,
-            })
+            },
+        )
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
@@ -144,8 +149,7 @@ class GuidanceBackend(BaseGrammarBackend):
             logger.warning(f"Skip invalid ebnf: regex={key_string}, {e=}")
             return None
 
-    def dispatch_structural_tag(self,
-                                key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
             structural_tag = json.loads(key_string)
             tags = [
@@ -154,7 +158,8 @@ class GuidanceBackend(BaseGrammarBackend):
                     grammar=structure["schema"],
                     end=structure["end"],
                     trigger=structural_tag["triggers"][0],  # TODO?
-                ) for structure in structural_tag["structures"]
+                )
+                for structure in structural_tag["structures"]
             ]
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
