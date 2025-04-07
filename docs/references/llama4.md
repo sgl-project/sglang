@@ -16,14 +16,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 
 ### Configuration Tips
 
-- **OOM Mitigation**: Adjust `--context-length` to avoid GPU out of memory issue.
-
-Here are some reference number for setting context length:
-
-| GPU Setting  | Scout Model (BF16)  | Maverick Model (BF16)  |
-|--------------|---------------------|------------------------|
-| 8*H100       | up to 1M            | -                      |
-| 8*H200       |                     |                        |
+- **OOM Mitigation**: Adjust `--context-length` to avoid a GPU out-of-memory issue. We recommend H100 users set this value at 1M for the Scout model and 2.5M for the Maverick model.
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
 
@@ -31,25 +24,23 @@ Here are some reference number for setting context length:
 
 ### Accuracy Test with `lm_eval`
 
-The accuracy on SGLang for both Llama4 Scout and Llama4 Maverick can match the [official benchmark numbers](https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md).
+The accuracy on SGLang for both Llama4 Scout and Llama4 Maverick can match the [official benchmark numbers](https://ai.meta.com/blog/llama-4-multimodal-intelligence/).
 
 Benchmark results on MMLU Pro dataset with 8*H100:
 |                    | Llama-4-Scout-17B-16E-Instruct | Llama-4-Maverick-17B-128E-Instruct  |
 |--------------------|--------------------------------|-------------------------------------|
 | Official Benchmark | 74.3                           | 80.5                                |
-| SGLang             | 75.3                           | 80.7                                |
+| SGLang             | 75.2                           | 80.7                                |
 
 Commands:
 
 ```bash
 # Llama-4-Scout-17B-16E-Instruct model
 python -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct --port 30000 --tp 8 --mem-fraction-static 0.8 --context-length 65536
-
 lm_eval --model local-chat-completions --model_args model=meta-llama/Llama-4-Scout-17B-16E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 --tasks mmlu_pro --batch_size 128 --apply_chat_template --num_fewshot 0
 
 # Llama-4-Maverick-17B-128E-Instruct
 python -m sglang.launch_server --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct --port 30000 --tp 8 --mem-fraction-static 0.8 --context-length 65536
-
 lm_eval --model local-chat-completions --model_args model=meta-llama/Llama-4-Maverick-17B-128E-Instruct,base_url=http://localhost:30000/v1/chat/completions,num_concurrent=128,timeout=999999,max_gen_toks=2048 --tasks mmlu_pro --batch_size 128 --apply_chat_template --num_fewshot 0
 ```
 
