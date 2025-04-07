@@ -115,10 +115,14 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states):
-        if TODO:
-            return self._forward_core_overlap(hidden_states)
+        if self._enable_shared_routed_overlap():
+            return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
+
+    def _enable_shared_routed_overlap(self, hidden_states):
+        batch_size = hidden_states.shape[0]
+        return batch_size < 4
 
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
@@ -130,7 +134,7 @@ class Llama4MoE(nn.Module):
         )
         return shared_out, routed_out
 
-    def _forward_core_overlap(self, hidden_states):
+    def _forward_core_shared_routed_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream()
 
         alt_stream.wait_stream(torch.cuda.current_stream())
