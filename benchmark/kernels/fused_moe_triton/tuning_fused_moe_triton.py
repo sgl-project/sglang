@@ -325,7 +325,7 @@ class BenchmarkWorker:
                 best_time = kernel_time
                 best_config = config
         now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens} {best_config=}")
         assert best_config is not None
         return best_config
 
