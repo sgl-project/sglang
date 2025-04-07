@@ -218,8 +218,10 @@ class FlashAttentionBackend(AttentionBackend):
                 len(forward_batch.mm_inputs) == 1
             ), "Only batch size 1 is supported for now"
 
-            metadata.encoder_lens_int32 = torch.tensor(
-                forward_batch.encoder_lens, device=device, dtype=torch.int32
+            metadata.encoder_lens_int32 = (
+                forward_batch.encoder_lens.clone()
+                .detach()
+                .to(device=device, dtype=torch.int32)
             )
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
@@ -231,13 +233,20 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
-            ## TODO: support batch size > 1
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
-            ]
+
+            # Set page table for batch size > 1
+            # TODO: optimize for loop
+            for i, seq_len in enumerate(metadata.cache_seqlens_int32):
+                metadata.page_table[:, :seq_len] = (
+                    forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices,
+                        metadata.encoder_lens_int32[i] : (
+                            metadata.encoder_lens_int32[i] + seq_len
+                        ),
+                    ]
+                )
+                metadata.page_table[:, seq_len:].fill_(0)
+
         # Precompute strided indices
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -306,6 +315,7 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k_new = metadata.encoder_cu_seqlens_k
+                window_size = (-1, -1)
             else:
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
@@ -427,6 +437,7 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.encoder_page_table
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k_new = metadata.encoder_cu_seqlens_k
+                window_size = (-1, -1)
             else:
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
