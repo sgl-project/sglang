@@ -13,7 +13,6 @@
 # ==============================================================================
 """Inference-only LLaVa model compatible with HuggingFace weights."""
 
-import itertools
 import math
 import re
 from typing import Iterable, List, Optional, Tuple, Union
@@ -59,6 +58,7 @@ class LlavaBaseForCausalLM(nn.Module):
         )
 
         pad_values = [item.pad_value for item in image_inputs.mm_items]
+
         # hardcode for spatial_unpad + anyres
         if any(
             item.modality == Modality.MULTI_IMAGES or item.modality == Modality.VIDEO
@@ -85,8 +85,8 @@ class LlavaBaseForCausalLM(nn.Module):
                     self.image_grid_pinpoints,
                     self.vision_tower.config.image_size,
                 )
-                h = num_patch_height * height // 2
-                w = num_patch_width * width // 2
+                h = num_patch_height * height
+                w = num_patch_width * width
                 new_h, new_w = unpad_image_shape(h, w, image_s)
 
                 if "anyres_max" in self.config.image_aspect_ratio:
@@ -112,11 +112,11 @@ class LlavaBaseForCausalLM(nn.Module):
             input_ids = (
                 input_ids[:offset]
                 + [pad_values[image_idx % len(pad_values)]] * new_image_feature_len
-                + [13]
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
             image_inputs.image_pad_len.append(new_image_feature_len)
+
         image_inputs.image_offsets = offset_list
         return input_ids
 
@@ -131,8 +131,9 @@ class LlavaBaseForCausalLM(nn.Module):
             torch.Tensor: encoded image features from the input image; if multiple, flattened by seq_len axis
         """
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-        selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
+        # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
 
+        selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
@@ -141,7 +142,6 @@ class LlavaBaseForCausalLM(nn.Module):
             raise ValueError(
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
             )
-
         image_features = self.multi_modal_projector(selected_image_feature)
 
         return image_features
@@ -172,10 +172,9 @@ class LlavaBaseForCausalLM(nn.Module):
                 if im:
                     modalities_list.extend([item.modality for item in im.mm_items])
                 if im and im.image_offsets:
-                    max_offset = np.max(
-                        np.array(im.image_offsets) + np.array(im.image_pad_len)
+                    max_image_offset.append(
+                        np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
                     )
-                    max_image_offset.append(max_offset)
                 else:
                     max_image_offset.append(-1)
 
@@ -191,7 +190,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         if need_vision[i]
                     ]
                 )
-
                 image_sizes = [
                     flatten_nested_list(
                         [item.image_sizes for item in image_inputs[i].mm_items]
@@ -225,9 +223,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 if self.mm_patch_merge_type.startswith("spatial"):
                     new_image_features = []
                     height = width = self.num_patches_per_side
-
                     for image_idx, image_feature in enumerate(image_features):
-
                         if modalities_list[image_idx] == Modality.IMAGE:
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
@@ -237,8 +233,9 @@ class LlavaBaseForCausalLM(nn.Module):
                             or modalities_list[image_idx] == Modality.VIDEO
                         ):
                             image_aspect_ratio = "pad"  # multi image
-
-                        # Processing for anyres with multiple image features
+                        # image_aspect_ratio = (
+                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
+                        # )
                         if (
                             image_feature.shape[0] > 1
                             and "anyres" in image_aspect_ratio
@@ -246,7 +243,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         ):
                             base_image_feature = image_feature[0]
                             image_feature = image_feature[1:]
-
                             assert height * width == base_image_feature.shape[0]
 
                             if "anyres_max" in image_aspect_ratio:
@@ -272,8 +268,8 @@ class LlavaBaseForCausalLM(nn.Module):
                                         )
                                     )
                                 except Exception as e:
+                                    print(f"Error: {e}")
                                     num_patch_width, num_patch_height = 2, 2
-
                                 image_feature = image_feature.view(
                                     num_patch_height, num_patch_width, height, width, -1
                                 )
@@ -281,6 +277,19 @@ class LlavaBaseForCausalLM(nn.Module):
                                 image_feature = image_feature.view(
                                     2, 2, height, width, -1
                                 )
+
+                            # (
+                            #     num_patch_width,
+                            #     num_patch_height,
+                            # ) = get_anyres_image_grid_shape(
+                            #     image_sizes[image_idx][0],
+                            #     self.image_grid_pinpoints,
+                            #     self.vision_tower.config.image_size,
+                            # )
+
+                            # image_feature = image_feature.view(
+                            #     num_patch_height, num_patch_width, height, width, -1
+                            # )
 
                             if "unpad" in self.mm_patch_merge_type:
                                 unit = image_feature.shape[2]
@@ -290,11 +299,9 @@ class LlavaBaseForCausalLM(nn.Module):
                                 image_feature = image_feature.flatten(1, 2).flatten(
                                     2, 3
                                 )
-
                                 image_feature = unpad_image(
                                     image_feature, image_sizes[image_idx][0]
                                 )
-
                                 if (
                                     "anyres_max" in image_aspect_ratio
                                     and matched_anyres_max_num_patches
@@ -310,7 +317,6 @@ class LlavaBaseForCausalLM(nn.Module):
                                             [int(h // times), int(w // times)],
                                             mode="bilinear",
                                         )[0]
-
                                 image_feature = torch.cat(
                                     (
                                         image_feature,
@@ -328,7 +334,6 @@ class LlavaBaseForCausalLM(nn.Module):
                                     0, 2, 1, 3, 4
                                 ).contiguous()
                                 image_feature = image_feature.flatten(0, 3)
-
                             image_feature = torch.cat(
                                 (base_image_feature, image_feature), dim=0
                             )
@@ -356,7 +361,6 @@ class LlavaBaseForCausalLM(nn.Module):
                                     .transpose(1, 2)
                                     .contiguous()
                                 )  # N, C, H*W
-
                             if "unpad" in self.mm_patch_merge_type:
                                 image_feature = torch.cat(
                                     (
@@ -374,7 +378,6 @@ class LlavaBaseForCausalLM(nn.Module):
                                 )
 
                         new_image_features.append(image_feature)
-
                     image_features = new_image_features
 
                 # Fill in the placeholder for the image
@@ -408,7 +411,6 @@ class LlavaBaseForCausalLM(nn.Module):
                         input_offset = image_offset - prefix_len
                         left_idx = start_idx + input_offset
                         right_idx = left_idx + pad_len
-
                         assert right_idx > start_idx
                         if input_offset < 0:
                             left_idx = start_idx
@@ -421,16 +423,18 @@ class LlavaBaseForCausalLM(nn.Module):
                         try:
                             input_embeds[left_idx:right_idx] = tmp_image_feature
                         except RuntimeError as e:
-                            pass
+                            print(f"RuntimeError in image encoding: {e}")
+                            print(f"{input_embeds.shape=}, {tmp_image_feature.shape=}")
+                            print(
+                                f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
+                            )
                     pt += 1
 
-            result = self.language_model(
+            return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
-            return result
         elif forward_batch.forward_mode.is_decode():
-            result = self.language_model(input_ids, positions, forward_batch)
-            return result
+            return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Load clip vision model by cfg['mm_vision_tower']:
@@ -447,10 +451,6 @@ class LlavaBaseForCausalLM(nn.Module):
             ).cuda()
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
-        elif hasattr(self, "vision_tower"):
-            pass
-        else:
-            pass
         self.vision_tower.eval()
 
         self.vision_feature_layer = self.config.mm_vision_select_layer
@@ -482,19 +482,14 @@ class LlavaBaseForCausalLM(nn.Module):
             "model.image_newline": "language_model.model.image_newline",
         }
         params_dict = dict(self.named_parameters())
-        weights_loaded = 0
         for name, loaded_weight in weights:
             if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
-                        mapped_name = name.replace(weight_name, param_name)
-                        if mapped_name in params_dict:
-                            param = params_dict[mapped_name]
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, loaded_weight)
-                            weights_loaded += 1
+                        name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             else:
                 self.language_model.load_weights([(name, loaded_weight)])
 
@@ -583,10 +578,8 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = MistralConfig(self.config._name_or_path)
 
-        if not hasattr(self.config.vision_config, "hidden_size"):
-            self.config.vision_config.hidden_size = config.mm_hidden_size
-        if not hasattr(self.config.text_config, "hidden_size"):
-            self.config.text_config.hidden_size = config.hidden_size
+        self.config.vision_config.hidden_size = config.mm_hidden_size
+        self.config.text_config.hidden_size = config.hidden_size
 
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
@@ -647,11 +640,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         self.text_config = config.text_config
         self.vision_config = config.vision_config
 
-        print(
-            "sglang.srt.models.llava.LlavaForConditionalGeneration.__init__: self.config: ",
-            self.config,
-        )
-
         if not hasattr(self.config, "vocab_size"):
             self.config.vocab_size = self.config.text_config.vocab_size
         if not hasattr(self.config, "image_aspect_ratio"):
@@ -710,29 +698,23 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
 
         Args:
             items: List of MultimodalDataItem objects containing image data
+                Note that an item can be either "image" or "multi-images"
 
         Returns:
-            torch.Tensor: Extracted image features
+            torch.Tensor: Extracted image features. If multiple, concat to same sequence feature
         """
         # Collect pixel values from items
-        pixel_values = [torch.tensor(item.pixel_values) for item in items]
-
-        # if (
-        #     pixel_values[0].ndim == 4
-        # ):  # For multi-patch images like llava-hd: [num_patch, C, H, W]
-        #     print("sglang.srt.models.llava.LlavaForConditionalGeneration.get_image_feature(): multi-patch images, dim=4")
-        #     pixel_values_concat = np.concatenate(pixel_values, axis=0)
-        #     concat_images = torch.tensor(
-        #         pixel_values_concat, device=self.vision_tower.device
-        #     )
-        #     concat_image_features = self.encode_images(concat_images)
-        #     return concat_image_features
-        # else:  # For standard images: [C, H, W]
-        #     print(f"sglang.srt.models.llava.LlavaForConditionalGeneration.get_image_feature(): standard images, dim={pixel_values[0].ndim}")
-        #     pixel_values_concat = torch.tensor(
-        #         np.array(pixel_values), device=self.vision_tower.device
-        #     )
-        #     return self.encode_images(pixel_values_concat)
+        # pixel_values = [torch.tensor(item.pixel_values) for item in items]
+        pixel_values = []
+        for item in items:
+            if item.modality == Modality.IMAGE:
+                pixel_values.append(torch.tensor(item.pixel_values))
+            elif item.modality == Modality.MULTI_IMAGES:
+                pixel_values += map(torch.tensor, item.pixel_values)
+            else:
+                raise NotImplementedError(
+                    f"Unexpected modality to `{self.__class__.__name__}` with encoder `{self.vision_tower.__class__.__name__}`: {item.modality}"
+                )
         return self.encode_images(pixel_values)
 
     def forward(
