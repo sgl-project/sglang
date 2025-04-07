@@ -54,7 +54,9 @@ jobs:
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
+          
           docker exec -w / ci_sglang mkdir -p /dummy-grok
+          docker exec ci_sglang apt install wget -y
           docker exec -w /dummy-grok ci_sglang wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json
 
       - name: Evaluate Accuracy
