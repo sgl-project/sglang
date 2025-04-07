@@ -65,6 +65,9 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.attention_chunk_size = getattr(
+            self.hf_text_config, "attention_chunk_size", None
+        )
 
         # Check model type
         self.is_generation = is_generation_model(
@@ -258,6 +261,7 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -466,6 +470,7 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    # TODO: add multimodal support for "Llama4ForConditionalGeneration",
     "LlavaLlamaForCausalLM",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
