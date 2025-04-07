@@ -24,8 +24,8 @@ from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.platforms import (
+    available_platforms,
     recommended_platform,
-    resolve_available_platforms,
     set_current_platform,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -524,7 +524,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help=f"The device to use {resolve_available_platforms()}. Defaults to auto-detection if not specified.",
+            help=f"The device to use {available_platforms()}. Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",

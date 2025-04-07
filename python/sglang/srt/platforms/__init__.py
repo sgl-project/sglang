@@ -126,7 +126,7 @@ _current_platform = None
 _init_trace: str = ""
 
 
-def resolve_available_platforms() -> list[str]:
+def available_platforms() -> list[str]:
     global _available_platforms
     if _available_platforms is not None:
         return _available_platforms
@@ -153,7 +153,7 @@ def set_current_platform(name: str) -> None:
         platform_cls_name = "sglang.srt.platforms.interface.UnspecifiedPlatform"
         name = "unspecified"
     else:
-        avail_platforms = resolve_available_platforms()
+        avail_platforms = available_platforms()
         if name not in avail_platforms:
             logger.error(
                 f'Platform "{name}" is not available. Currently available platforms are {avail_platforms}'
@@ -167,7 +167,7 @@ def set_current_platform(name: str) -> None:
 
 
 def recommended_platform() -> Optional[str]:
-    avail_platforms = resolve_available_platforms()
+    avail_platforms = available_platforms()
     if len(avail_platforms) == 0:
         platform_name = None
     else:
@@ -207,7 +207,7 @@ __all__ = [
     "Platform",
     "PlatformEnum",
     "current_platform",
-    "resolve_available_platforms",
+    "available_platforms",
     "recommended_platform",
     "set_current_platform",
     "_init_trace",
