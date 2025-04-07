@@ -142,7 +142,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk) -> "
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int n_share_experts_fusion) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
 

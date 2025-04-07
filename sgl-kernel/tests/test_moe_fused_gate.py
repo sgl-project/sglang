@@ -19,13 +19,15 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         (512, 16, 8, 16),
     ],
 )
-def test_moe_fused_gate_combined(seq_length, dtype, params):
+@pytest.mark.parametrize("n_share_experts_fusion", [0, 1, 8, 16])
+def test_moe_fused_gate_combined(seq_length, dtype, params, n_share_experts_fusion):
     num_experts, num_expert_group, topk_group, topk = params
 
     torch.manual_seed(seq_length)
     tensor = torch.rand((seq_length, num_experts)).to(dtype).cuda()
     scores = tensor.clone()
     bias = torch.rand(num_experts).to(dtype).cuda()
+    topk = topk + min(1, n_share_experts_fusion)
 
     output, indices = moe_fused_gate(
         tensor,
@@ -33,6 +35,7 @@ def test_moe_fused_gate_combined(seq_length, dtype, params):
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         topk=topk,
+        n_share_experts_fusion=n_share_experts_fusion,
     )
     ref_output, ref_indices = biased_grouped_topk(
         scores,
@@ -43,7 +46,17 @@ def test_moe_fused_gate_combined(seq_length, dtype, params):
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         compiled=False,
+        n_share_experts_fusion=n_share_experts_fusion,
     )
+
+    # When n_share_experts_fusion > 0, ignore the comparison of the last topk dimension
+    if n_share_experts_fusion > 0:
+        # For indices, we only compare the first topk-1 values
+        indices = indices[:, :-1]
+        ref_indices = ref_indices[:, :-1]
+        # For output, we also only compare the first topk-1 values
+        output = output[:, :-1]
+        ref_output = ref_output[:, :-1]
 
     idx_check = torch.allclose(
         ref_indices.sort()[0].to(torch.int32),
@@ -60,11 +73,11 @@ def test_moe_fused_gate_combined(seq_length, dtype, params):
 
     assert idx_check, (
         f"Indices mismatch at seq_length {seq_length}, dtype {dtype}, "
-        f"params {params}"
+        f"params {params}, n_share_experts_fusion {n_share_experts_fusion}"
     )
     assert output_check, (
         f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
-        f"params {params}"
+        f"params {params}, n_share_experts_fusion {n_share_experts_fusion}"
     )
 
 

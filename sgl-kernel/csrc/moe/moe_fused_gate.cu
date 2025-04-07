@@ -3,6 +3,8 @@
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+#include <curand.h>
+#include <curand_kernel.h>
 #include <stdio.h>
 #include <torch/all.h>
 
@@ -57,6 +59,7 @@ __device__ void moe_fused_gate_impl(
     int64_t num_rows,
     int64_t topk_group,
     int64_t topk,
+    int64_t n_share_experts_fusion,
     Params params) {
   int tidx = threadIdx.x;
   int64_t thread_row =
@@ -219,6 +222,30 @@ __device__ void moe_fused_gate_impl(
     __syncthreads();
   }
 
+  // Handle n_share_experts_fusion if needed
+  if (n_share_experts_fusion > 0 && thread_group_idx == 0) {
+    // For the last position, we need to set a random expert ID and adjust the weight
+    int64_t last_idx = topk * thread_row + (topk - 1);
+    
+    // Use curand to generate random number
+    curandStatePhilox4_32_10_t state;
+    curand_init(thread_row, 0, 0, &state);
+    int64_t random_offset = curand(&state) % n_share_experts_fusion;
+    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + random_offset);
+    
+    // Calculate the sum of the first k-1 weights
+    float prev_sum = 0.0f;
+    for (int ii = 0; ii < topk - 1; ++ii) {
+      prev_sum += output_ptr[topk * thread_row + ii];
+    }
+    
+    // Set the weight to the sum of the first k-1 weights divided by 2.5 (as in the Python implementation)
+    output_ptr[last_idx] = prev_sum / 2.5f;
+    
+    // For renormalization, we only use the sum of the first k-1 weights
+    output_sum = prev_sum;
+  }
+
   ////////////////////// Rescale Output //////////////////////
   if (thread_group_idx == 0) {
 #pragma unroll
@@ -257,9 +284,10 @@ __global__ void moe_fused_gate_kernel(
     int32_t* indices_ptr,
     int64_t num_rows,
     int64_t topk_group,
-    int64_t topk) {
+    int64_t topk,
+    int64_t n_share_experts_fusion) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
-  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, params);
+  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
 }
 
 // Macro to compute compile-time constants and launch the kernel.
@@ -277,7 +305,8 @@ __global__ void moe_fused_gate_kernel(
             indices.data_ptr<int32_t>(),                                                                 \
             num_rows,                                                                                    \
             topk_group,                                                                                  \
-            topk);                                                                                       \
+            topk,                                                                                        \
+            n_share_experts_fusion);                                                                     \
     dispatched = true;                                                                                   \
   } while (0)
 
@@ -303,7 +332,8 @@ __global__ void moe_fused_gate_kernel_dynamic(
     int64_t num_experts,
     int64_t num_expert_group,
     int64_t topk_group,
-    int64_t topk) {
+    int64_t topk,
+    int64_t n_share_experts_fusion) {
   KernelParamsDynamic params;
   params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
   params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
@@ -312,14 +342,14 @@ __global__ void moe_fused_gate_kernel_dynamic(
   params.ROWS_PER_WARP = std::max<int64_t>(1, WARP_SIZE / num_expert_group);  // WARP_SIZE is fixed as 32
   params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
-  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, params);
+  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
 }
 
 //------------------------------------------------------------------------------
 // Host Launcher Function
 //------------------------------------------------------------------------------
 std::vector<at::Tensor>
-moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk) {
+moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk, int64_t n_share_experts_fusion) {
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
@@ -416,7 +446,8 @@ moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, in
           num_experts,
           num_expert_group,
           topk_group,
-          topk);
+          topk,
+          n_share_experts_fusion);
     } else if (input.scalar_type() == at::kHalf) {
       moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -427,7 +458,8 @@ moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, in
           num_experts,
           num_expert_group,
           topk_group,
-          topk);
+          topk,
+          n_share_experts_fusion);
     } else if (input.scalar_type() == at::kFloat) {
       moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -438,7 +470,8 @@ moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, in
           num_experts,
           num_expert_group,
           topk_group,
-          topk);
+          topk,
+          n_share_experts_fusion);
     } else {
       TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
     }
