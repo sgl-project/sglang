@@ -39,7 +39,7 @@ Benchmark results on MMLU Pro dataset with 8*H100:
 
 Commands:
 
-```
+```bash
 # Llama-4-Scout-17B-16E-Instruct model
 python -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct --port 30000 --tp 8 --mem-fraction-static 0.8 --context-length 65536
 
