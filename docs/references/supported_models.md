@@ -1,8 +1,8 @@
 # Supported Models
 
 ## Generative Models
-- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3
-- Mistral / Mixtral / Pixtral / Mistral NeMo / Mistral Small 3
+- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3 / Llama 4
+- Mistral / Mixtral / Pixtral / Mistral NeMo / Mistral Small 3 / Mistral Small 3.1
 - Gemma / Gemma 2 / Gemma3
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / Olympic Coder
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)

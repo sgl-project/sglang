@@ -50,28 +50,38 @@ if torch.version.hip is not None:
         return torch.ops.sgl_kernel.get_meta_buffer_ipc_handle.default(inp)
 
 else:
-    # TRTLLM custom allreduce
-    def init_custom_reduce(
-        rank_id, num_devices, rank_data, buffers, tmp_buffers, barrier_in, barrier_out
-    ):
+
+    def init_custom_ar(
+        ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
+    ) -> int:
         return torch.ops.sgl_kernel.init_custom_ar.default(
-            rank_id,
-            num_devices,
-            rank_data,
-            buffers,
-            tmp_buffers,
-            barrier_in,
-            barrier_out,
+            ipc_tensors, rank_data, rank, full_nvlink
         )
 
-    def custom_dispose(fa):
+    def dispose(fa: int) -> None:
         torch.ops.sgl_kernel.dispose.default(fa)
 
-    def custom_reduce(fa, inp, out):
-        torch.ops.sgl_kernel.all_reduce.default(fa, inp, out)
+    def all_reduce(
+        fa: int,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        reg_buffer: int,
+        reg_buffer_sz_bytes: int,
+    ) -> None:
+        torch.ops.sgl_kernel.all_reduce.default(
+            fa, inp, out, reg_buffer, reg_buffer_sz_bytes
+        )
 
-    def get_graph_buffer_ipc_meta(fa):
+    def get_graph_buffer_ipc_meta(fa) -> Tuple[List[int], List[int]]:
         return torch.ops.sgl_kernel.get_graph_buffer_ipc_meta.default(fa)
 
-    def register_graph_buffers(fa, handles, offsets):
+    def register_buffer(fa: int, fake_ipc_ptrs: List[int]) -> None:
+        return torch.ops.sgl_kernel.register_buffer.default(fa, fake_ipc_ptrs)
+
+    def register_graph_buffers(
+        fa: int, handles: List[List[int]], offsets: List[List[int]]
+    ) -> None:
         torch.ops.sgl_kernel.register_graph_buffers.default(fa, handles, offsets)
+
+    def meta_size() -> int:
+        return torch.ops.sgl_kernel.meta_size.default()

@@ -577,7 +577,7 @@ def load_image(
     elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "7"))
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, stream=True, timeout=timeout).raw
         image = Image.open(response)
         response.close()
@@ -1791,7 +1791,7 @@ def retry(
             time.sleep(delay)
 
 
-def flatten_nested_list(nested_list):
+def flatten_nested_list(nested_list) -> List:
     if isinstance(nested_list, list):
         return [
             item for sublist in nested_list for item in flatten_nested_list(sublist)

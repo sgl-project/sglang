@@ -16,7 +16,7 @@
 import math
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, OrderedDict, Tuple, Type
+from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -32,8 +32,8 @@ from transformers import (
 from transformers.models.auto.modeling_auto import AutoModel, AutoModelForCausalLM
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
-# symbol only to prevent circular import
-import sglang.srt.models.registry as sgl_registry
+# leave till last and symbol only in case circular import
+import sglang.srt.models as sgl_models
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
@@ -123,9 +123,19 @@ class LlavaBaseForCausalLM(nn.Module):
         image_inputs.image_offsets = offset_list
         return input_ids
 
-    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def encode_images(
+        self, pixel_values: Union[torch.Tensor, List[torch.Tensor]]
+    ) -> torch.Tensor:
+        """
+        encode images by vision tower and multimodal projector
+        Args:
+            pixel_values: torch.Tensor or List[torch.Tensor]: each tensor for an input image
+        Returns:
+            torch.Tensor: encoded image features from the input image; if multiple, flattened by seq_len axis
+        """
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         # NOTE: This is not memory efficient. (output_hidden_states=True) will save all the hidden stated.
+
         selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
@@ -696,7 +706,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                     f"Multiple {auto_model_type.__name__} models found for submodule config `{config_cls_name}`, defaulting to [0]: {arch.__name__}"
                 )
             try:
-                return sgl_registry.ModelRegistry.resolve_model_cls(arch)[0]
+                return sgl_models.registry.ModelRegistry.resolve_model_cls(arch)[0]
             except Exception as e:
                 raise ValueError(
                     f"{auto_model_type.__name__} found a corresponding model `{arch}` for config class `{config_cls_name}`, but failed to load it from SGLang ModelRegistry. \n{e}"
@@ -787,40 +797,29 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_features(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
         """Extract features from image inputs.
 
         Args:
             items: List of MultimodalDataItem objects containing image data
+                Note that an item can be either "image" or "multi-images"
 
         Returns:
-            torch.Tensor: Extracted image features
+            torch.Tensor: Extracted image features. If multiple, concat to same sequence feature
         """
         # Collect pixel values from items
-        pixel_values = [item.pixel_values for item in items]
-        print(
-            f"LlavaForConditionalGeneration.get_image_feature: pixel_values has shape {pixel_values[0].shape}"
-        )
-
-        if (
-            pixel_values[0].ndim == 4
-        ):  # For multi-patch images like llava-hd: [num_patch, C, H, W]
-
-            pixel_values_concat = np.concatenate(pixel_values, axis=0)
-            concat_images = torch.tensor(
-                pixel_values_concat, device=self.vision_tower.device
-            )
-            print(
-                f"LlavaForConditionalGeneration.get_image_feature: concat_images has shape {concat_images.shape}"
-            )
-            image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in pixel_values]
-            return torch.split(image_features, split_sizes, dim=0)
-        else:  # For standard images: [C, H, W]
-            pixel_values_concat = torch.tensor(
-                np.array(pixel_values), device=self.vision_tower.device
-            )
-            return self.encode_images(pixel_values_concat)
+        # pixel_values = [torch.tensor(item.pixel_values) for item in items]
+        pixel_values = []
+        for item in items:
+            if item.modality == Modality.IMAGE:
+                pixel_values.append(torch.tensor(item.pixel_values))
+            elif item.modality == Modality.MULTI_IMAGES:
+                pixel_values += map(torch.tensor, item.pixel_values)
+            else:
+                raise NotImplementedError(
+                    f"Unexpected modality to `{self.__class__.__name__}` with encoder `{self.vision_tower.__class__.__name__}`: {item.modality}"
+                )
+        return self.encode_images(pixel_values)
 
     def forward(
         self,
@@ -838,8 +837,8 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
-            placeholder_token_ids=None,  # default to pad_value of multimodal items
+            image_data_embedding_func=self.get_image_features,
+            placeholder_token_ids=None,  # using mm_item.pad_value
             positions=positions,
         )
 
@@ -852,7 +851,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        # Set configuration properties needed by the base class
         if (
             self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"

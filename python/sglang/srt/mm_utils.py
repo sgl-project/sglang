@@ -171,7 +171,7 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     else:
         possible_resolutions = ast.literal_eval(grid_pinpoints)
     width, height = select_best_resolution(image_size, possible_resolutions)
-    return max((1, 1), (width // patch_size, height // patch_size))
+    return width // patch_size, height // patch_size
 
 
 def process_anyres_image(image, processor, grid_pinpoints):

@@ -30,11 +30,13 @@ from transformers.models.pixtral.image_processing_pixtral import (
 from transformers.models.pixtral.modeling_pixtral import (
     PixtralRotaryEmbedding,
     apply_rotary_pos_emb,
-    position_ids_in_meshgrid,
 )
+from transformers.models.pixtral.modeling_pixtral import (
+    generate_block_attention_mask as _get_pixtral_attention_mask,
+)
+from transformers.models.pixtral.modeling_pixtral import position_ids_in_meshgrid
 
 from python.sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
-from python.sglang.srt.models.llava import LlavaForConditionalGeneration
 from python.sglang.srt.utils import flatten_nested_list
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -47,13 +49,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 class PixtralHFInputPatcher:
     """
     TODO: refactor as multimodal data padding for Mistral's models.
-
     Pad input_ids with Mistral-exclusive formats.
     The multimodal special tokens:
     [IMG]: placeholder token, one per patch_size x patch_size grid
     [IMG_BREAK]: mark a "row" of pixels (or patch grid)'s ending; new line
     [IMG_END]: mark the end of the image
-
     Let's say we have patch_size = 16, and image_size = 40x30.
     Then we have ceil(40/16) x ceil(30/16) = 3 x 2 patch grids.
     For this prompt:
@@ -80,39 +80,37 @@ class PixtralHFInputPatcher:
         Args:
             input_ids: List[int]
             image_inputs: MultimodalInputs
-
         Returns:
             List[int]: padded input_ids
         """
-        padding_specs = flatten_nested_list(
-            [
-                (w, h, item.pad_value)
-                for item in image_inputs.mm_items
-                for w, h in item.image_sizes
-            ]
-        )
+        padding_specs = [
+            (w, h, item.pad_value)
+            for item in image_inputs.mm_items
+            for w, h in item.image_sizes
+        ]
 
         img_token_idxs = [i for i, t in enumerate(input_ids) if t == self.img_token_id]
 
         padded_input_ids = []
         offsets, pad_lens = [], []
         prev_img_offset = 0
-        for i, (h, w, pad_value) in enumerate(padding_specs):
-            img_offset = img_token_idxs[i]
+        for i, (w, h, pad_value) in enumerate(padding_specs):
+            next_img_idx = img_token_idxs[i]
             padding = self.get_padding_tokens(
                 image_width=w,
                 image_height=h,
                 pad_value=pad_value,
             )
-            padded_input_ids += input_ids[prev_img_offset:img_offset]
+            padded_input_ids += input_ids[prev_img_offset:next_img_idx]
             padded_input_ids += padding
-            prev_img_offset = img_offset + 1
-            offsets.append(img_offset)
+            prev_img_offset = next_img_idx + 1
+            offsets.append(next_img_idx)
             pad_lens.append(len(padding))
 
         padded_input_ids += input_ids[prev_img_offset:]
         image_inputs.image_pad_len = pad_lens
         image_inputs.image_offsets = offsets
+
         return padded_input_ids
 
     def get_padding_tokens(
@@ -122,6 +120,14 @@ class PixtralHFInputPatcher:
         image_height: int,
         pad_value: int = None,
     ) -> List[int]:
+        """
+        Args:
+            image_width: int
+            image_height: int
+            pad_value: int = None, default to self.img_token_id
+        Returns:
+            List[int]: padding tokens
+        """
         ncols, nrows = self.get_patch_grid_size(
             image_width=image_width,
             image_height=image_height,
@@ -497,7 +503,7 @@ class PixtralHFVisionModel(nn.Module):
     ) -> Union[torch.Tensor, tuple]:
         """
         Args:
-            pixel_values: Each image to be processed will be a separate tensor
+            pixel_values: Each image tensor of difference sizes
                 in pixel_values. This is a list of tensors because multiple
                 requests batched can have multiple images, each with their
                 own shape potentially.
@@ -511,9 +517,11 @@ class PixtralHFVisionModel(nn.Module):
               - hidden_states: Final model outputs (or selected layers if feature_sample_layers given)
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
-        # Process images through initial convolution independently
+        # List[?, C, H, W] => List[n, C, n_patch_h, n_patch_w]
+        # TODO(optimize): batch encode images with conv layer
         patch_embeds_list = [
-            self.patch_conv(img.unsqueeze(0).to(self.dtype)) for img in pixel_values
+            self.patch_conv(img.unsqueeze(0).to(self.device).to(self.dtype))
+            for img in pixel_values
         ]
         print(
             "PixtralHFVisionModel.forward: patch_embeds_list has {} elements".format(
@@ -521,25 +529,18 @@ class PixtralHFVisionModel(nn.Module):
             )
         )
 
-        # Reshape patches to token sequences
+        # => List[1, seq_len, C]
         patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
         embed_sizes = [p.shape[1] for p in patch_embeds]
+        patch_embeds = torch.cat(patch_embeds, dim=1)
 
-        # cat along the batch_size dimension
-        patch_embeds = torch.cat(patch_embeds, dim=0)
-
-        # Apply pre-layer norm
-        # RMSNorm expects 2D input, so reshape, apply norm, and reshape back
+        # layernorm 2d
         batch_size, seq_len, hidden_dim = patch_embeds.shape
         patch_embeds = self.ln_pre(patch_embeds.view(-1, hidden_dim)).view(
             batch_size, seq_len, hidden_dim
         )
-        print(
-            "PixtralHFVisionModel.forward: patch_embeds has shape {}".format(
-                patch_embeds.shape
-            )
-        )
-        # Compute positional embeddings
+
+        # positional embeddings
         position_ids = position_ids_in_meshgrid(
             patch_embeds_list,
             max_width=self.config.image_size // self.config.patch_size,
@@ -549,26 +550,9 @@ class PixtralHFVisionModel(nn.Module):
         # These tensors are used by apply_rotary_pos_emb in the transformer blocks
         position_embedding = self.patch_positional_embedding(patch_embeds, position_ids)
 
-        # Create attention mask for each image (block diagonal)
-        batch_size = len(patch_embeds_list)
-        seq_lengths = [p.shape[-2] * p.shape[-1] for p in patch_embeds_list]
-        max_seq_len = max(seq_lengths)
-        print(
-            f"batch_size: {batch_size}, seq_lengths: {seq_lengths}, max_seq_len: {max_seq_len}"
+        attention_mask = _get_pixtral_attention_mask(
+            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
         )
-        # Create a block diagonal mask
-        attention_mask = torch.zeros(
-            (batch_size, 1, max_seq_len, max_seq_len),
-            device=self.device,
-            dtype=torch.bool,
-        )
-
-        # Fill in the blocks
-        start_idx = 0
-        for i, seq_len in enumerate(seq_lengths):
-            end_idx = start_idx + seq_len
-            attention_mask[i, 0, start_idx:end_idx, start_idx:end_idx] = True
-            start_idx = end_idx
 
         # Process through transformer
         return_all_hidden_states = (
@@ -604,11 +588,7 @@ class PixtralHFVisionModel(nn.Module):
             out = transformer_outputs
 
         # Split back into separate tensors for each image
-        print(f"PixtralHFVisionModel.forward: out has shape {out.shape}")
-        print(f"PixtralHFVisionModel.forward: embed_sizes = {embed_sizes}")
-        print(f"Expected final output shape?")
-
-        final_outputs = out
+        final_outputs = torch.split(out.squeeze(0), embed_sizes)
 
         # Format return to be compatible with HuggingFace vision models
         if output_hidden_states:

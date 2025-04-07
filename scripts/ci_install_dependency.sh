@@ -20,14 +20,14 @@ pip install --upgrade pip
 
 # Install flashinfer and sgl-kernel
 pip install flashinfer_python==0.2.3 --find-links ${FLASHINFER_REPO} --no-cache-dir
-pip install sgl-kernel==0.0.7 --no-cache-dir
+pip install sgl-kernel==0.0.8 --no-cache-dir
 
 # Install the main package
 pip install -e "python[all]" --find-links ${FLASHINFER_REPO}
 
 # Install additional dependencies
 pip install torch_memory_saver
-pip install transformers==4.50.0 sentence_transformers accelerate==1.4.0 peft pandas datasets timm torchaudio
+pip install transformers==4.51.0 sentence_transformers accelerate==1.4.0 peft pandas datasets timm torchaudio
 
 # For compling xgrammar kernels
 pip install cuda-python nvidia-cuda-nvrtc-cu12

@@ -128,6 +128,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not server_args.disable_mla
         )
+        self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
         self.model_specific_adjustment()
