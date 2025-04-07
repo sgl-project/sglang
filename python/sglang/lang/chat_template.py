@@ -294,6 +294,30 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
+register_chat_template(
+    ChatTemplate(
+        name="llama-4",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": (
+                "<|header_start|>system<|header_end|>\n\n",
+                "<|eot|>",
+            ),
+            "user": (
+                "<|header_start|>user<|header_end|>\n\n",
+                "<|eot|>",
+            ),
+            "assistant": (
+                "<|header_start|>assistant<|header_end|>\n\n",
+                "<|eot|>",
+            ),
+        },
+        stop_str=("<|eot|>",),
+        image_token="<|image|>",
+    )
+)
+
 # Reference: https://modelscope.cn/models/01ai/Yi-1.5-34B-Chat/file/view/master?fileName=tokenizer_config.json&status=1
 register_chat_template(
     ChatTemplate(
