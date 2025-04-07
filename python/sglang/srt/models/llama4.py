@@ -165,7 +165,7 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attn_temperature_tuning = config.attn_temperature_tuning
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
