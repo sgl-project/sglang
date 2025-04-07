@@ -21,20 +21,21 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 _buffer = None
 
+
 def _get_deepep_buffer(
     group: dist.ProcessGroup,
     hidden: int,
-    low_latency_mode: bool = False,
+    deepep_mode: DeepEPMode,
     num_max_dispatch_tokens_per_rank: int = None,
     num_experts: int = None,
 ):
     global _buffer
-    
+
     # if _buffer is not None and _buffer.low_latency_mode == low_latency_mode:
     #     return _buffer
 
     num_nvl_bytes, num_rdma_bytes = 0, 0
-    if not low_latency_mode:
+    if deepep_mode.enable_normal():
         hidden_bytes = hidden * 2
         for config in (
             Buffer.get_dispatch_config(group.size()),
@@ -48,34 +49,35 @@ def _get_deepep_buffer(
                 config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                 num_rdma_bytes,
             )
-        if not (
-            _buffer is None
-            or _buffer.group != group
-            or _buffer.num_nvl_bytes < num_nvl_bytes
-            or _buffer.num_rdma_bytes < num_rdma_bytes
-        ):
-            return _buffer
-    else:
+    if deepep_mode.enable_low_latency():
         assert num_max_dispatch_tokens_per_rank is not None
         assert num_experts is not None and num_experts % group.size() == 0
-        num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
-            num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
+        num_rdma_bytes = max(
+            Buffer.get_low_latency_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
+            ),
+            num_rdma_bytes,
         )
-        if not (
-            _buffer is None
-            or _buffer.group != group
-            or not _buffer.low_latency_mode
-            or _buffer.num_rdma_bytes < num_rdma_bytes
+
+    if _buffer is not None and _buffer.group == group:
+        if deepep_mode.enable_normal() and (
+            _buffer.num_nvl_bytes >= num_nvl_bytes
+            and _buffer.num_rdma_bytes >= num_rdma_bytes
+        ):
+            return _buffer
+        if deepep_mode.enable_low_latency() and (
+            _buffer.low_latency_mode and _buffer.num_rdma_bytes >= num_rdma_bytes
         ):
             return _buffer
 
-    # Todo: simply set num_nvl_bytes as 1e9 to W/A intranode dispatch assertion error: num_ranks * (num_ranks + num_local_experts) * sizeof(int) <= num_nvl_bytes, need better solution
     _buffer = Buffer(
         group,
-        int(1e9),
+        num_nvl_bytes,
         num_rdma_bytes,
-        low_latency_mode=low_latency_mode,
-        num_qps_per_rank=(num_experts // group.size() if low_latency_mode else 1),
+        low_latency_mode=deepep_mode.enable_low_latency(),
+        num_qps_per_rank=(
+            num_experts // group.size() if deepep_mode.enable_low_latency() else 1
+        ),
     )
 
     return _buffer
@@ -134,7 +136,7 @@ class _DeepEPDispatcherImplBase:
 
     def combine_b(self, *args, **kwargs):
         raise NotImplementedError
-    
+
     def _get_buffer(self) -> Buffer:
         raise NotImplementedError
 
@@ -156,17 +158,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, previous_event
 
-    def dispatch_b(
-        self, hidden_states, topk_idx, topk_weights, previous_event
-    ):
+    def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
         (
             hidden_states,
             topk_idx,
             topk_weights,
             event,
-        ) = self._dispatch_core(
-            hidden_states, topk_idx, topk_weights, previous_event
-        )
+        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         if hidden_states.shape[0] > 0:
             reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
@@ -181,6 +179,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             )
 
         masked_m = expected_m = None
+
+        if self.deepep_mode.enable_low_latency():
+            buffer = self._get_buffer()
+            buffer.clean_low_latency_buffer(
+                self.num_max_dispatch_tokens_per_rank,
+                self.hidden_size,
+                self.num_experts,
+            )
 
         return (
             hidden_states,
@@ -200,10 +206,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
-        if self.deepep_mode.enable_low_latency():
-            buffer.clean_low_latency_buffer(
-                self.num_max_dispatch_tokens_per_rank, self.hidden_size, self.num_experts
-            )
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -221,7 +223,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
-        
+
         (
             recv_x,
             recv_topk_idx,
@@ -337,14 +339,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             allocate_on_comm_stream=previous_event is not None,
         )
         return combined_x, event
-    
+
     def _get_buffer(self):
         return _get_deepep_buffer(
             self.group,
             self.hidden_size,  #  * self.params_bytes
-            self.deepep_mode.enable_low_latency(),
+            self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
-            self.num_experts
+            self.num_experts,
         )
 
 
@@ -367,9 +369,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0]
-            * buffer.group_size
-            * topk_idx.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
@@ -487,15 +487,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = (
-            buffer.low_latency_combine(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                self.handle,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-            )
+        combined_hidden_states, event, hook = buffer.low_latency_combine(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            self.handle,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
         )
         self.handle = None
         return combined_hidden_states, event, hook
@@ -504,7 +502,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return _get_deepep_buffer(
             self.group,
             self.hidden_size,
-            True,
+            self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
