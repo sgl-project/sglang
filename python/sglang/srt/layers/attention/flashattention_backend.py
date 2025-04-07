@@ -213,10 +213,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
                 metadata.max_seq_len_q = metadata.max_seq_len_k
 
-        if forward_batch.mm_inputs[0] is not None:
+        if forward_batch.encoder_lens is not None:
             assert (
-                len(forward_batch.mm_inputs) == 1
-            ), "Only batch size 1 is supported for now"
+                len(forward_batch.encoder_lens) == 1
+            ), "Only encoder batch size 1 is supported for now"
 
             metadata.encoder_lens_int32 = (
                 forward_batch.encoder_lens.clone()
@@ -228,24 +228,17 @@ class FlashAttentionBackend(AttentionBackend):
                 (1, 0),
             )
             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
-            metadata.encoder_cu_seqlens_q = metadata.cu_seqlens_q
-            metadata.encoder_max_seq_len_q = metadata.max_seq_len_q
             metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # Set page table for batch size > 1
-            # TODO: optimize for loop
-            for i, seq_len in enumerate(metadata.cache_seqlens_int32):
-                metadata.page_table[:, :seq_len] = (
-                    forward_batch.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices,
-                        metadata.encoder_lens_int32[i] : (
-                            metadata.encoder_lens_int32[i] + seq_len
-                        ),
-                    ]
-                )
-                metadata.page_table[:, seq_len:].fill_(0)
+            # TODO: support len(forward_batch.encoder_lens) > 1
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices,
+                metadata.encoder_max_seq_len_k : (
+                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
+                ),
+            ]
 
         # Precompute strided indices
         if self.page_size > 1:
@@ -551,6 +544,22 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         }
 
+        self.encoder_metadata = {
+            "encoder_page_table": torch.zeros(
+                max_bs,
+                self.max_context_len * 2,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "encoder_lens_int32": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            ),
+            "encoder_cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "encoder_max_seq_len_k": 0,
+        }
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -645,6 +654,19 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
             self.target_verify_metadata[bs] = metadata
+
+        if encoder_lens is not None:
+            encoder_bs = len(encoder_lens)
+            metadata.encoder_lens_int32 = self.encoder_metadata["encoder_lens_int32"][
+                :encoder_bs
+            ]
+            metadata.encoder_cu_seqlens_k = self.encoder_metadata[
+                "encoder_cu_seqlens_k"
+            ][: (encoder_bs + 1)]
+
+            metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
+                req_pool_indices, :
+            ]
 
         self.forward_metadata = metadata
 
@@ -743,6 +765,33 @@ class FlashAttentionBackend(AttentionBackend):
             page_table = self.req_to_token[req_pool_indices, : metadata.max_seq_len_k]
             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
+        if encoder_lens is not None:
+            # Only support batch size 1 for encoder
+            encoder_lens_int32 = (
+                encoder_lens[:1].clone().detach().to(device=device, dtype=torch.int32)
+            )
+            metadata.encoder_max_seq_len_k = encoder_lens_int32.max().item()
+            metadata.encoder_lens_int32.copy_(encoder_lens_int32)
+            metadata.encoder_cu_seqlens_k.copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
+                    (1, 0),
+                )
+            )
+
+            metadata.encoder_page_table[:, : metadata.encoder_max_seq_len_k].copy_(
+                self.req_to_token[req_pool_indices, : metadata.encoder_max_seq_len_k]
+            )
+
+            # Update the regular page table
+            page_table = self.req_to_token[
+                req_pool_indices,
+                metadata.encoder_max_seq_len_k : (
+                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
+                ),
+            ]
+            metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -791,7 +840,7 @@ class FlashAttentionMultiStepBackend:
                 forward_batch.batch_size * self.topk,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
-                encoder_lens=None,
+                encoder_lens=forward_batch.encoder_lens,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
             )
@@ -808,7 +857,7 @@ class FlashAttentionMultiStepBackend:
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
-                encoder_lens=None,
+                encoder_lens=forward_batch.encoder_lens,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
