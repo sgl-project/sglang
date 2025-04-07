@@ -101,15 +101,15 @@ class TestVerlEngine(CustomTestCase):
     ):
         """
         Tests VerlEngine with tensor parallelism across multiple processes.
-        
+
         Spawns tp_size processes to test distributed execution, including:
         - Model inference via direct API and HTTP server
         - Weight updating functionality
         - Memory management (release/resume)
-        
+
         The test validates output correctness against a reference implementation
         within specified tolerance bounds.
-        
+
         Parameters:
         -----------
         index: int - Test index for logging
@@ -157,10 +157,10 @@ class TestVerlEngine(CustomTestCase):
     def test_models(self):
         """
         Orchestrates end-to-end testing across configured model sets.
-        
+
         In CI environments: Randomly selects one model for faster testing.
         In development: Tests all configured models for comprehensive validation.
-        
+
         Each model configuration specifies model path, memory settings,
         tensor-parallel size, and error tolerance bounds.
         """
@@ -168,7 +168,9 @@ class TestVerlEngine(CustomTestCase):
             # Randomly select one model in CI for faster testing
             if CI_MODELS:  # Make sure list is not empty
                 model_info = random.choice(CI_MODELS)
-                print(f"CI environment: Testing randomly selected model: {model_info['model_path']}")
+                print(
+                    f"CI environment: Testing randomly selected model: {model_info['model_path']}"
+                )
                 self.assert_fragment_e2e_execution(index=0, **model_info)
             return
 
@@ -191,15 +193,15 @@ def _run_subprocess(
 ):
     """
     Executes a single tensor-parallel process for testing VerlEngine.
-    
+
     Performs the core test operations:
     1. Initializes distributed environment
     2. Loads HuggingFace model for reference
     3. Tests VerlEngine API (generation, memory management, weight updates)
     4. Tests OpenAI-compatible endpoints on rank 0
-    
+
     Reports success/failure via output_writer pipe.
-    
+
     Parameters:
     tp_rank: int - Process rank in tensor parallel group
     tp_size: int - Total processes in tensor parallel group
@@ -272,8 +274,10 @@ def _run_subprocess(
             port=PORT,
         )
         # test direct generate API with multiple different requests
-        print(f"subprocess[{tp_rank=}] testing direct generate API with multiple requests")
-        
+        print(
+            f"subprocess[{tp_rank=}] testing direct generate API with multiple requests"
+        )
+
         # Request 1: Basic generation with temperature
         print(f"subprocess[{tp_rank=}] test request 1: Basic generation")
         direct_response = engine.generate(
@@ -281,7 +285,7 @@ def _run_subprocess(
             sampling_params={"temperature": 0.7, "max_new_tokens": 20},
         )
         print(f"Response 1: {direct_response}")
-        
+
         # Request 2: Zero temperature (greedy) generation
         print(f"subprocess[{tp_rank=}] test request 2: Greedy generation")
         direct_response = engine.generate(
@@ -289,7 +293,7 @@ def _run_subprocess(
             sampling_params={"temperature": 0.0, "max_new_tokens": 10},
         )
         print(f"Response 2: {direct_response}")
-        
+
         # Request 3: Batch generation
         print(f"subprocess[{tp_rank=}] test request 3: Batch generation")
         batch_response = engine.generate(
@@ -297,7 +301,6 @@ def _run_subprocess(
             sampling_params={"temperature": 0.8, "max_new_tokens": 15},
         )
         print(f"Response 3: {batch_response}")
-
 
         # test memory occupation APIs
         print(f"subprocess[{tp_rank=}] testing memory occupation APIs")
@@ -312,26 +315,32 @@ def _run_subprocess(
         if tp_rank == 0:
             client = OpenAI(api_key="None", base_url=f"http://localhost:{PORT}/v1")
             print(client.models.list().data[0].id)
-            
+
             # Multiple HTTP API requests
             print("Testing HTTP API with multiple requests")
-            
+
             # Request 1
             url = f"http://localhost:{PORT}/generate"
             data = {"text": "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="}
             response = requests.post(url, json=data)
             print(f"HTTP Response 1: {response.json()}")
-            
+
             # Request 2
-            data = {"text": "The capital of France is", "sampling_params": {"temperature": 0.2}}
+            data = {
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0.2},
+            }
             response = requests.post(url, json=data)
             print(f"HTTP Response 2: {response.json()}")
-            
+
             # Request 3
-            data = {"text": "List three colors:", "sampling_params": {"top_p": 0.95, "max_new_tokens": 25}}
+            data = {
+                "text": "List three colors:",
+                "sampling_params": {"top_p": 0.95, "max_new_tokens": 25},
+            }
             response = requests.post(url, json=data)
             print(f"HTTP Response 3: {response.json()}")
-        
+
         if _ENABLE_UPDATE_WEIGHTS:
             print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
 
@@ -365,15 +374,15 @@ def _run_subprocess(
 def _get_fsdp_state_dict(hf_model, tp_size: int):
     """
     Creates a sharded state dictionary for weight update testing.
-    
+
     Wraps the HuggingFace model with FSDP (FullyShardedDataParallel),
     configures precision settings, and returns a sharded state dict
     for testing VerlEngine's weight update capabilities.
-    
+
     Parameters:
     hf_model - HuggingFace model to wrap
     tp_size: int - Number of tensor-parallel shards
-        
+
     Returns:
     dict - Sharded state dict for update_weights_from_tensor
     """
