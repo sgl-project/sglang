@@ -115,12 +115,13 @@ class Llama4MoE(nn.Module):
         return out_aD
 
     def _forward_core(self, hidden_states):
-        if self._enable_shared_routed_overlap():
+        if self._enable_shared_routed_overlap(hidden_states):
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
 
-    def _enable_shared_routed_overlap(self, hidden_states):
+    @staticmethod
+    def _enable_shared_routed_overlap(hidden_states):
         batch_size = hidden_states.shape[0]
         return batch_size < 4
 
