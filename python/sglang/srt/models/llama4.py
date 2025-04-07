@@ -35,7 +35,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
 from torch import nn
@@ -105,7 +105,7 @@ class Llama4MoE(nn.Module):
         )
 
     def forward(self, hidden_states, forward_batch: ForwardBatch):
-        shared_out, routed_out = self._forward_core(hidden_states)
+        shared_out, routed_out = self._forward_core(hidden_states, forward_batch.forward_mode)
 
         out_aD = routed_out + shared_out
 
@@ -114,16 +114,16 @@ class Llama4MoE(nn.Module):
 
         return out_aD
 
-    def _forward_core(self, hidden_states):
-        if self._enable_shared_routed_overlap(hidden_states):
+    def _forward_core(self, hidden_states, forward_mode: ForwardMode):
+        if self._enable_shared_routed_overlap(hidden_states, forward_mode):
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
 
     @staticmethod
-    def _enable_shared_routed_overlap(hidden_states):
+    def _enable_shared_routed_overlap(hidden_states, forward_mode: ForwardMode):
         batch_size = hidden_states.shape[0]
-        return batch_size < 4
+        return forward_mode.is_decode() and (batch_size < 4)
 
     def _forward_core_normal(self, hidden_states):
         # router_scores: [num_tokens, num_experts]
