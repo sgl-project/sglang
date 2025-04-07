@@ -372,7 +372,7 @@ def save_configs(
         block_shape,
     )
 
-    print(f"Writing best config to {filename}...")
+    print(f"Writing best config to {filename} with content {configs=}")
     with open(filename, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
