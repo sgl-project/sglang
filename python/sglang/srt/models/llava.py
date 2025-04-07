@@ -16,7 +16,7 @@
 import itertools
 import math
 import re
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -120,7 +120,16 @@ class LlavaBaseForCausalLM(nn.Module):
         image_inputs.image_offsets = offset_list
         return input_ids
 
-    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def encode_images(
+        self, pixel_values: Union[torch.Tensor, List[torch.Tensor]]
+    ) -> torch.Tensor:
+        """
+        encode images by vision tower and multimodal projector
+        Args:
+            pixel_values: torch.Tensor or List[torch.Tensor]: each tensor for an input image
+        Returns:
+            torch.Tensor: encoded image features from the input image; if multiple, flattened by seq_len axis
+        """
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_outputs.hidden_states[self.vision_feature_layer]
 
@@ -696,7 +705,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
         """Extract features from image inputs.
 
         Args:
@@ -706,23 +715,25 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             torch.Tensor: Extracted image features
         """
         # Collect pixel values from items
-        pixel_values = [item.pixel_values for item in items]
+        pixel_values = [torch.tensor(item.pixel_values) for item in items]
 
-        if (
-            pixel_values[0].ndim == 4
-        ):  # For multi-patch images like llava-hd: [num_patch, C, H, W]
-            pixel_values_concat = np.concatenate(pixel_values, axis=0)
-            concat_images = torch.tensor(
-                pixel_values_concat, device=self.vision_tower.device
-            )
-            image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in pixel_values]
-            return torch.split(image_features, split_sizes, dim=0)
-        else:  # For standard images: [C, H, W]
-            pixel_values_concat = torch.tensor(
-                np.array(pixel_values), device=self.vision_tower.device
-            )
-            return self.encode_images(pixel_values_concat)
+        # if (
+        #     pixel_values[0].ndim == 4
+        # ):  # For multi-patch images like llava-hd: [num_patch, C, H, W]
+        #     print("sglang.srt.models.llava.LlavaForConditionalGeneration.get_image_feature(): multi-patch images, dim=4")
+        #     pixel_values_concat = np.concatenate(pixel_values, axis=0)
+        #     concat_images = torch.tensor(
+        #         pixel_values_concat, device=self.vision_tower.device
+        #     )
+        #     concat_image_features = self.encode_images(concat_images)
+        #     return concat_image_features
+        # else:  # For standard images: [C, H, W]
+        #     print(f"sglang.srt.models.llava.LlavaForConditionalGeneration.get_image_feature(): standard images, dim={pixel_values[0].ndim}")
+        #     pixel_values_concat = torch.tensor(
+        #         np.array(pixel_values), device=self.vision_tower.device
+        #     )
+        #     return self.encode_images(pixel_values_concat)
+        return self.encode_images(pixel_values)
 
     def forward(
         self,
@@ -741,7 +752,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             get_embedding=get_embedding,
             language_model=self.language_model,
             image_data_embedding_func=self.get_image_feature,
-            placeholder_token_ids=[self.config.image_token_index],
+            placeholder_token_ids=None,  # using mm_items.pad_value
             positions=positions,
         )
 

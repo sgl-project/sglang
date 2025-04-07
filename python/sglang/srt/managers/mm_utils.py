@@ -124,58 +124,69 @@ class MultiModalityDataPaddingPatternImageTokens(MultiModalityDataPaddingPattern
 
 
 def get_embedding_and_mask(
-    data_embedding_func: Callable[[List[MultimodalDataItem]], torch.Tensor],
+    data_embedding_func: Callable[[List[MultimodalDataItem]], List[torch.Tensor]],
     embedding_items: List[MultimodalDataItem],
     placeholder_tensor: torch.Tensor,
     input_ids: torch.Tensor,
 ):
     """
     Get the multimodal embedding and its mask from input_ids
-
     """
     # 1. Get the embedding
-    embedding = data_embedding_func(embedding_items)
+    embeddings = data_embedding_func(embedding_items)
+    if not isinstance(embeddings, list):
+        embeddings = [embeddings]
 
-    # 2. Check the embedding
-    if embedding.dim() == 2:
-        num_mm_tokens_in_embedding = embedding.shape[0]
+    if hasattr(embeddings[0], "shape"):
+        print(f"get_embedding_and_mask: embedding has shape {embeddings[0].shape}")
     else:
-        num_mm_tokens_in_embedding = embedding.shape[0] * embedding.shape[1]
-
-    # the mask of multimodal tokens from input_ids
-    special_multimodal_mask = torch.isin(
-        input_ids,
-        placeholder_tensor,
-    ).unsqueeze(-1)
-
-    num_mm_tokens_in_input_ids = special_multimodal_mask.sum()
-    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
-        logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text."
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            "tokens from multimodal embeddings."
+        print(
+            f"get_embedding_and_mask: embedding has shape {(embedding.shape for embedding in embedding)}"
         )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            # TODO: chunked prefill will split special tokens from input_ids into several passes, failing the embedding
-            # a fix may be cache the unfinished multimodal embedding for future reuse, determine the tokens to embed with
-            # extend_start_loc and extend_seq_lens
-            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
+    # 2. Check the embedding
+    return_embeddings, return_masks = [], []
+    for embedding in embeddings:
+        if embedding.dim() == 2:
+            num_mm_tokens_in_embedding = embedding.shape[0]
         else:
-            raise RuntimeError(
-                "Insufficient multimodal embedding length. This is an internal error"
-            )
+            num_mm_tokens_in_embedding = embedding.shape[0] * embedding.shape[1]
 
-    return embedding, special_multimodal_mask
+        # the mask of multimodal tokens from input_ids
+        special_multimodal_mask = torch.isin(
+            input_ids,
+            placeholder_tensor,
+        ).unsqueeze(-1)
+
+        num_mm_tokens_in_input_ids = special_multimodal_mask.sum()
+        if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+            logger.warning(
+                f"Number of tokens in multimodal embedding does not match those in the input text."
+                f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
+                "tokens from multimodal embeddings."
+            )
+            if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
+                # TODO: chunked prefill will split special tokens from input_ids into several passes, failing the embedding
+                # a fix may be cache the unfinished multimodal embedding for future reuse, determine the tokens to embed with
+                # extend_start_loc and extend_seq_lens
+                chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+                if chunked_prefill_size != -1:
+                    logger.warning(
+                        "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
+                    )
+                # extract from the end: this is a compromise
+                if embedding.dim() == 2:
+                    embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+                else:
+                    num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
+                    embedding = embedding[-num_multimodal:, :]
+            else:
+                raise RuntimeError(
+                    "Insufficient multimodal embedding length. This is an internal error"
+                )
+        return_embeddings.append(embedding)
+        return_masks.append(special_multimodal_mask)
+
+    return return_embeddings, return_masks
 
 
 def embed_mm_inputs(
@@ -269,7 +280,7 @@ def embed_mm_inputs(
             and audio_data_embedding_func
         ):
             items = [item for item in appearing_items if item.is_audio()]
-            embedding, mask = get_embedding_and_mask(
+            embeddings, masks = get_embedding_and_mask(
                 data_embedding_func=audio_data_embedding_func,
                 embedding_items=items,
                 placeholder_tensor=(
@@ -282,8 +293,8 @@ def embed_mm_inputs(
                 ),
                 input_ids=input_ids,
             )
-            embeddings += [embedding]
-            masks += [mask]
+            embeddings += embeddings
+            masks += masks
 
         # 3. Get input embeddings
         vocab_size = input_embedding.num_embeddings
