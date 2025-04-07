@@ -20,15 +20,13 @@ except ImportError:
 
 class KVArgs:
     engine_rank: int
-    kv_tensors: List[torch.Tensor]
-    aux_tensors: List[torch.Tensor]
-    # kv_data_ptrs: list[int]
-    # kv_data_lens: list[int]
-    # kv_item_lens: list[int]
-    # aux_data_ptrs: list[int]
-    # aux_data_lens: list[int]
-    # aux_item_lens: list[int]
-    # ib_device: str
+    kv_data_ptrs: list[int]
+    kv_data_lens: list[int]
+    kv_item_lens: list[int]
+    aux_data_ptrs: list[int]
+    aux_data_lens: list[int]
+    aux_item_lens: list[int]
+    ib_device: str
 
 
 class KVManager:
@@ -39,10 +37,16 @@ class KVManager:
         if nixl_agent is None:
             raise Exception("NIXL is not available")
         self.agent = nixl_agent(str(uuid.uuid4()))
-        self.kv_descs = self.agent.register_memory(self.args.kv_tensors)
+
+        # Register buffers.
+        kv_addrs = []
+        for data_ptr, data_len in zip(self.args.kv_data_ptrs, self.args.kv_data_lens):
+            kv_addrs.append((data_ptr, data_len, self.args.engine_rank, ""))
+        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
-        self.aux_descs = self.agent.register_memory(self.args.aux_tensors)
+        aux_addrs = [(self.args.aux_data_ptrs[0], self.args.aux_data_lens[0], 0, "")]
+        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -85,8 +89,6 @@ class KVSender:
         self.has_sent = False
         self.mgr = mgr
         self.bootstrap_room = bootstrap_room
-        self.num_layers = len(self.mgr.args.kv_tensors)
-        self.num_blocks = self.mgr.args.kv_tensors[0].shape[0]
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
@@ -95,8 +97,13 @@ class KVSender:
         # Get descs
         remote_kv_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
         remote_aux_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
-        kv_descs = self.mgr.agent.get_xfer_descs([kv_layer[i, :, :] for i in kv_indices for kv_layer in self.mgr.args.kv_tensors])
-        aux_descs = self.mgr.agent.get_xfer_descs([aux[self.aux_index, :] for aux in self.mgr.args.aux_tensors])
+        kv_addrs = []
+        for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
+            for i in kv_indices:
+                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
+        aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
+        aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
@@ -144,8 +151,13 @@ class KVReceiver:
         self.aux_transfer_done = False
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        kv_descs = self.mgr.agent.get_xfer_descs([kv_layer[i, :, :] for i in kv_indices for kv_layer in self.mgr.args.kv_tensors])
-        aux_descs = self.mgr.agent.get_xfer_descs([aux[aux_index, :] for aux in self.mgr.args.aux_tensors])
+        kv_addrs = []
+        for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
+            for i in kv_indices:
+                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
+        aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
+        aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(kv_descs))
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(aux_descs))
         self.has_init = True
