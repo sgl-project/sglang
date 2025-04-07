@@ -31,6 +31,7 @@ from sglang.srt.platforms import (
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
+    configure_logger,
     is_flashinfer_available,
     is_port_available,
     is_remote_url,
@@ -195,6 +196,8 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
+        configure_logger(self)
+
         # Init Platform
         set_current_platform(self.device)
 
@@ -203,6 +206,11 @@ class ServerArgs:
         if current_platform.is_unspecified():
             logger.error(f"SGLang cannot launch unspecified platform server")
             raise NotImplementedError()
+
+        logger.info(
+            f'Use device type "{current_platform.device_type}" for {current_platform.device_name} platform'
+        )
+        self.device = current_platform.device_type
 
         # Expert parallelism
         if self.enable_ep_moe:
