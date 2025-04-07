@@ -1,7 +1,7 @@
 # Supported Models
 
 ## Generative Models
-- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3
+- Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3 / Llama 4
 - Mistral / Mixtral / Mistral NeMo / Mistral Small 3
 - Gemma / Gemma 2 / Gemma3
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / Olympic Coder

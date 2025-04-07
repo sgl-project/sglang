@@ -18,23 +18,26 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/allreduce
    */
-  m.def(
-      "init_custom_ar(int rank_id, int world_size, Tensor rank_data, int[] buffers, int[] tmp_result_buffers, int[] "
-      "barrier_in, int[] barrier_out) -> int");
-  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
-
-  m.def("dispose", &dispose);
-
-  m.def("all_reduce(int fa, Tensor inp, Tensor! out) -> ()");
-  m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
   m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   m.def("register_graph_buffers", &register_graph_buffers);
+  m.def("dispose", &dispose);
+  m.def("meta_size", &meta_size);
+  m.def("register_buffer", &register_buffer);
 
+  m.def(
+      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
+      "int rank, bool full_nvlink) -> int");
+  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
+
+  m.def(
+      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  m.impl("all_reduce", torch::kCUDA, &all_reduce);
   /*
    * From csrc/attention
    */
@@ -137,6 +140,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+
+  m.def(
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk) -> "
+      "(Tensor[])");
+  m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
 
   /*
    * From csrc/speculative

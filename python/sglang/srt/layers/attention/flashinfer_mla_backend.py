@@ -71,8 +71,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
 
-        global_config.enable_flashinfer_mla = True
-
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -797,7 +795,7 @@ class FlashInferMLAMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.decode_seq_lens_cpu,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
