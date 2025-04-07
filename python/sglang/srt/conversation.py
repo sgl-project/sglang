@@ -158,11 +158,11 @@ class Conversation:
                     ret += role + ":"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA4:
-            ret = "<|begin_of_text|>"
+            # begin_of_text is added by default
             if self.system_message:
-                ret += system_prompt
+                ret = system_prompt
             else:
-                ret += ""
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|header_start|>{role}<|header_end|>\n\n"
@@ -171,11 +171,10 @@ class Conversation:
                     ret += f"<|header_start|>{role}<|header_end|>\n\n"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA3:
-            ret = "<|begin_of_text|>"
             if self.system_message:
-                ret += system_prompt
+                ret = system_prompt
             else:
-                ret += ""
+                ret = ""
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
