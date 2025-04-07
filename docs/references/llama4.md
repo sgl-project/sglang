@@ -18,10 +18,12 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 
 - **OOM Mitigation**: Adjust `--context-length` to avoid GPU out of memory issue.
 
-| GPU      | Scout Model Context | Maverick Model Context |
-|----------|---------------------|------------------------|
-| H100     | Up to 1M tokens     | Up to 32K tokens       |
-| H200     | Up to 5M tokens     | Up to 64K tokens       |
+Here are some reference number for setting context length:
+
+| GPU Setting  | Scout Model (BF16)  | Maverick Model (BF16)  |
+|--------------|---------------------|------------------------|
+| 8*H100       | up to 1M            | -                      |
+| 8*H200       |                     |                        |
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
 
