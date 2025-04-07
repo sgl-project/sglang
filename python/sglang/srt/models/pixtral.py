@@ -36,14 +36,14 @@ from transformers.models.pixtral.modeling_pixtral import (
 )
 from transformers.models.pixtral.modeling_pixtral import position_ids_in_meshgrid
 
-from python.sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
-from python.sglang.srt.utils import flatten_nested_list
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import flatten_nested_list
 
 
 class PixtralHFInputPatcher:
