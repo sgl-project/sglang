@@ -131,10 +131,10 @@ class Llama4Attention(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
+        layer_id: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
@@ -146,9 +146,8 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.no_rope_layers = config.no_rope_layers
-        self.nope = self.no_rope_layers[self.layer_id] == 0
-        self.use_qk_norm = config.use_qk_norm and not self.nope
+        self.use_rope = int((layer_id + 1) % 4 != 0)
+        self.use_qk_norm = config.use_qk_norm and self.use_rope
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -166,10 +165,8 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.attn_temperature_tuning = (
-            getattr(config, "attn_temperature_tuning", False) and self.nope
-        )
+        self.scaling = self.head_dim ** -0.5
+        self.attn_temperature_tuning = config.attn_temperature_tuning
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
         self.rope_theta = rope_theta
@@ -210,7 +207,7 @@ class Llama4Attention(nn.Module):
         )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "llama":
+        if is_gguf and config.model_type in ["llama", "llama4"]:
             is_neox_style = False
 
         self.rotary_emb = (
@@ -222,7 +219,7 @@ class Llama4Attention(nn.Module):
                 rope_scaling=rope_scaling if rope_scaling != "default" else None,
                 is_neox_style=is_neox_style,
             )
-            if not self.nope
+            if self.use_rope
             else None
         )
 
@@ -233,7 +230,7 @@ class Llama4Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
-            use_irope=not self.nope,
+            use_irope=self.use_rope,
         )
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
@@ -263,7 +260,7 @@ class Llama4Attention(nn.Module):
         # the inference-time temperature tuning function is customized to not affect short context
         # while working at very long context
         # https://arxiv.org/abs/2501.19399
-        if self.attn_temperature_tuning and self.nope:
+        if self.attn_temperature_tuning and not self.use_rope:
             attn_scale = self._get_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
 
@@ -289,10 +286,10 @@ class Llama4DecoderLayer(nn.Module):
 
         self.self_attn = Llama4Attention(
             config=config,
+            layer_id=layer_id,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
