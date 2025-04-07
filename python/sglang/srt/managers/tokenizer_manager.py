@@ -494,7 +494,7 @@ class TokenizerManager:
         obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
-        logger.info(f"Starting batch tokenization for {batch_size} text requests")
+        logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
@@ -503,7 +503,6 @@ class TokenizerManager:
         # Batch tokenize all texts
         encoded = self.tokenizer(texts)
         input_ids_list = encoded["input_ids"]
-        logger.info(f"Batch tokenized {batch_size} texts")
 
         # Process all requests
         tokenized_objs = []
@@ -609,14 +608,10 @@ class TokenizerManager:
 
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self.server_args.enable_tokenizer_batch_encode:
-                logger.info(f"Using batch tokenization for {batch_size}")
                 # Validate batch tokenization constraints
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
-                start_batch = time.time()
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)  # Type-safe cast assumed
-                batch_time = (time.time() - start_batch) * 1000  # Convert to milliseconds
-                print(f"Time taken for batch tokenization of {batch_size} inputs: {batch_time:.2f} ms")
+                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
@@ -624,23 +619,13 @@ class TokenizerManager:
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing
-                logger.info("Using Sequential tokenization for {batch_size}")
-                total_seq_time = 0
-                
+                # Sequential tokenization and processing           
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    start_one = time.time()
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    one_time = (time.time() - start_one) * 1000  # Convert to milliseconds
-                    total_seq_time += one_time
-                    print(f"Time taken to tokenize input {i+1}/{batch_size}: {one_time:.2f} ms")
-                    
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)                    
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
-                
-                print(f"Total time for sequential tokenization of {batch_size} inputs: {total_seq_time:.2f} ms")
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:

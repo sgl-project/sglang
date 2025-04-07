@@ -15,11 +15,11 @@ from sglang.utils import http_request
 # CONFIG
 ###############################################################################
 ENDPOINT_URL = "http://127.0.0.1:30000"
-TOKENIZER_DIR = "/shared/public/sharing/fait360brew/training/models/meta-llama/Llama-3.2-3B"
+TOKENIZER_DIR = "/models/meta-llama/Llama-3.2-3B"
 
 # Benchmark configurations
 NUM_REQUESTS = 10  # Total number of requests (each with BATCH_SIZE prompts)
-NUM_TOKENS = 10000  # Tokens per prompt
+NUM_TOKENS = 32000  # Tokens per prompt
 BATCH_SIZE = 8  # Number of prompts per request
 GEN_TOKENS = 0  # Tokens to generate per prompt
 
@@ -150,7 +150,6 @@ def process_results(results, total_latency, num_requests):
     print(f"  Total latency (all requests): {total_latency:.2f} ms")
     print(f"  Avg per request latency:     {avg_request_latency:.2f} ms")
     print(f"  Avg per prompt latency:      {avg_per_prompt_latency:.2f} ms")
-    print(f"  Total processing time:       {total_time:.2f} s")
     print(f"  Throughput:                  {throughput:.2f} prompts/second\n")
 
 
