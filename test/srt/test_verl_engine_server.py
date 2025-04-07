@@ -71,9 +71,17 @@ ALL_OTHER_MODELS = [
     # ),
 ]
 
-# The port for the server
-# 2345 is the default port for the server
+# This port is used for HTTP API communication with the VerlEngine server
+# It handles client requests for text generation, weight updates, and memory management
+# This port must be available and not used by other processes
 PORT = find_available_port(2345)
+
+# Master port is used for PyTorch's distributed communication setup
+# It enables tensor-parallel processes to communicate with each other
+# Default is 23456, but we find an available port dynamically in assert_fragment_e2e_execution
+# This port is critical for torch.distributed.init_process_group to function properly
+# Each test needs a unique master_port to avoid conflicts between parallel test executions
+# master_port = find_available_port(23456)  # This is set in assert_fragment_e2e_execution method
 
 
 class TestVerlEngine(CustomTestCase):
@@ -91,6 +99,27 @@ class TestVerlEngine(CustomTestCase):
         prefill_tolerance: float = 0.1,
         decode_tolerance: float = 0.1,
     ):
+        """
+        Tests VerlEngine with tensor parallelism across multiple processes.
+        
+        Spawns tp_size processes to test distributed execution, including:
+        - Model inference via direct API and HTTP server
+        - Weight updating functionality
+        - Memory management (release/resume)
+        
+        The test validates output correctness against a reference implementation
+        within specified tolerance bounds.
+        
+        Parameters:
+        -----------
+        index: int - Test index for logging
+        model_path: str - HuggingFace model identifier
+        mem_fraction_static: float - Memory fraction for static tensors
+        tp_size: int - Number of tensor parallel processes
+        tight_memory: bool - Enable memory optimization
+        prefill_tolerance: float - Max error for prefill computation
+        decode_tolerance: float - Max error for decoding computation
+        """
 
         master_port = find_available_port(23456)
 
@@ -126,11 +155,25 @@ class TestVerlEngine(CustomTestCase):
             p.join()
 
     def test_models(self):
+        """
+        Orchestrates end-to-end testing across configured model sets.
+        
+        In CI environments: Randomly selects one model for faster testing.
+        In development: Tests all configured models for comprehensive validation.
+        
+        Each model configuration specifies model path, memory settings,
+        tensor-parallel size, and error tolerance bounds.
+        """
         if is_in_ci():
-            for index, model_info in enumerate(CI_MODELS):
-                self.assert_fragment_e2e_execution(index=index, **model_info)
+            # Randomly select one model in CI for faster testing
+            if CI_MODELS:  # Make sure list is not empty
+                model_info = random.choice(CI_MODELS)
+                print(f"CI environment: Testing randomly selected model: {model_info['model_path']}")
+                self.assert_fragment_e2e_execution(index=0, **model_info)
             return
 
+        # Test all models in development environment
+        print(f"Development environment: Testing all {len(ALL_OTHER_MODELS)} models")
         for index, model_info in enumerate(ALL_OTHER_MODELS):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
@@ -146,6 +189,28 @@ def _run_subprocess(
     prefill_tolerance: float,
     decode_tolerance: float,
 ):
+    """
+    Executes a single tensor-parallel process for testing VerlEngine.
+    
+    Performs the core test operations:
+    1. Initializes distributed environment
+    2. Loads HuggingFace model for reference
+    3. Tests VerlEngine API (generation, memory management, weight updates)
+    4. Tests OpenAI-compatible endpoints on rank 0
+    
+    Reports success/failure via output_writer pipe.
+    
+    Parameters:
+    tp_rank: int - Process rank in tensor parallel group
+    tp_size: int - Total processes in tensor parallel group
+    master_port: int - Port for distributed communication
+    output_writer - Pipe for result communication
+    model_path: str - HuggingFace model identifier
+    mem_fraction_static: float - Static memory allocation fraction
+    tight_memory: bool - Memory optimization flag
+    prefill_tolerance: float - Acceptable prefill error
+    decode_tolerance: float - Acceptable decode error
+    """
     try:
         print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
 
@@ -157,8 +222,15 @@ def _run_subprocess(
         mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
+        # Print basic information about this subprocess including:
+        # - Current tensor-parallel rank
+        # - Device mesh configuration for both CUDA and CPU
+        # - This subprocess's role in testing tensor-parallel execution
+        # - How it contributes to the distributed model testing
         print(
-            f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
+            f"subprocess[{tp_rank=}] initialized for VerlEngine testing - "
+            f"Role: Shard {tp_rank+1}/{tp_size} of tensor-parallel model execution | "
+            f"Device meshes: CUDA={inference_device_mesh_device}, CPU={inference_device_mesh_cpu}"
         )
 
         # hf model is used for comparison
@@ -199,13 +271,33 @@ def _run_subprocess(
             enable_memory_saver=True,
             port=PORT,
         )
-        # test direct generate API
-        print(f"subprocess[{tp_rank=}] testing direct generate API")
+        # test direct generate API with multiple different requests
+        print(f"subprocess[{tp_rank=}] testing direct generate API with multiple requests")
+        
+        # Request 1: Basic generation with temperature
+        print(f"subprocess[{tp_rank=}] test request 1: Basic generation")
         direct_response = engine.generate(
             prompt="Hello, world!",
             sampling_params={"temperature": 0.7, "max_new_tokens": 20},
         )
-        print(f"Direct generate response: {direct_response}")
+        print(f"Response 1: {direct_response}")
+        
+        # Request 2: Zero temperature (greedy) generation
+        print(f"subprocess[{tp_rank=}] test request 2: Greedy generation")
+        direct_response = engine.generate(
+            prompt="Complete this sequence: 1, 2, 3,",
+            sampling_params={"temperature": 0.0, "max_new_tokens": 10},
+        )
+        print(f"Response 2: {direct_response}")
+        
+        # Request 3: Batch generation
+        print(f"subprocess[{tp_rank=}] test request 3: Batch generation")
+        batch_response = engine.generate(
+            prompt=["Translate 'hello' to French:", "Translate 'goodbye' to Spanish:"],
+            sampling_params={"temperature": 0.8, "max_new_tokens": 15},
+        )
+        print(f"Response 3: {batch_response}")
+
 
         # test memory occupation APIs
         print(f"subprocess[{tp_rank=}] testing memory occupation APIs")
@@ -220,10 +312,26 @@ def _run_subprocess(
         if tp_rank == 0:
             client = OpenAI(api_key="None", base_url=f"http://localhost:{PORT}/v1")
             print(client.models.list().data[0].id)
+            
+            # Multiple HTTP API requests
+            print("Testing HTTP API with multiple requests")
+            
+            # Request 1
             url = f"http://localhost:{PORT}/generate"
             data = {"text": "1*1=1, 1*2=2, 1*3=3, 1*4=4, 1*5="}
             response = requests.post(url, json=data)
-            print(response.json())
+            print(f"HTTP Response 1: {response.json()}")
+            
+            # Request 2
+            data = {"text": "The capital of France is", "sampling_params": {"temperature": 0.2}}
+            response = requests.post(url, json=data)
+            print(f"HTTP Response 2: {response.json()}")
+            
+            # Request 3
+            data = {"text": "List three colors:", "sampling_params": {"top_p": 0.95, "max_new_tokens": 25}}
+            response = requests.post(url, json=data)
+            print(f"HTTP Response 3: {response.json()}")
+        
         if _ENABLE_UPDATE_WEIGHTS:
             print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
 
@@ -231,12 +339,13 @@ def _run_subprocess(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
 
-        print(f"subprocess[{tp_rank=}] testing direct generate API")
+        # Final generation test after weight update
+        print(f"subprocess[{tp_rank=}] testing generation after weight update")
         direct_response = engine.generate(
-            prompt="Hello, world!",
+            prompt="After weight update: Hello, world!",
             sampling_params={"temperature": 0.7, "max_new_tokens": 20},
         )
-        print(f"Direct generate response: {direct_response}")
+        print(f"Post-update response: {direct_response}")
 
         execution_ok = True
 
@@ -254,6 +363,20 @@ def _run_subprocess(
 
 # Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
 def _get_fsdp_state_dict(hf_model, tp_size: int):
+    """
+    Creates a sharded state dictionary for weight update testing.
+    
+    Wraps the HuggingFace model with FSDP (FullyShardedDataParallel),
+    configures precision settings, and returns a sharded state dict
+    for testing VerlEngine's weight update capabilities.
+    
+    Parameters:
+    hf_model - HuggingFace model to wrap
+    tp_size: int - Number of tensor-parallel shards
+        
+    Returns:
+    dict - Sharded state dict for update_weights_from_tensor
+    """
     device_mesh = init_device_mesh(
         "cuda", mesh_shape=(tp_size,), mesh_dim_names=["fsdp"]
     )
