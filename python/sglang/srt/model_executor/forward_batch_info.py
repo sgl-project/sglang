@@ -180,14 +180,28 @@ class ForwardBatch:
 
     # For MLA chunked prefix cache used in chunked prefill
     enable_chunked_prefix: bool = False
-    num_prefix_chunks: Optional[int] = None # Number of prefix cache chunks
-    prefix_chunk_idx: Optional[int] = None # Index of current chunk, used by attention backend.
-    prefix_chunk_len: Optional[int] = None  # Maximum number of tokens in each chunk per sequence. Computed from workspace size
-    prefix_chunk_starts: Optional[torch.Tensor] = None # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
-    prefix_chunk_seq_lens: Optional[torch.Tensor] = None # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
-    prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = None # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
-    prefix_chunk_max_seq_lens: Optional[torch.Tensor] = None # Max lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
-    prefix_chunk_num_tokens: Optional[List[int]] = None # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
+    num_prefix_chunks: Optional[int] = None  # Number of prefix cache chunks
+    prefix_chunk_idx: Optional[int] = (
+        None  # Index of current chunk, used by attention backend.
+    )
+    prefix_chunk_len: Optional[int] = (
+        None  # Maximum number of tokens in each chunk per sequence. Computed from workspace size
+    )
+    prefix_chunk_starts: Optional[torch.Tensor] = (
+        None  # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    )
+    prefix_chunk_seq_lens: Optional[torch.Tensor] = (
+        None  # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    )
+    prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = (
+        None  # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
+    )
+    prefix_chunk_max_seq_lens: Optional[torch.Tensor] = (
+        None  # Max lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
+    )
+    prefix_chunk_num_tokens: Optional[List[int]] = (
+        None  # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
+    )
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -457,11 +471,13 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-
     def get_chunk_workspace_size(self):
         # Maximum number of tokens in each chunk
         # TODO: Should be changed to a better value, maybe passed through server args
         return 128 * 1024
+
+    def set_prefix_chunk_idx(self, idx: int):
+        self.prefix_chunk_idx = idx
 
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
@@ -470,7 +486,7 @@ class ForwardBatch:
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
-        
+
         # If no sequence has prefix, then no need to use chunked kv cache
         if (self.extend_prefix_lens_cpu > 0).sum().item() == 0:
             self.enable_chunked_prefix = False
@@ -480,25 +496,43 @@ class ForwardBatch:
         self.enable_chunked_prefix = True
         self.prefix_chunk_idx = -1
         self.prefix_chunk_len = self.get_chunk_workspace_size() // self.batch_size
-        
+
         # Here we suppose the length of each chunk is equal
         # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
-        # num_prefix_chunks = cdiv(1024, 256) = 4 
+        # num_prefix_chunks = cdiv(1024, 256) = 4
         # prefix_chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
         # prefix_chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
         # prefix_chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
         # TODO: Implement a better way to allocate chunk lengths that uses workspace more efficiently.
-        self.num_prefix_chunks = (self.extend_prefix_lens_cpu.max().item() + self.prefix_chunk_len - 1) // self.prefix_chunk_len
-        self.prefix_chunk_starts = torch.arange(self.prefix_kv_chunks, device=device, dtype=torch.int32) \
-            .unsqueeze(1).expand(-1, self.batch_size) * self.prefix_chunk_len
-        prefix_chunk_ends = torch.min(self.extend_prefix_lens.unsqueeze(0), self.prefix_chunk_starts + self.prefix_chunk_len) 
-        self.prefix_chunk_seq_lens = (prefix_chunk_ends - self.prefix_chunk_starts).clamp(min=0)
-        
+        self.num_prefix_chunks = (
+            self.extend_prefix_lens_cpu.max().item() + self.prefix_chunk_len - 1
+        ) // self.prefix_chunk_len
+        self.prefix_chunk_starts = (
+            torch.arange(self.prefix_kv_chunks, device=device, dtype=torch.int32)
+            .unsqueeze(1)
+            .expand(-1, self.batch_size)
+            * self.prefix_chunk_len
+        )
+        prefix_chunk_ends = torch.min(
+            self.extend_prefix_lens.unsqueeze(0),
+            self.prefix_chunk_starts + self.prefix_chunk_len,
+        )
+        self.prefix_chunk_seq_lens = (
+            prefix_chunk_ends - self.prefix_chunk_starts
+        ).clamp(min=0)
+
         # Metadata for attention backend
-        self.prefix_chunk_cu_seq_lens = torch.zeros(self.num_prefix_chunks, self.batch_size + 1, device=device, dtype=torch.int32)
-        self.prefix_chunk_cu_seq_lens[:, 1:] = self.prefix_chunk_seq_lens.cumsum(dim=1).to(torch.int32)
+        self.prefix_chunk_cu_seq_lens = torch.zeros(
+            self.num_prefix_chunks,
+            self.batch_size + 1,
+            device=device,
+            dtype=torch.int32,
+        )
+        self.prefix_chunk_cu_seq_lens[:, 1:] = self.prefix_chunk_seq_lens.cumsum(
+            dim=1
+        ).to(torch.int32)
         self.prefix_chunk_max_seq_lens = self.prefix_chunk_seq_lens.max(dim=1).values
-        
+
         # For allocation of workspace tensor
         self.prefix_chunk_num_tokens = self.prefix_chunk_seq_lens.sum(dim=1).tolist()
         assert max(self.prefix_chunk_num_tokens) <= self.get_chunk_workspace_size()
