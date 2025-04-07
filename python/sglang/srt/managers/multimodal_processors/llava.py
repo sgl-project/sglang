@@ -135,13 +135,17 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                             img_data, aspect_ratio, grid_pinpoints
                         )
                     )
+
                 res = await asyncio.gather(*res)
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)
                     image_sizes.append(image_s)
 
-                if isinstance(pixel_values[0], np.ndarray):
+                if (
+                    isinstance(pixel_values[0], np.ndarray)
+                    and len(set(image_sizes)) == 1
+                ):
                     pixel_values = np.stack(pixel_values, axis=0)
             else:
                 # A single image

@@ -200,11 +200,9 @@ class MultimodalDataItem:
 
         def hash_feature(f):
             if isinstance(f, list):
-                return hash(tuple(flatten_nested_list(f)))
+                f = tuple(map(hash_feature, flatten_nested_list(f)))
             elif isinstance(f, np.ndarray):
-                arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
-                return hash(arr_bytes)
+                f = np.ascontiguousarray(f).data.tobytes()
             return hash(f)
 
         if self.is_audio():

@@ -95,21 +95,22 @@ class PixtralHFInputPatcher:
         offsets, pad_lens = [], []
         prev_img_offset = 0
         for i, (w, h, pad_value) in enumerate(padding_specs):
-            img_offset = img_token_idxs[i]
+            next_img_idx = img_token_idxs[i]
             padding = self.get_padding_tokens(
                 image_width=w,
                 image_height=h,
                 pad_value=pad_value,
             )
-            padded_input_ids += input_ids[prev_img_offset:img_offset]
+            padded_input_ids += input_ids[prev_img_offset:next_img_idx]
             padded_input_ids += padding
-            prev_img_offset = img_offset + 1
-            offsets.append(img_offset)
+            prev_img_offset = next_img_idx + 1
+            offsets.append(next_img_idx)
             pad_lens.append(len(padding))
 
         padded_input_ids += input_ids[prev_img_offset:]
         image_inputs.image_pad_len = pad_lens
         image_inputs.image_offsets = offsets
+
         return padded_input_ids
 
     def get_padding_tokens(
@@ -492,10 +493,10 @@ class PixtralHFVisionModel(nn.Module):
               - hidden_states: Final model outputs (or selected layers if feature_sample_layers given)
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
-        # List[1, C, H, W] => List[1, C, n_patch_h, n_patch_w]
-        # TODO: check if same device is necessary or need to be moved out of model implementation
+        # List[?, C, H, W] => List[n, C, n_patch_h, n_patch_w]
+        # TODO(optimize): batch encode images with conv layer
         patch_embeds_list = [
-            self.patch_conv(img.unsqueeze(0).to(self.dtype).to(self.device))
+            self.patch_conv(img.unsqueeze(0).to(self.device).to(self.dtype))
             for img in pixel_values
         ]
 
