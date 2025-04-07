@@ -52,6 +52,8 @@ jobs:
 
           docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
           docker exec -w /human-eval ci_sglang pip install -e .
+          docker exec -w / ci_sglang mkdir -p /dummy-grok
+          docker exec -w /dummy-grok ci_sglang wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json
 
       - name: Evaluate Accuracy
         timeout-minutes: 20
@@ -59,6 +61,7 @@ jobs:
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_accuracy_large.py
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 test_eval_fp8_accuracy.py
           docker exec -w /sglang-checkout/test/srt -e SGLANG_IS_IN_CI=1 ci_sglang python3 models/test_qwen_models.py
+          docker exec -w /sglang-checkout -e SGLANG_IS_IN_CI=1 ci_sglang python -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 8 --model /dummy-grok --tokenizer-path Xenova/grok-1-tokenizer --load-format dummy --tp 8 --quantization fp8
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
