@@ -172,17 +172,9 @@ class Llama4Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.n_rep = self.num_heads // self.num_kv_heads
-        self.q_norm = (
+        self.qk_norm = (
             RMSNorm(
-                hidden_size=self.q_size,
-                eps=config.rms_norm_eps,
-            )
-            if self.use_qk_norm
-            else None
-        )
-        self.k_norm = (
-            RMSNorm(
-                hidden_size=self.kv_size,
+                hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
             )
             if self.use_qk_norm
@@ -250,11 +242,15 @@ class Llama4Attention(nn.Module):
 
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
-        if self.q_norm is not None:
+
+        if self.qk_norm is not None:
             # TODO: support float
-            q = self.q_norm(q.bfloat16().contiguous()).to(q.dtype)
-        if self.k_norm is not None:
-            k = self.k_norm(k.bfloat16().contiguous()).to(k.dtype)
+            q = q.reshape(-1, self.head_dim).contiguous().bfloat16()
+            k = k.reshape(-1, self.head_dim).contiguous().bfloat16()
+            q = self.qk_norm(q).to(q.dtype)
+            k = self.qk_norm(k).to(k.dtype)
+            q = q.reshape(-1, self.q_size)
+            k = k.reshape(-1, self.kv_size)
 
         # We are applying temperature tuning (https://arxiv.org/abs/2501.19399) to NoPE layers, where
         # the inference-time temperature tuning function is customized to not affect short context
