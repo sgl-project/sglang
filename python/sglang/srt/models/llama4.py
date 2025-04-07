@@ -46,7 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
-from sglang.srt.utils import add_prefix, make_layers, get_compiler_backend
+from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
 
