@@ -9,8 +9,6 @@ import ray
 import torch
 import triton
 from ray.experimental.tqdm_ray import tqdm
-from transformers import AutoConfig
-
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe,
     get_config_dtype_str,
@@ -19,6 +17,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     get_moe_configs,
 )
 from sglang.srt.utils import is_hip
+from transformers import AutoConfig
 
 _is_hip_ = is_hip()
 
@@ -326,7 +325,7 @@ class BenchmarkWorker:
                 best_time = kernel_time
                 best_config = config
         now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens} {best_config=}")
         assert best_config is not None
         return best_config
 
@@ -373,7 +372,7 @@ def save_configs(
         block_shape,
     )
 
-    print(f"Writing best config to {filename}...")
+    print(f"Writing best config to {filename} with content {configs=}")
     with open(filename, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
@@ -388,16 +387,19 @@ def main(args: argparse.Namespace):
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
     elif config.architectures[0] == "JambaForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
     elif config.architectures[0] == "Qwen2MoeForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         n_share_fusion_experts = args.n_share_experts_fusion
         E = (
@@ -408,6 +410,14 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        n_share_fusion_experts = args.n_share_experts_fusion
+        E = config.text_config.num_local_experts + n_share_fusion_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.text_config.hidden_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
@@ -417,14 +427,15 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+        hidden_size = config.hidden_size
 
-    hidden_size = config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -485,7 +496,7 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
-        print(f"Start tuning over {len(search_space)} configurations...")
+        print(f"Start tuning over {len(search_space)} configurations... ({E=} {shard_intermediate_size=} {dtype=} {block_shape=})")
 
         start = time.time()
         configs = _distribute(
