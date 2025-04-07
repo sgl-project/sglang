@@ -614,4 +614,4 @@ class PixtralVisionModel(PixtralHFVisionModel):
 
 
 # Register the model classes for external access
-EntityClass = [PixtralHFVisionModel, PixtralVisionModel]
+EntryClass = [PixtralVisionModel]

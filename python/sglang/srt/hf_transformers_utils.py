@@ -46,7 +46,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
-    Mistral3Config.model_type: Mistral3Config,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

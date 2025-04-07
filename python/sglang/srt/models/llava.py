@@ -15,7 +15,8 @@
 
 import math
 import re
-from typing import Iterable, List, Optional, Tuple, Union
+from functools import lru_cache
+from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -28,8 +29,11 @@ from transformers import (
     Qwen2Config,
     SiglipVisionModel,
 )
+from transformers.models.auto.modeling_auto import AutoModel, AutoModelForCausalLM
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
+# leave till last and symbol only in case circular import
+import sglang.srt.models as sgl_models
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
@@ -46,9 +50,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
-from sglang.srt.models.pixtral import PixtralHFVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -600,31 +603,63 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
 
 class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     """
-    LlavaForConditionalGeneration is an adaptor class to enable support for multiple mmlm such as mistral-community/pixtral-12b
-    It follows the structure of (language_model, multimodal_projector, vision_tower)
-    and has text_config and vision_config in its config.json
+    An adaptor class to enable support for multiple mmlm such as mistral-community/pixtral-12b
+    It follows the structure of (vision_tower, multi_modal_projector, language_model)
+
+    Once a model config is loaded, text_config and vision_config will be extracted, and
+    LlavaForConditionalGeneration will load the language_model and vision_tower models
+    according to config.
     """
 
-    model_cls = {
-        "mistral": MistralForCausalLM,
-        "qwen": Qwen2ForCausalLM,
-        "llama": LlamaForCausalLM,
-        # LLava arch is HF community version
-        "pixtral": PixtralHFVisionModel,
-    }
-
-    config_cls = {
-        "mistral": MistralConfig,
-        "qwen": Qwen2Config,
-        "llama": LlavaConfig,
-        # "pixtral": PixtralVisionConfig,
-    }
+    MULTIMODAL_PROJECTOR_TYPE = LlavaMultiModalProjector
 
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
         else:
             return super().pad_input_ids(input_ids, image_inputs)
+
+    def _get_sgl_model_cls(self, config, auto_model_type: Type[AutoModel] = AutoModel):
+        """
+        Get the SGLang model implementation class according to config.
+
+        Args:
+            config: The config object of the model.
+            auto_model_type: The type of the auto model.
+
+        Returns:
+            The SGLang model implementation class.
+        """
+        config_cls_name = config.__class__.__name__
+        arch_name_mapping = self._config_cls_name_to_arch_name_mapping(auto_model_type)
+        if arch := arch_name_mapping.get(config_cls_name):
+            if isinstance(arch, tuple):
+                arch = arch[0]
+                logger.warning(
+                    f"Multiple {auto_model_type.__name__} models found for submodule config `{config_cls_name}`, defaulting to [0]: {arch.__name__}"
+                )
+            try:
+                return sgl_models.registry.ModelRegistry.resolve_model_cls(arch)[0]
+            except Exception as e:
+                raise ValueError(
+                    f"{auto_model_type.__name__} found a corresponding model `{arch}` for config class `{config_cls_name}`, but failed to load it from SGLang ModelRegistry. \n{e}"
+                )
+        else:
+            raise ValueError(
+                f"{auto_model_type.__name__} cannot find a corresponding model for config class `{config_cls_name}`"
+            )
+
+    @lru_cache
+    def _config_cls_name_to_arch_name_mapping(
+        self, auto_model_type: Type[AutoModel]
+    ) -> Dict[str, str]:
+        mapping = {}
+        for config_cls, archs in auto_model_type._model_mapping.items():
+            if isinstance(archs, tuple):
+                mapping[config_cls.__name__] = tuple(map(lambda x: x.__name__, archs))
+            else:
+                mapping[config_cls.__name__] = archs.__name__
+        return mapping
 
     def __init__(
         self,
@@ -662,27 +697,31 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         if not hasattr(self.config, "projector_hidden_act"):
             self.config.projector_hidden_act = "gelu"
 
-        self.vision_feature_layer = self.config.vision_feature_layer
-        self.vision_feature_select_strategy = self.config.vision_feature_select_strategy
+        self.vision_feature_layer = getattr(config, "vision_feature_layer", -1)
+        self.vision_feature_select_strategy = getattr(
+            config, "vision_feature_select_strategy", "full"
+        )
         self.image_size = self.config.vision_config.image_size
         self.patch_size = self.config.vision_config.patch_size
 
-        self.mm_patch_merge_type = self.config.mm_patch_merge_type
-        self.image_aspect_ratio = self.config.image_aspect_ratio
-        self.image_grid_pinpoints = self.config.image_grid_pinpoints
+        self.mm_patch_merge_type = config.mm_patch_merge_type
+        self.image_aspect_ratio = config.image_aspect_ratio
+        self.image_grid_pinpoints = config.image_grid_pinpoints
 
         self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
 
-        self.multi_modal_projector = LlavaMultiModalProjector(config)
+        self.multi_modal_projector = self.MULTIMODAL_PROJECTOR_TYPE(config)
 
-        # TODO: prefixes don't work here. Still had to truncate at load_weights()
-        self.language_model = self.model_cls[config.text_config.model_type](
+        language_model_cls = self._get_sgl_model_cls(
+            config.text_config, AutoModelForCausalLM
+        )
+        vision_model_cls = self._get_sgl_model_cls(config.vision_config, AutoModel)
+        self.language_model = language_model_cls(
             config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
-
-        self.vision_tower = self.model_cls[config.vision_config.model_type](
+        self.vision_tower = vision_model_cls(
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
@@ -693,7 +732,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
+    def get_image_features(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
         """Extract features from image inputs.
 
         Args:
@@ -733,8 +772,8 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
-            placeholder_token_ids=None,  # using mm_items.pad_value
+            image_data_embedding_func=self.get_image_features,
+            placeholder_token_ids=None,  # using mm_item.pad_value
             positions=positions,
         )
 
@@ -747,7 +786,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        # Set configuration properties needed by the base class
         if (
             self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"
