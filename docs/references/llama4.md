@@ -1,4 +1,5 @@
 # Llama4 Usage
+
 [Llama 4](https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md) is Meta's latest generation of open-source LLM model with industry-leading performance.
 
 SGLang has supported Llama 4 Scout (109B) and Llama 4 Maverick (400B) since [v0.4.5](https://github.com/sgl-project/sglang/releases/tag/v0.4.5).
@@ -6,13 +7,15 @@ SGLang has supported Llama 4 Scout (109B) and Llama 4 Maverick (400B) since [v0.
 Ongoing optimizations are tracked in the [Roadmap](https://github.com/sgl-project/sglang/issues/5118).
 
 ## Launch Llama 4 with SGLang
+
 To serve Llama 4 models on 8xH100/H200 GPUs:
 
 ```bash
 python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct --tp 8 --context-length 1000000
 ```
 
-### Configuration Tips:
+### Configuration Tips
+
 - **OOM Mitigation**: Adjust `--context-length` to avoid GPU out of memory issue.
 
 | GPU      | Scout Model Context | Maverick Model Context |
@@ -25,6 +28,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 ## Benchmarking Results
 
 ### Accuracy Test with `lm_eval`
+
 The accuracy on SGLang for both Llama4 Scout and Llama4 Maverick can match the [official benchmark numbers](https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md).
 
 Benchmark results on MMLU Pro dataset with 8*H100:
