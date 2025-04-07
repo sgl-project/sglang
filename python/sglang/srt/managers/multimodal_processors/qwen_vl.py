@@ -5,7 +5,7 @@ from typing import List, Union
 import torch
 from PIL import Image
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.managers.multimodal_processors.base_processor import (
