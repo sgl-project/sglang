@@ -496,7 +496,7 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
-        print(f"Start tuning over {len(search_space)} configurations...")
+        print(f"Start tuning over {len(search_space)} configurations... ({E=} {shard_intermediate_size=} {dtype=} {block_shape=})")
 
         start = time.time()
         configs = _distribute(
