@@ -8,7 +8,7 @@ import time
 
 @dataclass
 class InputParameters:
-    num_token = 30
+    num_token = 10
     num_heads = 4
     head_size = 128
     max_total_num_tokens = 300
@@ -554,7 +554,9 @@ def test_correctness():
     input_parem = InputParameters()
     cudnn_bknd = CuDNNBackend()
     torch_native_backend = TorchNativeAttnBackend()
-    
+
+    vals = torch.randint(low=1, high=6, size=(input_parem.num_seqs,))
+    input_parem.num_token = sum(vals)
     # TODO: dtype
     query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
     output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
@@ -567,14 +569,13 @@ def test_correctness():
     req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
     extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
-    vals = [1, 2, 3, 4, 5, 3, 3, 3, 3, 3]  # sum is 30
+    
     extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
-    #extend_seq_lens = torch.randint(low=1,high=3,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
     # req_to_token[request_index]: list of index of tokens in query and value for that request_index
     # sum(len(tokens_per_request)) = num_tokens in query
     req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
-    #seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
+    # seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
     seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
     scaling = 1/math.sqrt(input_parem.head_size)
 
@@ -593,6 +594,7 @@ def test_correctness():
     # )
 
     # torch_output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+    # start_time =time.perf_counter()
     # torch_output = torch_native_backend._run_sdpa_forward_decode(
     #     query=query,
     #     output=torch_output,
@@ -603,7 +605,8 @@ def test_correctness():
     #     seq_lens=seq_lens,
     #     scaling=scaling
     # )
-
+    # end_time =time.perf_counter()
+    # print(f"torch sdpa decode time: {end_time-start_time}")
     # print("Decode output shapes:", output.shape, torch_output.shape)
     # output = output.squeeze()
     # torch_output = torch_output.squeeze()
@@ -620,6 +623,7 @@ def test_correctness():
     assert extend_seq_lens.sum() == input_parem.num_token, \
            "extend_seq_lens sum doesn't match input_parem.num_token."
 
+    torch.cuda.reset_peak_memory_stats()
     output = cudnn_bknd._run_sdpa_forward_extend(
         query=query,
         output=output,
@@ -632,8 +636,14 @@ def test_correctness():
         extend_seq_lens=extend_seq_lens,
         scaling=scaling
     )
+    torch.cuda.synchronize()
+    print(f"[cuDNN] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
 
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     torch_output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+    
+    start_time =time.perf_counter()
     torch_output = torch_native_backend._run_sdpa_forward_extend(
         query=query,
         output=torch_output,
@@ -646,7 +656,10 @@ def test_correctness():
         extend_seq_lens=extend_seq_lens,
         scaling=scaling
     )
-
+    torch.cuda.synchronize()
+    print(f"[Torch Native] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
+    end_time =time.perf_counter()
+    print(f"torch sdpa extend time: {end_time-start_time}")
     print("Extend output shapes:", output.shape, torch_output.shape)
     output = output.squeeze()
     torch_output = torch_output.squeeze()
