@@ -20,9 +20,6 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-from transformers import Llama4TextConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -41,6 +38,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from torch import nn
+from transformers import Llama4TextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +49,10 @@ class Llama4MoE(nn.Module):
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
+            hidden_states: torch.Tensor,
+            gating_output: torch.Tensor,
+            topk: int,
+            renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
@@ -65,10 +64,10 @@ class Llama4MoE(nn.Module):
         )
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -106,9 +105,7 @@ class Llama4MoE(nn.Module):
         )
 
     def forward(self, hidden_states, forward_batch: ForwardBatch):
-        shared_out, routed_out = self._forward_core(
-            hidden_states, forward_batch.forward_mode
-        )
+        shared_out, routed_out = self._forward_core(hidden_states, forward_batch.forward_mode)
 
         out_aD = routed_out + shared_out
 
@@ -170,19 +167,19 @@ def _get_or_create_alt_stream():
 class Llama4Attention(nn.Module):
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        layer_id: int,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
-        bias: bool = False,
-        bias_o_proj: bool = False,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            layer_id: int,
+            hidden_size: int,
+            num_heads: int,
+            num_kv_heads: int,
+            rope_theta: float = 10000,
+            rope_scaling: Optional[Dict[str, Any]] = None,
+            max_position_embeddings: int = 8192,
+            quant_config: Optional[QuantizationConfig] = None,
+            bias: bool = False,
+            bias_o_proj: bool = False,
+            prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -206,7 +203,7 @@ class Llama4Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attn_temperature_tuning = config.attn_temperature_tuning
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
@@ -273,10 +270,10 @@ class Llama4Attention(nn.Module):
         return attn_scale.unsqueeze(-1)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -308,11 +305,11 @@ class Llama4Attention(nn.Module):
 
 class Llama4DecoderLayer(nn.Module):
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            layer_id: int = 0,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -356,11 +353,11 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
+            residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -382,10 +379,10 @@ class Llama4DecoderLayer(nn.Module):
 
 class Llama4Model(nn.Module):
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -409,11 +406,11 @@ class Llama4Model(nn.Module):
         self.layers_to_capture = []
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            input_embeds: torch.Tensor = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -446,18 +443,18 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     }
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
 
     def _init_model(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
