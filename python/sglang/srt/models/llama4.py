@@ -104,7 +104,7 @@ class Llama4MoE(nn.Module):
             reduce_results=False,  # We need to do scatter before reduce
         )
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, forward_batch: ForwardBatch):
         shared_out, routed_out = self._forward_core(hidden_states)
 
         out_aD = routed_out + shared_out
@@ -373,7 +373,7 @@ class Llama4DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = self.feed_forward(hidden_states, forward_batch)
         return hidden_states, residual
 
 
