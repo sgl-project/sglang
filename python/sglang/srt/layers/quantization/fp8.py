@@ -860,7 +860,7 @@ class Fp8MoEMethod:
             layer.w13_weight_scale1[expert_id] *= max_w13_scales[expert_id]
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
-    def process_weights_hip_scale_padding(self, layer: Module, padding_size: int):
+    def process_weights_hip_scale_padding(self, layer: Module):
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             padding_size,  # Avoid circular import
         )
@@ -905,6 +905,7 @@ class Fp8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
@@ -975,6 +976,7 @@ class Fp8MoEMethod:
                 topk_ids=topk_ids,
                 inplace=inplace and not no_combine,
                 activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
                 use_fp8_w8a8=True,
                 w1_scale=(
                     layer.w13_weight_scale_inv
