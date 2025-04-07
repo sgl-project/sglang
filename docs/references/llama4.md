@@ -1,10 +1,11 @@
-## Llama4 Usage
+# Llama4 Usage
+[Llama 4](https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md) is Meta's latest generation of open-source LLM model with industry-leading performance.
 
-SGLang has supported Llama 4 Scout and Llama 4 Maverick since [v0.4.5](https://github.com/sgl-project/sglang/releases/tag/v0.4.5), including both base models and instruct-tuned models.
+SGLang has supported Llama 4 Scout (109B) and Llama 4 Maverick (400B) since [v0.4.5](https://github.com/sgl-project/sglang/releases/tag/v0.4.5).
 
 Ongoing optimizations are tracked in the [Roadmap](https://github.com/sgl-project/sglang/issues/5118).
 
-## Launching Llama 4 with SGLang
+## Launch Llama 4 with SGLang
 To serve Llama 4 models on 8xH100/H200 GPUs:
 
 ```bash
