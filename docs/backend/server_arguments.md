@@ -82,6 +82,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `ssl_certfile`: The file path to the SSL cert file.
 * `ssl_ca_certs`: The CA certificates file.
 * `ssl_cert_reqs`: Whether client certificate is required, see [ssl module](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.verify_mode).
+* `ssl_self_signed_cert`: Whether the certfile passed is a self-signed certificate.
 
 ## Parallelism
 

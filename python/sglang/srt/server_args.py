@@ -72,6 +72,7 @@ class ServerArgs:
     ssl_certfile: Optional[str] = None
     ssl_ca_certs: Optional[str] = None
     ssl_cert_reqs: int = 0
+    ssl_self_signed_cert: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -588,6 +589,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ssl_cert_reqs,
             help="Whether client certificate is required. ",
+        )
+        parser.add_argument(
+            "--ssl-self-signed-cert",
+            action="store_true",
+            help="Whether the SSL certificate is self-signed.",
         )
 
         # Memory and scheduling
@@ -1209,7 +1215,8 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            proto = "https" if self.ssl_certfile else "http"
+            return f"{proto}://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
