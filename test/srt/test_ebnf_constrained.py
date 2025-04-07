@@ -238,5 +238,11 @@ class TestEBNFConstrained(CustomTestCase):
         )
 
 
+class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, "llguidance", disable_overlap=False)
+
+
 if __name__ == "__main__":
     unittest.main()
