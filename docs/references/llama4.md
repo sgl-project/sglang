@@ -32,7 +32,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 The accuracy on SGLang for both Llama4 Scout and Llama4 Maverick can match the [official benchmark numbers](https://github.com/meta-llama/llama-models/blob/main/models/llama4/MODEL_CARD.md).
 
 Benchmark results on MMLU Pro dataset with 8*H100:
-|                    | Llama-4-Scout-17B-16E-Instruct | Llama-4-Maverick-400B-128E-Instruct |
+|                    | Llama-4-Scout-17B-16E-Instruct | Llama-4-Maverick-17B-128E-Instruct  |
 |--------------------|--------------------------------|-------------------------------------|
 | Official Benchmark | 74.3                           | 80.5                                |
 | SGLang             | 75.3                           | 80.7                                |
