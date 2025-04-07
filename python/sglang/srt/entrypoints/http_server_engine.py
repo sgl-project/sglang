@@ -31,7 +31,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     p.start()
 
     base_url = server_args.url()
-    timeout = 120.0
+    timeout = 180.0
     start_time = time.time()
 
     with requests.Session() as session:
@@ -56,7 +56,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-class HttpServerEngineAdapter(EngineBase):
+class HttpServerEngineForRL(EngineBase):
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
         # self.server_args = copy.deepcopy(server_args)
@@ -80,7 +80,7 @@ class HttpServerEngineAdapter(EngineBase):
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
 
-        print(f"update_weights_from_tensor of HttpServerEngineAdapter")
+        print(f"update_weights_from_tensor of HttpServerEngineForRL")
         serialized_named_tensors = HttpSerializer.serialize(
             MultiprocessingSerializer.serialize(named_tensors)
         )

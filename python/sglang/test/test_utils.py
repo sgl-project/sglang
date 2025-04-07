@@ -25,7 +25,7 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
+from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry, is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
@@ -101,6 +101,16 @@ def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None)
     assert res.status_code == 200
     pred = res.json()["generated_text"][0]
     return pred
+
+def find_available_port(base_port: int):
+    port = base_port + random.randint(100, 1000)
+    while True:
+        if is_port_available(port):
+            return port
+        if port < 60000:
+            port += 42
+        else:
+            port -= 43
 
 
 def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
