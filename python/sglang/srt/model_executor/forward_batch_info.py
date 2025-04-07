@@ -44,7 +44,11 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import (
+        KVCache,
+        MLATokenToKVPool,
+        ReqToTokenPool,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -180,28 +184,24 @@ class ForwardBatch:
 
     # For MLA chunked prefix cache used in chunked prefill
     enable_chunked_prefix: bool = False
-    num_prefix_chunks: Optional[int] = None  # Number of prefix cache chunks
-    prefix_chunk_idx: Optional[int] = (
-        None  # Index of current chunk, used by attention backend.
-    )
-    prefix_chunk_len: Optional[int] = (
-        None  # Maximum number of tokens in each chunk per sequence. Computed from workspace size
-    )
-    prefix_chunk_starts: Optional[torch.Tensor] = (
-        None  # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
-    )
-    prefix_chunk_seq_lens: Optional[torch.Tensor] = (
-        None  # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
-    )
-    prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = (
-        None  # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
-    )
-    prefix_chunk_max_seq_lens: Optional[torch.Tensor] = (
-        None  # Max lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
-    )
-    prefix_chunk_num_tokens: Optional[List[int]] = (
-        None  # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
-    )
+    # Number of prefix cache chunks
+    num_prefix_chunks: Optional[int] = None
+    # Index of current chunk, used by attention backend
+    prefix_chunk_idx: Optional[int] = None
+    # Maximum number of tokens in each chunk per sequence. Computed from maximum chunk capacity
+    prefix_chunk_len: Optional[int] = None
+    # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_starts: Optional[torch.Tensor] = None
+    # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_seq_lens: Optional[torch.Tensor] = None
+    # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
+    prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = None
+    # Max lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
+    prefix_chunk_max_seq_lens: Optional[torch.Tensor] = None
+    # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
+    prefix_chunk_num_tokens: Optional[List[int]] = None
+    # KV Indices for each chunk
+    prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -471,7 +471,7 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-    def get_chunk_workspace_size(self):
+    def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
         # TODO: Should be changed to a better value, maybe passed through server args
         return 128 * 1024
@@ -479,9 +479,37 @@ class ForwardBatch:
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx
 
+    def prepare_chunked_kv_indices(self, device: torch.device):
+        self.prefix_chunk_kv_indices = []
+        for idx in range(self.num_prefix_chunks):
+            chunk_starts = self.prefix_chunk_starts[idx]
+            chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
+            chunk_cu_seq_lens = self.prefix_chunk_cu_seq_lens[idx]
+            num_chunk_tokens = self.prefix_chunk_num_tokens[idx]
+
+            chunk_kv_indices = torch.empty(
+                num_chunk_tokens, dtype=torch.int32, device=device
+            )
+
+            create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                chunk_starts,
+                chunk_seq_lens,
+                chunk_cu_seq_lens,
+                chunk_kv_indices,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+            self.prefix_chunk_kv_indices.append(chunk_kv_indices)
+
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-    def prepare_chunked_prefix_cache_info(self, model_runner: ModelRunner):
+    def prepare_chunked_prefix_cache_info(
+        self, device: torch.device, cache_dtype: torch.dtype, head_dim: int
+    ):
+        assert isinstance(
+            self.token_to_kv_pool, MLATokenToKVPool
+        ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
@@ -492,10 +520,12 @@ class ForwardBatch:
             self.enable_chunked_prefix = False
             return
 
-        device = model_runner.device
         self.enable_chunked_prefix = True
         self.prefix_chunk_idx = -1
-        self.prefix_chunk_len = self.get_chunk_workspace_size() // self.batch_size
+
+        # chunk_capacity is the maximum number of tokens in each chunk
+        chunk_capacity = self.get_max_chunk_capacity()
+        self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         # Here we suppose the length of each chunk is equal
         # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
@@ -503,7 +533,7 @@ class ForwardBatch:
         # prefix_chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
         # prefix_chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
         # prefix_chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
-        # TODO: Implement a better way to allocate chunk lengths that uses workspace more efficiently.
+        # TODO: Implement a better way to allocate chunk lengths that uses memory spaces more efficiently.
         self.num_prefix_chunks = (
             self.extend_prefix_lens_cpu.max().item() + self.prefix_chunk_len - 1
         ) // self.prefix_chunk_len
@@ -533,9 +563,11 @@ class ForwardBatch:
         ).to(torch.int32)
         self.prefix_chunk_max_seq_lens = self.prefix_chunk_seq_lens.max(dim=1).values
 
-        # For allocation of workspace tensor
         self.prefix_chunk_num_tokens = self.prefix_chunk_seq_lens.sum(dim=1).tolist()
-        assert max(self.prefix_chunk_num_tokens) <= self.get_chunk_workspace_size()
+        assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()
+
+        # Precompute the kv indices for each chunk
+        self.prepare_chunked_kv_indices(device)
 
 
 def compute_position_triton(
@@ -614,3 +646,40 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+@triton.jit
+def create_chunked_prefix_cache_kv_indices(
+    req_to_token_ptr,  # (max_batch, max_context_len,)
+    req_pool_indices_ptr,  # (batch_size,)
+    chunk_start_idx_ptr,  # (batch_size,)
+    chunk_seq_lens_ptr,  # (batch_size,)
+    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
+    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
+
+    # get the token positions of current chunk
+    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < chunk_seq_len
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + chunk_start_pos
+            + offset,
+            mask=mask,
+        )
+        tl.store(
+            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
+        )

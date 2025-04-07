@@ -1049,7 +1049,6 @@ class DeepseekV2AttentionMLA(nn.Module):
     def _chunked_prefix_attn_mha(
         self,
         q: torch.Tensor,
-        q_pe_before_rope: torch.Tensor,
         accum_output: torch.Tensor,
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -1058,33 +1057,29 @@ class DeepseekV2AttentionMLA(nn.Module):
         assert is_flashinfer_available()
         from flashinfer.cascade import merge_state
 
+        assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
-            num_prefix_tokens = forward_batch.prefix_chunk_num_tokens[i]
 
-            # TODO: Fetch correct kv cache and turns it into multi-head form.
-            # Postisions for Rope should be created at the same time.
-            latent_cache, positions = fetch_latent_cache(forward_batch)
+            # Fetch latent cache from memory pool with precomputed chunked kv indices
+            latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                self.attn_mha.layer_id
+            )
+            latent_cache = latent_cache_buf[
+                forward_batch.prefix_chunk_kv_indices[i]
+            ].contiguous()
 
-            kv_a, _ = latent_cache.split(
+            kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
-            latent_cache = latent_cache.unsqueeze(
-                1
-            )  # latent_cache:(num_prefix_tokens, 1, kv_lora_rank + qk_rope_head_dim)
-            kv_a = self.kv_a_layernorm(
-                kv_a.contiguous()
-            )  # kv_a: (num_prefix_tokens, kv_lora_rank)
-            kv = self.kv_b_proj(kv_a)[0]
+            kv_a_normed = kv_a_normed.squeeze(1)
+            kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
-            k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-            q_pe, k_pe = self.rotary_emb(positions, q_pe_before_rope, k_pe)
-            q[..., self.qk_nope_head_dim :] = q_pe
             k = torch.empty_like(q)
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
@@ -1126,9 +1121,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         v = kv[..., self.qk_nope_head_dim :]
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-        # The q_pe before rotary should be kept for later use
-        q_pe_extend, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe_extend
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
@@ -1143,11 +1137,14 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         # Do mha attention with chunked prefix cache if needed
-        forward_batch.prepare_chunked_prefix_cache_info(self.runner)
+        forward_batch.prepare_chunked_prefix_cache_info(
+            self.runner.device,
+            latent_cache.dtype,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
         if forward_batch.enable_chunked_prefix:
             attn_output, _ = self._chunked_prefix_attn_mha(
                 q=q,
-                q_pe_before_rope=q_pe,
                 accum_output=attn_output,
                 accum_lse=lse,
                 forward_batch=forward_batch,
