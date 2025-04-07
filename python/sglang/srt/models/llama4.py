@@ -122,7 +122,7 @@ class Llama4MoE(nn.Module):
 
     @staticmethod
     def _enable_shared_routed_overlap(hidden_states, forward_mode: ForwardMode):
-        batch_size = hidden_states.shape[0]
+        batch_size, _ = hidden_states.shape
         return forward_mode.is_decode() and (batch_size < 4)
 
     def _forward_core_normal(self, hidden_states):
