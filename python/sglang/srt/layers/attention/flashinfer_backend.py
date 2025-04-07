@@ -56,7 +56,6 @@ class PrefillMetadata:
     use_ragged: bool
     extend_no_prefix: bool
 
-
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -497,7 +496,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Use dynamo-safe wrapper for the forward call
-        @make_custom_op_dynamo_safe
         def safe_forward_call(q, kv_cache):
             return decode_wrapper.forward(
                 q,
@@ -1155,7 +1153,6 @@ def should_use_tensor_core(
 global_override_indptr_cpu = None
 
 
-@make_custom_op_dynamo_safe
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -1168,8 +1165,9 @@ def fast_decode_plan(
     pos_encoding_mode: str = "NONE",
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
-    data_type: Union[str, torch.dtype] = "float16",
     q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1184,6 +1182,18 @@ def fast_decode_plan(
     batch_size = len(last_page_len)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
+        
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+        
+    if kv_data_type is None:
+        kv_data_type = q_data_type
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
@@ -1200,36 +1210,33 @@ def fast_decode_plan(
             raise ValueError(
                 "The size of indices should be less than or equal to the allocated buffer"
             )
-        # Skip these copies because we directly write to them during prepartion
-        # self._paged_kv_indptr_buf.copy_(indptr)
-        # self._paged_kv_indices_buf[: len(indices)] = indices
-        # self._paged_kv_last_page_len_buf.copy_(last_page_len)
     else:
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
         self._paged_kv_last_page_len_buf = last_page_len
-        self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=non_blocking)
+        if self.use_tensor_cores:
+            self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=non_blocking)
 
-    # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
-    if not q_data_type:
-        q_data_type = data_type
-
-    if not hasattr(self, "empty_q_data"):
-        self.empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
-        )
-        self.empty_kv_cache = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, data_type) if isinstance(data_type, str) else data_type
-            ),
-        )
-        self.last_page_len = torch.ones(32768, dtype=torch.int32)
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, q_data_type)
+            if isinstance(q_data_type, str)
+            else q_data_type
+        ),
+        device=self.device,
+    )
+    
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, kv_data_type)
+            if isinstance(kv_data_type, str)
+            else kv_data_type
+        ),
+        device=self.device,
+    )
 
     indptr_host = (
         global_override_indptr_cpu
@@ -1237,33 +1244,16 @@ def fast_decode_plan(
         else indptr.cpu()
     )
 
-    if self.use_tensor_cores:
-        kv_lens_arr_host = get_seq_lens(
-            indptr_host, self.last_page_len[:batch_size], page_size
-        )
+    with torch.cuda.device(self.device):
+        stream = torch.cuda.current_stream().cuda_stream
         
-        # Try with fewer arguments to match the API
-        try:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                indptr_host,
-                kv_lens_arr_host,
-                batch_size,  # total_num_rows
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim,
-                head_dim,
-                False,  # causal
+        if self.use_tensor_cores:
+            kv_lens_arr_host = get_seq_lens(
+                indptr_host, last_page_len, page_size
             )
-        except (TypeError, RuntimeError) as e:
-            # If the error indicates too many arguments, try with fewer
-            if "expected at most 15 argument(s)" in str(e):
+            
+            try:
+                # Standard 15-argument version based on documentation
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -1279,33 +1269,16 @@ def fast_decode_plan(
                     self.is_cuda_graph_enabled,
                     head_dim,
                     head_dim,
+                    False,  # causal
                 )
-            else:
-                # Re-raise if it's a different error
+            except Exception as e:
+                # Log the error for debugging
+                import logging
+                logging.error(f"Error in tensor core plan: {e}")
                 raise
-    else:
-        try:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                indptr_host,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                window_left,
-                logits_soft_cap,
-                head_dim,
-                head_dim,
-                self.empty_q_data,
-                self.empty_kv_cache,
-                torch.cuda.current_stream().cuda_stream,
-            )
-        except (TypeError, RuntimeError) as e:
-            # If the error indicates too many arguments, try with fewer
-            if "expected at most 15 argument(s)" in str(e):
+        else:
+            try:
+                # Standard 15-argument version based on documentation
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -1320,10 +1293,13 @@ def fast_decode_plan(
                     logits_soft_cap,
                     head_dim,
                     head_dim,
-                    self.empty_q_data,
+                    empty_q_data,
+                    empty_kv_cache,
                 )
-            else:
-                # Re-raise if it's a different error
+            except Exception as e:
+                # Log the error for debugging
+                import logging
+                logging.error(f"Error in standard plan: {e}")
                 raise
 
     self._pos_encoding_mode = pos_encoding_mode
@@ -1333,10 +1309,4 @@ def fast_decode_plan(
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
 
-def make_custom_op_dynamo_safe(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Disable tracing for this function
-        with torch._dynamo.disable():
-            return func(*args, **kwargs)
-    return wrapper
+
