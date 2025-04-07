@@ -106,19 +106,37 @@ class Llama4MoE(nn.Module):
         )
 
     def forward(self, hidden_states):
-        # router_scores: [num_tokens, num_experts]
-        router_logits, _ = self.router(hidden_states)
+        alt_stream = _get_or_create_alt_stream()
+
+        alt_stream.wait_stream(torch.cuda.current_stream())
+
         shared_out = self.shared_expert(hidden_states)
-        routed_out = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+
+        with torch.cuda.stream(alt_stream):
+            # router_scores: [num_tokens, num_experts]
+            router_logits, _ = self.router(hidden_states)
+            routed_out = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        torch.cuda.current_stream().wait_stream(alt_stream)
+
         out_aD = routed_out + shared_out
 
         if self.tp_size > 1:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
         return out_aD
+
+
+_alt_stream = None
+
+
+def _get_or_create_alt_stream():
+    global _alt_stream
+    if _alt_stream is None:
+        _alt_stream = torch.cuda.Stream()
+    return _alt_stream
 
 
 class Llama4Attention(nn.Module):
@@ -394,7 +412,6 @@ class Llama4Model(nn.Module):
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
