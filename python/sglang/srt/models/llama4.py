@@ -20,9 +20,6 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-from transformers import Llama4TextConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -41,6 +38,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from torch import nn
+from transformers import Llama4TextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +121,14 @@ class Llama4MoE(nn.Module):
             return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(self, hidden_states):
-        return TODO
+        # router_scores: [num_tokens, num_experts]
+        router_logits, _ = self.router(hidden_states)
+        shared_out = self.shared_expert(hidden_states)
+        routed_out = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        return shared_out, routed_out
 
     def _forward_core_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream()
