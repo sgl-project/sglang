@@ -23,7 +23,9 @@ import torch.nn.functional as F
 
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+_is_cuda = is_cuda_available()
+
+if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from sglang.srt.custom_op import CustomOp
@@ -165,7 +167,7 @@ def get_act_fn(
     return act_fn
 
 
-if not is_cuda_available():
+if not _is_cuda:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

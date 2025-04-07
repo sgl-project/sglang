@@ -8,7 +8,7 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 The `/generate` endpoint accepts the following parameters in JSON format. For in detail usage see the [native api doc](./native_api.ipynb).
 
-* `prompt: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
+* `text: Optional[Union[List[str], str]] = None` The input prompt. Can be a single prompt or a batch of prompts.
 * `input_ids: Optional[Union[List[List[int]], List[int]]] = None` Alternative to `text`. Specify the input as token IDs instead of text.
 * `sampling_params: Optional[Union[List[Dict], Dict]] = None` The sampling parameters as described in the sections below.
 * `return_logprob: Optional[Union[List[bool], bool]] = None` Whether to return log probabilities for tokens.
@@ -25,7 +25,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 
 * `max_new_tokens: int = 128` The maximum output length measured in tokens.
 * `stop: Optional[Union[str, List[str]]] = None` One or multiple [stop words](https://platform.openai.com/docs/api-reference/chat/create#chat-create-stop). Generation will stop if one of these words is sampled.
-* `stop_token_ids: Optional[List[int]] = []` Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
+* `stop_token_ids: Optional[List[int]] = None` Provide stop words in form of token ids. Generation will stop if one of these token ids is sampled.
 * `temperature: float = 1.0` [Temperature](https://platform.openai.com/docs/api-reference/chat/create#chat-create-temperature) when sampling the next token. `temperature = 0` corresponds to greedy sampling, higher temperature leads to more diversity.
 * `top_p: float = 1.0` [Top-p](https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_p) selects tokens from the smallest sorted set whose cumulative probability exceeds `top_p`. When `top_p = 1`, this reduces to unrestricted sampling from all tokens.
 * `top_k: int = -1` [Top-k](https://developer.nvidia.com/blog/how-to-get-better-outputs-from-your-large-language-model/#predictability_vs_creativity) randomly selects from the `k` highest-probability tokens.
@@ -33,11 +33,9 @@ The `/generate` endpoint accepts the following parameters in JSON format. For in
 
 ### Penalizers
 
-To use penalizers you will need to `--disable-overlap`. Please note that this might degrade performance.
-
 * `frequency_penalty: float = 0.0`: Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token.
 * `presence_penalty: float = 0.0`: Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occured.
-* `repetition_penalty: float = 0.0`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `2` encourages sampling of new tokens. The penalization scales multiplicatively.
+* `repetition_penalty: float = 0.0`: Penalizes tokens if they appeared in prompt or generation so far. Must be between `0` and `2` where numbers smaller than `1` encourage repeatment of tokens and numbers larger than `1` encourages sampling of new tokens. The penalization scales multiplicatively.
 * `min_new_tokens: int = 0`: Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior for example if the distribution is highly skewed towards these tokens.
 
 ### Constrained decoding

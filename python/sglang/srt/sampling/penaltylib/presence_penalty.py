@@ -56,7 +56,6 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         ]
 
     def _merge(self, their: "BatchedPresencePenalizer"):
-        print(f"{self.presence_penalties.shape=}, {their.presence_penalties.shape=}")
         self.presence_penalties = torch.cat(
             [self.presence_penalties, their.presence_penalties], dim=0
         )

@@ -1,9 +1,7 @@
-import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
-import torch.nn as nn
 from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
 

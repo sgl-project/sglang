@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from typing_extensions import Literal
 
 
@@ -28,6 +28,7 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
     root: Optional[str] = None
+    max_model_len: Optional[int] = None
 
 
 class ModelList(BaseModel):
@@ -187,7 +188,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Literal["stop", "length", "content_filter"]
     matched_stop: Union[None, int, str] = None
 
 
@@ -204,7 +205,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -227,14 +228,25 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+class ChatCompletionMessageContentAudioURL(BaseModel):
+    url: str
+
+
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
+class ChatCompletionMessageContentAudioPart(BaseModel):
+    type: Literal["audio_url"]
+    audio_url: ChatCompletionMessageContentAudioURL
+
+
 ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart, ChatCompletionMessageContentImagePart
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentAudioPart,
 ]
 
 
@@ -276,6 +288,7 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: Optional[str] = None
     parameters: Optional[object] = None
+    strict: bool = False
 
 
 class Tool(BaseModel):
@@ -310,7 +323,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Union[ResponseFormat, StructuralTagResponseFormat] = None
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
@@ -322,6 +335,15 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+
+    @root_validator(pre=True)
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -366,7 +388,9 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: str
+    finish_reason: Literal[
+        "stop", "length", "tool_calls", "content_filter", "function_call"
+    ]
     matched_stop: Union[None, int, str] = None
 
 
@@ -390,7 +414,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[str] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+    ] = None
     matched_stop: Union[None, int, str] = None
 
 
@@ -403,10 +429,17 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: Optional[UsageInfo] = None
 
 
+class MultimodalEmbeddingInput(BaseModel):
+    text: Optional[str] = None
+    image: Optional[str] = None
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[List[int], List[List[int]], str, List[str]]
+    input: Union[
+        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+    ]
     model: str
     encoding_format: str = "float"
     dimensions: int = None

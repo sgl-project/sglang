@@ -27,7 +27,7 @@ The router supports two working modes:
 This will be a drop-in replacement for the existing `--dp-size` argument of SGLang Runtime. Under the hood, it uses multi-processes to launch multiple workers, wait for them to be ready, then connect the router to all workers.
 
 ```bash
-python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 4
+python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dp-size 4 --host 0.0.0.0
 ```
 
 After the server is ready, you can directly send requests to the router as the same way as sending requests to each single worker.

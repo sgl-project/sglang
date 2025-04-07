@@ -3,7 +3,7 @@
 SGLang supports various quantization methods, including offline quantization and online dynamic quantization.
 
 Offline quantization loads pre-quantized model weights directly during inference. This is required for quantization methods
-such as GPTQ and AWQ that collects and pre-compute various stats from the original weights using the calibration dataset.
+such as GPTQ and AWQ, which collect and pre-compute various statistics from the original weights using the calibration dataset.
 
 Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime.
 Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors
@@ -12,7 +12,8 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
 If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
-For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2) or [NeuralMagic](https://huggingface.co/collections/neuralmagic)  collections on HF for some
+For popular pre-quantized models, please visit [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
+or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.
 
@@ -25,6 +26,15 @@ downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already i
 ```bash
 python3 -m sglang.launch_server \
     --model-path hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 \
+    --port 30000 --host 0.0.0.0
+```
+
+Take note, if your model is **per-channel quantized (INT8 or FP8) with per-token dynamic quantization activation**, you can opt to include `--quantization w8a8_int8` or `--quantization w8a8_fp8` to invoke the corresponding CUTLASS int8_kernel or fp8_kernel in sgl-kernel. This action will ignore the Hugging Face config's quantization settings. For instance, with `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic`, if you execute with `--quantization w8a8_fp8`, the system will use the `W8A8Fp8Config` from SGLang to invoke the sgl-kernel, rather than the `CompressedTensorsConfig` for vLLM kernels.
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic \
+    --quantization w8a8_fp8 \
     --port 30000 --host 0.0.0.0
 ```
 
@@ -111,9 +121,9 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-Our team is working on supporting more online quantization methods. We will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`
+Our team is working on supporting more online quantization methods. SGLang will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`.
 
-We also support quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
+SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
 
 ```bash
 python3 -m sglang.launch_server \
@@ -122,7 +132,7 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
-We support the following quantization methods based on torchao `["int8dq", "int8wo", "fp8wo", "fp8dq-per_tensor", "fp8dq-per_row", "int4wo-32", "int4wo-64", "int4wo-128", "int4wo-256"]`.
+SGLang supports the following quantization methods based on torchao `["int8dq", "int8wo", "fp8wo", "fp8dq-per_tensor", "fp8dq-per_row", "int4wo-32", "int4wo-64", "int4wo-128", "int4wo-256"]`.
 
 Note: According to [this issue](https://github.com/sgl-project/sglang/issues/2219#issuecomment-2561890230), `"int8dq"` method currently has some bugs when using together with cuda graph capture. So we suggest to disable cuda graph capture when using `"int8dq"` method. Namely, please use the following command:
 
@@ -133,8 +143,6 @@ python3 -m sglang.launch_server \
     --disable-cuda-graph \
     --port 30000 --host 0.0.0.0
 ```
-
-
 
 ## Reference
 

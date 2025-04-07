@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -42,7 +42,6 @@ class Sampler(nn.Module):
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
-        batch_next_token_ids: Optional[torch.Tensor] = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -72,8 +71,7 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            if batch_next_token_ids is None:
-                batch_next_token_ids = torch.argmax(logits, -1)
+            batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
@@ -94,42 +92,38 @@ class Sampler(nn.Module):
                         top_p_normalize_probs_torch(probs, sampling_info.top_ps)
                     ).clamp(min=torch.finfo(probs.dtype).min)
 
-                if batch_next_token_ids is None:
-                    max_top_k_round, batch_size = 32, probs.shape[0]
-                    uniform_samples = torch.rand(
-                        (max_top_k_round, batch_size), device=probs.device
+                max_top_k_round, batch_size = 32, probs.shape[0]
+                uniform_samples = torch.rand(
+                    (max_top_k_round, batch_size), device=probs.device
+                )
+                if sampling_info.need_min_p_sampling:
+                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    batch_next_token_ids = min_p_sampling_from_probs(
+                        probs, uniform_samples, sampling_info.min_ps
                     )
-                    if sampling_info.need_min_p_sampling:
-                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                        batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, uniform_samples, sampling_info.min_ps
-                        )
-                    else:
-                        batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
-                            probs,
-                            uniform_samples,
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            filter_apply_order="joint",
-                        )
-
-                        if self.use_nan_detection and not torch.all(success):
-                            logger.warning("Detected errors during sampling!")
-                            batch_next_token_ids = torch.zeros_like(
-                                batch_next_token_ids
-                            )
-
-            elif global_server_args_dict["sampling_backend"] == "pytorch":
-                if batch_next_token_ids is None:
-                    # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                else:
+                    batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
                         probs,
+                        uniform_samples,
                         sampling_info.top_ks,
                         sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
+                        filter_apply_order="joint",
                     )
+
+                    if self.use_nan_detection and not torch.all(success):
+                        logger.warning("Detected errors during sampling!")
+                        batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
+
+            elif global_server_args_dict["sampling_backend"] == "pytorch":
+                # A slower fallback implementation with torch native operations.
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                )
 
                 if return_logprob:
                     # clamp to avoid -inf
@@ -174,7 +168,7 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
-        return batch_next_token_ids.to(torch.int32)
+        return batch_next_token_ids
 
     def _apply_custom_logit_processor(
         self, logits: torch.Tensor, sampling_batch_info: SamplingBatchInfo

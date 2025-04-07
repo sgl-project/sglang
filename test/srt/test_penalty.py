@@ -10,11 +10,12 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestPenalty(unittest.TestCase):
+class TestPenalty(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -42,7 +43,7 @@ class TestPenalty(unittest.TestCase):
                 # prompt that is supposed to generate < 32 tokens
                 "text": "<|start_header_id|>user<|end_header_id|>\n\nWhat is the answer for 1 + 1 = ?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
                 "sampling_params": {
-                    "max_new_tokens": 32,
+                    "max_new_tokens": 48,
                     "n": n,
                     **sampling_params,
                 },
@@ -68,19 +69,22 @@ class TestPenalty(unittest.TestCase):
     def test_presence_penalty(self):
         self.run_decode({"presence_penalty": 2})
 
-    def test_mixed(self):
+    def test_penalty_mixed(self):
         args = [
             {},
             {},
             {},
             {"frequency_penalty": 2},
-            {"min_new_tokens": 16},
             {"presence_penalty": 1},
+            {"min_new_tokens": 16},
             {"frequency_penalty": 0.2},
-            {"min_new_tokens": 8},
             {"presence_penalty": 0.4},
-            {"presence_penalty": 0.4, "frequency_penalty": 2},
-            {"min_new_tokens": 12, "frequency_penalty": 2},
+            {"min_new_tokens": 8},
+            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"frequency_penalty": 0.4, "min_new_tokens": 12},
+            {"presence_penalty": 0.8, "min_new_tokens": 12},
+            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
+            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
         ]
         random.shuffle(args * 5)
         with ThreadPoolExecutor(8) as executor:

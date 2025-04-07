@@ -32,6 +32,7 @@ from sglang.lang.choices import (
 )
 from sglang.utils import LazyImport
 
+ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
@@ -67,6 +68,7 @@ __all__ = [
     "greedy_token_selection",
     "token_length_normalized",
     "unconditional_likelihood_normalized",
+    "ServerArgs",
     "Anthropic",
     "LiteLLM",
     "OpenAI",

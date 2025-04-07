@@ -178,11 +178,73 @@ python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1
 
 ### Example: Serving with 8 A100/A800 with AWQ Quantization
 
-AWQ does not support BF16, so add the `--dtype half` flag if AWQ is used for quantization. One example is as follows:
+Add `--quantization moe_wna16` flag to enable moe wna16 kernel for better performance.
+One example is as follows:
 
 ```bash
-python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --dtype half
+python3 -m sglang.launch_server --model cognitivecomputations/DeepSeek-R1-AWQ --tp 8 --trust-remote-code --quantization moe_wna16
 ```
+
+
+### Example: Serving with 16 A100/A800 with int8 Quantization
+
+There are block-wise and per-channel quantization methods, and the quantization parameters have already been uploaded to Huggingface. One example is as follows:
+
+- [meituan/DeepSeek-R1-Block-INT8](https://huggingface.co/meituan/DeepSeek-R1-Block-INT8)
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-INT8` and port=5000, we can have following commands to launch the server:
+```bash
+#master
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 0 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
+#cluster
+python3 -m sglang.launch_server \
+	--model meituan/DeepSeek-R1-Block-INT8 --tp 16 --dist-init-addr \
+	MASTER_IP:5000 --nnodes 2 --node-rank 1 --trust-remote-code --enable-torch-compile --torch-compile-max-bs 8
+```
+
+> **Note that the launch command here enables `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+
+Then on the **master node**, supposing the ShareGPT data is located at `/path/to/ShareGPT_V3_unfiltered_cleaned_split.json`, you can run the following commands to benchmark the launched server:
+
+```bash
+# bench accuracy
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
+
+# bench serving
+python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
+```
+
+> **Note: using `--parallel 200` can accelerate accuracy benchmarking**.
+
+### Example: Serving with 32 L40S with int8 Quantization
+
+Running with per-channel quantization model:
+
+- [meituan/DeepSeek-R1-Channel-INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8)
+
+Assuming that master node IP is `MASTER_IP`, checkpoint path is `/path/to/DeepSeek-R1-Channel-INT8` and port=5000, we can have following commands to launch the server:
+
+```bash
+#master
+python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 0 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+#cluster
+python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 1 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 2 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+python3 -m sglang.launch_server --model meituan/DeepSeek-R1-Channel-INT8 --tp 32 --quantization w8a8_int8 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 3 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+```
+
+The benchmarking method is the same as describted in the previous [16 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization) example.
 
 ### Example: Serving on any cloud or Kubernetes with SkyPilot
 

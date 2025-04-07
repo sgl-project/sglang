@@ -14,11 +14,12 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
 )
 
 
-class TestNightlyHumanEval(unittest.TestCase):
+class TestNightlyHumanEval(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if is_in_ci():

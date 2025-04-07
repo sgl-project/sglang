@@ -16,6 +16,7 @@ __all__ = [
     "ModelWeightParameter",
     "ChannelQuantScaleParameter",
     "GroupQuantScaleParameter",
+    "BlockQuantScaleParameter",
     "PackedColumnParameter",
     "RowvLLMParameter",
 ]
@@ -104,6 +105,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
+        tp_rank = kwargs.get("tp_rank")
         use_presharded_weights = kwargs.get("use_presharded_weights")
         if (
             isinstance(self, (PackedColumnParameter, PackedvLLMParameter))
@@ -115,7 +117,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = self.data
 
-        tp_rank = get_tensor_model_parallel_rank()
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         if not use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
@@ -216,6 +217,15 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     """
     Parameter class for weight scales loaded for weights with
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
+    """
+
+    pass
+
+
+class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
+    """
+    Parameter class for weight scales loaded for weights with
+    block-wise quantization. Uses both column and row parallelism.
     """
 
     pass

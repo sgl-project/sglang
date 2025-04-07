@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn import Module
-from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -13,13 +12,13 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]

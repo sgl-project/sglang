@@ -5,12 +5,6 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    apply_fp8_linear,
-    cutlass_fp8_supported,
-    requantize_with_max_scale,
-)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.linear import LinearBase, LinearMethodBase
@@ -18,6 +12,15 @@ from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScalePara
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    cutlass_fp8_supported,
+)
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    requantize_with_max_scale,
 )
 
 # Initialize logger for the module
@@ -161,6 +164,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
+        # cutlass sgl-kernel only supports per-channel scale
+        if self.cutlass_fp8_supported:
+            max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 

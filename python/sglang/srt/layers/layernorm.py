@@ -21,7 +21,9 @@ import torch.nn as nn
 
 from sglang.srt.utils import is_cuda_available
 
-if is_cuda_available():
+_is_cuda = is_cuda_available()
+
+if _is_cuda:
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -117,7 +119,27 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-if not is_cuda_available():
+class Gemma3RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+if not _is_cuda:
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )

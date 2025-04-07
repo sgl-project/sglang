@@ -56,7 +56,6 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         ]
 
     def _merge(self, their: "BatchedFrequencyPenalizer"):
-        print(f"{self.frequency_penalties.shape=}, {their.frequency_penalties.shape=}")
         self.frequency_penalties = torch.cat(
             [self.frequency_penalties, their.frequency_penalties], dim=0
         )

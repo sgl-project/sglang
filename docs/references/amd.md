@@ -1,10 +1,8 @@
 # SGLang on AMD
 
-## Introduction
-
 This document describes how to set up an AMD-based environment for [SGLang](https://github.com/sgl-project/sglang). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues) on the SGLang repository.
 
-## System Configure
+## System Configuration
 
 When using AMD GPUs (such as MI300X), certain system-level optimizations help ensure stable performance. Here we take MI300X as an example. AMD provides official documentation for MI300X optimization and system tuning:
 
@@ -13,9 +11,9 @@ When using AMD GPUs (such as MI300X), certain system-level optimizations help en
   - [AMD Instinct MI300X System Optimization](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html)
   - [AMD Instinct MI300X Workload Optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html)
 
-**NOTE:** We strongly recommend reading theses docs entirely guide to fully utilize your system.
+**NOTE:** We strongly recommend reading these docs and guides entirely to fully utilize your system.
 
-Below are a few key settings to confirm or enable:
+Below are a few key settings to confirm or enable for SGLang:
 
 ### Update GRUB Settings
 
@@ -56,51 +54,50 @@ pip install -e "python[all_hip]"
 
 1. Build the docker image.
 
-```bash
-docker build -t sglang_image -f Dockerfile.rocm .
-```
+   ```bash
+   docker build -t sglang_image -f Dockerfile.rocm .
+   ```
 
 2. Create a convenient alias.
 
-```bash
-alias drun='docker run -it --rm --network=host --privileged --device=/dev/kfd --device=/dev/dri \
-    --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    -v $HOME/dockerx:/dockerx \
-    -v /data:/data'
-```
+   ```bash
+   alias drun='docker run -it --rm --network=host --privileged --device=/dev/kfd --device=/dev/dri \
+       --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE \
+       --security-opt seccomp=unconfined \
+       -v $HOME/dockerx:/dockerx \
+       -v /data:/data'
+   ```
 
 If you are using RDMA, please note that:
 
 1. `--network host` and `--privileged` are required by RDMA. If you don't need RDMA, you can remove them.
 2. You may need to set `NCCL_IB_GID_INDEX` if you are using RoCE, for example: `export NCCL_IB_GID_INDEX=3`.
-
 3. Launch the server.
 
-**NOTE:** Replace `<secret>` below with your [huggingface hub token](https://huggingface.co/docs/hub/en/security-tokens).
+   **NOTE:** Replace `<secret>` below with your [huggingface hub token](https://huggingface.co/docs/hub/en/security-tokens).
 
-```bash
-drun -p 30000:30000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HF_TOKEN=<secret>" \
-    sglang_image \
-    python3 -m sglang.launch_server \
-    --model-path NousResearch/Meta-Llama-3.1-8B \
-    --host 0.0.0.0 \
-    --port 30000
-```
+   ```bash
+   drun -p 30000:30000 \
+       -v ~/.cache/huggingface:/root/.cache/huggingface \
+       --env "HF_TOKEN=<secret>" \
+       sglang_image \
+       python3 -m sglang.launch_server \
+       --model-path NousResearch/Meta-Llama-3.1-8B \
+       --host 0.0.0.0 \
+       --port 30000
+   ```
 
 4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.ai/backend/openai_api_completions.html) to send requests to the engine.
 
-```bash
-drun sglang_image \
-    python3 -m sglang.bench_serving \
-    --backend sglang \
-    --dataset-name random \
-    --num-prompts 4000 \
-    --random-input 128 \
-    --random-output 128
-```
+   ```bash
+   drun sglang_image \
+       python3 -m sglang.bench_serving \
+       --backend sglang \
+       --dataset-name random \
+       --num-prompts 4000 \
+       --random-input 128 \
+       --random-output 128
+   ```
 
 With your AMD system properly configured and SGLang installed, you can now fully leverage AMD hardware to power SGLang’s machine learning capabilities.
 
@@ -108,7 +105,7 @@ With your AMD system properly configured and SGLang installed, you can now fully
 
 ### Running DeepSeek-V3
 
-The only difference in running DeepSeek-V3 is when starting the server. Here's an example command:
+The only difference when running DeepSeek-V3 is in how you start the server. Here's an example command:
 
 ```bash
 drun -p 30000:30000 \
@@ -128,7 +125,7 @@ drun -p 30000:30000 \
 
 ### Running Llama3.1
 
-Running Llama3.1 is nearly identical. The only difference is in the model specified when starting the server, shown by the following example command:
+Running Llama3.1 is nearly identical to running DeepSeek-V3. The only difference is in the model specified when starting the server, shown by the following example command:
 
 ```bash
 drun -p 30000:30000 \
@@ -146,4 +143,4 @@ drun -p 30000:30000 \
 
 ### Warmup Step
 
-When the server displays "The server is fired up and ready to roll!", it means the startup is successful.
+When the server displays `The server is fired up and ready to roll!`, it means the startup is successful.

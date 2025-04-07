@@ -57,7 +57,7 @@ class BenchArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        # use the default value's type to case the args into correct types.
+        # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
