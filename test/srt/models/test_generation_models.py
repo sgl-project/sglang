@@ -135,7 +135,7 @@ class TestGenerationModels(CustomTestCase):
 
     def test_others(self):
         model_cases = (
-            ALL_OTHER_MODELS if is_in_ci() else [random.choice(ALL_OTHER_MODELS)]
+            ALL_OTHER_MODELS if not is_in_ci() else [random.choice(ALL_OTHER_MODELS)]
         )
         for model_case in model_cases:
             # Only run a specified model
