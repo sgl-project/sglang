@@ -37,9 +37,9 @@ class KVPoll:
     Success = 4
 
 
-RequestPoolType = Dict[int, Tuple[npt.NDArray[np.int32], Optional[int]]]
+RequestPoolType = Dict[int, Tuple[npt.NDArray[np.int64], Optional[int]]]
 WaitingPoolType = Dict[
-    int, Tuple[str, list[int], npt.NDArray[np.int32], list[int], int]
+    int, Tuple[str, list[int], npt.NDArray[np.int64], list[int], int]
 ]
 KVSENDER_POLLING_PORT = 17788
 KVRECEIVER_POLLING_PORT = 27788
@@ -86,9 +86,9 @@ class KVManager:
     def send_kvcache(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
+        prefill_kv_indices: npt.NDArray[np.int64],
         dst_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int64],
     ):
         layer_num = int(len(self.kv_args.kv_data_ptrs) / 2)
         for layer_id in range(layer_num):
@@ -181,10 +181,10 @@ class KVManager:
                 endpoint = endpoint.decode("ascii")
                 mooncake_session_id = mooncake_session_id.decode("ascii")
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
-                dst_ptrs = list(struct.unpack(f"{len(dst_ptrs)//8}q", dst_ptrs))
-                dst_kv_indices = np.frombuffer(dst_kv_indices, dtype=np.int32)
+                dst_ptrs = list(struct.unpack(f"{len(dst_ptrs)//8}Q", dst_ptrs))
+                dst_kv_indices = np.frombuffer(dst_kv_indices, dtype=np.int64)
                 dst_aux_ptrs = list(
-                    struct.unpack(f"{len(dst_aux_ptrs)//8}q", dst_aux_ptrs)
+                    struct.unpack(f"{len(dst_aux_ptrs)//8}Q", dst_aux_ptrs)
                 )
                 dst_aux_index = int(dst_aux_index.decode("ascii"))
                 self.waiting_pool[bootstrap_room] = (
@@ -264,7 +264,7 @@ class KVManager:
     def enqueue_request(
         self,
         bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int32],
+        kv_indices: npt.NDArray[np.int64],
         aux_index: Optional[int],
     ):
         self.request_pool[bootstrap_room] = (kv_indices, aux_index)
@@ -304,7 +304,7 @@ class KVSender:
         self.aux_index = aux_index
         self.num_kv_indices = num_kv_indices
 
-    def send(self, kv_indices: npt.NDArray[np.int32]):
+    def send(self, kv_indices: npt.NDArray[np.int64]):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, self.aux_index)
 
     def poll(self) -> KVPoll:
@@ -337,13 +337,13 @@ class KVReceiver:
         socket.connect(endpoint)
         return socket
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, aux_index)
         packed_kv_data_ptrs = b"".join(
-            struct.pack("q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
         packed_aux_data_ptrs = b"".join(
-            struct.pack("q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
         )
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [

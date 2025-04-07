@@ -24,6 +24,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -187,6 +188,7 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
+                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (
