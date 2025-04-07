@@ -23,7 +23,6 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 
-
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("MOE_PADDING", "0"))) else 0
 
@@ -1079,6 +1078,7 @@ def inplace_fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1099,6 +1099,7 @@ def inplace_fused_experts(
         topk_ids,
         True,
         activation,
+        apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
@@ -1120,6 +1121,7 @@ def inplace_fused_experts_fake(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1150,6 +1152,7 @@ def outplace_fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1171,6 +1174,7 @@ def outplace_fused_experts(
         topk_ids,
         False,
         activation,
+        apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
@@ -1193,6 +1197,7 @@ def outplace_fused_experts_fake(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1225,6 +1230,7 @@ def fused_experts(
     topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1247,6 +1253,7 @@ def fused_experts(
             topk_weights,
             topk_ids,
             activation,
+            apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1268,6 +1275,7 @@ def fused_experts(
             topk_weights,
             topk_ids,
             activation,
+            apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -1291,6 +1299,7 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     inplace: bool = False,
     activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
@@ -1423,7 +1432,7 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            False,
+            apply_router_weight_on_input,
             topk_ids.shape[1],
             config,
             compute_type=compute_type,
@@ -1456,7 +1465,7 @@ def fused_experts_impl(
             (
                 intermediate_cache3
                 if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx]
+                else out_hidden_states[begin_chunk_idx:end_chunk_idx].unsqueeze(0)
             ),
             a2_scale,
             w2_scale,
@@ -1466,7 +1475,7 @@ def fused_experts_impl(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            True,
+            not apply_router_weight_on_input,
             1,
             config,
             compute_type=compute_type,

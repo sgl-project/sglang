@@ -847,3 +847,68 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def compute_shared_experts_fusion_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    n_share_experts_fusion: Optional[int],
+    n_routed_experts: int,
+    moe_layer_ids: Iterable[int],
+    suffix_list: List[str],
+    shared_expert_name_template: str,
+    routed_expert_name_template: str,
+):
+    if n_share_experts_fusion is None or n_share_experts_fusion == 0:
+        return weights
+
+    weights_list = list(weights)
+    weights_dict = dict(weights_list)
+    names_to_remove = []
+    for moe_layer_id in tqdm(
+        moe_layer_ids,
+        desc=f"Cloning {n_share_experts_fusion} "
+        "replicas of the shared expert into MoE",
+    ):
+        for repeat_index in range(n_share_experts_fusion):
+            for suffix in suffix_list:
+                shared_expert_weight_name = shared_expert_name_template.format(
+                    moe_layer_id=moe_layer_id, suffix=suffix
+                )
+                weights_list.append(
+                    (
+                        routed_expert_name_template.format(
+                            moe_layer_id=moe_layer_id,
+                            expert_index=n_routed_experts + repeat_index,
+                            suffix=suffix,
+                        ),
+                        # TODO is it ok we remove `clone`?
+                        # weights_dict[shared_expert_weight_name].clone(),
+                        weights_dict[shared_expert_weight_name],
+                    )
+                )
+                names_to_remove += [shared_expert_weight_name]
+    return [w for w in weights_list if w[0] not in names_to_remove]
+
+
+# TODO update deepseek v2 later using this
+def _how_deepseek_v2_should_call_it(self, weights):
+    weights = compute_shared_experts_fusion_weights(
+        weights,
+        n_share_experts_fusion=self.n_share_experts_fusion,
+        n_routed_experts=self.config.n_routed_experts,
+        moe_layer_ids=range(
+            self.config.first_k_dense_replace,
+            self.config.num_hidden_layers,
+            self.config.moe_layer_freq,
+        ),
+        suffix_list=[
+            "down_proj.weight",
+            "down_proj.weight_scale_inv",
+            "gate_proj.weight",
+            "gate_proj.weight_scale_inv",
+            "up_proj.weight",
+            "up_proj.weight_scale_inv",
+        ],
+        shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
+        routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
+    )
