@@ -285,6 +285,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         activation: str = "silu",
         inplace: bool = True,
         no_combine: bool = False,
+        apply_router_weight_on_input: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
@@ -314,6 +315,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
 
