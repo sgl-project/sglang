@@ -425,7 +425,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-tokenizer-batch-encode",
             action="store_true",
-            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds."
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         )
         parser.add_argument(
             "--load-format",

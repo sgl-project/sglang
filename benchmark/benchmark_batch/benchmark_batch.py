@@ -1,15 +1,15 @@
+import concurrent.futures
+import os
 import random
 import time
-import requests
-import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
 from statistics import mean
+
+import requests
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from concurrent.futures import ProcessPoolExecutor
-import os
 
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import http_request
 
 ###############################################################################
 # CONFIG
@@ -22,6 +22,7 @@ NUM_REQUESTS = 10  # Total number of requests (each with BATCH_SIZE prompts)
 NUM_TOKENS = 32000  # Tokens per prompt
 BATCH_SIZE = 8  # Number of prompts per request
 GEN_TOKENS = 0  # Tokens to generate per prompt
+
 
 ###############################################################################
 # REQUEST GENERATION (in parallel)
@@ -59,11 +60,12 @@ def prepare_all_prompts(num_requests, batch_size, num_tokens, tokenizer_dir):
             all_prompts[index] = future.result()
 
     batched_prompts = [
-        all_prompts[i * batch_size:(i + 1) * batch_size]
-        for i in range(num_requests)
+        all_prompts[i * batch_size : (i + 1) * batch_size] for i in range(num_requests)
     ]
 
-    print(f"Generated {total_prompts} prompts with {num_tokens} tokens each, grouped into {num_requests} requests of {batch_size} prompts.\n")
+    print(
+        f"Generated {total_prompts} prompts with {num_tokens} tokens each, grouped into {num_requests} requests of {batch_size} prompts.\n"
+    )
     return batched_prompts
 
 
@@ -78,10 +80,12 @@ def send_batch_request(endpoint, prompts, gen_tokens, request_id):
         "stop": "\n",
     }
     data = {"text": prompts, "sampling_params": sampling_params}
-    
+
     start_time = time.time()
     try:
-        response = requests.post(endpoint.base_url + "/generate", json=data, timeout=3600)
+        response = requests.post(
+            endpoint.base_url + "/generate", json=data, timeout=3600
+        )
         if response.status_code != 200:
             error = response.json()
             raise RuntimeError(f"Request {request_id} failed: {error}")
@@ -98,21 +102,25 @@ def run_benchmark(endpoint, batched_prompts, batch_size, gen_tokens):
     """Run the benchmark sequentially."""
     results = []
     num_requests = len(batched_prompts)
-    
+
     # Record start time for total latency
     benchmark_start_time = time.time()
-    
+
     for i, batch_prompts in enumerate(batched_prompts):
         request_id = i + 1
-        assert len(batch_prompts) == batch_size, f"Request {request_id} should have {batch_size} prompts, got {len(batch_prompts)}"
-        
-        print(f"[Request] Sending request {request_id}/{num_requests} with {len(batch_prompts)} prompts at {int(time.time()*1000)}")
+        assert (
+            len(batch_prompts) == batch_size
+        ), f"Request {request_id} should have {batch_size} prompts, got {len(batch_prompts)}"
+
+        print(
+            f"[Request] Sending request {request_id}/{num_requests} with {len(batch_prompts)} prompts at {int(time.time()*1000)}"
+        )
         result = send_batch_request(endpoint, batch_prompts, gen_tokens, request_id)
         results.append(result)
 
     # Calculate total latency
     total_latency = (time.time() - benchmark_start_time) * 1000  # Convert to ms
-    
+
     return results, total_latency
 
 
@@ -161,14 +169,20 @@ def main():
     endpoint = RuntimeEndpoint(ENDPOINT_URL)
 
     # Generate prompts
-    batched_prompts = prepare_all_prompts(NUM_REQUESTS, BATCH_SIZE, NUM_TOKENS, TOKENIZER_DIR)
+    batched_prompts = prepare_all_prompts(
+        NUM_REQUESTS, BATCH_SIZE, NUM_TOKENS, TOKENIZER_DIR
+    )
 
     # Flush cache before benchmark
     # endpoint.flush_cache()
 
     # Run benchmark
-    print(f"Starting benchmark: NUM_TOKENS={NUM_TOKENS}, BATCH_SIZE={BATCH_SIZE}, NUM_REQUESTS={NUM_REQUESTS}\n")
-    results, total_latency = run_benchmark(endpoint, batched_prompts, BATCH_SIZE, GEN_TOKENS)
+    print(
+        f"Starting benchmark: NUM_TOKENS={NUM_TOKENS}, BATCH_SIZE={BATCH_SIZE}, NUM_REQUESTS={NUM_REQUESTS}\n"
+    )
+    results, total_latency = run_benchmark(
+        endpoint, batched_prompts, BATCH_SIZE, GEN_TOKENS
+    )
 
     # Process and display results
     process_results(results, total_latency, NUM_REQUESTS)

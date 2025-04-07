@@ -405,12 +405,12 @@ class TokenizerManager:
             input_ids = image_inputs["input_ids"]
 
         self._validate_token_len(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids, input_embeds, image_inputs)
+        return self._create_tokenized_object(
+            obj, input_text, input_ids, input_embeds, image_inputs
+        )
 
     def _validate_token_len(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        input_ids: List[int]
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
@@ -424,7 +424,10 @@ class TokenizerManager:
 
         # Check total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if max_new_tokens is not None and (max_new_tokens + input_token_num) >= self.context_len:
+        if (
+            max_new_tokens is not None
+            and (max_new_tokens + input_token_num) >= self.context_len
+        ):
             total_tokens = max_new_tokens + input_token_num
             error_msg = (
                 f"Requested token count exceeds the model's maximum context length "
@@ -489,9 +492,7 @@ class TokenizerManager:
         return tokenized_obj
 
     async def _batch_tokenize_and_process(
-        self,
-        batch_size: int,
-        obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
@@ -509,24 +510,30 @@ class TokenizerManager:
         for i, req in enumerate(requests):
             self._validate_token_len(obj[i], input_ids_list[i])
             tokenized_objs.append(
-                self._create_tokenized_object(req, req.text, input_ids_list[i], None, None)
+                self._create_tokenized_object(
+                    req, req.text, input_ids_list[i], None, None
+                )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
     def _validate_batch_tokenization_constraints(
-        self,
-        batch_size: int,
-        obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
             if self.is_generation and obj[i].image_data:
-                raise ValueError("For image input processing do not set `enable_tokenizer_batch_encode`.")
+                raise ValueError(
+                    "For image input processing do not set `enable_tokenizer_batch_encode`."
+                )
             if obj[i].input_ids is not None:
-                raise ValueError("Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`.")
+                raise ValueError(
+                    "Batch tokenization is not needed for pre-tokenized input_ids. Do not set `enable_tokenizer_batch_encode`."
+                )
             if obj[i].input_embeds is not None:
-                raise ValueError("Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`.")
+                raise ValueError(
+                    "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
+                )
 
     def _send_one_request(
         self,
@@ -612,17 +619,17 @@ class TokenizerManager:
                 self._validate_batch_tokenization_constraints(batch_size, obj)
 
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                
+
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing           
+                # Sequential tokenization and processing
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)                    
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
