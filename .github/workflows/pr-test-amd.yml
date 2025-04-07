@@ -38,12 +38,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.3.post4-rocm630
+          docker pull lmsysorg/sglang:v0.4.5-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${HF_TOKEN} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.3.post4-rocm630
+            lmsysorg/sglang:v0.4.5-rocm630
 
       - name: Install dependencies
         run: |
@@ -56,7 +56,7 @@ jobs:
           docker exec -w /human-eval ci_sglang pip install -e .
 
           docker exec -w / ci_sglang mkdir -p /dummy-grok
-          docker exec ci_sglang apt update && apt install -y wget
+          docker exec ci_sglang sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update && apt install -y apt-transport-https ca-certificates wget
           docker exec -w /dummy-grok ci_sglang wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json
 
       - name: Evaluate Accuracy
@@ -83,12 +83,12 @@ jobs:
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
-          docker pull lmsysorg/sglang:v0.4.3.post4-rocm630
+          docker pull lmsysorg/sglang:v0.4.5-rocm630
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             -v ${{ github.workspace }}:/sglang-checkout --ipc=host --group-add video \
             --cap-add=SYS_PTRACE -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} --security-opt seccomp=unconfined \
             -w /sglang-checkout --name ci_sglang \
-            lmsysorg/sglang:v0.4.3.post4-rocm630
+            lmsysorg/sglang:v0.4.5-rocm630
 
       - name: Install dependencies
         run: |
