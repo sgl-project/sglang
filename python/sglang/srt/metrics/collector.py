@@ -27,6 +27,11 @@ class SchedulerStats:
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
     spec_accept_length: float = 0.0
+    mempool_size: int = 0
+    mempool_available_size: int = 0
+    tree_cache_size: int = 0
+    tree_cache_evictable_size: int = 0
+    retract_count: int = 0
 
 
 class SchedulerMetricsCollector:
@@ -87,6 +92,41 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.mempool_size = Gauge(
+            name="sglang:mempool_size",
+            documentation="The size of the memory pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.mempool_available_size = Gauge(
+            name="sglang:mempool_available_size",
+            documentation="The available size of the memory pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.tree_cache_size = Gauge(
+            name="sglang:tree_cache_size",
+            documentation="The size of the tree cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.tree_cache_evictable_size = Gauge(
+            name="sglang:tree_cache_evictable_size",
+            documentation="The size of the evictable tree cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.retract_count = Gauge(
+            name="sglang:retract_count",
+            documentation="The number of retracted requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -99,6 +139,11 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.mempool_size, stats.mempool_size)
+        self._log_gauge(self.mempool_available_size, stats.mempool_available_size)
+        self._log_gauge(self.tree_cache_size, stats.tree_cache_size)
+        self._log_gauge(self.tree_cache_evictable_size, stats.tree_cache_evictable_size)
+        self._log_gauge(self.retract_count, stats.retract_count)
         self.last_log_time = time.time()
 
 

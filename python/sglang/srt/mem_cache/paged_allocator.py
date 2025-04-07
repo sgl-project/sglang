@@ -190,6 +190,9 @@ class PagedTokenToKVPoolAllocator:
     def available_size(self):
         return len(self.free_pages) * self.page_size
 
+    def total_size(self):
+        return self.size
+
     def get_kvcache(self):
         return self._kvcache
 

@@ -517,6 +517,8 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        # The number of retracted requests
+        self.retract_count = 0
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
@@ -1031,6 +1033,14 @@ class Scheduler(
             self._largest_prefill_len, adder.log_input_tokens
         )
 
+        mempool_size = self.token_to_kv_pool_allocator.total_size()
+        mempool_available_size = self.token_to_kv_pool_allocator.available_size()
+        tree_cache_size = self.tree_cache.total_size()
+        tree_cache_evictable_size = self.tree_cache.evictable_size()
+        cache_hit_rate = adder.log_hit_tokens / (
+            adder.log_input_tokens + adder.log_hit_tokens
+        )
+
         f = (
             f"Prefill batch. "
             f"#new-seq: {len(can_run_list)}, "
@@ -1039,18 +1049,22 @@ class Scheduler(
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
+            f"mempool size: {mempool_size}, available size: {mempool_available_size}, "
+            f"tree cache size: {tree_cache_size}, evictable size: {tree_cache_evictable_size}, "
+            f"cache hit rate: {cache_hit_rate:.2f}, "
         )
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / (
-                adder.log_input_tokens + adder.log_hit_tokens
-            )
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.mempool_size = mempool_size
+            self.stats.mempool_available_size = mempool_available_size
+            self.stats.tree_cache_size = tree_cache_size
+            self.stats.tree_cache_evictable_size = tree_cache_evictable_size
             self.metrics_collector.log_stats(self.stats)
 
     def log_decode_stats(self):
@@ -1069,6 +1083,11 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
+        mempool_size = self.token_to_kv_pool_allocator.total_size()
+        mempool_available_size = self.token_to_kv_pool_allocator.available_size()
+        tree_cache_size = self.tree_cache.total_size()
+        tree_cache_evictable_size = self.tree_cache.evictable_size()
+
         if self.spec_algorithm.is_none():
             msg = (
                 f"Decode batch. "
@@ -1077,6 +1096,9 @@ class Scheduler(
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
+                f"mempool size: {mempool_size}, available size: {mempool_available_size}, "
+                f"tree cache size: {tree_cache_size}, evictable size: {tree_cache_evictable_size}, "
+                f"retract count: {self.retract_count}, "
             )
             spec_accept_length = 0
         else:
@@ -1094,6 +1116,9 @@ class Scheduler(
                 f"accept len: {spec_accept_length:.2f}, "
                 f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
                 f"#queue-req: {len(self.waiting_queue)}, "
+                f"mempool size: {mempool_size}, available size: {mempool_available_size}, "
+                f"tree cache size: {tree_cache_size}, evictable size: {tree_cache_evictable_size}, "
+                f"retract count: {self.retract_count}, "
             )
 
         logger.info(msg)
@@ -1105,6 +1130,11 @@ class Scheduler(
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.mempool_size = mempool_size
+            self.stats.mempool_available_size = mempool_available_size
+            self.stats.tree_cache_size = tree_cache_size
+            self.stats.tree_cache_evictable_size = tree_cache_evictable_size
+            self.stats.retract_count = self.retract_count
             self.metrics_collector.log_stats(self.stats)
 
     def check_memory(self):
@@ -1362,6 +1392,7 @@ class Scheduler(
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
             self._extend_requests_to_queue(retracted_reqs)
+            self.retract_count += len(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,

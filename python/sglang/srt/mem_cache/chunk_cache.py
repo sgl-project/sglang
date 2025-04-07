@@ -63,3 +63,6 @@ class ChunkCache(BasePrefixCache):
 
     def pretty_print(self):
         return ""
+
+    def total_size(self):
+        return 0
