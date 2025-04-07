@@ -22,6 +22,7 @@ To test a specific model:
 import dataclasses
 import multiprocessing as mp
 import os
+import random
 import unittest
 from typing import List
 
@@ -133,10 +134,10 @@ class TestGenerationModels(CustomTestCase):
                 )
 
     def test_others(self):
-        if is_in_ci():
-            return
-
-        for model_case in ALL_OTHER_MODELS:
+        model_cases = (
+            ALL_OTHER_MODELS if is_in_ci() else [random.choice(ALL_OTHER_MODELS)]
+        )
+        for model_case in model_cases:
             # Only run a specified model
             if (
                 "ONLY_RUN" in os.environ
