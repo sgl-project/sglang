@@ -51,7 +51,6 @@ except ImportError:
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -203,6 +202,8 @@ def get_linear_quant_method(
 
 
 def gptq_get_quant_method(self, layer, prefix):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
 
@@ -279,6 +280,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
     ):
