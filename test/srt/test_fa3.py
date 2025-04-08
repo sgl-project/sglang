@@ -106,7 +106,7 @@ class TestFlashAttention3DisableCudaGraph(BaseFlashAttentionTest):
 
 
 class TestFlashAttention3MLA(BaseFlashAttentionTest):
-    """Test FlashAttention3 with MLA disabled."""
+    """Test FlashAttention3 with MLA."""
 
     model = MODEL_USED_FOR_TEST_MLA
 
@@ -120,7 +120,7 @@ class TestFlashAttention3MLA(BaseFlashAttentionTest):
             ]
         )
         return args
-    
+
 
 class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
     """Test FlashAttention3 with speculative decode enabled."""
