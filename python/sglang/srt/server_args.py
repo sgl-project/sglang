@@ -196,6 +196,9 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
 
+    # For PD colocation using POD Attention
+    enable_pd_colocation: bool = False
+    
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -1175,11 +1178,20 @@ class ServerArgs:
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
+<<<<<<< HEAD
         parser.add_argument(
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
             help="The backend for disaggregation transfer. Default is mooncake.",
+=======
+        
+        # Colocation
+        parser.add_argument(
+            "--enable-pd-colocation",
+            action="store_true",
+            help="Enable colocation of prefill and decode batches into one kernel.",
+>>>>>>> POD Attn with valid output!
         )
 
     @classmethod
@@ -1211,7 +1223,21 @@ class ServerArgs:
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
-
+        
+        if self.enable_pd_colocation:
+            assert self.disaggregation_mode == "null", \
+                "PD colocation cannot run with disaggregation."
+            assert self.attention_backend == "flashinfer", \
+                "PD colocation is only backed by flashinfer attention backend."
+            assert self.enable_mixed_chunk, \
+                "Chunked prefill must be enabled for colocation of Prefill and Decode batches."
+            assert self.disable_cuda_graph, \
+                "CUDA graph will be supported for PD colocation soon" #TODO(Wenxuan)
+            assert self.page_size == 1, \
+                "Page size > 1 for PD colocation to be supported" 
+            assert self.speculative_algorithm is None, \
+                "Speculative decoding to be supported for PD colocation"
+                
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
             self.lora_paths = {}

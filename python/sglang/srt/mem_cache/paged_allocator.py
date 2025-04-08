@@ -134,6 +134,7 @@ def alloc_decode_kernel(
 
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (pre_lens + page_size - 1) // page_size
+    # Each sequence allocates at most one new page for one decoded token
     num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (

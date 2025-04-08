@@ -180,6 +180,8 @@ class ForwardBatch:
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    num_decode_reqs: Optional[int] = 0
+
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
@@ -290,6 +292,7 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_decode_reqs=batch.num_decode_reqs,
         )
 
         # For DP attention

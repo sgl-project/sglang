@@ -492,7 +492,6 @@ def match_llama3_instruct(model_path: str):
 
 @register_chat_template_matching_function
 def match_chat_ml(model_path: str):
-    # import pdb;pdb.set_trace()
     model_path = model_path.lower()
     if "tinyllama" in model_path:
         return get_chat_template("chatml")

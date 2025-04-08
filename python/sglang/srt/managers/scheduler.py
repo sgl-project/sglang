@@ -189,7 +189,8 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-
+        self.enable_colocation = server_args.enable_pd_colocation
+        
         # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
@@ -1279,6 +1280,7 @@ class Scheduler(
         )
         new_batch.prepare_for_extend()
 
+        
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -1286,6 +1288,7 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -1353,6 +1356,7 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+                # Push a new batch to the queue             
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )

@@ -245,6 +245,7 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # + page_size to ensure size is a multiple of page_size
             self.k_buffer = [
                 torch.zeros(
                     (self.size + self.page_size, self.head_num, self.head_dim),
