@@ -190,7 +190,7 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
         self.enable_colocation = server_args.enable_pd_colocation
-        
+
         # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.dp_rank = (
@@ -1280,7 +1280,6 @@ class Scheduler(
         )
         new_batch.prepare_for_extend()
 
-        
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -1356,7 +1355,7 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-                # Push a new batch to the queue             
+                # Push a new batch to the queue
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )

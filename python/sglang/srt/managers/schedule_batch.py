@@ -1534,9 +1534,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            num_decode_reqs=(len(self.reqs) - len(self.decoding_reqs) 
-                             if self.forward_mode.is_mixed()
-                             else 0),
+            num_decode_reqs=(
+                len(self.reqs) - len(self.decoding_reqs)
+                if self.forward_mode.is_mixed()
+                else 0
+            ),
         )
 
     def copy(self):
@@ -1594,7 +1596,7 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
-    
+
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]
 
@@ -1618,9 +1620,9 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    
+
     # For PD colocation, number of extend-only requests in chunked prefill
-    num_decode_reqs: Optional[int] = 0 
+    num_decode_reqs: Optional[int] = 0
 
 
 @triton.jit

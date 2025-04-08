@@ -879,9 +879,9 @@ class ModelRunner:
             # Init streams
             if self.server_args.speculative_algorithm == "EAGLE":
                 self.plan_stream_for_flashinfer = torch.cuda.Stream()
-            self.attn_backend = FlashInferAttnBackend(self,
-                                                      enable_pd_colocation=self.server_args.enable_pd_colocation
-                                                      )
+            self.attn_backend = FlashInferAttnBackend(
+                self, enable_pd_colocation=self.server_args.enable_pd_colocation
+            )
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
@@ -1011,8 +1011,7 @@ class ModelRunner:
                 forward_batch,
                 get_embedding=True,
             )
-            
-    
+
     def forward_idle(self, forward_batch: ForwardBatch):
         return self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
@@ -1031,10 +1030,8 @@ class ModelRunner:
             )
 
         if forward_batch.forward_mode.is_decode():
-            print("Decode batch")
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
-            print("Prefill batch")
             return self.forward_extend(
                 forward_batch, skip_attn_backend_init=skip_attn_backend_init
             )
