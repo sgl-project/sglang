@@ -289,14 +289,14 @@ class ModelOptFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.attention.layer import Attention  # Avoid circular import
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules):
                 return UnquantizedLinearMethod()
             return ModelOptFp4LinearMethod(self)
-        elif isinstance(layer, Attention):
+        elif isinstance(layer, AttentionBackend):
             return ModelOptFp8KVCacheMethod(self)
+
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -406,7 +406,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
-        if scales.ndim == 2:
+        scale_ndim = scales.ndim
+        if scale_ndim == 2:
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
@@ -420,9 +421,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert cols % 4 == 0
         padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
         padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
-        layer.weight_scale_interleaved = Parameter(
-            padded_scales.contiguous().cuda(), requires_grad=False
-        )
+        padded_scales = padded_scales.contiguous().cuda()
+        padded_scales = padded_scales.reshape(M, K) if scale_ndim == 2 else padded_scales.reshape(B, M, K)
+        layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
 
     def apply(
         self,
