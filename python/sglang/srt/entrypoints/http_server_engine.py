@@ -73,7 +73,7 @@ class HttpServerEngineForRL(EngineBase):
         flush_cache: bool = False,
     ):
         """
-        Update model weights from tensor data.
+        Update model weights from tensor data. The HTTPS server will only post meta data, and the real weights will be copied directly from GPUs.
 
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
