@@ -208,7 +208,7 @@ class TokenizerManager:
                 )
 
         # Store states
-        self.no_create_loop = False
+        self._chosen_loop = None
         self.rid_to_state: Dict[str, ReqState] = {}
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
@@ -860,11 +860,14 @@ class TokenizerManager:
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if self.no_create_loop:
+        if self._chosen_loop is not None:
+            assert (
+                asyncio.get_event_loop() == self._chosen_loop
+            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {asyncio.get_event_loop()}"
             return
 
-        self.no_create_loop = True
         loop = asyncio.get_event_loop()
+        self._chosen_loop = loop
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
