@@ -763,9 +763,7 @@ class FlashAttentionBackend(AttentionBackend):
             "cu_seqlens_q": torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            "cu_seqlens_k": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
+            # cu_seqlens_k will be computed in capture_cuda_graph
             "page_table": torch.zeros(
                 max_bs,
                 (self.max_context_len + self.page_size - 1) // self.page_size,
@@ -785,9 +783,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.target_verify_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens_q": torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            ),
+            # cu_seqlens_q will be computed in capture_cuda_graph
             "cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
