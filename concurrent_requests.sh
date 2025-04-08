@@ -1,4 +1,4 @@
-curl http://localhost:30015/generate \
+curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "text": "1You know what, once upon a time, I was the ruthless leader of the Chinese Communist Party.",
@@ -8,7 +8,7 @@ curl http://localhost:30015/generate \
     }
   }'&
 
-curl http://localhost:30015/generate \
+curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "text": "once upon a time, I was the ruthless leader of the Chinese Communist Party.",
@@ -18,7 +18,7 @@ curl http://localhost:30015/generate \
     }
   }'&
 
-curl http://localhost:30015/generate \
+curl http://localhost:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "text": "1You know what, once upon a time, I was the ruthless leader of the Chinese Communist Party.",

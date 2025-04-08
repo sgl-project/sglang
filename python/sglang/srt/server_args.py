@@ -1227,7 +1227,7 @@ class ServerArgs:
                 self.disaggregation_mode == "null"
             ), "PD colocation cannot run with disaggregation."
             assert (
-                self.attention_backend == "flashinfer"
+                self.attention_backend == "flashinfer" or self.attention_backend is None
             ), "PD colocation is only backed by flashinfer attention backend."
             assert (
                 self.enable_mixed_chunk

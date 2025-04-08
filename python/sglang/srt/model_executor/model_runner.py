@@ -870,18 +870,20 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                self.attn_backend = FlashInferAttnBackend(self)
+                self.attn_backend = FlashInferAttnBackend(
+                    self, enable_pd_colocation=self.server_args.enable_pd_colocation
+                )
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
                 )
 
-            # Init streams
-            if self.server_args.speculative_algorithm == "EAGLE":
-                self.plan_stream_for_flashinfer = torch.cuda.Stream()
-            self.attn_backend = FlashInferAttnBackend(
-                self, enable_pd_colocation=self.server_args.enable_pd_colocation
-            )
+                # Init streams
+                if self.server_args.speculative_algorithm == "EAGLE":
+                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
+                self.attn_backend = FlashInferAttnBackend(
+                    self, enable_pd_colocation=self.server_args.enable_pd_colocation
+                )
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
