@@ -138,6 +138,7 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        ep_back_mapping_tensor: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -198,6 +199,8 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+        self.ep_back_mapping_tensor = ep_back_mapping_tensor.to(torch.cuda.current_device()) if ep_back_mapping_tensor is not None else None
+
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
@@ -218,6 +221,13 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
         )
+        
+        if torch.distributed.get_rank() == 0:
+            print(f"topk_ids before: {topk_ids}")
+        if self.ep_back_mapping_tensor is not None:
+            topk_ids = self.ep_back_mapping_tensor[topk_ids]
+        if torch.distributed.get_rank() == 0:
+            print(f"topk_ids after: {topk_ids}")
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
@@ -406,6 +416,7 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        expert_id = self.ep_back_mapping_tensor[expert_id] if self.ep_back_mapping_tensor is not None else expert_id
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
         expert_id = expert_id - self.start_expert_id
@@ -1046,9 +1057,9 @@ class DeepEPMoE(EPMoE):
         return down_output
 
 
-class PermutedEPMoE(EPMoE):
+class EPLBMoE(EPMoE):
     """
-    MOE EP with permuted expert loading.
+    MOE EP with load balance expert loading.
     """
     def __init__(
         self,
@@ -1067,7 +1078,7 @@ class PermutedEPMoE(EPMoE):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
-        layer_ep_load_tensor: torch.Tensor = None,
+        ep_back_mapping_tensor: torch.Tensor = None,
     ):
         super().__init__(
             num_experts,
@@ -1086,9 +1097,181 @@ class PermutedEPMoE(EPMoE):
             custom_routing_function,
             activation,
         )
-        self.layer_ep_load_tensor = layer_ep_load_tensor[self.start_expert_id:self.end_expert_id]
-        # print(f"Layer {self.layer_id} is loading, tp_rank {self.tp_rank}, load tensor for this layer: {self.layer_ep_load_tensor}")
-    
+        self.ep_back_mapping_tensor = ep_back_mapping_tensor.to(torch.cuda.current_device())
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        assert self.quant_method is not None
+
+        if self.grouped_gemm_runner is None:
+            self.grouped_gemm_runner = GroupedGemmRunner(
+                hidden_states.device,
+                use_flashinfer=False,  # TODO: use flashinfer
+            )
+
+        topk_weights, real_topk_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            use_grouped_topk=self.use_grouped_topk,
+            renormalize=self.renormalize,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            correction_bias=self.correction_bias,
+            custom_routing_function=self.custom_routing_function,
+        )
+        topk_ids = self.ep_back_mapping_tensor[real_topk_ids]
+
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+            topk_ids, self.num_experts
+        )
+
+        gateup_input = torch.empty(
+            (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=(
+                self.fp8_dtype
+                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+            max_value = (
+                torch.max(hidden_states)
+                .repeat(self.num_experts_per_partition)
+                .to(torch.float32)
+            )
+            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+
+        # PreReorder
+        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            self.w13_input_scale,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.top_k,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+        )
+
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        weight_indices_cur_rank = torch.arange(
+            0,
+            self.num_experts_per_partition,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
+        # GroupGemm-0
+        gateup_output = torch.empty(
+            gateup_input.shape[0],
+            self.w13_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        gateup_output = self.grouped_gemm_runner(
+            a=gateup_input,
+            b=self.w13_weight,
+            c=gateup_output,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w13_input_scale,
+            scale_b=(
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+
+        # Act
+        down_input = torch.empty(
+            gateup_output.shape[0],
+            gateup_output.shape[1] // 2,
+            device=gateup_output.device,
+            dtype=(
+                self.fp8_dtype
+                if (self.use_fp8_w8a8 and not self.use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
+        if self.w2_input_scale is None and not self.use_block_quant:
+            self.w2_input_scale = torch.ones(
+                self.num_experts_per_partition,
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+        if self.activation == "silu":
+            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                self.w2_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        elif self.activation == "gelu":
+            gelu_and_mul_triton_kernel[(gateup_output.shape[0],)](
+                gateup_output,
+                down_input,
+                gateup_output.shape[1],
+                reorder_topk_ids,
+                self.w2_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                BLOCK_SIZE=512,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        # GroupGemm-1
+        down_output = torch.empty(
+            down_input.shape[0],
+            self.w2_weight.shape[1],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        down_output = self.grouped_gemm_runner(
+            a=down_input,
+            b=self.w2_weight,
+            c=down_output,
+            batch_size=self.num_experts_per_partition,
+            weight_column_major=True,
+            seg_indptr=seg_indptr_cur_rank,
+            weight_indices=weight_indices_cur_rank,
+            use_fp8_w8a8=self.use_fp8_w8a8,
+            scale_a=self.w2_input_scale,
+            scale_b=(
+                self.w2_weight_scale_inv
+                if self.use_block_quant
+                else self.w2_weight_scale
+            ),
+            block_shape=self.block_shape,
+        )
+
+        # PostReorder
+        output = torch.empty_like(hidden_states)
+        post_reorder_triton_kernel[(hidden_states.size(0),)](
+            down_output,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.top_k,
+            hidden_states.size(1),
+            BLOCK_SIZE=512,
+        )
+        return output
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -1101,7 +1284,7 @@ class PermutedEPMoE(EPMoE):
             return
         
         # Find the index of the expert_id in the layer_ep_load_tensor
-        expert_id = (self.layer_ep_load_tensor == expert_id).nonzero(as_tuple=True)[0].item()
+        expert_id = expert_id - self.start_expert_id
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
