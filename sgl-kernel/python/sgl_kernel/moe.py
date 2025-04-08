@@ -34,7 +34,9 @@ def topk_softmax(
     )
 
 
-def moe_fused_gate(input_tensor, bias, num_expert_group, topk_group, topk, n_share_experts_fusion=0):
+def moe_fused_gate(
+    input_tensor, bias, num_expert_group, topk_group, topk, n_share_experts_fusion=0
+):
     # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
     # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
     # as the group weight to select exerpt groups and then select topk experts within the selected groups

@@ -1,10 +1,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <curand.h>
+#include <curand_kernel.h>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
-#include <curand.h>
-#include <curand_kernel.h>
 #include <stdio.h>
 #include <torch/all.h>
 
@@ -232,7 +232,7 @@ __device__ void moe_fused_gate_impl(
     curand_init(thread_row, 0, 0, &state);
     int64_t random_offset = curand(&state) % n_share_experts_fusion;
     indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + random_offset);
-    
+
     // Calculate the sum of the first k-1 weights
     float prev_sum = 0.0f;
     for (int ii = 0; ii < topk - 1; ++ii) {
@@ -240,10 +240,10 @@ __device__ void moe_fused_gate_impl(
     }
 
     __syncthreads();
-    
+
     // Set the weight to the sum of the first k-1 weights divided by 2.5 (as in the Python implementation)
     output_ptr[last_idx] = prev_sum / 2.5f;
-    
+
     // For renormalization, we only use the sum of the first k-1 weights
     output_sum = prev_sum;
 
@@ -291,7 +291,8 @@ __global__ void moe_fused_gate_kernel(
     int64_t topk,
     int64_t n_share_experts_fusion) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
-  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
+  moe_fused_gate_impl<T>(
+      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
 }
 
 // Macro to compute compile-time constants and launch the kernel.
@@ -346,14 +347,20 @@ __global__ void moe_fused_gate_kernel_dynamic(
   params.ROWS_PER_WARP = std::max<int64_t>(1, WARP_SIZE / num_expert_group);  // WARP_SIZE is fixed as 32
   params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
-  moe_fused_gate_impl<T>(input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
+  moe_fused_gate_impl<T>(
+      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
 }
 
 //------------------------------------------------------------------------------
 // Host Launcher Function
 //------------------------------------------------------------------------------
-std::vector<at::Tensor>
-moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk, int64_t n_share_experts_fusion) {
+std::vector<at::Tensor> moe_fused_gate(
+    at::Tensor& input,
+    at::Tensor& bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t n_share_experts_fusion) {
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
