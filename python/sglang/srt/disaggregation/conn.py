@@ -131,9 +131,12 @@ class KVManager:
 
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 prefill_key_addr = (
-                    prefill_key_layer_ptr + prefill_index[0] * key_item_len
+                    prefill_key_layer_ptr + int(prefill_index[0]) * key_item_len
                 )
-                decode_key_addr = decode_key_layer_ptr + decode_index[0] * key_item_len
+                decode_key_addr = (
+                    decode_key_layer_ptr + int(decode_index[0]) * key_item_len
+                )
+
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
                     mooncake_session_id,
@@ -145,11 +148,13 @@ class KVManager:
                     return status
 
                 prefill_value_addr = (
-                    prefill_value_layer_ptr + prefill_index[0] * value_item_len
+                    prefill_value_layer_ptr + int(prefill_index[0]) * value_item_len
                 )
+
                 decode_value_addr = (
-                    decode_value_layer_ptr + decode_index[0] * value_item_len
+                    decode_value_layer_ptr + int(decode_index[0]) * value_item_len
                 )
+
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
                     mooncake_session_id,
