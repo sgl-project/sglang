@@ -46,15 +46,30 @@ class MiniLoadBalancer:
                     total=3600
                 )  # Add timeout for request reliability
             ) as session:
-                # Create the tasks for both prefill and decode requests
-                tasks = [
-                    session.post(f"{prefill_server}/generate", json=modified_request),
-                    session.post(f"{decode_server}/generate", json=modified_request),
-                ]
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
-                async for chunk in decode_response.content:
-                    yield chunk
+                try:
+                    # Create the tasks for both prefill and decode requests
+                    tasks = [
+                        session.post(
+                            f"{prefill_server}/generate", json=modified_request
+                        ),
+                        session.post(
+                            f"{decode_server}/generate", json=modified_request
+                        ),
+                    ]
+                    # Wait for both responses to complete. Since this is streaming, they return immediately.
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
+                    async for chunk in decode_response.content:
+                        yield chunk
+                except Exception as e:
+                    error_msg = {
+                        "error": {"message": f"Stream processing error: {str(e)}"}
+                    }
+                    yield b"data: " + orjson.dumps(
+                        error_msg, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
+                finally:
+                    if prefill_response is not None:
+                        await prefill_response.release()
 
         return StreamingResponse(
             stream_results(),
