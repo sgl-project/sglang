@@ -1135,14 +1135,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
 
+        # Do mha for extended part without prefix
+        forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        # Do mha attention with chunked prefix cache if needed
-        forward_batch.prepare_chunked_prefix_cache_info(
-            self.runner.device,
-            latent_cache.dtype,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-        )
-        if forward_batch.enable_chunked_prefix:
+
+        # Do mha attention with chunked prefix cache if there are any sequence with prefix
+        if any(forward_batch.extend_prefix_lens_cpu):
+            # Only initialize the info once
+            if forward_batch.num_prefix_chunks is None:
+                forward_batch.prepare_chunked_prefix_cache_info(q.device)
+
+            forward_batch.set_attn_attend_prefix_cache(True)
             attn_output, _ = self._chunked_prefix_attn_mha(
                 q=q,
                 accum_output=attn_output,

@@ -590,7 +590,8 @@ class FlashAttentionBackend(AttentionBackend):
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            if forward_batch.enable_chunked_prefix:
+            if forward_batch.attn_attend_prefix_cache:
+                # MHA for chunked prefix kv cache when running model with MLA
                 assert forward_batch.prefix_chunk_idx is not None
                 assert forward_batch.prefix_chunk_cu_seq_lens is not None
                 assert forward_batch.prefix_chunk_max_seq_lens is not None
@@ -598,7 +599,7 @@ class FlashAttentionBackend(AttentionBackend):
                 chunk_idx = forward_batch.prefix_chunk_idx
                 assert chunk_idx >= 0
 
-                output, lse, *rest = self.flash_attn_varlen_func(
+                output, lse, *rest = flash_attn_varlen_func(
                     q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -608,10 +609,10 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_k=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
                     softmax_scale=layer.scaling,
                     causal=False,
-                    return_softmax_lse=True,
                 )
             else:
-                output, lse, *rest = self.flash_attn_varlen_func(
+                # MHA for extend part of sequence without attending prefix kv cache
+                output, lse, *rest = flash_attn_varlen_func(
                     q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
@@ -621,7 +622,6 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
                     causal=False,
-                    return_softmax_lse=True,
                 )
             return output, lse
 

@@ -179,7 +179,8 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For MLA chunked prefix cache used in chunked prefill
-    enable_chunked_prefix: bool = False
+    # Tell attention backend whether the kv cache needs to be attended in current pass
+    attn_attend_prefix_cache: bool = False
     # Number of prefix cache chunks
     num_prefix_chunks: Optional[int] = None
     # Index of current chunk, used by attention backend
@@ -475,6 +476,9 @@ class ForwardBatch:
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx
 
+    def set_attn_attend_prefix_cache(self, attn_attend_prefix_cache: bool):
+        self.attn_attend_prefix_cache = attn_attend_prefix_cache
+
     def prepare_chunked_kv_indices(self, device: torch.device):
         self.prefix_chunk_kv_indices = []
         for idx in range(self.num_prefix_chunks):
@@ -512,12 +516,6 @@ class ForwardBatch:
             # Chunked kv cache info already prepared by prior modules
             return
 
-        # If no sequence has prefix, then no need to use chunked kv cache
-        if not any(self.extend_prefix_lens_cpu):
-            self.enable_chunked_prefix = False
-            return
-
-        self.enable_chunked_prefix = True
         self.prefix_chunk_idx = -1
 
         # chunk_capacity is the maximum number of tokens in each chunk
@@ -543,10 +541,10 @@ class ForwardBatch:
         prefix_chunk_ends = torch.min(
             self.extend_prefix_lens.unsqueeze(0),
             self.prefix_chunk_starts + self.prefix_chunk_len,
-        )
+        ).to(torch.int32)
         self.prefix_chunk_seq_lens = (
-            prefix_chunk_ends - self.prefix_chunk_starts
-        ).clamp(min=0)
+            (prefix_chunk_ends - self.prefix_chunk_starts).clamp(min=0).to(torch.int32)
+        )
 
         # Metadata for attention backend
         self.prefix_chunk_cu_seq_lens = torch.zeros(
@@ -558,7 +556,9 @@ class ForwardBatch:
         self.prefix_chunk_cu_seq_lens[:, 1:] = self.prefix_chunk_seq_lens.cumsum(
             dim=1
         ).to(torch.int32)
-        self.prefix_chunk_max_seq_lens = self.prefix_chunk_seq_lens.max(dim=1).values
+        self.prefix_chunk_max_seq_lens = self.prefix_chunk_seq_lens.max(
+            dim=1
+        ).values.to(torch.int32)
 
         self.prefix_chunk_num_tokens = self.prefix_chunk_seq_lens.sum(dim=1).tolist()
         assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()

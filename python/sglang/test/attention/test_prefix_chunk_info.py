@@ -7,6 +7,33 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.test.test_utils import CustomTestCase
 
 TEST_CASES = [
+    # Sequence with same prefix lens
+    {
+        "batch_size": 3,
+        "prefix_lens": [64, 64, 64],
+        "max_chunk_capacity": 48,
+        "prefix_chunk_len": 16,
+        "num_prefix_chunks": 4,
+        "prefix_chunk_starts": torch.tensor(
+            [
+                [0, 0, 0],
+                [16, 16, 16],
+                [32, 32, 32],
+                [48, 48, 48],
+            ],
+            dtype=torch.int32,
+        ),
+        "prefix_chunk_seq_lens": torch.tensor(
+            [
+                [16, 16, 16],
+                [16, 16, 16],
+                [16, 16, 16],
+                [16, 16, 16],
+            ],
+            dtype=torch.int32,
+        ),
+    },
+    # Sequence with different prefix lens
     {
         "batch_size": 4,
         "prefix_lens": [16, 32, 48, 64],
@@ -32,6 +59,34 @@ TEST_CASES = [
             dtype=torch.int32,
         ),
     },
+    # Sequence with irregular shapes
+    {
+        "batch_size": 2,
+        "prefix_lens": [1, 64],
+        "max_chunk_capacity": 31,
+        "prefix_chunk_len": 15,
+        "num_prefix_chunks": 5,
+        "prefix_chunk_starts": torch.tensor(
+            [
+                [0, 0],
+                [15, 15],
+                [30, 30],
+                [45, 45],
+                [60, 60],
+            ],
+            dtype=torch.int32,
+        ),
+        "prefix_chunk_seq_lens": torch.tensor(
+            [
+                [1, 15],
+                [0, 15],
+                [0, 15],
+                [0, 15],
+                [0, 4],
+            ],
+            dtype=torch.int32,
+        ),
+    },
 ]
 
 
@@ -51,6 +106,29 @@ class MockReqToTokenPool:
             .reshape(batch_size, seq_len)
             .to(torch.int32)
         )
+
+
+# Test correctness of triton kernel for computing kv indices
+def check_kv_indices(forward_batch):
+    for i in range(forward_batch.num_prefix_chunks):
+        computed_kv_indices = forward_batch.prefix_chunk_kv_indices[i]
+        req_to_token = forward_batch.req_to_token_pool.req_to_token[
+            : forward_batch.batch_size, :
+        ]
+        ref_kv_indices = torch.empty(
+            forward_batch.prefix_chunk_num_tokens[i],
+            dtype=torch.int32,
+            device=computed_kv_indices.device,
+        )
+        running_ptr = 0
+        for j in range(forward_batch.batch_size):
+            seq_start = forward_batch.prefix_chunk_starts[i, j].item()
+            seq_len = forward_batch.prefix_chunk_seq_lens[i, j].item()
+            ref_kv_indices[running_ptr : running_ptr + seq_len].copy_(
+                req_to_token[j, seq_start : seq_start + seq_len]
+            )
+            running_ptr += seq_len
+        assert torch.allclose(computed_kv_indices, ref_kv_indices)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -89,7 +167,9 @@ class TestPrefixChunkInfo(CustomTestCase):
         """Test the standard extend operation."""
 
         for test_case in TEST_CASES:
-
+            print(
+                f"Test case with batch_size={test_case['batch_size']}, prefix_lens={test_case['prefix_lens']}, max_chunk_capacity={test_case['max_chunk_capacity']}"
+            )
             batch_size = test_case["batch_size"]
             prefix_lens_cpu = test_case["prefix_lens"]
             assert len(prefix_lens_cpu) == batch_size
@@ -126,6 +206,18 @@ class TestPrefixChunkInfo(CustomTestCase):
 
             forward_batch.prepare_chunked_prefix_cache_info(self.device)
             assert forward_batch.get_max_chunk_capacity() == max_chunk_capacity
+            assert forward_batch.prefix_chunk_len == test_case["prefix_chunk_len"]
+            assert forward_batch.num_prefix_chunks == test_case["num_prefix_chunks"]
+            assert torch.allclose(
+                forward_batch.prefix_chunk_starts,
+                test_case["prefix_chunk_starts"].to(self.device),
+            )
+            assert torch.allclose(
+                forward_batch.prefix_chunk_seq_lens,
+                test_case["prefix_chunk_seq_lens"].to(self.device),
+            )
+
+            check_kv_indices(forward_batch)
 
 
 if __name__ == "__main__":
