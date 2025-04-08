@@ -313,7 +313,7 @@ async def flush_cache():
     _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -637,10 +637,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -771,7 +771,15 @@ def _wait_and_warmup(
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO
+        # TODO hack
+        # TODO
+        assert server_args.dp_size == 2
+        json_data["text"] = [
+            "1+1=",
+            "The capital city of France is",
+        ]
+        # json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
