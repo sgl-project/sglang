@@ -187,6 +187,8 @@ class Llama4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
 
         self.o_proj = RowParallelLinear(
@@ -195,6 +197,8 @@ class Llama4Attention(nn.Module):
             bias=bias_o_proj,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
