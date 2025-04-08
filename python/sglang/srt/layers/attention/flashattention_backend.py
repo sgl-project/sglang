@@ -52,16 +52,6 @@ class FlashAttentionMetadata:
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
 
-    # Encoder metadata
-    # Cumulative sequence lengths for encoder key
-    encoder_cu_seqlens_k: torch.Tensor = None
-    # Maximum sequence length for encoder key
-    encoder_max_seq_len_k: int = 0
-    # Sequence lengths for the forward batch
-    encoder_lens_int32: torch.Tensor = None
-    # Page table for the encoder
-    encoder_page_table: torch.Tensor = None
-
     @dataclass
     class LocalAttentionMetadata:
         local_query_start_loc: torch.Tensor = None  # cu_seqlens_q for local attention
@@ -458,14 +448,10 @@ class FlashAttentionBackend(AttentionBackend):
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
             assert (
-                len(forward_batch.encoder_lens) == 1
+                forward_batch.encoder_lens.numel() == 1
             ), "Only encoder size 1 is supported for now"
 
-            metadata.encoder_lens_int32 = (
-                forward_batch.encoder_lens.clone()
-                .detach()
-                .to(device=device, dtype=torch.int32)
-            )
+            metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
             metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
@@ -475,7 +461,7 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # Currently only support len(forward_batch.encoder_lens) == 1
+            # Currently only support forward_batch.encoder_lens.numel() == 1
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
                 metadata.encoder_max_seq_len_k : (
@@ -802,7 +788,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.encoder_metadata = {
             "encoder_page_table": torch.zeros(
                 max_bs,
-                self.max_context_len * 2,
+                self.max_context_len,
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -812,7 +798,6 @@ class FlashAttentionBackend(AttentionBackend):
             "encoder_cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            "encoder_max_seq_len_k": 0,
         }
 
     def init_forward_metadata_capture_cuda_graph(
@@ -901,7 +886,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.target_verify_metadata[bs] = metadata
 
         if encoder_lens is not None:
-            encoder_bs = len(encoder_lens)
+            encoder_bs = encoder_lens.numel()
             metadata.encoder_lens_int32 = self.encoder_metadata["encoder_lens_int32"][
                 :encoder_bs
             ]
