@@ -437,7 +437,8 @@ class Llama4Model(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
