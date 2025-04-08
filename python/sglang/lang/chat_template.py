@@ -420,7 +420,7 @@ register_chat_template(
 
 register_chat_template(
     ChatTemplate(
-        name="internvl2_5",
+        name="internvl-2-5",
         default_system_prompt="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
         role_prefix_and_suffix={
             "system": ("<|im_start|>system\n", "<|im_end|>\n"),
@@ -605,7 +605,7 @@ def match_gemma3_instruct(model_path: str):
 def match_internvl_chat(model_path: str):
     model_path = model_path.lower()
     if "internvl" in model_path:
-        return get_chat_template("internvl2_5")
+        return get_chat_template("internvl-2-5")
 
 
 if __name__ == "__main__":

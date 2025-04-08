@@ -54,7 +54,11 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
 )
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,

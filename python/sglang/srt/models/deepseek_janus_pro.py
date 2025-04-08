@@ -400,20 +400,20 @@ class PatchEmbed(nn.Module):
                 _assert(
                     H == self.img_size[0],
                     f"Input height ({H}) doesn't match model ({self.img_size[0]}).",
-                    )
+                )
                 _assert(
                     W == self.img_size[1],
                     f"Input width ({W}) doesn't match model ({self.img_size[1]}).",
-                    )
+                )
             elif not self.dynamic_img_pad:
                 _assert(
                     H % self.patch_size[0] == 0,
                     f"Input height ({H}) should be divisible by patch size ({self.patch_size[0]}).",
-                    )
+                )
                 _assert(
                     W % self.patch_size[1] == 0,
                     f"Input width ({W}) should be divisible by patch size ({self.patch_size[1]}).",
-                    )
+                )
         if self.dynamic_img_pad:
             pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
             pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
@@ -606,8 +606,8 @@ class PatchDropout(nn.Module):
         L = x.shape[1]
         num_keep = max(1, int(L * (1.0 - self.prob)))
         keep_indices = torch.argsort(torch.randn(B, L, device=x.device), dim=-1)[
-                       :, :num_keep
-                       ]
+            :, :num_keep
+        ]
         if self.ordered:
             # NOTE does not need to maintain patch order in typical transformer use,
             # but possibly useful for debug / visualization
@@ -1648,8 +1648,8 @@ class VectorQuantizer(nn.Module):
             + torch.sum(embedding**2, dim=1)
             - 2
             * torch.einsum(
-            "bd,dn->bn", z_flattened, torch.einsum("n d -> d n", embedding)
-        )
+                "bd,dn->bn", z_flattened, torch.einsum("n d -> d n", embedding)
+            )
         )
 
         min_encoding_indices = torch.argmin(d, dim=1)

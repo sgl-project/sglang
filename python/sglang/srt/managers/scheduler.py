@@ -461,7 +461,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,

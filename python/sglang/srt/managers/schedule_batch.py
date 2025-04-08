@@ -35,7 +35,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -302,11 +302,6 @@ class MultimodalInputs:
     audio_start_id: Optional[torch.Tensor] = None
     audio_end_id: Optional[torch.Tensor] = None
 
-    # denotes the number of valid image tokens in each image
-    images_emb_mask: Optional[torch.BoolTensor] = None
-
-    media_padding_helper: MediaPaddingHelper = None
-
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(
@@ -323,14 +318,12 @@ class MultimodalInputs:
             "mrope_positions",
             "mrope_position_delta",
             "im_token_id",
-            "im_token_id",
             "im_start_id",
             "im_end_id",
             "slice_start_id",
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
-            "images_emb_mask",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -388,25 +381,6 @@ class MultimodalInputs:
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
-
-    def pad_media_tokens(self, input_ids: List[int]) -> List[int]:
-        """
-        Pad media tokens (image/audio) in input_ids with special values.
-
-        Args:
-            input_ids: List of token ids containing media tokens
-
-        Returns:
-            List of token ids with media tokens replaced by padding values
-        """
-        if self.media_padding_helper is None:
-            return input_ids
-        return self.media_padding_helper.pad_input_tokens(
-            input_ids=input_ids, image_inputs=self
-        )
-
-    def image_count(self) -> int:
-        return self.pixel_values.shape[0]
 
 
 class Req:

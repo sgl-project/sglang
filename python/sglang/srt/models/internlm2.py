@@ -114,6 +114,7 @@ class InternLM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+
         self.wqkv = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -288,6 +289,9 @@ class InternLM2ForCausalLM(nn.Module):
             config.vocab_size, config.hidden_size, prefix=add_prefix("output", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.tok_embeddings
 
     @torch.no_grad()
     def forward(

@@ -39,6 +39,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     MultiModalityConfig,
 )
+from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
 
@@ -48,26 +49,12 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
-    MultiModalityConfig.model_type: MultiModalityConfig,
+    InternVLChatConfig.model_type: InternVLChatConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
-
-
-def suppress_transformers_warnings():
-    transformers.logging.set_verbosity_error()
-    warnings.simplefilter("ignore")
-
-
-@contextlib.contextmanager
-def suppress_warnings():
-    warnings.simplefilter("ignore")
-    try:
-        yield
-    finally:
-        warnings.resetwarnings()
 
 
 def download_from_hf(model_path: str):
@@ -84,7 +71,6 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
-    suppress_transformers_warnings()
     is_gguf = check_gguf_file(model)
     if is_gguf:
         kwargs["gguf_file"] = model
@@ -101,18 +87,17 @@ def get_config(
             setattr(config, key, val)
         setattr(config, "architectures", ["MultiModalityCausalLM"])
 
-    # Pour langauge_config to first-level
-    if isinstance(model, str) and "InternVL" in model:
-        for key, val in config.llm_config.__dict__.items():
-            if not hasattr(config, key):
-                setattr(config, key, val)
-
-
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
+
+    if isinstance(model, str) and config.model_type == "internvl_chat":
+        for key, val in config.llm_config.__dict__.items():
+            if not hasattr(config, key):
+                setattr(config, key, val)
+
     if model_override_args:
         config.update(model_override_args)
 
@@ -234,6 +219,7 @@ def get_tokenizer(
     return tokenizer
 
 
+# Some models doesn't have an available processor, e.g.: InternVL
 def get_tokenizer_from_processor(processor):
     if isinstance(processor, PreTrainedTokenizerBase):
         return processor

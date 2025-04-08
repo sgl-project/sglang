@@ -18,7 +18,6 @@ import torch
 
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 import torch.nn.functional as F
-from modelscope.models.cv.action_recognition.tada_convnext import DropPath
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
@@ -26,9 +25,14 @@ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPo
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs, MediaPaddingHelperTokenPairs
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternTokenPairs,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.utils import logger
 
@@ -211,7 +215,7 @@ class InternVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             use_context_forward=False,
             dropout=config.attention_dropout,
-            use_full_precision_softmax=False,
+            softmax_in_single_precision=False,
         )
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -503,6 +507,19 @@ class InternVLChatModel(nn.Module):
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
+    def get_image_feature(self, items: List[MultimodalDataItem]):
+        """
+        Projects the last hidden state from the vision model into language model space.
+
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+
+        print(f"{items=}")
+        pixel_values = torch.cat([item.pixel_values for item in items])
+        image_features = self.extract_feature(pixel_values)
+        return image_features
+
     @torch.no_grad()
     def forward(
         self,
@@ -511,58 +528,26 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if (
-            forward_batch.image_inputs is not None
-            and forward_batch.image_inputs[0] is not None
-        ):
-            image_input = forward_batch.image_inputs[0]
 
-            image_token_indices = torch.isin(
-                input_ids,
-                torch.tensor(image_input.pad_values).to(device=input_ids.device),
-            )
-            if image_token_indices.sum() == 0:
-                pass
-            else:
-                # [B * S] -> [B, S]
-                input_ids = input_ids.unsqueeze(0)
-
-                input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-                input_embeds = self.language_model.model.tok_embeddings(input_ids)
-
-                B, N, C = input_embeds.shape
-                input_embeds = input_embeds.reshape(B * N, C)
-
-                pixel_values = image_input.pixel_values
-                vit_embeds = self.extract_feature(pixel_values)
-
-                num_image_tokens = image_token_indices.sum()
-                input_embeds[image_token_indices] = vit_embeds.reshape(-1, C)[
-                    -num_image_tokens:
-                ].to(input_embeds.device)
-                input_embeds = input_embeds.reshape(N, C)
-                input_ids = None
-
-        if input_ids is not None:
-            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-        return self.language_model(
+        hs = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.language_model,
+            image_data_embedding_func=self.get_image_feature,
+            positions=positions,
         )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        return hs
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
+        im_start_id: int = mm_inputs.im_start_id
+        im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        image_inputs.media_padding_helper = MediaPaddingHelperTokenPairs(
-            media_token_pairs
-        )
+        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return image_inputs.pad_media_tokens(input_ids)
+        return helper.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
