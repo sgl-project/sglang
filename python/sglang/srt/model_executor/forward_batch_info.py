@@ -179,7 +179,6 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     num_decode_reqs: Optional[int] = 0
 
-
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
 

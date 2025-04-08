@@ -18,8 +18,8 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
-    create_flashinfer_kv_indices_triton,
     create_casual_mask_paged_triton,
+    create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -35,7 +35,7 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
-        PODWithPagedKVCacheWrapper
+        PODWithPagedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
     from flashinfer.decode import _get_range_buf, get_seq_lens
@@ -56,16 +56,16 @@ class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
-    
+
     # POD Attention
     use_pod: Optional[bool] = False
     pod_wrappers: Optional[List[PODWithPagedKVCacheWrapper]] = None
-    num_decode_reqs: Optional[torch.Tensor] = 0 
-    prefill_qo_indptr: Optional[torch.Tensor] = None # output seqlens
+    num_decode_reqs: Optional[torch.Tensor] = 0
+    prefill_qo_indptr: Optional[torch.Tensor] = None  # output seqlens
     prefill_kv_indptr: Optional[torch.Tensor] = None
-    prefill_kv_indices: Optional[torch.Tensor] = None # page to kv indices
+    prefill_kv_indices: Optional[torch.Tensor] = None  # page to kv indices
 
-    
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -100,9 +100,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.enable_pd_colocation = enable_pd_colocation
         if enable_pd_colocation:
-            assert not self.is_multimodal, "PD colocation doesn't support multimodal models"
-            assert model_runner.sliding_window_size is None, "PD colocation only supports vanilla attention for now"
-            
+            assert (
+                not self.is_multimodal
+            ), "PD colocation doesn't support multimodal models"
+            assert (
+                model_runner.sliding_window_size is None
+            ), "PD colocation only supports vanilla attention for now"
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -175,7 +179,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.prefill_wrappers_pod.append(
                         PODWithPagedKVCacheWrapper(
                             self.workspace_buffer,
-                            "NHD",                            
+                            "NHD",
                         )
                     )
                 self.prefill_wrappers_paged.append(
@@ -256,36 +260,38 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             if self.is_multimodal:
                 use_ragged = False
-                extend_no_prefix = False                
+                extend_no_prefix = False
             elif self.enable_pd_colocation:
                 use_ragged = False
                 extend_no_prefix = False
             else:
                 # use_ragged = True
-                use_ragged = False # debug
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)            
-                
+                use_ragged = False  # debug
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
             seq_lens = forward_batch.seq_lens
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens_sum = forward_batch.seq_lens_sum
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
             )
-            
+
             # Split prefill and decode batches because prefill is non-paged for POD Attn
             if self.enable_pd_colocation and forward_batch.num_decode_reqs > 0:
                 self.forward_metadata.use_pod = True
                 self.forward_metadata.num_decode_reqs = forward_batch.num_decode_reqs
                 self.forward_metadata.pod_wrappers = self.prefill_wrappers_pod
-                
+
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
                 seq_lens_sum,
                 prefix_lens,
-                prefill_wrappers=(self.prefill_wrappers_paged 
-                                  if not self.forward_metadata.use_pod
-                                  else self.prefill_wrappers_pod),
+                prefill_wrappers=(
+                    self.prefill_wrappers_paged
+                    if not self.forward_metadata.use_pod
+                    else self.prefill_wrappers_pod
+                ),
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
@@ -447,7 +453,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
         logits_soft_cap = layer.logit_cap
-            
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -455,7 +461,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_scale, v_scale
                     )
-                    
+
             if self.enable_pd_colocation and self.forward_metadata.num_decode_reqs > 0:
                 pod_wrapper = self.forward_metadata.pod_wrappers[
                     self._get_wrapper_idx(layer)
@@ -463,20 +469,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 bs = forward_batch.req_pool_indices.shape[0]
                 # Fetch prefill kv cache from the pool
-                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
                 kv_indices_p = self.forward_metadata.prefill_kv_indices
-                kv_indptr_p = self.forward_metadata.prefill_kv_indptr 
+                kv_indptr_p = self.forward_metadata.prefill_kv_indptr
                 # del self.forward_metadata.prefill_kv_indices, self.forward_metadata.prefill_kv_indptr
                 kv_pool_indices_p = kv_indices_p[: kv_indptr_p[-1]]
-                
+
                 # TODO(Wenxuan) Handle last_page_len for page size > 1 here
                 num_prefill_reqs = bs - self.forward_metadata.num_decode_reqs
-                k_cache_p = k_cache[kv_pool_indices_p] 
+                k_cache_p = k_cache[kv_pool_indices_p]
                 v_cache_p = v_cache[kv_pool_indices_p]
-                q_p = q[: num_prefill_reqs]
+                q_p = q[:num_prefill_reqs]
                 q_d = q[num_prefill_reqs:]
                 qo_indptr_p = self.forward_metadata.prefill_qo_indptr
-                mask_p = torch.zeros(qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool)
+                mask_p = torch.zeros(
+                    qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
+                )
                 # TODO(Wenxuan) debug this
                 # create_casual_mask_paged_triton[(num_prefill_reqs)](
                 #     mask_p,
@@ -499,26 +509,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 for i in range(num_prefill_reqs):
                     q_start = qo_indptr_p[i]
                     q_end = qo_indptr_p[i + 1]
-                    kv_start = kv_indptr_p[i] 
+                    kv_start = kv_indptr_p[i]
                     kv_end = kv_indptr_p[i + 1]
                     for j in range(q_start, q_end):
-                        submask = torch.arange(kv_start, kv_end, device=q.device, dtype=torch.int32)
-                        mask_p[j][kv_start:kv_end] = submask < (j + forward_batch.extend_prefix_lens[i])
+                        submask = torch.arange(
+                            kv_start, kv_end, device=q.device, dtype=torch.int32
+                        )
+                        mask_p[j][kv_start:kv_end] = submask < (
+                            j + forward_batch.extend_prefix_lens[i]
+                        )
 
                 o_p, o_d = pod_wrapper.run(
-                        q_p,
-                        k_cache_p,
-                        v_cache_p,
-                        q_d,
-                        paged_kv_cache_d=(k_cache, v_cache),
-                        # logits_soft_cap_p=layer.logit_cap,
-                        # logits_soft_cap_d=layer.logit_cap,
-                        # TODO
-                        # window_left_p=layer.sliding_window_size,
-                        # window_left_d=layer.sliding_window_size,
-                        # sm_scale_p=layer.scaling,
-                        # sm_scale_d=layer.scaling,
-                    )
+                    q_p,
+                    k_cache_p,
+                    v_cache_p,
+                    q_d,
+                    paged_kv_cache_d=(k_cache, v_cache),
+                    # logits_soft_cap_p=layer.logit_cap,
+                    # logits_soft_cap_d=layer.logit_cap,
+                    # TODO
+                    # window_left_p=layer.sliding_window_size,
+                    # window_left_d=layer.sliding_window_size,
+                    # sm_scale_p=layer.scaling,
+                    # sm_scale_d=layer.scaling,
+                )
                 o = torch.cat([o_p, o_d], dim=0)
                 print("pod forward")
             else:
@@ -607,7 +621,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-        
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
             return 0
@@ -849,7 +862,9 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
-        prefill_wrappers: List[Union[BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper]],
+        prefill_wrappers: List[
+            Union[BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper]
+        ],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -857,7 +872,9 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().to(device="cpu", non_blocking=True).item()
+            paged_kernel_lens_sum = (
+                paged_kernel_lens.sum().to(device="cpu", non_blocking=True).item()
+            )
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -962,7 +979,9 @@ class FlashInferIndicesUpdaterPrefill:
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
-        wrapper_paged: Union[BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper],
+        wrapper_paged: Union[
+            BatchPrefillWithPagedKVCacheWrapper, PODWithPagedKVCacheWrapper
+        ],
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
@@ -980,9 +999,9 @@ class FlashInferIndicesUpdaterPrefill:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
-            kv_indptr = kv_indptr[: bs + 1] # cumulative page ranges for each req 
-            kv_indices = torch.empty( # page to kv indices
-                paged_kernel_lens_sum + 256, 
+            kv_indptr = kv_indptr[: bs + 1]  # cumulative page ranges for each req
+            kv_indices = torch.empty(  # page to kv indices
+                paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -992,7 +1011,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens,
                 kv_indptr,
                 kv_start_idx,
-                kv_indices, 
+                kv_indices,
                 self.req_to_token.shape[1],
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
@@ -1012,16 +1031,16 @@ class FlashInferIndicesUpdaterPrefill:
             )
         if forward_metadata.use_pod:
             num_prefill_reqs = bs - forward_metadata.num_decode_reqs
-            decode_kv_indptr = kv_indptr[num_prefill_reqs : bs + 1] 
+            decode_kv_indptr = kv_indptr[num_prefill_reqs : bs + 1]
             forward_metadata.prefill_kv_indptr = kv_indptr[: num_prefill_reqs + 1]
             forward_metadata.prefill_qo_indptr = qo_indptr[: num_prefill_reqs + 1]
             forward_metadata.prefill_kv_indices = kv_indices
-            
+
             # set page indices for decode
             wrapper_paged.begin_forward(
                 decode_kv_indptr,
-                kv_indices,  
-                self.kv_last_page_len[num_prefill_reqs: bs],
+                kv_indices,
+                self.kv_last_page_len[num_prefill_reqs:bs],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -1041,12 +1060,12 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
         else:
-            # Normal prefill kernel 
+            # Normal prefill kernel
             # cached part
             wrapper_paged.begin_forward(
                 qo_indptr,
                 kv_indptr,
-                kv_indices, 
+                kv_indices,
                 self.kv_last_page_len[:bs],
                 self.num_qo_heads,
                 self.num_kv_heads,

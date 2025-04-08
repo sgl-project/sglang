@@ -96,12 +96,13 @@ def create_flashmla_kv_indices_triton(
             mask=mask_out,
         )
 
+
 @triton.jit
 def create_casual_mask_paged_triton(
-    mask_ptr, # [qo_len, kv_len]
-    qo_indptr, # [bs + 1], cumulative ranges for each req
-    kv_indptr, # [bs + 1]
-    prefix_lens_ptr, # [bs + 1]
+    mask_ptr,  # [qo_len, kv_len]
+    qo_indptr,  # [bs + 1], cumulative ranges for each req
+    kv_indptr,  # [bs + 1]
+    prefix_lens_ptr,  # [bs + 1]
     stride_mask_qo: tl.constexpr,
 ):
     pid_bs = tl.program_id(axis=0)
@@ -110,7 +111,7 @@ def create_casual_mask_paged_triton(
     kv_start = tl.load(kv_indptr + pid_bs).to(tl.int32)
     kv_end = tl.load(kv_indptr + pid_bs + 1).to(tl.int32)
     kv_len = kv_end - kv_start
-    
+
     for i in range(qo_start, qo_end):
         mask_offset = i * stride_mask_qo + kv_start + tl.arange(kv_len, dtype=tl.int32)
         qo_index = i + tl.load(prefix_lens_ptr + pid_bs)
