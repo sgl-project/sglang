@@ -99,19 +99,18 @@ class IntelAMXAttnBackend(AttentionBackend):
     ):
         attn_logits, _ = self.forward_metadata
 
-        if q.ndim == 2:
-            q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
         self.decode_attention_fwd(
-            q,
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,
             forward_batch.out_cache_loc,
