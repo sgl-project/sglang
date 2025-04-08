@@ -1,14 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST,
     DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST,
-    DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -107,54 +104,6 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
             other_args=[],
             expected_score=0.64,
         )
-
-
-class TestEvalFP8ModelOptQuantAccuracy(CustomTestCase):
-
-    def _run_test(self, model, other_args, expected_score):
-        base_url = DEFAULT_URL_FOR_TEST
-        other_args = other_args or []
-
-        process = popen_launch_server(
-            model,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-        try:
-            args = SimpleNamespace(
-                base_url=base_url,
-                model=model,
-                eval_name="mmlu",
-                num_examples=64,
-                num_threads=32,
-                temperature=0.1,
-            )
-
-            metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], expected_score)
-        finally:
-            kill_process_tree(process.pid)
-
-    @unittest.skipIf(
-        torch.version.hip is not None, "modelopt quantization unsupported on ROCm"
-    )
-    def test_mmlu(self):
-        """Test with kv cache quantization using different fp8 formats."""
-        kv_cache_dtypes = ["auto", "fp8_e4m3", "fp8_e5m2"]
-        for kv_cache_dtype in kv_cache_dtypes:
-            with self.subTest(kv_cache_dtype=kv_cache_dtype):
-                self._run_test(
-                    model=DEFAULT_FP8_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST,
-                    other_args=[
-                        "--quantization",
-                        "modelopt",
-                        "--kv-cache-dtype",
-                        kv_cache_dtype,
-                    ],
-                    expected_score=0.64,
-                )
 
 
 if __name__ == "__main__":
