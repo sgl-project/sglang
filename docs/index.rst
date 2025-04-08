@@ -20,6 +20,7 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
+   references/llama4
    references/deepseek
    backend/send_request.ipynb
    backend/openai_api_completions.ipynb
