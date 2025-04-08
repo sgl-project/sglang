@@ -19,7 +19,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
-    is_layer_skipped,
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -289,12 +288,14 @@ class ModelOptFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        if self.exclude_modules and any(
+            module in prefix for module in self.exclude_modules
+        ):
+            return None
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.exclude_modules):
-                return UnquantizedLinearMethod()
             return ModelOptFp4LinearMethod(self)
-        elif isinstance(layer, AttentionBackend):
+        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
 
         return None
