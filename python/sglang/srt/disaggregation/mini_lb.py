@@ -207,7 +207,6 @@ async def handle_generate_request(request_data: dict):
                                     error_msg, option=orjson.OPT_NON_STR_KEYS
                                 ) + b"\n\n"
                                 return
-                            prefill_response.release()
                         else:
                             decode_response = response
                             if response.status != 200:
@@ -233,6 +232,9 @@ async def handle_generate_request(request_data: dict):
                     yield b"data: " + orjson.dumps(
                         error_msg, option=orjson.OPT_NON_STR_KEYS
                     ) + b"\n\n"
+                finally:
+                    if prefill_response is not None:
+                        await prefill_response.release()
 
         return StreamingResponse(
             stream_results(),
