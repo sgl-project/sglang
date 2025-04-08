@@ -15,9 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <ATen/ATen.h>
+#include <ATen/Tensor.h>
 #include <Python.h>
-#include <torch/extension.h>
+#include <torch/library.h>
+#include <torch/torch.h>
 
+#include <tuple>
 #include <vector>
 
 #define _CONCAT(A, B) A##B
@@ -60,18 +64,14 @@ void register_graph_buffers(
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
 #else
-// TRTLLM custom allreduce
-fptr_t init_custom_ar(
-    int64_t rank_id,
-    int64_t world_size,
-    torch::Tensor& rank_data,
-    const std::vector<fptr_t>& buffers,
-    const std::vector<fptr_t>& tmp_result_buffers,
-    const std::vector<fptr_t>& barrier_in,
-    const std::vector<fptr_t>& barrier_out);
+// custom allreduce
+fptr_t
+init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink);
 void dispose(fptr_t _fa);
-void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+int64_t meta_size();
+void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
 #endif
@@ -196,6 +196,9 @@ void topk_softmax(
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
 
+std::vector<at::Tensor>
+moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk);
+
 /*
  * From csrc/speculative
  */
@@ -253,23 +256,12 @@ void min_p_sampling_from_probs(
     double min_p_val,
     bool deterministic,
     int64_t cuda_stream);
-// top k renorm probs
-// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
 void top_k_renorm_probs(
     at::Tensor probs,
     at::Tensor renorm_probs,
     std::optional<at::Tensor> maybe_top_k_arr,
-    unsigned int top_k_val,
-    int64_t cuda_stream);
-// patch here, cause flashinfer use unsigned int. but torch must use int64_t for extension.
-inline void top_k_renorm_probs_wrapper(
-    at::Tensor probs,
-    at::Tensor renorm_probs,
-    std::optional<at::Tensor> maybe_top_k_arr,
     int64_t top_k_val,
-    int64_t cuda_stream) {
-  top_k_renorm_probs(probs, renorm_probs, maybe_top_k_arr, static_cast<unsigned int>(top_k_val), cuda_stream);
-}
+    int64_t cuda_stream);
 void top_p_renorm_probs(
     at::Tensor probs,
     at::Tensor renorm_probs,

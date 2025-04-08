@@ -29,6 +29,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          find /public_sglang_ci/runner-a-gpu-1/_work/_tool/Python/3.9.21/x64/lib/python3.9/site-packages -name "sgl-kernel*" -exec rm -rf {} + || true
           bash scripts/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update
@@ -48,6 +49,7 @@ jobs:
           make compile
 
           make html
+          python3 wrap_run_llm.py
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
