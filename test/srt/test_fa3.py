@@ -84,7 +84,6 @@ class TestFlashAttention3(BaseFlashAttentionTest):
             [
                 "--cuda-graph-max-bs",
                 "2",
-                "--disable-mla",
             ]
         )
         return args
@@ -99,7 +98,6 @@ class TestFlashAttention3DisableCudaGraph(BaseFlashAttentionTest):
         args.extend(
             [
                 "--disable-cuda-graph",
-                "--disable-mla",
             ]
         )
         return args
