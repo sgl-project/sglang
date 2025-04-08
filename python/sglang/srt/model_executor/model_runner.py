@@ -128,6 +128,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not server_args.disable_mla
         )
+        self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -885,7 +886,7 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             logger.warning(
-                "FlashAttention v3 Backend is in Beta. Multimodal, FP8, and Speculative Decoding are not supported."
+                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
