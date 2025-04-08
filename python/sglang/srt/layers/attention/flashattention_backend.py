@@ -617,8 +617,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         if not self.use_mla:
             # Do multi-head attention
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
