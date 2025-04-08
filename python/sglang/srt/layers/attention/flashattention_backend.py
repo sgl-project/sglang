@@ -954,11 +954,15 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
 
-                page_table = self.req_to_token[
-                    req_pool_indices, : metadata.max_seq_len_k
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                page_indices = self.req_to_token[
+                    :,
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
                 ]
-
-                metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+                page_indices = page_indices[req_pool_indices] // self.page_size
+                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
             else:
                 # Normal Decode
                 max_len = seq_lens_cpu.max().item()
@@ -978,7 +982,6 @@ class FlashAttentionBackend(AttentionBackend):
                 ]
                 page_indices = page_indices[req_pool_indices] // self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
-                metadata.page_table[:, max_seq_pages:].fill_(0)
 
         elif forward_mode.is_target_verify():
             metadata = self.target_verify_metadata[bs]
@@ -997,8 +1000,16 @@ class FlashAttentionBackend(AttentionBackend):
                     (1, 0),
                 )
             )
-            page_table = self.req_to_token[req_pool_indices, : metadata.max_seq_len_k]
-            metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                :,
+                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+            ]
+            page_indices = page_indices[req_pool_indices] // self.page_size
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
