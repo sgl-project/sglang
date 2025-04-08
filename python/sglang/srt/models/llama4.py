@@ -247,8 +247,7 @@ class Llama4Attention(nn.Module):
             del q_view, k_view, q_out_unused, k_out_unused
 
         if self.qk_norm is not None:
-            # TODO there are 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous()
-            #      maybe we can fuse them later
+            # TODO there are still 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous(), maybe we can fuse them later
             qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
             qk = self.qk_norm(qk).to(torch.bfloat16)
             qk = qk.reshape(-1, self.q_size + self.kv_size)
