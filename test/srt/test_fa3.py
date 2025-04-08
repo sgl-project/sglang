@@ -77,8 +77,6 @@ class BaseFlashAttentionTest(unittest.TestCase):
 class TestFlashAttention3(BaseFlashAttentionTest):
     """Test FlashAttention3 with MLA model and CUDA graph enabled."""
 
-    model = MODEL_USED_FOR_TEST_MLA
-
     @classmethod
     def get_server_args(cls):
         args = super().get_server_args()
@@ -86,6 +84,7 @@ class TestFlashAttention3(BaseFlashAttentionTest):
             [
                 "--cuda-graph-max-bs",
                 "2",
+                "--disable-mla",
             ]
         )
         return args
@@ -100,13 +99,16 @@ class TestFlashAttention3DisableCudaGraph(BaseFlashAttentionTest):
         args.extend(
             [
                 "--disable-cuda-graph",
+                "--disable-mla",
             ]
         )
         return args
 
 
-class TestFlashAttention3DisableMLA(BaseFlashAttentionTest):
+class TestFlashAttention3MLA(BaseFlashAttentionTest):
     """Test FlashAttention3 with MLA disabled."""
+
+    model = MODEL_USED_FOR_TEST_MLA
 
     @classmethod
     def get_server_args(cls):
@@ -115,9 +117,17 @@ class TestFlashAttention3DisableMLA(BaseFlashAttentionTest):
             [
                 "--cuda-graph-max-bs",
                 "2",
-                "--disable-mla",
             ]
         )
+        return args
+    
+
+class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
+    """Test FlashAttention3 with speculative decode enabled."""
+
+    @classmethod
+    def get_server_args(cls):
+        args = super().get_server_args()
         return args
 
 
