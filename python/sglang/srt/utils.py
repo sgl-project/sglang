@@ -1824,8 +1824,7 @@ class DeepEPMode(Enum):
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
-        max_value, max_index = torch.max(values, dim=dim)
-        return max_value.unsqueeze(1), max_index.unsqueeze(1)
+        return torch.max(values, dim=dim, keepdim=True)
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
