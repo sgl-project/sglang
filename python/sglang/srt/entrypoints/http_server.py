@@ -774,11 +774,10 @@ def _wait_and_warmup(
         # TODO
         # TODO hack
         # TODO
-        assert server_args.dp_size == 2
         json_data["text"] = [
             "1+1=",
             "The capital city of France is",
-        ]
+        ][: server_args.dp_size]
         # json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
