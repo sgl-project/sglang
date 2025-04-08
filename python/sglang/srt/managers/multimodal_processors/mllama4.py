@@ -132,8 +132,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         # Convert to the format expected by SGLang
         image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
 
-        tokenizer = processor.tokenizer
-
         image_inputs["im_start_id"] = self.boi_token_index
         image_inputs["im_end_id"] = self.eoi_token_index
         image_inputs["im_token_id"] = self.image_token_index
@@ -143,10 +141,6 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             MultimodalDataItem(
                 pixel_values=image_inputs["pixel_values"],
                 modality=Modality.IMAGE,
-                # Add additional metadata needed for Llama4 vision processing
-                embed_is_patch=image_inputs.get("embed_is_patch", None),
-                aspect_ratios=image_inputs.get("aspect_ratios", None),
-                patches_per_image=image_inputs.get("patches_per_image", None),
             )
         ]
 

@@ -180,9 +180,6 @@ class MultimodalDataItem:
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
     second_per_grid_ts: Optional[List[torch.Tensor]] = None
-    embed_is_patch: Optional[torch.Tensor] = None
-    aspect_ratios: Optional[torch.Tensor] = None
-    patches_per_image: Optional[torch.Tensor] = None
 
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None

@@ -1,4 +1,3 @@
-# TODO: add Adopted from vllm/mllama4.py
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -137,11 +136,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         num_experts = self.config.text_config.num_local_experts
 
         for name, loaded_weight in weights:
-            # if name.startswith(
-            #     "multi_modal_projector"
-            # ):
-            #     continue
-
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
