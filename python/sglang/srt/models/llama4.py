@@ -199,6 +199,7 @@ class Llama4Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            reduce_results=False,
         )
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
