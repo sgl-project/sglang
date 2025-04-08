@@ -583,10 +583,6 @@ class FlashAttentionBackend(AttentionBackend):
                 v_cache=value_cache,
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k,
-                max_seqlen_q=metadata.max_seq_len_q,
-                cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
@@ -1004,12 +1000,9 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
         if encoder_lens is not None:
-            # Only support batch size 1 for encoder
-            encoder_lens_int32 = (
-                encoder_lens[:1].clone().detach().to(device=device, dtype=torch.int32)
-            )
-            metadata.encoder_max_seq_len_k = encoder_lens_int32.max().item()
-            metadata.encoder_lens_int32.copy_(encoder_lens_int32)
+            # Only support encoder size 1 for now
+            metadata.encoder_max_seq_len_k = encoder_lens[0]
+            metadata.encoder_lens_int32.copy_(encoder_lens[:1])
             metadata.encoder_cu_seqlens_k.copy_(
                 torch.nn.functional.pad(
                     torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
