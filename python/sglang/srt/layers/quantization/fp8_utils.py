@@ -171,6 +171,7 @@ def input_to_float8(
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     fp8_max = finfo.max
     if _is_hip:
+        dtype = torch.float8_e4m3fnuz
         fp8_max = 224.0
     scale = fp8_max / amax
     x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
