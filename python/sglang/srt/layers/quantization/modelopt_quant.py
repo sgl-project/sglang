@@ -358,7 +358,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         weight = ModelWeightParameter(
             data=torch.empty(
-                # 2 fp4 data is packed in one fp8 in the input dimension
+                # 2 fp4 data is packed in one uint8 in the input dimension
                 output_size_per_partition,
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
