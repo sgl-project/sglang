@@ -12,6 +12,10 @@ def create_flashinfer_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
 ):
+    """
+    Fill kv_indices with token page indices from `req_to_token_pool`, which
+    will be used to index into `token_to_kv_pool`.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
@@ -27,6 +31,7 @@ def create_flashinfer_kv_indices_triton(
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    # Load all kv indices for a request
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
@@ -90,3 +95,24 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+@triton.jit
+def create_casual_mask_paged_triton(
+    mask_ptr, # [qo_len, kv_len]
+    qo_indptr, # [bs + 1], cumulative ranges for each req
+    kv_indptr, # [bs + 1]
+    prefix_lens_ptr, # [bs + 1]
+    stride_mask_qo: tl.constexpr,
+):
+    pid_bs = tl.program_id(axis=0)
+    qo_start = tl.load(qo_indptr + pid_bs).to(tl.int32)
+    qo_end = tl.load(qo_indptr + pid_bs + 1).to(tl.int32)
+    kv_start = tl.load(kv_indptr + pid_bs).to(tl.int32)
+    kv_end = tl.load(kv_indptr + pid_bs + 1).to(tl.int32)
+    kv_len = kv_end - kv_start
+    
+    for i in range(qo_start, qo_end):
+        mask_offset = i * stride_mask_qo + kv_start + tl.arange(kv_len, dtype=tl.int32)
+        qo_index = i + tl.load(prefix_lens_ptr + pid_bs)
+        mask = tl.arange(kv_start, kv_end) < qo_index
+        tl.store(mask_ptr + mask_offset, mask)

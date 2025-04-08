@@ -8,7 +8,7 @@ Enable speculative sampling in FlashMLA
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, Tuple
 
 import torch
 import triton
