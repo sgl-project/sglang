@@ -534,7 +534,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     # sm_scale_d=layer.scaling,
                 )
                 o = torch.cat([o_p, o_d], dim=0)
-                print("pod forward")
+                # print("pod forward")
             else:
                 o = prefill_wrapper_paged.forward(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
