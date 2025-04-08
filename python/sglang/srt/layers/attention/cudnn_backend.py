@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 import cudnn
 import logging
-from torch.nn.functional import scaled_dot_product_attention
+from dataclasses import dataclass
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -15,15 +15,175 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+
+@dataclass
+class _CuDNNInputParameters:
+    num_heads = 4
+    head_size = 128
+    max_total_num_tokens = 300
+    max_num_reqs = 100
+    max_context_lenght = 300
+
+
 class CuDNNBackend(AttentionBackend):
-    def __init__(self):
+    @dataclass
+    class _ArgMapKeys:
+        q = "q"
+        k_container = "k_container"
+        v_container = "v_container"
+        k_page_table = "k_page_table"
+        v_page_table = "v_page_table"
+        seq_len_q_tensor_info = "seq_len_q_tensor_info"
+        seq_len_kv_tensor_info = "seq_len_kv_tensor_info"
+        o = "o"
+
+    def __init__(self, model_runner: ModelRunner, use_cuda_graph = True):
         super().__init__()
         self.forward_metadata = None
 
+        self._model_runner=model_runner
+        # should the number of requests be max_request or max_batch_size
+        self.input_size_params=_CuDNNInputParameters(
+            num_heads=model_runner.model_config.num_attention_heads,
+            head_size=model_runner.model_config.head_dim,
+            max_total_num_tokens=model_runner.max_total_num_tokens,
+            max_num_reqs = model_runner.server_args.max_running_requests
+        )
+
+        self._decode_graphs=self._init_decode_graphs()
+        self._forward_graphs=self._init_prefill_graphs()
+
+
+    def _create_cudnn_graph(self, batch_size:int, query_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len):
+        graph = cudnn.pygraph(
+                io_data_type=cudnn.data_type.HALF,
+                intermediate_data_type=cudnn.data_type.FLOAT,
+                compute_data_type=cudnn.data_type.FLOAT,
+            )
+
+            # q shape: [num_token, num_heads, 1,  head_size], where 1 is sequence length
+        q_cudnn = graph.tensor(
+            name="q",
+            dim=query_shape,
+            stride=self._make_compact_strides(query_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+
+        # container: num_blocks, num heads, tokens_per_block, dim
+        # container: max_tokens, num_heads, 1, head_dim since sglang block size is 1
+        k_container_cudnn = graph.tensor(
+            name="k_container",
+            dim=kv_container_shape,
+            stride=self._make_compact_strides(kv_container_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+        v_container_cudnn = graph.tensor(
+            name="v_container",
+            dim=kv_container_shape,
+            stride=self._make_compact_strides(kv_container_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+
+        k_page_table = graph.tensor(
+            name="k_page_table",
+            dim=kv_page_table_shape,
+            stride=self._make_compact_strides(kv_page_table_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+        v_page_table = graph.tensor(
+            name="v_page_table",
+            dim=kv_page_table_shape,
+            stride=self._make_compact_strides(kv_page_table_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+            
+        kv_seq_len = graph.tensor(
+            name="kv_seq_len",
+            dim=seq_len_shape,
+            stride=self._make_compact_strides(seq_len_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+        q_seq_len = graph.tensor(
+            name="q_seq_len",
+            dim=seq_len_shape,
+            stride=self._make_compact_strides(seq_len_shape),
+            data_type=cudnn.data_type.HALF,
+        )
+
+        # TODO: casual, padding mask and gqa same as forward call
+        o, _ = graph.sdpa(
+            name="sdpa",
+            q=q_cudnn,
+            k=k_container_cudnn,  # Container K: non contiguous container with K blocks
+            v=v_container_cudnn,  # Container V: non contiguous container with V blocks
+            is_inference=True,
+            attn_scale=self._model_runner.model_config.scaling,
+            use_causal_mask=True,
+            use_padding_mask=True,
+            seq_len_q=q_seq_len,
+            seq_len_kv=kv_seq_len,
+            paged_attention_k_table=k_page_table,  # Page Table K: Tensor containing offsets to the container with K blocks
+            paged_attention_v_table=v_page_table,  # Page Table V: Tensor containing offsets to the container with V blocks
+            paged_attention_max_seq_len_kv=max_seq_len,  # The maximum sequence length for K caches (this is optional, but recommended)
+        )
+        logging.info(graph)
+
+
+        o.set_output(True).set_dim(query_shape).set_stride(self._make_compact_strides(query_shape))
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans()
+
+        args_map = {
+                self._ArgMapKeys.q: q_cudnn,
+                self._ArgMapKeys.k_container: k_container_cudnn,
+                self._ArgMapKeys.v_container: v_container_cudnn,
+                self._ArgMapKeys.k_page_table: k_page_table,
+                self._ArgMapKeys.v_page_table: v_page_table, 
+                self._ArgMapKeys.seq_len_q_tensor_info: q_seq_len,
+                self._ArgMapKeys.seq_len_kv_tensor_info: kv_seq_len,
+                self._ArgMapKeys.o: o,
+            }
+        return args_map,graph
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
         pass
 
+
+    def _make_compact_strides(tensor_shape):
+            """Make compact strides for a tensor shape."""
+            strides = []
+            stride = 1
+            for dim in reversed(tensor_shape):
+                strides.append(stride)
+                stride *= dim
+            return list(reversed(strides))
+    
+    def _init_decode_graphs(self,max_batch_size):
+        
+        max_seq_len = self._model_runner.server_args.max_total_tokens
+        for batch_size in range(1,max_batch_size+1):
+            # Radix Attention use KVCache of Block Size 1
+
+            q_shape=[batch_size, self._model_runner.model_config.num_attention_heads,1,self._model_runner.model_config.head_dim]
+            kv_container_shape=[self._model_runner.server_args.max_total_tokens,self._model_runner.model_config.num_attention_heads,1,self._model_runner.model_config.head_dim]
+            kv_page_table_shape=[self._model_runner.server_args.max_running_requests,self._model_runner.server_args.max_total_tokens]
+            seq_len_shape=[batch_size,1,1,1]
+
+            tensor_args,graph = self._create_cudnn_graph(batch_size, q_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len)
+            self._decode_graphs.append((tensor_args, graph))
+            assert batch_size == len(self._decode_graphs), f"batch size {batch_size} does not match the number of graphs {len(self._decode_graphs)}"
+
+        return self._decode_graphs
+
+    
+    def _init_prefill_graphs(self,max_batch_size):
+        pass
+
+
+    
     def _run_sdpa_forward_extend(
         self,
         query: torch.Tensor,
@@ -73,7 +233,7 @@ class CuDNNBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         scaling=None,
         enable_gqa=False,
-        causal=False,
+        causal=True,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -92,18 +252,14 @@ class CuDNNBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
-
-        logging.info("Running decode")
-        print("output shape: ",output.shape)
         assert query.shape[0] == seq_lens.shape[0], "batch size must be the same"
 
-        max_seq_len = k_cache.shape[0]
+        tensor_key_map,cudnn_decode_graph = self._decode_graphs[query.shape[0]-1]
         # Convert into CuDNN Query format (B, H, S, D)
         # where B is number of queries and S is sequence per query (1 in decoding)
         # [num_tokens, num_heads, head_size] -> [num_token, num_heads, 1,  head_size]
         query = query.unsqueeze(1).movedim(1,2)
-        print(query.shape)
-        print(query.device)
+
 
         # heads, tokens, head size
         # The tokens of queries are indexed by req_to_token
@@ -113,98 +269,41 @@ class CuDNNBackend(AttentionBackend):
 
         # Radix Attention use KVCache of Block Size 1
 
-        # TODO: determine data type
-        graph = cudnn.pygraph(
-            io_data_type=cudnn.data_type.HALF,
-            intermediate_data_type=cudnn.data_type.FLOAT,
-            compute_data_type=cudnn.data_type.FLOAT,
-        )
-        print(graph)
-
-        # query contains num_tokens queries batched togather
-        q_gpu = query
-        q = graph.tensor_like(q_gpu)
-
-
         # get the request id of each query up to t
         # per_req_tokens = req_to_token[req_pool_indices, :seq_len_kv]
 
         # get the token location in kvcache, only up to seq_len_kv is valid
         # cudnn required shape: (num_block, 1, ceil(s/num_block), 1)
-        print("req index shape: ",req_pool_indices.shape,"req to token shape: ",req_to_token.shape)
         per_req_tokens = req_to_token[req_pool_indices, :]
-        print("per req token shape: ",per_req_tokens.shape)
 
         # get the kv cache with request id
         # container: num_blocks, num heads, tokens_per_block, dim
-        # TODO: permute for correctness
         container_k_gpu = k_cache.view(s,h,b,d)
-        print('cache shape: ',container_k_gpu.shape)
         container_v_gpu = v_cache.view(s,h,b,d)
 
-
-        container_k = graph.tensor_like(container_k_gpu)
-        container_v = graph.tensor_like(container_v_gpu)
-
-
         page_table_k_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
-        print("paged table k shape: ",page_table_k_gpu.shape)
         page_table_v_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
-        print("page table v shape: ",page_table_v_gpu.shape)
-        page_table_k = graph.tensor_like(page_table_k_gpu)
-        page_table_v = graph.tensor_like(page_table_v_gpu)
-
+        
         seq_lens_kv = seq_lens.view(seq_lens.shape[0], 1, 1, 1)
-
         seq_lens_q = torch.ones_like(seq_lens_kv)
 
-        seq_len_q_tensor_info = graph.tensor_like(seq_lens_q)
-        seq_len_kv_tensor_info = graph.tensor_like(seq_lens_kv)
-
-        o, _ = graph.sdpa(
-            name="sdpa",
-            q=q,
-            k=container_k,  # Container K: non contiguous container with K blocks
-            v=container_v,  # Container V: non contiguous container with V blocks
-            is_inference=True,
-            attn_scale=scaling,
-            use_causal_mask=True,
-            use_padding_mask=True,
-            seq_len_q=seq_len_q_tensor_info,
-            seq_len_kv=seq_len_kv_tensor_info,
-            paged_attention_k_table=page_table_k,  # Page Table K: Tensor containing offsets to the container with K blocks
-            paged_attention_v_table=page_table_v,  # Page Table V: Tensor containing offsets to the container with V blocks
-            paged_attention_max_seq_len_kv=max_seq_len,  # The maximum sequence length for K caches (this is optional, but recommended)
-        )
-        logging.info(graph)
 
         output = output.view(*query.shape)
-        dims = output.shape
-        strides = output.stride()
-        print("output shape: ",output.shape)
-
-
-        o.set_output(True).set_dim(dims).set_stride(strides)
-        graph.validate()
-        graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-        graph.build_plans()
-
         variant_pack = {
-            q: q_gpu,
-            container_k: container_k_gpu,
-            container_v: container_v_gpu,
-            page_table_k: page_table_k_gpu,
-            page_table_v: page_table_v_gpu,
-            seq_len_q_tensor_info: seq_lens_q,
-            seq_len_kv_tensor_info: seq_lens_kv,
-            o: output,
+            tensor_key_map[self._ArgMapKeys.q]: query,
+            tensor_key_map[self._ArgMapKeys.k_container]: container_k_gpu,
+            tensor_key_map[self._ArgMapKeys.v_container]: container_v_gpu,
+            tensor_key_map[self._ArgMapKeys.k_page_table]: page_table_k_gpu,
+            tensor_key_map[self._ArgMapKeys.v_page_table]: page_table_v_gpu,  
+            tensor_key_map[self._ArgMapKeys.seq_len_q_tensor_info]: seq_lens_q,
+            tensor_key_map[self._ArgMapKeys.seq_len_kv_tensor_info]: seq_lens_kv,
+            tensor_key_map[self._ArgMapKeys.o]: output,
         }
 
+    
+        workspace = torch.empty(cudnn_decode_graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+        cudnn_decode_graph.execute(variant_pack, workspace)
 
-        workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-        graph.execute(variant_pack, workspace)
         return output
 
     def forward_extend(
