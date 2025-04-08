@@ -495,17 +495,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 #     forward_batch.extend_prefix_lens,
                 #     stride_mask_qo=mask_p.stride(0),
                 # )
-                # import socket
-                # from remote_pdb import RemotePdb
-
-                # def find_unused_port():
-                #     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                #         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #         s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-                #         return s.getsockname()[1]
-
-                # port = find_unused_port()
-                # RemotePdb(host='localhost', port=port).set_trace()
                 for i in range(num_prefill_reqs):
                     q_start = qo_indptr_p[i]
                     q_end = qo_indptr_p[i + 1]
