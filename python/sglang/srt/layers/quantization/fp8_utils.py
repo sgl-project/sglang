@@ -243,8 +243,8 @@ def apply_fp8_linear(
         if _is_cuda:
             qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
         else:
-            qinput, x_scale = per_token_group_quant_fp8(
-                input_2d, group_size=input_2d.shape[1]
+            qinput, x_scale = ops.scaled_fp8_quant(
+                input_2d, input_scale, use_per_token_if_dynamic=use_per_token_if_dynamic
             )
 
     if cutlass_fp8_supported:
