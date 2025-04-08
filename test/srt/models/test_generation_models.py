@@ -67,7 +67,7 @@ ALL_OTHER_MODELS = [
     ModelCase("microsoft/Phi-3-small-8k-instruct"),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
-    ModelCase("mistral-community/Pixtral-12B", skip_long_prompt=True),
+    ModelCase("mistral-community/pixtral-12b", tp_size=2, skip_long_prompt=True),
 ]
 
 TORCH_DTYPES = [torch.float16]
