@@ -1330,17 +1330,18 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        # Only Deepseek V3/R1 tp mode can use shared experts fusion optimization now.
         if (
             global_server_args_dict.get("disable_shared_experts_fusion", False)
             or self.config.architectures[0] != "DeepseekV3ForCausalLM"
             or self.config.n_routed_experts != 256
             or self.config.routed_scaling_factor != 2.5
+            or global_server_args_dict["enable_deepep_moe"]
         ):
             self.n_share_experts_fusion = None
             global_server_args_dict["n_share_experts_fusion"] = None
             logger.info(
-                "Only Deepseek V3/R1 can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+                "Only Deepseek V3/R1 tp mode can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
             )
         elif self.n_share_experts_fusion is None:
             global_server_args_dict["n_share_experts_fusion"] = self.tp_size

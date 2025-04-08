@@ -226,12 +226,20 @@ __device__ void moe_fused_gate_impl(
   if (n_share_experts_fusion > 0 && thread_group_idx == 0) {
     // For the last position, we need to set a random expert ID and adjust the weight
     int64_t last_idx = topk * thread_row + (topk - 1);
+
+    // Use curand to generate random number
+    curandStatePhilox4_32_10_t state;
+    curand_init(thread_row, 0, 0, &state);
+    int64_t random_offset = curand(&state) % n_share_experts_fusion;
+    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + random_offset);
     
     // Calculate the sum of the first k-1 weights
     float prev_sum = 0.0f;
     for (int ii = 0; ii < topk - 1; ++ii) {
       prev_sum += output_ptr[topk * thread_row + ii];
     }
+
+    __syncthreads();
     
     // Set the weight to the sum of the first k-1 weights divided by 2.5 (as in the Python implementation)
     output_ptr[last_idx] = prev_sum / 2.5f;
@@ -247,7 +255,7 @@ __device__ void moe_fused_gate_impl(
 #pragma unroll
     for (int ii = 0; ii < topk; ++ii) {
       int64_t const idx = topk * thread_row + ii;
-      output_ptr[idx] = static_cast<float>(static_cast<T>(output_ptr[idx]) / static_cast<T>(output_sum));
+      output_ptr[idx] = output_ptr[idx] / output_sum;
     }
   }
 }

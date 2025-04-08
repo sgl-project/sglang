@@ -54,9 +54,6 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, n_share_experts_fusi
         # For indices, we only compare the first topk-1 values
         indices = indices[:, :-1]
         ref_indices = ref_indices[:, :-1]
-        # For output, we also only compare the first topk-1 values
-        output = output[:, :-1]
-        ref_output = ref_output[:, :-1]
 
     idx_check = torch.allclose(
         ref_indices.sort()[0].to(torch.int32),
