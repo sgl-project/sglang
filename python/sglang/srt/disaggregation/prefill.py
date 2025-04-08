@@ -95,7 +95,7 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_manager = KVManager(kv_args, mode="prefill")
         return kv_manager
 
     def add(self, req: Req) -> None:
