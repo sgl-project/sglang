@@ -5,7 +5,7 @@ import logging
 import struct
 import threading
 from functools import cache
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -16,6 +16,32 @@ from sglang.srt.disaggregation.transfer_engine.mooncake import MooncakeTransferE
 from sglang.srt.disaggregation.utils import DisaggregationMode
 
 logger = logging.getLogger(__name__)
+
+
+def group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    src_groups = []
+    dst_groups = []
+    current_src = [src_indices[0]]
+    current_dst = [dst_indices[0]]
+
+    for i in range(1, len(src_indices)):
+        src_contiguous = src_indices[i] == src_indices[i - 1] + 1
+        dst_contiguous = dst_indices[i] == dst_indices[i - 1] + 1
+        if src_contiguous and dst_contiguous:
+            current_src.append(src_indices[i])
+            current_dst.append(dst_indices[i])
+        else:
+            src_groups.append(current_src)
+            dst_groups.append(current_dst)
+            current_src = [src_indices[i]]
+            current_dst = [dst_indices[i]]
+
+    src_groups.append(current_src)
+    dst_groups.append(current_dst)
+
+    return src_groups, dst_groups
 
 
 class KVArgs:
@@ -91,6 +117,9 @@ class KVManager:
         dst_kv_indices: npt.NDArray[np.int64],
     ):
         layer_num = int(len(self.kv_args.kv_data_ptrs) / 2)
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
         for layer_id in range(layer_num):
             prefill_key_layer_ptr = self.kv_args.kv_data_ptrs[layer_id]
             key_item_len = self.kv_args.kv_item_lens[layer_id]
@@ -99,29 +128,34 @@ class KVManager:
 
             decode_key_layer_ptr = dst_ptrs[layer_id]
             decode_value_layer_ptr = dst_ptrs[layer_num + layer_id]
-            # TODO: Maybe combine multiple contiguous indices into one transfer_sync op
-            for prefill_index, decode_index in zip(prefill_kv_indices, dst_kv_indices):
-                prefill_key_addr = prefill_key_layer_ptr + prefill_index * key_item_len
-                decode_key_addr = decode_key_layer_ptr + decode_index * key_item_len
+
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                prefill_key_addr = (
+                    prefill_key_layer_ptr + prefill_index[0] * key_item_len
+                )
+                decode_key_addr = decode_key_layer_ptr + decode_index[0] * key_item_len
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
-                    mooncake_session_id, prefill_key_addr, decode_key_addr, key_item_len
+                    mooncake_session_id,
+                    prefill_key_addr,
+                    decode_key_addr,
+                    key_item_len * len(prefill_index),
                 )
                 if status != 0:
                     return status
 
                 prefill_value_addr = (
-                    prefill_value_layer_ptr + prefill_index * value_item_len
+                    prefill_value_layer_ptr + prefill_index[0] * value_item_len
                 )
                 decode_value_addr = (
-                    decode_value_layer_ptr + decode_index * value_item_len
+                    decode_value_layer_ptr + decode_index[0] * value_item_len
                 )
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
                     mooncake_session_id,
                     prefill_value_addr,
                     decode_value_addr,
-                    value_item_len,
+                    value_item_len * len(prefill_index),
                 )
                 if status != 0:
                     return status
