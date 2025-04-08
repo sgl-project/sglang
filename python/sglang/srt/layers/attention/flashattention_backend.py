@@ -263,7 +263,6 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
-
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -476,7 +475,7 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
-            # TODO: support len(forward_batch.encoder_lens) > 1
+            # Currently only support len(forward_batch.encoder_lens) == 1
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
                 metadata.encoder_max_seq_len_k : (
