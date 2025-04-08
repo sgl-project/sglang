@@ -58,18 +58,7 @@ class SchedulerOutputProcessorMixin:
                         )
 
             hidden_state_offset = 0
-            # if batch.forward_mode.is_mixed():
-            #     import socket
-            #     from remote_pdb import RemotePdb
 
-            #     def find_unused_port():
-            #         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            #             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            #             s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-            #             return s.getsockname()[1]
-
-            #     port = find_unused_port()
-            #     RemotePdb(host='localhost', port=port).set_trace()
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
