@@ -423,7 +423,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
         padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
-        padded_scales = padded_scales.reshape(M, K) if scale_ndim == 2 else padded_scales.reshape(B, M, K)
+        padded_scales = (
+            padded_scales.reshape(M, K)
+            if scale_ndim == 2
+            else padded_scales.reshape(B, M, K)
+        )
         layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
 
     def apply(
