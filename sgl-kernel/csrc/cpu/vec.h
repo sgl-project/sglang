@@ -116,14 +116,4 @@ inline void quantize_row_int8<at::BFloat16>(uint8_t* __restrict__ Aq, float& As,
 }
 #endif
 
-// TODO: debug print, remove me later
-template<typename scalar_t>
-void print_array(scalar_t* ptr, int size) {
-  for (int d = 0; d < size; ++d) {
-    if (d % 16 == 0) { std::cout << std::endl; }
-    std::cout << ptr[d] << " ";
-  }
-  std::cout << std::endl;
-}
-
 } // anonymous namespace

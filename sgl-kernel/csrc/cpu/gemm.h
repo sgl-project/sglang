@@ -98,35 +98,3 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg);
-
-// TODO: debug print, remove me later
-inline void print_16x32i(const __m512i x) {
-  int32_t a[16];
-  _mm512_storeu_si512((__m512i *)a, x);
-
-  for (int i = 0; i < 16; i++){
-    std::cout << a[i] << " ";
-  }
-  std::cout << std::endl;
-}
-
-inline void print_16x32(const __m512 x) {
-  float a[16];
-  _mm512_storeu_ps((__m512 *)a, x);
-
-  for (int i = 0; i < 16; i++){
-    std::cout << a[i] << " ";
-  }
-  std::cout << std::endl;
-}
-
-
-inline void print_32x8u(const __m256i x) {
-  uint8_t a[32];
-  _mm256_storeu_si256((__m256i *)a, x);
-
-  for (int i = 0; i < 32; ++i) {
-    std::cout << int32_t(a[i]) << " ";
-  }
-  std::cout << std::endl;
-}
