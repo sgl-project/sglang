@@ -58,7 +58,7 @@ jobs:
           docker exec -w / ci_sglang mkdir -p /dummy-grok
           mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -P dummy-grok
           docker cp ./dummy-grok ci_sglang:/dummy-grok/
-          docker exec -w /sglang-checkout ls /dummy-grok/
+          docker exec -w /sglang-checkout ci_sglang ls /dummy-grok/
           
 
       - name: Evaluate Accuracy
