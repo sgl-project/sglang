@@ -76,7 +76,6 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
@@ -199,8 +198,15 @@ class MultimodalDataItem:
         Set the pad value after first hashign the data
         """
 
+        def tensor_hash(f):
+            f_list = flatten_nested_list(f)
+            f_cat = torch.concat(f_list).contiguous().numpy().tobytes()
+            return hash(f_cat)
+
         def hash_feature(f):
             if isinstance(f, list):
+                if isinstance(f[0], torch.Tensor):
+                    return tensor_hash(f)
                 return hash(tuple(flatten_nested_list(f)))
             elif isinstance(f, np.ndarray):
                 arr = np.ascontiguousarray(f)
@@ -1437,7 +1443,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["enable_flashinfer_mla"]
+            (
+                global_server_args_dict["use_mla_backend"]
+                and global_server_args_dict["attention_backend"] == "flashinfer"
+            )
             or global_server_args_dict["enable_flashmla"]
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
