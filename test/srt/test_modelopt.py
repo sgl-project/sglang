@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
+
 import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -11,7 +13,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
 
 
 class TestEvalFP8ModelOptQuantAccuracy(CustomTestCase):
