@@ -207,6 +207,7 @@ async def handle_generate_request(request_data: dict):
                                     error_msg, option=orjson.OPT_NON_STR_KEYS
                                 ) + b"\n\n"
                                 return
+                            prefill_response.release()
                         else:
                             decode_response = response
                             if response.status != 200:
