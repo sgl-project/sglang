@@ -20,13 +20,11 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-from transformers import Llama4TextConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -41,6 +39,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from torch import nn
+from transformers import Llama4TextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +50,10 @@ class Llama4MoE(nn.Module):
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     @staticmethod
     def custom_routing_function(
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
+            hidden_states: torch.Tensor,
+            gating_output: torch.Tensor,
+            topk: int,
+            renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
@@ -65,10 +65,10 @@ class Llama4MoE(nn.Module):
         )
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -124,43 +124,47 @@ class Llama4MoE(nn.Module):
 class Llama4Attention(nn.Module):
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        layer_id: int,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
-        bias: bool = False,
-        bias_o_proj: bool = False,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            layer_id: int,
+            hidden_size: int,
+            num_heads: int,
+            num_kv_heads: int,
+            rope_theta: float = 10000,
+            rope_scaling: Optional[Dict[str, Any]] = None,
+            max_position_embeddings: int = 8192,
+            quant_config: Optional[QuantizationConfig] = None,
+            bias: bool = False,
+            bias_o_proj: bool = False,
+            prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.use_rope = int((layer_id + 1) % 4 != 0)
         self.use_qk_norm = config.use_qk_norm and self.use_rope
-        tp_size = get_tensor_model_parallel_world_size()
+
+        self.dp_size = get_attention_dp_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attn_temperature_tuning = config.attn_temperature_tuning
         self.floor_scale = config.floor_scale
         self.attn_scale = config.attn_scale
@@ -227,10 +231,10 @@ class Llama4Attention(nn.Module):
         return attn_scale.unsqueeze(-1)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -262,11 +266,11 @@ class Llama4Attention(nn.Module):
 
 class Llama4DecoderLayer(nn.Module):
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            layer_id: int = 0,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -310,11 +314,11 @@ class Llama4DecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
+            residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -336,10 +340,10 @@ class Llama4DecoderLayer(nn.Module):
 
 class Llama4Model(nn.Module):
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -363,11 +367,11 @@ class Llama4Model(nn.Module):
         self.layers_to_capture = []
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: ForwardBatch,
+            input_embeds: torch.Tensor = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -394,25 +398,24 @@ class Llama4Model(nn.Module):
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
 
     def _init_model(
-        self,
-        config: Llama4TextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+            self,
+            config: Llama4TextConfig,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
