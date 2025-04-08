@@ -51,7 +51,6 @@ except ImportError:
 
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -64,10 +63,6 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    UnquantizedEmbeddingMethod,
-)
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -177,6 +172,13 @@ def get_linear_quant_method(
     prefix: str,
     linear_method_cls: type,
 ):
+    # Move import here to avoid circular import. This is only used in monkey patching
+    # of vllm's QuantizationConfig.
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        UnquantizedEmbeddingMethod,
+    )
+
     cloned_config = deepcopy(config)
     parallel_lm_head_quantized = (
         isinstance(layer, ParallelLMHead) and cloned_config.lm_head_quantized
@@ -203,6 +205,8 @@ def get_linear_quant_method(
 
 
 def gptq_get_quant_method(self, layer, prefix):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     if isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
 
@@ -279,6 +283,7 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
     ):
