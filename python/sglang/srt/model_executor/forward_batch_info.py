@@ -44,11 +44,7 @@ from sglang.srt.utils import get_compiler_backend
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
-    from sglang.srt.mem_cache.memory_pool import (
-        KVCache,
-        MLATokenToKVPool,
-        ReqToTokenPool,
-    )
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -504,9 +500,10 @@ class ForwardBatch:
 
     # Called before each attention module if using chunked kv cache for prefill
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-    def prepare_chunked_prefix_cache_info(
-        self, device: torch.device, cache_dtype: torch.dtype, head_dim: int
-    ):
+    def prepare_chunked_prefix_cache_info(self, device: torch.device):
+
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
         assert isinstance(
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
@@ -516,7 +513,7 @@ class ForwardBatch:
             return
 
         # If no sequence has prefix, then no need to use chunked kv cache
-        if (self.extend_prefix_lens_cpu > 0).sum().item() == 0:
+        if not any(self.extend_prefix_lens_cpu):
             self.enable_chunked_prefix = False
             return
 
@@ -535,10 +532,10 @@ class ForwardBatch:
         # prefix_chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
         # TODO: Implement a better way to allocate chunk lengths that uses memory spaces more efficiently.
         self.num_prefix_chunks = (
-            self.extend_prefix_lens_cpu.max().item() + self.prefix_chunk_len - 1
+            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
         ) // self.prefix_chunk_len
         self.prefix_chunk_starts = (
-            torch.arange(self.prefix_kv_chunks, device=device, dtype=torch.int32)
+            torch.arange(self.num_prefix_chunks, device=device, dtype=torch.int32)
             .unsqueeze(1)
             .expand(-1, self.batch_size)
             * self.prefix_chunk_len
