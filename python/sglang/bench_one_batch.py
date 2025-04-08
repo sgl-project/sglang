@@ -137,6 +137,7 @@ def load_model(server_args, port_args, tp_rank):
         is_embedding=server_args.is_embedding,
         dtype=server_args.dtype,
         quantization=server_args.quantization,
+        is_context_extended=server_args.enable_hip_attention,
     )
     model_runner = ModelRunner(
         model_config=model_config,
@@ -236,6 +237,7 @@ def extend(reqs, model_runner):
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         enable_custom_logit_processor=False,
+        hip_attention_config=model_runner.server_args.hip_attention_config,
     )
     batch.prepare_for_extend()
     model_worker_batch = batch.get_model_worker_batch()

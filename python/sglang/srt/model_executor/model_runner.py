@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -46,6 +47,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -270,6 +272,10 @@ class ModelRunner:
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
+        elif server_args.enable_hip_attention:
+            logger.info("HIP attention is turned on.")
+            server_args.attention_backend = "hip_attention"
+
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
             logger.info(
@@ -391,6 +397,19 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
+        if self.server_args.enable_hip_attention:
+            orig_context_length = get_context_length(self.model_config.hf_config)
+            if self.server_args.context_length is None:
+                self.server_args.context_length = orig_context_length
+            update_context_length(
+                self.model_config.hf_config, self.server_args.context_length
+            )
+            self.model_config.hf_config.orig_context_len = orig_context_length
+            logger.info(
+                f"Update model config for HiP context extension "
+                f"{orig_context_length} -> {self.server_args.context_length}."
+            )
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -427,6 +446,23 @@ class ModelRunner:
                     "provided. Defaulting to scaling factors of 1.0. "
                     "This may lead to less accurate results!"
                 )
+
+        if self.server_args.enable_hip_attention:
+            model_supports_hip_attention = hasattr(
+                self.model, "hip_attention_supported"
+            )
+            if self.server_args.hip_attention_config.using_extend:
+                if not model_supports_hip_attention:
+                    raise RuntimeError(
+                        "Model does not support HiP attention context length extension. "
+                        "Try disabling context extension in --hip-attention-config."
+                    )
+            if self.server_args.enable_hip_kv_cache_offload:
+                if not model_supports_hip_attention:
+                    raise RuntimeError(
+                        "Model does not support HiP attention KV cache offloading. "
+                        "Try disabling --enable-hip-kv-cache-offload."
+                    )
 
         # Parse other args
         self.sliding_window_size = (
@@ -741,7 +777,12 @@ class ModelRunner:
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."
                 )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            if self.server_args.enable_hip_kv_cache_offload:
+                self.max_total_num_tokens = max_total_tokens
+            else:
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens, max_total_tokens
+                )
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
@@ -788,6 +829,21 @@ class ModelRunner:
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+        elif (
+            self.server_args.enable_hip_attention
+            and self.server_args.enable_hip_kv_cache_offload
+        ):
+            self.token_to_kv_pool = MHATokenToHiPOffloadKVPool(
+                max_token_size=self.max_total_num_tokens,
+                max_mask_cache_factor=self.server_args.hip_max_mask_cache_factor,
+                max_sa_cache_factor=self.server_args.hip_max_sa_cache_factor,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=torch.device(self.gpu_id),
+                hip_config=self.server_args.hip_attention_config,
+            )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
@@ -818,6 +874,21 @@ class ModelRunner:
                 )
         else:
             assert self.is_draft_worker
+
+        self.hip_metadata_cache_pool = None
+        if self.server_args.enable_hip_attention:
+            from hip_attn.v1_2 import HiPMetadataCachePool
+
+            self.hip_metadata_cache_pool = HiPMetadataCachePool(
+                self.max_total_num_tokens,
+                query_head_num=(
+                    self.model_config.num_attention_heads // self.server_args.tp_size
+                ),
+                layer_num=self.model_config.num_hidden_layers,
+                context_length=self.model_config.context_len,
+                device=self.device,
+                hip_config=self.server_args.hip_attention_config,
+            )
 
         logger.info(
             f"Memory pool end. "
@@ -893,6 +964,12 @@ class ModelRunner:
             )
 
             self.attn_backend = FlashAttentionBackend(self)
+
+        elif self.server_args.enable_hip_attention:
+            from sglang.srt.layers.attention.hip_attention import HiPAttentionBackend
+
+            self.attn_backend = HiPAttentionBackend(self)
+
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
