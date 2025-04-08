@@ -125,7 +125,7 @@ def fused_moe_router_impl(
     config = {
         "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
         "num_warps": max(
-            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), 16), 4
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), min_num_warps), 4
         ),
     }
 
