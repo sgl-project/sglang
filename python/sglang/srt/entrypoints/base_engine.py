@@ -24,7 +24,7 @@ class EngineBase(ABC):
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
-        """Generate text based on given inputs."""
+        """Generate outputs based on given inputs."""
         pass
 
     @abstractmethod
@@ -44,7 +44,7 @@ class EngineBase(ABC):
 
     @abstractmethod
     def resume_memory_occupation(self):
-        """Resume GPU memory occupation previously released."""
+        """Resume GPU memory occupation which is previously released."""
         pass
 
     @abstractmethod
