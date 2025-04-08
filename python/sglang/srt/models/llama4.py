@@ -40,8 +40,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
-from sglang.srt.speculative.eagle_utils import fast_topk
-from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
 
