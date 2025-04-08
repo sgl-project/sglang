@@ -40,6 +40,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
+from sglang.srt.speculative.eagle_utils import fast_topk
 from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
 
 logger = logging.getLogger(__name__)
@@ -55,10 +56,7 @@ class Llama4MoE(nn.Module):
         topk: int,
         renormalize: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert topk == 1
-        router_scores_aK, router_indices_aK = torch.max(
-            gating_output, dim=-1, keepdim=True
-        )
+        router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
             hidden_states.dtype
         )
@@ -397,7 +395,6 @@ class Llama4Model(nn.Module):
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
