@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
