@@ -1080,11 +1080,21 @@ class DeepseekV2AttentionMLA(nn.Module):
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            k = torch.empty_like(q)
+            k = torch.empty(
+                (
+                    k_nope.shape[0],
+                    self.num_local_heads,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim,
+                ),
+                dtype=v.dtype,
+                device=v.device,
+            )
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            lse = torch.transpose(lse, 0, 1).contiguous()
+            print(accum_output.shape, accum_lse.shape, output.shape, lse.shape)
             accum_output, accum_lse = merge_state(accum_output, accum_lse, output, lse)
 
         return accum_output, accum_lse
@@ -1138,6 +1148,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         attn_output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        lse = torch.transpose(lse, 0, 1).contiguous()
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
         if any(forward_batch.extend_prefix_lens_cpu):
