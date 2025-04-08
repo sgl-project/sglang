@@ -41,7 +41,7 @@ class MooncakeTransferEngine:
 
     def __init__(self):
         try:
-            import mooncake_sglang_adaptor as msa
+            from mooncake.engine import TransferEngine
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
@@ -49,7 +49,7 @@ class MooncakeTransferEngine:
                 "to run SGLang with MooncakeTransferEngine."
             ) from e
 
-        self.engine = msa.TransferEngine()
+        self.engine = TransferEngine()
 
         try:
             self.config = MooncakeTransferEngineConfig.load_from_env()
@@ -73,10 +73,10 @@ class MooncakeTransferEngine:
         )
 
     def register(self, ptr, length):
-        self.engine.expRegisterMemory(ptr, length)
+        self.engine.register_memory(ptr, length)
 
     def deregister(self, ptr):
-        self.engine.expUnregisterMemory(ptr)
+        self.engine.unregister_memory(ptr)
 
     def initialize(
         self,
@@ -93,9 +93,8 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified address."""
 
-        write_op = self.engine.TransferOpcode.WRITE
-        ret = self.engine.transferSyncExt(
-            session_id, buffer, peer_buffer_address, length, write_op
+        ret = self.engine.transfer_sync_write(
+            session_id, buffer, peer_buffer_address, length
         )
         if ret < 0:
             logger.error("Transfer Return Error")
