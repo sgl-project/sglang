@@ -12,7 +12,6 @@ void rmsnorm_kernel_impl(
     int64_t batch_size,
     int64_t hidden_size,
     float eps = 1e-5) {
-
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -27,7 +26,7 @@ void rmsnorm_kernel_impl(
       float sum_val = float(0);
 
       int64_t d;
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -36,7 +35,7 @@ void rmsnorm_kernel_impl(
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         sum_val += x_val * x_val;
@@ -46,7 +45,7 @@ void rmsnorm_kernel_impl(
       float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
       const fVec scale_fvec = fVec(rsqrt_var);
 
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -62,7 +61,7 @@ void rmsnorm_kernel_impl(
         bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
         out_bvec.store(out_ptr + d);
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         float w_val = static_cast<float>(weight[d]);
@@ -81,7 +80,6 @@ void fused_add_rmsnorm_kernel_impl(
     int64_t batch_size,
     int64_t hidden_size,
     float eps = 1e-5) {
-
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -99,7 +97,7 @@ void fused_add_rmsnorm_kernel_impl(
       float sum_val = float(0);
 
       int64_t d;
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -121,7 +119,7 @@ void fused_add_rmsnorm_kernel_impl(
         x_fvec0.store(buffer_ptr + d);
         x_fvec1.store(buffer_ptr + d + fVec::size());
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         float r_val = static_cast<float>(residual_ptr[d]);
@@ -137,7 +135,7 @@ void fused_add_rmsnorm_kernel_impl(
       float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
       const fVec scale_fvec = fVec(rsqrt_var);
 
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
         fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
@@ -151,7 +149,7 @@ void fused_add_rmsnorm_kernel_impl(
         bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
         x_bvec.store(input_ptr + d);
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = buffer_ptr[d] * rsqrt_var * static_cast<float>(weight[d]);
         input_ptr[d] = x_val;
@@ -160,7 +158,7 @@ void fused_add_rmsnorm_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
@@ -192,8 +190,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
 // residual: {batch_size, hidden_size}
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION(
-    "sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
+  RECORD_FUNCTION("sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);

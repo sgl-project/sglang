@@ -1,6 +1,6 @@
 #include "common.h"
-#include "vec.h"
 #include "gemm.h"
+#include "vec.h"
 
 namespace {
 
@@ -18,7 +18,6 @@ void bmm_kernel_impl(
     int64_t out_strideB,
     int64_t out_strideM,
     float scale = 0.f) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -68,15 +67,14 @@ void bmm_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // mat1 : [B, M, K]
 // mat2 : [B, N, K] or [B, OC, IC]
 // out  : [B, M, N]
 // scale: [] 0-dim tensor for per tensor quant
 //
-void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni,
-    std::optional<at::Tensor>& scale) {
+void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, std::optional<at::Tensor>& scale) {
   RECORD_FUNCTION("sgl-kernel::bmm_cpu", std::vector<c10::IValue>({out, mat1, mat2}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);

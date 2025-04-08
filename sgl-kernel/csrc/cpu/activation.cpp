@@ -7,10 +7,10 @@ template <typename scalar_t, typename func_t, typename vec_func_t>
 void act_and_mul_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
-    int64_t num_tokens, int64_t dim,
+    int64_t num_tokens,
+    int64_t dim,
     const func_t& f,
     const vec_func_t& vf) {
-
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -23,7 +23,7 @@ void act_and_mul_kernel_impl(
       scalar_t* __restrict__ output_ptr = output + i * dim;
 
       int64_t d;
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= dim - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -42,7 +42,7 @@ void act_and_mul_kernel_impl(
         x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
         x_bvec.store(output_ptr + d);
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < dim; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         float y_val = static_cast<float>(input_other_ptr[d]);
@@ -52,7 +52,7 @@ void act_and_mul_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}

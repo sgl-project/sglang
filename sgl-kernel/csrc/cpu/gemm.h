@@ -8,18 +8,32 @@
 #define TILE_K 32
 
 // block size for AMX gemm
-constexpr int block_size_m() { return 2 * TILE_M; }
-constexpr int block_size_n() { return 2 * TILE_N; }
+constexpr int block_size_m() {
+  return 2 * TILE_M;
+}
+constexpr int block_size_n() {
+  return 2 * TILE_N;
+}
 
 // define threshold using brgemm (intel AMX)
-template <typename T> inline bool can_use_brgemm(int M);
-template <> inline bool can_use_brgemm<at::BFloat16>(int M) { return M > 4; }
-template <> inline bool can_use_brgemm<at::Half>(int M) { return true; }
+template <typename T>
+inline bool can_use_brgemm(int M);
+template <>
+inline bool can_use_brgemm<at::BFloat16>(int M) {
+  return M > 4;
+}
+template <>
+inline bool can_use_brgemm<at::Half>(int M) {
+  return true;
+}
 // TODO: add u8s8 brgemm, this requires PyTorch 2.7
-template <> inline bool can_use_brgemm<int8_t>(int M) { return false; }
+template <>
+inline bool can_use_brgemm<int8_t>(int M) {
+  return false;
+}
 
 // work around compiler internal error
-#define BLOCK_K 128 // 4 * TILE_K
+#define BLOCK_K 128  // 4 * TILE_K
 
 // adjust leading dimension size for K
 template <typename T>

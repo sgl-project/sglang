@@ -11,38 +11,37 @@
 namespace {
 
 // dispatch bool
-#define AT_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)                                 \
-  [&] {                                                                          \
-    if (BOOL_V) {                                                                \
-      constexpr bool BOOL_NAME = true;                                           \
-      return __VA_ARGS__();                                                      \
-    } else {                                                                     \
-      constexpr bool BOOL_NAME = false;                                          \
-      return __VA_ARGS__();                                                      \
-    }                                                                            \
+#define AT_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...) \
+  [&] {                                          \
+    if (BOOL_V) {                                \
+      constexpr bool BOOL_NAME = true;           \
+      return __VA_ARGS__();                      \
+    } else {                                     \
+      constexpr bool BOOL_NAME = false;          \
+      return __VA_ARGS__();                      \
+    }                                            \
   }()
 
 // dispatch: bfloat16, float16, int8_t
-#define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                                    \
-  [&] {                                                                         \
-    switch (TYPE) {                                                             \
-      case at::ScalarType::BFloat16 : {                                         \
-        using packed_t = at::BFloat16;                                          \
-        return __VA_ARGS__();                                                   \
-      }                                                                         \
-      case at::ScalarType::Half: {                                              \
-        using packed_t = at::Half;                                              \
-        return __VA_ARGS__();                                                   \
-      }                                                                         \
-      case at::ScalarType::Char : {                                             \
-        using packed_t = int8_t;                                                \
-        return __VA_ARGS__();                                                   \
-      }                                                                         \
-      default:                                                                  \
-        TORCH_CHECK(false, "Unsupported floating data type.\n");                \
-    }                                                                           \
+#define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
+  [&] {                                                          \
+    switch (TYPE) {                                              \
+      case at::ScalarType::BFloat16: {                           \
+        using packed_t = at::BFloat16;                           \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Half: {                               \
+        using packed_t = at::Half;                               \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Char: {                               \
+        using packed_t = int8_t;                                 \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      default:                                                   \
+        TORCH_CHECK(false, "Unsupported floating data type.\n"); \
+    }                                                            \
   }()
-
 
 #define UNUSED(x) (void)(x)
 
@@ -67,7 +66,9 @@ namespace {
 constexpr int GRAIN_SIZE = 1024;
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
-inline T div_up(T x, T y) { return (x + y - 1) / y; }
+inline T div_up(T x, T y) {
+  return (x + y - 1) / y;
+}
 
 template <typename T>
 inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
@@ -86,10 +87,10 @@ inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
     }
     n_end += n_start;
 #else
-    // pytorch aten partition pattern
-    T n_my = div_up(n, nth);
-    n_start = ith * n_my;
-    n_end = std::min(n_start + n_my, n);
+  // pytorch aten partition pattern
+  T n_my = div_up(n, nth);
+  n_start = ith * n_my;
+  n_end = std::min(n_start + n_my, n);
 #endif
 }
 
@@ -97,15 +98,15 @@ template <typename func_t>
 inline void parallel_for(int n, const func_t& f) {
 #if defined(_OPENMP)
 #pragma omp parallel
-{
+  {
     int nth = omp_get_num_threads();
     int ith = omp_get_thread_num();
     int tbegin, tend;
     balance211(n, nth, ith, tbegin, tend);
     f(tbegin, tend);
-}
+  }
 #else
-    f(0, n);
+  f(0, n);
 #endif
 }
 
@@ -160,4 +161,4 @@ struct Unroll<1> {
   }
 };
 
-} // anonymous namespace
+}  // anonymous namespace

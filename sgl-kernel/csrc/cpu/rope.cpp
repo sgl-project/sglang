@@ -71,10 +71,10 @@ std::tuple<at::Tensor, at::Tensor>
 rotary_position_embedding_cpu(at::Tensor& t_pos, at::Tensor& q_pe, at::Tensor& k_pe, at::Tensor& t_emb_pos) {
   RECORD_FUNCTION(
       "sgl-kernel::rotary_position_embedding_cpu", std::vector<c10::IValue>({t_pos, q_pe, k_pe, t_emb_pos}));
-  CHECK_INPUT (t_pos);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT (q_pe);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT (k_pe);
-  CHECK_INPUT (t_emb_pos);
+  CHECK_INPUT(t_pos);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_pe);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_pe);
+  CHECK_INPUT(t_emb_pos);
   CHECK_DIM(1, t_pos);
   CHECK_DIM(3, q_pe);
   CHECK_DIM(3, k_pe);

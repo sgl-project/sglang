@@ -11,8 +11,7 @@ namespace {
 
 using namespace at::vec;
 
-template <typename scalar_t,
-          typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
 inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, const Vectorized<float>& b) {
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
@@ -22,15 +21,14 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
 // use native instruction for bfloat16->float32 conversion
 template <>
-inline Vectorized<at::BFloat16> convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
+inline Vectorized<at::BFloat16>
+convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
   return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
 }
 
-#define CVT_BF16_TO_FP32(a) \
-    _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
+#define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-#define CVT_FP16_TO_FP32(a) \
-    _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
+#define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
 
 #endif
 
@@ -55,10 +53,9 @@ inline float vec_reduce_max(const Vectorized<float>& a) {
 
 // https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
 template <typename scalar_t>
-inline void quantize_row_int8(uint8_t* __restrict__ Aq, float& As,
-    const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
-
-  float amax = 0.f; // absolute max
+inline void
+quantize_row_int8(uint8_t* __restrict__ Aq, float& As, const scalar_t* __restrict__ A, int64_t K, float eps = 1e-7) {
+  float amax = 0.f;  // absolute max
   for (int64_t k = 0; k < K; ++k) {
     const float val = static_cast<float>(A[k]);
     amax = std::max(amax, std::abs(val));
@@ -77,9 +74,8 @@ inline void quantize_row_int8(uint8_t* __restrict__ Aq, float& As,
 
 #if defined(CPU_CAPABILITY_AVX512)
 template <>
-inline void quantize_row_int8<at::BFloat16>(uint8_t* __restrict__ Aq, float& As,
-    const at::BFloat16* __restrict__ A, int64_t K, float eps) {
-
+inline void quantize_row_int8<at::BFloat16>(
+    uint8_t* __restrict__ Aq, float& As, const at::BFloat16* __restrict__ A, int64_t K, float eps) {
   const __m512 signBit = _mm512_set1_ps(-0.0f);
   const __m512i off = _mm512_set1_epi32(128);
 
@@ -116,4 +112,4 @@ inline void quantize_row_int8<at::BFloat16>(uint8_t* __restrict__ Aq, float& As,
 }
 #endif
 
-} // anonymous namespace
+}  // anonymous namespace

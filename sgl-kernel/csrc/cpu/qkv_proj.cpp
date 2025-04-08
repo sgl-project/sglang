@@ -1,6 +1,6 @@
 #include "common.h"
-#include "vec.h"
 #include "gemm.h"
+#include "vec.h"
 
 namespace {
 
@@ -25,7 +25,6 @@ void segment_gemm_kernel_impl(
     int64_t N0,
     int64_t N1,
     int64_t K) {
-
   // convert_weight_packed make sure N0 and N1 are 32x
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
@@ -52,7 +51,7 @@ void segment_gemm_kernel_impl(
       int nb_size = BLOCK_N;
 
       const scalar_t* __restrict__ B = nb < NB0 ? B0 : B1;
-      scalar_t* __restrict__ C       = nb < NB0 ? C0 : C1;
+      scalar_t* __restrict__ C = nb < NB0 ? C0 : C1;
       int64_t ldc = nb < NB0 ? N0 : N1;
       int64_t local_nb_start = nb < NB0 ? nb_start : nb_start - N0;
 
@@ -94,7 +93,6 @@ void segment_gemm_kernel_impl(
     int64_t N0,
     int64_t N1,
     int64_t K) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -123,9 +121,9 @@ void segment_gemm_kernel_impl(
       int nb_start = nb * BLOCK_N;
       int nb_size = BLOCK_N;
 
-      const int8_t* __restrict__ B = nb < NB0 ? B0  : B1;
+      const int8_t* __restrict__ B = nb < NB0 ? B0 : B1;
       const float* __restrict__ Bs = nb < NB0 ? Bs0 : Bs1;
-      scalar_t* __restrict__ C     = nb < NB0 ? C0  : C1;
+      scalar_t* __restrict__ C = nb < NB0 ? C0 : C1;
       int64_t ldc = nb < NB0 ? N0 : N1;
       int64_t local_nb_start = nb < NB0 ? nb_start : nb_start - N0;
 
@@ -160,8 +158,8 @@ inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
   using fVec = at::vec::Vectorized<float>;
   fVec sum_fvec = fVec(float(0));
 
-  // no remainder
-  #pragma GCC unroll 4
+// no remainder
+#pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += bVec::size()) {
     bVec x_bvec = bVec::loadu(x + d);
     fVec x_fvec0, x_fvec1;
@@ -174,15 +172,13 @@ inline float reduce(const scalar_t* __restrict__ x, int64_t size) {
 
 // map2 from aten functional doesn't have fast bf16->fp32 conversion
 template <typename scalar_t>
-inline void map2(scalar_t* y, const scalar_t* x,
-    const scalar_t* __restrict__ w, float scale, int64_t size) {
-
+inline void map2(scalar_t* y, const scalar_t* x, const scalar_t* __restrict__ w, float scale, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   fVec scale_fvec = fVec(scale);
 
-  // no remainder
-  #pragma GCC unroll 4
+// no remainder
+#pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += bVec::size()) {
     bVec x_bvec = bVec::loadu(x + d);
     fVec x_fvec0, x_fvec1;
@@ -208,7 +204,6 @@ void rms_norm_kernel_impl(
     int64_t N1,
     int64_t stride1,
     float eps = 1e-5) {
-
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
       scalar_t* x0 = input0 + m * N0;
@@ -224,27 +219,22 @@ void rms_norm_kernel_impl(
 }
 
 template <typename scalar_t>
-inline void rotary(const scalar_t* input, scalar_t* out, const scalar_t* cos,
-    const scalar_t* sin, int64_t size) {
+inline void rotary(const scalar_t* input, scalar_t* out, const scalar_t* cos, const scalar_t* sin, int64_t size) {
   TORCH_CHECK(false, "rotary scalar path not implemented.");
 }
 
 #if defined(CPU_CAPABILITY_AVX512)
 template <>
-inline void rotary<at::BFloat16>(const at::BFloat16* input, at::BFloat16* out,
-    const at::BFloat16* cos, const at::BFloat16* sin, int64_t size) {
+inline void rotary<at::BFloat16>(
+    const at::BFloat16* input, at::BFloat16* out, const at::BFloat16* cos, const at::BFloat16* sin, int64_t size) {
   // permute indices
-  const __m512i idx1 = _mm512_set_epi32(30, 28, 26, 24, 22, 20, 18, 16,
-                                        14, 12, 10,  8,  6,  4,  2,  0);
-  const __m512i idx2 = _mm512_set_epi32(31, 29, 27, 25, 23, 21, 19, 17,
-                                        15, 13, 11,  9,  7,  5,  3,  1);
-  const __m512i idy1 = _mm512_set_epi32(23,  7, 22,  6, 21,  5, 20,  4,
-                                        19,  3, 18,  2, 17,  1, 16,  0);
-  const __m512i idy2 = _mm512_set_epi32(31, 15, 30, 14, 29, 13, 28, 12,
-                                        27, 11, 26, 10, 25,  9, 24,  8);
+  const __m512i idx1 = _mm512_set_epi32(30, 28, 26, 24, 22, 20, 18, 16, 14, 12, 10, 8, 6, 4, 2, 0);
+  const __m512i idx2 = _mm512_set_epi32(31, 29, 27, 25, 23, 21, 19, 17, 15, 13, 11, 9, 7, 5, 3, 1);
+  const __m512i idy1 = _mm512_set_epi32(23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
+  const __m512i idy2 = _mm512_set_epi32(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8);
 
-  // rotary dim is 64, just 2 iters
-  #pragma GCC unroll 2
+// rotary dim is 64, just 2 iters
+#pragma GCC unroll 2
   for (int64_t d = 0; d < size; d += 32) {
     int64_t d2 = d >> 1;
     // load coefs
@@ -287,7 +277,6 @@ void rotary_emb_kernel_impl(
     int64_t oq_strideB,
     int64_t oq_strideH,
     int64_t ok_strideB) {
-
   TORCH_CHECK(rotary_dim % 32 == 0, "rotary_dim is not 32x.");
   const int64_t rotary_offset = rotary_dim / 2;
 
@@ -304,12 +293,10 @@ void rotary_emb_kernel_impl(
       const scalar_t* cos = cos_sin + index * rotary_dim;
       const scalar_t* sin = cos + rotary_offset;
 
-      const scalar_t* input = (head_id < num_heads)
-          ? q_pe + seq * q_strideB + head_id * q_strideH
-          : k_pe + seq * k_strideB;
-      scalar_t* out = (head_id < num_heads)
-          ? q_pe_out + seq * oq_strideB + head_id * oq_strideH
-          : k_pe_out + seq * ok_strideB;
+      const scalar_t* input =
+          (head_id < num_heads) ? q_pe + seq * q_strideB + head_id * q_strideH : k_pe + seq * k_strideB;
+      scalar_t* out =
+          (head_id < num_heads) ? q_pe_out + seq * oq_strideB + head_id * oq_strideH : k_pe_out + seq * ok_strideB;
       rotary<scalar_t>(input, out, cos, sin, rotary_dim);
 
       // move to the next index
@@ -318,17 +305,21 @@ void rotary_emb_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
-extern at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
-    std::optional<at::Tensor>& bias, bool is_vnni);
+extern at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, std::optional<at::Tensor>& bias, bool is_vnni);
 
-extern at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2,
-    std::optional<at::Tensor>& bias, at::ScalarType out_dtype, bool is_vnni);
+extern at::Tensor int8_scaled_mm_with_quant(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
 
-extern void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni,
-    std::optional<at::Tensor>& scale);
-
+extern void
+bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, std::optional<at::Tensor>& scale);
 
 // NB: shapes in DeepDeek R1
 //
@@ -356,9 +347,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor>& q_b_proj_scale,
     std::optional<at::Tensor>& kv_a_proj_scale,
     bool is_vnni) {
-
-  RECORD_FUNCTION("sgl-kernel::qkv_proj_with_rope", std::vector<c10::IValue>({
-      hidden_states, q_a_proj_weight, q_b_proj_weight, kv_a_proj_weight, w_kc}));
+  RECORD_FUNCTION(
+      "sgl-kernel::qkv_proj_with_rope",
+      std::vector<c10::IValue>({hidden_states, q_a_proj_weight, q_b_proj_weight, kv_a_proj_weight, w_kc}));
 
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
@@ -416,7 +407,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
   // stage 1: q_a_proj and kv_a_proj
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "qkv_proj_kernel_impl", [&] {
     if (use_int8_w8a8) {
-
       auto q_a_proj_s = q_a_proj_scale.value();
       auto kv_a_proj_s = kv_a_proj_scale.value();
       TORCH_CHECK(q_a_proj_s.numel() == q_lora_rank);
@@ -427,13 +417,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
       float* __restrict__ As_data = (float*)((void*)(Aq_data + num_seqs * hidden_size));
       const scalar_t* __restrict__ A_data = hidden_states.data_ptr<scalar_t>();
 
-      at::parallel_for(0, num_seqs, 0, [&] (int64_t begin, int64_t end) {
+      at::parallel_for(0, num_seqs, 0, [&](int64_t begin, int64_t end) {
         for (int64_t m = begin; m < end; ++m) {
-          quantize_row_int8<scalar_t>(
-              Aq_data + m * hidden_size,
-              As_data[m],
-              A_data + m * hidden_size,
-              hidden_size);
+          quantize_row_int8<scalar_t>(Aq_data + m * hidden_size, As_data[m], A_data + m * hidden_size, hidden_size);
         }
       });
 
@@ -461,7 +447,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
           q_lora_rank,
           kv_lora_rank + qk_rope_head_dim,
           hidden_size);
-      }
+    }
   });
 
   // stage 2: apply rmsnorm inplace

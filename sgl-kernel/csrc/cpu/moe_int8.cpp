@@ -1,14 +1,14 @@
 #include "common.h"
-#include "vec.h"
 #include "gemm.h"
+#include "vec.h"
 
 namespace {
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
-  // no remainder
-  #pragma GCC unroll 4
+// no remainder
+#pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
     Vec data = Vec::loadu(input + d);
     data.store(out + d);
@@ -28,7 +28,7 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   constexpr int kVecSize = bVec::size();
   const fVec weight_vec = fVec(weight);
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d) * weight_vec;
     fVec data1 = fVec::loadu(input + d + fVec::size()) * weight_vec;
@@ -52,7 +52,7 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
   } else {
     // do sum for topk != 1
     int64_t d;
-    #pragma GCC unroll 4
+#pragma GCC unroll 4
     for (d = 0; d <= K - kVecSize; d += kVecSize) {
       fVec sum_fvec0 = fVec(0.f);
       fVec sum_fvec1 = fVec(0.f);
@@ -79,15 +79,18 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
 
 // out = input + input2 * scale
 template <typename scalar_t>
-inline void add_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input,
-    const scalar_t* __restrict__ input2, float scale, int64_t size) {
-
+inline void add_mul_stub(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ input,
+    const scalar_t* __restrict__ input2,
+    float scale,
+    int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   const fVec s_vec = fVec(scale);
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec x0 = fVec::loadu(input + d);
     fVec x1 = fVec::loadu(input + d + fVec::size());
@@ -110,10 +113,19 @@ inline void add_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ i
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni {
   static inline void apply(
-      const uint8_t* __restrict__ A, const int8_t* __restrict__ B0, const int8_t* __restrict__ B1, scalar_t* __restrict__ C,
-      const float* __restrict__ As, const float* __restrict__ Bs0, const float* __restrict__ Bs1,
-      const int32_t* __restrict__ Bcomp0, const int32_t* __restrict__ Bcomp1,
-      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+      const uint8_t* __restrict__ A,
+      const int8_t* __restrict__ B0,
+      const int8_t* __restrict__ B1,
+      scalar_t* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs0,
+      const float* __restrict__ Bs1,
+      const int32_t* __restrict__ Bcomp0,
+      const int32_t* __restrict__ Bcomp1,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
@@ -122,11 +134,19 @@ struct tinygemm_kernel_vnni {
 template <int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const uint8_t* __restrict__ A, const int8_t* __restrict__ B0, const int8_t* __restrict__ B1, at::BFloat16* __restrict__ C,
-      const float* __restrict__ As, const float* __restrict__ Bs0, const float* __restrict__ Bs1,
-      const int32_t* __restrict__ Bcomp0, const int32_t* __restrict__ Bcomp1,
-      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
-
+      const uint8_t* __restrict__ A,
+      const int8_t* __restrict__ B0,
+      const int8_t* __restrict__ B1,
+      at::BFloat16* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs0,
+      const float* __restrict__ Bs1,
+      const int32_t* __restrict__ Bcomp0,
+      const int32_t* __restrict__ Bcomp1,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
     static_assert(COLS % 2 == 0);
@@ -138,9 +158,9 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
     __m512i vc1[ROWS * COLS];
     __m512i vcomp0[COLS];
     __m512i vcomp1[COLS];
-    __m512  vas;
-    __m512  vbs0[COLS];
-    __m512  vbs1[COLS];
+    __m512 vas;
+    __m512 vbs0[COLS];
+    __m512 vbs1[COLS];
 
     auto loadc = [&](auto i) {
       vc0[i] = _mm512_set1_epi32(0);
@@ -150,7 +170,7 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
 
     const int64_t K4 = K >> 2;
     const int64_t lda4 = lda >> 2;
-    const int64_t ldb4 = ldb; // ldb * 4 >> 2;
+    const int64_t ldb4 = ldb;  // ldb * 4 >> 2;
     const int32_t* a_ptr = reinterpret_cast<const int32_t*>(A);
     const int32_t* b0_ptr = reinterpret_cast<const int32_t*>(B0);
     const int32_t* b1_ptr = reinterpret_cast<const int32_t*>(B1);
@@ -178,7 +198,7 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
       constexpr int col = i % COLS;
 
       // load a scale
-      if constexpr(col == 0) {
+      if constexpr (col == 0) {
         vas = _mm512_set1_ps(As[row]);
       }
       // load b scale and vcomp
@@ -216,19 +236,28 @@ struct tinygemm_kernel_vnni<at::BFloat16, BLOCK_M, BLOCK_N> {
         _mm512_storeu_si512(
             reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
             (__m512i)(_mm512_cvtne2ps_pbh(__m512(x1), __m512(x0))));
-        }
+      }
     };
     Unroll<ROWS * COLS>{}(storec);
   }
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_VNNI(MB_SIZE, NB_SIZE)                        \
-    tinygemm_kernel_vnni<scalar_t, MB_SIZE, NB_SIZE>::apply(                 \
-        A + mb_start * lda, B0 + nb_start * 4, B1 + nb_start * 4,            \
-        C + mb_start * ldc + nb_start, As + mb_start,                        \
-        Bs0 + nb_start, Bs1 + nb_start, Bcomp0 + nb_start, Bcomp1 + nb_start,\
-        K, lda, ldb, ldc);
+#define LAUNCH_TINYGEMM_KERNEL_VNNI(MB_SIZE, NB_SIZE)      \
+  tinygemm_kernel_vnni<scalar_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                  \
+      B0 + nb_start * 4,                                   \
+      B1 + nb_start * 4,                                   \
+      C + mb_start * ldc + nb_start,                       \
+      As + mb_start,                                       \
+      Bs0 + nb_start,                                      \
+      Bs1 + nb_start,                                      \
+      Bcomp0 + nb_start,                                   \
+      Bcomp1 + nb_start,                                   \
+      K,                                                   \
+      lda,                                                 \
+      ldb,                                                 \
+      ldc);
 
 template <typename scalar_t>
 void tinygemm_kernel(
@@ -245,7 +274,6 @@ void tinygemm_kernel(
     int64_t lda,
     int64_t ldb,
     int64_t ldc) {
-
   const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + block_size_n() * K);
   const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + block_size_n() * K);
 
@@ -261,12 +289,21 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size >> 4) {
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_VNNI(1, 32); break;
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_VNNI(2, 32); break;
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_VNNI(3, 32); break;
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_VNNI(4, 32); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      switch (mb_size << 4 | nb_size >> 4) {
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_VNNI(1, 32);
+          break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_VNNI(2, 32);
+          break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_VNNI(3, 32);
+          break;
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_VNNI(4, 32);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
@@ -276,9 +313,16 @@ void tinygemm_kernel(
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni2 {
   static inline void apply(
-      const uint8_t* __restrict__ A, const int8_t* __restrict__ B, float* __restrict__ C,
-      const float* __restrict__ As, const float* __restrict__ Bs, const int32_t* __restrict__ Bcomp,
-      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+      const uint8_t* __restrict__ A,
+      const int8_t* __restrict__ B,
+      float* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs,
+      const int32_t* __restrict__ Bcomp,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
@@ -287,10 +331,16 @@ struct tinygemm_kernel_vnni2 {
 template <int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const uint8_t* __restrict__ A, const int8_t* __restrict__ B, float* __restrict__ C,
-      const float* __restrict__ As, const float* __restrict__ Bs, const int32_t* __restrict__ Bcomp,
-      int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
-
+      const uint8_t* __restrict__ A,
+      const int8_t* __restrict__ B,
+      float* __restrict__ C,
+      const float* __restrict__ As,
+      const float* __restrict__ Bs,
+      const int32_t* __restrict__ Bcomp,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
     static_assert(COLS % 2 == 0);
@@ -299,17 +349,15 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
     __m512i vb[COLS];
     __m512i vc[ROWS * COLS];
     __m512i vcomp[COLS];
-    __m512  vas;
-    __m512  vbs[COLS];
+    __m512 vas;
+    __m512 vbs[COLS];
 
-    auto loadc = [&](auto i) {
-      vc[i] = _mm512_set1_epi32(0);
-    };
+    auto loadc = [&](auto i) { vc[i] = _mm512_set1_epi32(0); };
     Unroll<ROWS * COLS>{}(loadc);
 
     const int64_t K4 = K >> 2;
     const int64_t lda4 = lda >> 2;
-    const int64_t ldb4 = ldb; // ldb * 4 >> 2;
+    const int64_t ldb4 = ldb;  // ldb * 4 >> 2;
     const int32_t* a_ptr = reinterpret_cast<const int32_t*>(A);
     const int32_t* b_ptr = reinterpret_cast<const int32_t*>(B);
 
@@ -334,7 +382,7 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
       constexpr int col = i % COLS;
 
       // load a scale
-      if constexpr(col == 0) {
+      if constexpr (col == 0) {
         vas = _mm512_set1_ps(As[row]);
       }
       // load b scale and vcomp per 2 vectors
@@ -356,11 +404,18 @@ struct tinygemm_kernel_vnni2<at::BFloat16, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_VNNI2(MB_SIZE, NB_SIZE)                       \
-    tinygemm_kernel_vnni2<scalar_t, MB_SIZE, NB_SIZE>::apply(                \
-        A + mb_start * lda, B + nb_start * 4, C + mb_start * ldc + nb_start, \
-        As + mb_start, Bs + nb_start, Bcomp + nb_start,                      \
-        K, lda, ldb, ldc);
+#define LAUNCH_TINYGEMM_KERNEL_VNNI2(MB_SIZE, NB_SIZE)      \
+  tinygemm_kernel_vnni2<scalar_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                   \
+      B + nb_start * 4,                                     \
+      C + mb_start * ldc + nb_start,                        \
+      As + mb_start,                                        \
+      Bs + nb_start,                                        \
+      Bcomp + nb_start,                                     \
+      K,                                                    \
+      lda,                                                  \
+      ldb,                                                  \
+      ldc);
 
 template <typename scalar_t>
 void tinygemm_kernel(
@@ -375,7 +430,6 @@ void tinygemm_kernel(
     int64_t lda,
     int64_t ldb,
     int64_t ldc) {
-
   // B compensation
   const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * K);
 
@@ -391,18 +445,27 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size >> 4) {
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_VNNI2(1, 32); break;
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_VNNI2(2, 32); break;
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_VNNI2(3, 32); break;
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_VNNI2(4, 32); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+      switch (mb_size << 4 | nb_size >> 4) {
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_VNNI2(1, 32);
+          break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_VNNI2(2, 32);
+          break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_VNNI2(3, 32);
+          break;
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_VNNI2(4, 32);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 template <typename scalar_t>
 void fused_experts_int8_kernel_impl(
@@ -428,7 +491,6 @@ void fused_experts_int8_kernel_impl(
     int64_t E,
     int64_t topk,
     int64_t num_tokens_post_pad) {
-
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
@@ -436,11 +498,7 @@ void fused_experts_int8_kernel_impl(
   // stage 0: quantize input to uint8, [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      quantize_row_int8<scalar_t>(
-          Aq_tmp + m * K,
-          As_tmp[m],
-          input + m * K,
-          K);
+      quantize_row_int8<scalar_t>(Aq_tmp + m * K, As_tmp[m], input + m * K, K);
     }
   });
 
@@ -512,11 +570,7 @@ void fused_experts_int8_kernel_impl(
   // stage 1.5: quantize ic1 to uint8, [M * topk, N]
   at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      quantize_row_int8<scalar_t>(
-          Aq_tmp + m * N,
-          As_tmp[m],
-          ic1 + m * N,
-          N);
+      quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
   });
 
@@ -587,17 +641,30 @@ void fused_experts_int8_kernel_impl(
   });
 }
 
-#define INSTANTIATE_MOE_INT8_TEMPLATE(TYPE)                                                  \
-  template void fused_experts_int8_kernel_impl<TYPE> (                                       \
-      TYPE* __restrict__ output, TYPE* __restrict__ ic1,                                     \
-      TYPE* __restrict__ ic2, uint8_t* __restrict__ A_tmp,                                   \
-      float* __restrict__ C_tmp, uint8_t* __restrict__ Aq_tmp,                               \
-      float* __restrict__ As_tmp, const TYPE* __restrict__ input,                            \
-      const int8_t* __restrict__ packed_w1, const int8_t* __restrict__ packed_w2,            \
-      const float* __restrict__ w1s, const float* __restrict__ w2s,                          \
-      const float* __restrict__ topk_weights, const int32_t* __restrict__ sorted_ids,        \
-      const int32_t* __restrict__ expert_ids, const int32_t* __restrict__ offsets,           \
-      int64_t M, int64_t N, int64_t K, int64_t E, int64_t topk, int64_t num_tokens_post_pad)
+#define INSTANTIATE_MOE_INT8_TEMPLATE(TYPE)           \
+  template void fused_experts_int8_kernel_impl<TYPE>( \
+      TYPE* __restrict__ output,                      \
+      TYPE* __restrict__ ic1,                         \
+      TYPE* __restrict__ ic2,                         \
+      uint8_t* __restrict__ A_tmp,                    \
+      float* __restrict__ C_tmp,                      \
+      uint8_t* __restrict__ Aq_tmp,                   \
+      float* __restrict__ As_tmp,                     \
+      const TYPE* __restrict__ input,                 \
+      const int8_t* __restrict__ packed_w1,           \
+      const int8_t* __restrict__ packed_w2,           \
+      const float* __restrict__ w1s,                  \
+      const float* __restrict__ w2s,                  \
+      const float* __restrict__ topk_weights,         \
+      const int32_t* __restrict__ sorted_ids,         \
+      const int32_t* __restrict__ expert_ids,         \
+      const int32_t* __restrict__ offsets,            \
+      int64_t M,                                      \
+      int64_t N,                                      \
+      int64_t K,                                      \
+      int64_t E,                                      \
+      int64_t topk,                                   \
+      int64_t num_tokens_post_pad)
 
 INSTANTIATE_MOE_INT8_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_INT8_TEMPLATE(at::Half);
@@ -619,7 +686,6 @@ void shared_expert_int8_kernel_impl(
     int64_t M,
     int64_t N,
     int64_t K) {
-
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
@@ -627,15 +693,11 @@ void shared_expert_int8_kernel_impl(
   // stage 0: quantize input to uint8, [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      quantize_row_int8<scalar_t>(
-          Aq_tmp + m * K,
-          As_tmp[m],
-          input + m * K,
-          K);
+      quantize_row_int8<scalar_t>(Aq_tmp + m * K, As_tmp[m], input + m * K, K);
     }
   });
 
-   // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
+  // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
@@ -688,11 +750,7 @@ void shared_expert_int8_kernel_impl(
   // stage 1.5: quantize ic1 to uint8, [M * topk, N]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
-      quantize_row_int8<scalar_t>(
-          Aq_tmp + m * N,
-          As_tmp[m],
-          ic1 + m * N,
-          N);
+      quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
   });
 
@@ -750,15 +808,23 @@ void shared_expert_int8_kernel_impl(
   });
 }
 
-#define INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(TYPE)                                        \
-  template void shared_expert_int8_kernel_impl<TYPE> (                                       \
-      TYPE* __restrict__ output, TYPE* __restrict__ ic1,                                     \
-      float* __restrict__ C_tmp, uint8_t* __restrict__ Aq_tmp,                               \
-      float* __restrict__ As_tmp, const TYPE* __restrict__ input,                            \
-      const int8_t* __restrict__ packed_w1, const int8_t* __restrict__ packed_w2,            \
-      const float* __restrict__ w1s, const float* __restrict__ w2s,                          \
-      const TYPE* __restrict__ fused_experts_out, float routed_scaling_factor,               \
-      int64_t M, int64_t N, int64_t K)
+#define INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(TYPE) \
+  template void shared_expert_int8_kernel_impl<TYPE>( \
+      TYPE* __restrict__ output,                      \
+      TYPE* __restrict__ ic1,                         \
+      float* __restrict__ C_tmp,                      \
+      uint8_t* __restrict__ Aq_tmp,                   \
+      float* __restrict__ As_tmp,                     \
+      const TYPE* __restrict__ input,                 \
+      const int8_t* __restrict__ packed_w1,           \
+      const int8_t* __restrict__ packed_w2,           \
+      const float* __restrict__ w1s,                  \
+      const float* __restrict__ w2s,                  \
+      const TYPE* __restrict__ fused_experts_out,     \
+      float routed_scaling_factor,                    \
+      int64_t M,                                      \
+      int64_t N,                                      \
+      int64_t K)
 
 INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(at::BFloat16);
 INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(at::Half);

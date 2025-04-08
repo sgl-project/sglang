@@ -1,6 +1,7 @@
+#include "gemm.h"
+
 #include "common.h"
 #include "vec.h"
-#include "gemm.h"
 
 namespace {
 
@@ -21,13 +22,13 @@ inline void s8s8_compensation(int8_t* __restrict__ packed, int K) {
   const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
   for (int k = 0; k < K / 4; ++k) {
     for (int col = 0; col < COLS; ++col) {
-      __m512i vb = _mm512_loadu_si512((const __m512i *)(packed + k * BLOCK_N * 4 + col * 64));
+      __m512i vb = _mm512_loadu_si512((const __m512i*)(packed + k * BLOCK_N * 4 + col * 64));
       vcomp[col] = _mm512_dpbusd_epi32(vcomp[col], off, vb);
     }
   }
 
   for (int col = 0; col < COLS; ++col) {
-    _mm512_storeu_si512((__m512i *)(packed + offset + col * 64), vcomp[col]);
+    _mm512_storeu_si512((__m512i*)(packed + offset + col * 64), vcomp[col]);
   }
 #else
   TORCH_CHECK(false, "s8s8_compensation not implemented!");
@@ -71,7 +72,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d);
     fVec data1 = fVec::loadu(input + d + fVec::size());
@@ -84,13 +85,14 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
-inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+inline void copy_add_stub(
+    scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
 
   int64_t d;
-  #pragma GCC unroll 4
+#pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
     fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
     fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
@@ -105,8 +107,14 @@ inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ 
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
-      const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
-      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
+      const scalar_t* __restrict__ A,
+      const scalar_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
   }
 };
@@ -115,9 +123,14 @@ struct tinygemm_kernel_nn {
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B, at::BFloat16* __restrict__ C,
-      const float* __restrict__ bias, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
-
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
@@ -140,7 +153,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 
     const int64_t K2 = K >> 1;
     const int64_t lda2 = lda >> 1;
-    const int64_t ldb2 = ldb; // ldb * 2 >> 1;
+    const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
     const float* b_ptr = reinterpret_cast<const float*>(B);
 
@@ -175,9 +188,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
               (__m512i)(_mm512_cvtne2ps_pbh(vc[row * COLS + col + 1], vc[row * COLS + col])));
         }
       } else {
-        _mm256_storeu_si256(
-            reinterpret_cast<__m256i*>(C + row * ldc + col * 16),
-            (__m256i)(_mm512_cvtneps_pbh(vc[i])));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(C + row * ldc + col * 16), (__m256i)(_mm512_cvtneps_pbh(vc[i])));
       }
     };
     Unroll<ROWS * COLS>{}(storec);
@@ -185,22 +196,33 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                          \
-    tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply(         \
-        A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, \
-        has_bias ? bias + nb_start : nullptr, K, lda, ldb, ldc);
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                \
+  tinygemm_kernel_nn<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                          \
+      B + nb_start * 2,                                            \
+      C + mb_start * ldc + nb_start,                               \
+      has_bias ? bias + nb_start : nullptr,                        \
+      K,                                                           \
+      lda,                                                         \
+      ldb,                                                         \
+      ldc);
 
 template <typename scalar_t, bool has_bias>
 struct brgemm {
   static inline void apply(
-      const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
-      float* __restrict__ Ctmp, const float* __restrict__ bias,
-      int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc) {
-
+      const scalar_t* __restrict__ A,
+      const scalar_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      float* __restrict__ Ctmp,
+      const float* __restrict__ bias,
+      int64_t M,
+      int64_t N,
+      int64_t K,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc) {
     constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(
-        M, N, K, lda, ldb, BLOCK_N, /* add_C */false,
-        A, B, Ctmp);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
 
     // copy from Ctmp to C
     for (int64_t m = 0; m < M; ++m) {
@@ -227,11 +249,8 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg) {
-
   if (brg) {
-    brgemm<scalar_t, has_bias>::apply(
-        A, B, C, Ctmp, bias,
-        M, N, K, lda, ldb, ldc);
+    brgemm<scalar_t, has_bias>::apply(A, B, C, Ctmp, bias, M, N, K, lda, ldb, ldc);
     return;
   }
 
@@ -247,20 +266,37 @@ void tinygemm_kernel(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size >> 4) {
+      switch (mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
-        case 0x14: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          break;
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          break;
         // mb_size = 2
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
-        case 0x24: LAUNCH_TINYGEMM_KERNEL_NN(2, 64); break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
+          break;
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
+          break;
         // mb_size = 3
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
-        case 0x34: LAUNCH_TINYGEMM_KERNEL_NN(3, 64); break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
+          break;
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
+          break;
         // mb_size = 4
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
-        case 0x44: LAUNCH_TINYGEMM_KERNEL_NN(4, 64); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
+          break;
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
@@ -277,7 +313,6 @@ void weight_packed_linear_kernel_impl(
     int64_t K,
     int64_t mat1_strideM,
     int64_t out_strideM) {
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -327,20 +362,38 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // tinygemm interface
 template <typename scalar_t>
-void tinygemm_kernel(const scalar_t* __restrict__ A, const scalar_t* __restrict__ B, scalar_t* __restrict__ C,
-    float* __restrict__ Ctmp, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, bool brg) {
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    float* __restrict__ Ctmp,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
   tinygemm_kernel<scalar_t, false>(A, B, C, Ctmp, nullptr, M, N, K, lda, ldb, ldc, brg);
 }
 
-#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)                                             \
-    template void tinygemm_kernel<TYPE>(                                                \
-        const TYPE* __restrict__ A, const TYPE* __restrict__ B, TYPE* __restrict__ C,   \
-        float* __restrict__ Ctmp, int64_t M, int64_t N, int64_t K, int64_t lda,         \
-        int64_t ldb, int64_t ldc, bool brg)
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE) \
+  template void tinygemm_kernel<TYPE>(      \
+      const TYPE* __restrict__ A,           \
+      const TYPE* __restrict__ B,           \
+      TYPE* __restrict__ C,                 \
+      float* __restrict__ Ctmp,             \
+      int64_t M,                            \
+      int64_t N,                            \
+      int64_t K,                            \
+      int64_t lda,                          \
+      int64_t ldb,                          \
+      int64_t ldc,                          \
+      bool brg)
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
@@ -370,8 +423,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   auto packed_weight = at::empty({}, weight.options());
   const int64_t stride = OC * IC;
 
-  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf || st == at::kChar,
-      "expect weight to be bfloat16, float16 or int8.");
+  TORCH_CHECK(
+      st == at::kBFloat16 || st == at::kHalf || st == at::kChar, "expect weight to be bfloat16, float16 or int8.");
 
   CPU_DISPATCH_PACKED_TYPES(st, [&] {
     // adjust most inner dimension size
@@ -394,10 +447,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
         int64_t n = nb * BLOCK_N;
         int64_t n_size = std::min(BLOCK_N, OC - n);
         pack_vnni<packed_t>(
-            packed_data + e * OC * packed_row_size + n * packed_row_size,
-            w_data + e * stride + n * IC,
-            n_size,
-            IC);
+            packed_data + e * OC * packed_row_size + n * packed_row_size, w_data + e * stride + n * IC, n_size, IC);
 
         // move to the next index
         data_index_step(e, E, nb, NB);
@@ -412,10 +462,8 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
-    std::optional<at::Tensor>& bias, bool is_vnni) {
-  RECORD_FUNCTION(
-    "sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
+at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, std::optional<at::Tensor>& bias, bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
 
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 

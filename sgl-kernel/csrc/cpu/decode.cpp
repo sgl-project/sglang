@@ -42,10 +42,16 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
 template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt {
   static inline void apply(
-      const scalar_t* __restrict__ A, const scalar_t* __restrict__ B,
-      float* __restrict__ C, const index_t* __restrict__ indices,
-      float scale, int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
-
+      const scalar_t* __restrict__ A,
+      const scalar_t* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      float scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
     for (int64_t m = 0; m < BLOCK_M; ++m) {
       for (int64_t n = 0; n < BLOCK_N; ++n) {
         float sum = 0.f;
@@ -64,10 +70,16 @@ struct tinygemm_kernel_nt {
 template <typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const at::BFloat16* __restrict__ A, const at::BFloat16* __restrict__ B,
-      float* __restrict__ C, const index_t* __restrict__ indices,
-      float scale, int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
-
+      const at::BFloat16* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      float scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N;
 
@@ -76,9 +88,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
     __m512 vc[ROWS * COLS];
     __m512 vscale = _mm512_set1_ps(scale);
 
-    auto loadc = [&](auto i) {
-      vc[i] = _mm512_setzero_ps();
-    };
+    auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
     Unroll<ROWS * COLS>{}(loadc);
 
     // for main loop
@@ -92,7 +102,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
       if constexpr (row == 0) {
         if constexpr (col + 1 < COLS) {
           int64_t b_idx_prefetch = indices[col + 1];
-           _mm_prefetch(B + b_idx_prefetch * ldb + k, _MM_HINT_T0);
+          _mm_prefetch(B + b_idx_prefetch * ldb + k, _MM_HINT_T0);
         }
         int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
@@ -137,20 +147,26 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_NT(MB_SIZE, NB_SIZE)                         \
-    tinygemm_kernel_nt<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply(         \
-        A + mb_start * lda, B, C + mb_start * ldc + nb_start,               \
-        indices + nb_start, scale,                                          \
-        lda, ldb, ldc, K, max_tokens);
+#define LAUNCH_TINYGEMM_KERNEL_NT(MB_SIZE, NB_SIZE)               \
+  tinygemm_kernel_nt<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda, B, C + mb_start * ldc + nb_start, indices + nb_start, scale, lda, ldb, ldc, K, max_tokens);
 
 // this is used when N isn't multiple of 16,
 // N corresponds to `head_size_v` which should be 16x
 template <typename scalar_t, typename index_t>
 inline void tinygemm_kernel_nn_scalar(
-    const float* __restrict__ A, const scalar_t* __restrict__ B,
-    float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-    int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
-
+    const float* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    const index_t* __restrict__ indices,
+    const float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    int64_t max_tokens) {
   for (int64_t m = 0; m < M; ++m) {
     for (int64_t n = 0; n < N; ++n) {
       C[m * ldc + n] *= scale[m];
@@ -171,9 +187,16 @@ inline void tinygemm_kernel_nn_scalar(
 template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
-      const float* __restrict__ A, const scalar_t* __restrict__ B,
-      float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-      int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
+      const float* __restrict__ A,
+      const scalar_t* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      const float* __restrict__ scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
     tinygemm_kernel_nn_scalar(A, B, C, indices, scale, BLOCK_M, BLOCK_N, K, lda, ldb, ldc, max_tokens);
   }
 };
@@ -182,10 +205,16 @@ struct tinygemm_kernel_nn {
 template <typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
-      const float* __restrict__ A, const at::BFloat16* __restrict__ B,
-      float* __restrict__ C, const index_t* __restrict__ indices, const float* __restrict__ scale,
-      int64_t lda, int64_t ldb, int64_t ldc, int64_t K, int64_t max_tokens) {
-
+      const float* __restrict__ A,
+      const at::BFloat16* __restrict__ B,
+      float* __restrict__ C,
+      const index_t* __restrict__ indices,
+      const float* __restrict__ scale,
+      int64_t lda,
+      int64_t ldb,
+      int64_t ldc,
+      int64_t K,
+      int64_t max_tokens) {
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
@@ -226,7 +255,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
         // for COLS = 2, 4, 6, 8 use 512 bit load
         // for COLS = 1, 3, 5, 7 use 256 bit load
         if constexpr (COLS % 2 == 0) {
-          if constexpr (col % 2  == 0) {
+          if constexpr (col % 2 == 0) {
             __m512i b16 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(B + b_idx * ldb + col * 16));
             vb[col + 0] = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(b16, 0));
             vb[col + 1] = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(b16, 1));
@@ -253,18 +282,33 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                         \
-    tinygemm_kernel_nn<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply(         \
-        A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start,    \
-        indices, scale + mb_start,                                          \
-        lda, ldb, ldc, K, max_tokens);
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)               \
+  tinygemm_kernel_nn<scalar_t, index_t, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                         \
+      B + nb_start,                                               \
+      C + mb_start * ldc + nb_start,                              \
+      indices,                                                    \
+      scale + mb_start,                                           \
+      lda,                                                        \
+      ldb,                                                        \
+      ldc,                                                        \
+      K,                                                          \
+      max_tokens);
 
 template <typename scalar_t, typename index_t>
 void index_gemm_kernel_nt(
-    const scalar_t* __restrict__ A, const scalar_t* __restrict__ B,
-    float* __restrict__ C, const index_t* __restrict__ indices,
-    float scale, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
-
+    const scalar_t* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    const index_t* __restrict__ indices,
+    float scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    int64_t max_tokens) {
   // pattern: 1-8-8
   if (M == 1) {
     constexpr int64_t BLOCK_N = 8;
@@ -275,16 +319,33 @@ void index_gemm_kernel_nt(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(nb_size) {
-        case 1: LAUNCH_TINYGEMM_KERNEL_NT(1, 1); break;
-        case 2: LAUNCH_TINYGEMM_KERNEL_NT(1, 2); break;
-        case 3: LAUNCH_TINYGEMM_KERNEL_NT(1, 3); break;
-        case 4: LAUNCH_TINYGEMM_KERNEL_NT(1, 4); break;
-        case 5: LAUNCH_TINYGEMM_KERNEL_NT(1, 5); break;
-        case 6: LAUNCH_TINYGEMM_KERNEL_NT(1, 6); break;
-        case 7: LAUNCH_TINYGEMM_KERNEL_NT(1, 7); break;
-        case 8: LAUNCH_TINYGEMM_KERNEL_NT(1, 8); break;
-        default: TORCH_CHECK(false, "Unexpected block size, 1x", "nb_size");
+      switch (nb_size) {
+        case 1:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 1);
+          break;
+        case 2:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 2);
+          break;
+        case 3:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 3);
+          break;
+        case 4:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 4);
+          break;
+        case 5:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 5);
+          break;
+        case 6:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 6);
+          break;
+        case 7:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 7);
+          break;
+        case 8:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 8);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, 1x", "nb_size");
       }
     }
     return;
@@ -303,36 +364,85 @@ void index_gemm_kernel_nt(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size) {
+      switch (mb_size << 4 | nb_size) {
         // mb_size = 1
-        case 0x11: LAUNCH_TINYGEMM_KERNEL_NT(1, 1); break;
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_NT(1, 2); break;
-        case 0x13: LAUNCH_TINYGEMM_KERNEL_NT(1, 3); break;
-        case 0x14: LAUNCH_TINYGEMM_KERNEL_NT(1, 4); break;
-        case 0x15: LAUNCH_TINYGEMM_KERNEL_NT(1, 5); break;
-        case 0x16: LAUNCH_TINYGEMM_KERNEL_NT(1, 6); break;
+        case 0x11:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 1);
+          break;
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 2);
+          break;
+        case 0x13:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 3);
+          break;
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 4);
+          break;
+        case 0x15:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 5);
+          break;
+        case 0x16:
+          LAUNCH_TINYGEMM_KERNEL_NT(1, 6);
+          break;
         // mb_size = 2
-        case 0x21: LAUNCH_TINYGEMM_KERNEL_NT(2, 1); break;
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_NT(2, 2); break;
-        case 0x23: LAUNCH_TINYGEMM_KERNEL_NT(2, 3); break;
-        case 0x24: LAUNCH_TINYGEMM_KERNEL_NT(2, 4); break;
-        case 0x25: LAUNCH_TINYGEMM_KERNEL_NT(2, 5); break;
-        case 0x26: LAUNCH_TINYGEMM_KERNEL_NT(2, 6); break;
+        case 0x21:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 1);
+          break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 2);
+          break;
+        case 0x23:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 3);
+          break;
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 4);
+          break;
+        case 0x25:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 5);
+          break;
+        case 0x26:
+          LAUNCH_TINYGEMM_KERNEL_NT(2, 6);
+          break;
         // mb_size = 3
-        case 0x31: LAUNCH_TINYGEMM_KERNEL_NT(3, 1); break;
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_NT(3, 2); break;
-        case 0x33: LAUNCH_TINYGEMM_KERNEL_NT(3, 3); break;
-        case 0x34: LAUNCH_TINYGEMM_KERNEL_NT(3, 4); break;
-        case 0x35: LAUNCH_TINYGEMM_KERNEL_NT(3, 5); break;
-        case 0x36: LAUNCH_TINYGEMM_KERNEL_NT(3, 6); break;
+        case 0x31:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 1);
+          break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 2);
+          break;
+        case 0x33:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 3);
+          break;
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 4);
+          break;
+        case 0x35:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 5);
+          break;
+        case 0x36:
+          LAUNCH_TINYGEMM_KERNEL_NT(3, 6);
+          break;
         // mb_size = 4
-        case 0x41: LAUNCH_TINYGEMM_KERNEL_NT(4, 1); break;
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_NT(4, 2); break;
-        case 0x43: LAUNCH_TINYGEMM_KERNEL_NT(4, 3); break;
-        case 0x44: LAUNCH_TINYGEMM_KERNEL_NT(4, 4); break;
-        case 0x45: LAUNCH_TINYGEMM_KERNEL_NT(4, 5); break;
-        case 0x46: LAUNCH_TINYGEMM_KERNEL_NT(4, 6); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+        case 0x41:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 1);
+          break;
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 2);
+          break;
+        case 0x43:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 3);
+          break;
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 4);
+          break;
+        case 0x45:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 5);
+          break;
+        case 0x46:
+          LAUNCH_TINYGEMM_KERNEL_NT(4, 6);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
@@ -340,10 +450,18 @@ void index_gemm_kernel_nt(
 
 template <typename scalar_t, typename index_t>
 void index_gemm_kernel_nn(
-    const float* __restrict__ A, const scalar_t* __restrict__ B,
-    float* __restrict__ C, const index_t* __restrict__ indices, float* __restrict__ scale,
-    int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb, int64_t ldc, int64_t max_tokens) {
-
+    const float* __restrict__ A,
+    const scalar_t* __restrict__ B,
+    float* __restrict__ C,
+    const index_t* __restrict__ indices,
+    float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    int64_t max_tokens) {
   constexpr int kVecSize = 16;
   if ((N & (kVecSize - 1)) != 0) {
     tinygemm_kernel_nn_scalar(A, B, C, indices, scale, M, N, K, lda, ldb, ldc, max_tokens);
@@ -360,16 +478,33 @@ void index_gemm_kernel_nn(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(nb_size >> 4) {
-        case 1: LAUNCH_TINYGEMM_KERNEL_NN(1, 16); break;
-        case 2: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
-        case 3: LAUNCH_TINYGEMM_KERNEL_NN(1, 48); break;
-        case 4: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
-        case 5: LAUNCH_TINYGEMM_KERNEL_NN(1, 80); break;
-        case 6: LAUNCH_TINYGEMM_KERNEL_NN(1, 96); break;
-        case 7: LAUNCH_TINYGEMM_KERNEL_NN(1, 112); break;
-        case 8: LAUNCH_TINYGEMM_KERNEL_NN(1, 128); break;
-        default: TORCH_CHECK(false, "Unexpected block size, 1x", "nb_size");
+      switch (nb_size >> 4) {
+        case 1:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
+          break;
+        case 2:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          break;
+        case 3:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
+          break;
+        case 4:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          break;
+        case 5:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 80);
+          break;
+        case 6:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 96);
+          break;
+        case 7:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 112);
+          break;
+        case 8:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 128);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, 1x", "nb_size");
       }
     }
     return;
@@ -387,36 +522,85 @@ void index_gemm_kernel_nn(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
 
-      switch(mb_size << 4 | nb_size >> 4) {
+      switch (mb_size << 4 | nb_size >> 4) {
         // mb_size = 1
-        case 0x11: LAUNCH_TINYGEMM_KERNEL_NN(1, 16); break;
-        case 0x12: LAUNCH_TINYGEMM_KERNEL_NN(1, 32); break;
-        case 0x13: LAUNCH_TINYGEMM_KERNEL_NN(1, 48); break;
-        case 0x14: LAUNCH_TINYGEMM_KERNEL_NN(1, 64); break;
-        case 0x15: LAUNCH_TINYGEMM_KERNEL_NN(1, 80); break;
-        case 0x16: LAUNCH_TINYGEMM_KERNEL_NN(1, 96); break;
+        case 0x11:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 16);
+          break;
+        case 0x12:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 32);
+          break;
+        case 0x13:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 48);
+          break;
+        case 0x14:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 64);
+          break;
+        case 0x15:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 80);
+          break;
+        case 0x16:
+          LAUNCH_TINYGEMM_KERNEL_NN(1, 96);
+          break;
         // mb_size = 2
-        case 0x21: LAUNCH_TINYGEMM_KERNEL_NN(2, 16); break;
-        case 0x22: LAUNCH_TINYGEMM_KERNEL_NN(2, 32); break;
-        case 0x23: LAUNCH_TINYGEMM_KERNEL_NN(2, 48); break;
-        case 0x24: LAUNCH_TINYGEMM_KERNEL_NN(2, 64); break;
-        case 0x25: LAUNCH_TINYGEMM_KERNEL_NN(2, 80); break;
-        case 0x26: LAUNCH_TINYGEMM_KERNEL_NN(2, 96); break;
+        case 0x21:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 16);
+          break;
+        case 0x22:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 32);
+          break;
+        case 0x23:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 48);
+          break;
+        case 0x24:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 64);
+          break;
+        case 0x25:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 80);
+          break;
+        case 0x26:
+          LAUNCH_TINYGEMM_KERNEL_NN(2, 96);
+          break;
         // mb_size = 3
-        case 0x31: LAUNCH_TINYGEMM_KERNEL_NN(3, 16); break;
-        case 0x32: LAUNCH_TINYGEMM_KERNEL_NN(3, 32); break;
-        case 0x33: LAUNCH_TINYGEMM_KERNEL_NN(3, 48); break;
-        case 0x34: LAUNCH_TINYGEMM_KERNEL_NN(3, 64); break;
-        case 0x35: LAUNCH_TINYGEMM_KERNEL_NN(3, 80); break;
-        case 0x36: LAUNCH_TINYGEMM_KERNEL_NN(3, 96); break;
+        case 0x31:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 16);
+          break;
+        case 0x32:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 32);
+          break;
+        case 0x33:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 48);
+          break;
+        case 0x34:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 64);
+          break;
+        case 0x35:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 80);
+          break;
+        case 0x36:
+          LAUNCH_TINYGEMM_KERNEL_NN(3, 96);
+          break;
         // mb_size = 4
-        case 0x41: LAUNCH_TINYGEMM_KERNEL_NN(4, 16); break;
-        case 0x42: LAUNCH_TINYGEMM_KERNEL_NN(4, 32); break;
-        case 0x43: LAUNCH_TINYGEMM_KERNEL_NN(4, 48); break;
-        case 0x44: LAUNCH_TINYGEMM_KERNEL_NN(4, 64); break;
-        case 0x45: LAUNCH_TINYGEMM_KERNEL_NN(4, 80); break;
-        case 0x46: LAUNCH_TINYGEMM_KERNEL_NN(4, 96); break;
-        default: TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
+        case 0x41:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 16);
+          break;
+        case 0x42:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 32);
+          break;
+        case 0x43:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 48);
+          break;
+        case 0x44:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 64);
+          break;
+        case 0x45:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 80);
+          break;
+        case 0x46:
+          LAUNCH_TINYGEMM_KERNEL_NN(4, 96);
+          break;
+        default:
+          TORCH_CHECK(false, "Unexpected block size, ", mb_size, "x", "nb_size");
       }
     }
   }
@@ -446,7 +630,6 @@ void decode_attention_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
@@ -520,28 +703,18 @@ void decode_attention_kernel_impl(
         }
 
         // m_i: max value per row
-        float m_i = at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
-            s_i,
-            n_size);
+        float m_i = at::vec::reduce_all<float>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i, n_size);
         m_i = std::max(m_i, m_prime);
 
         // m_delta <- exp(m' - m_i)
         float m_delta = std::exp(m_prime - m_i);
 
         // s_delta <- exp(s_i - m_i)
-        at::vec::map<float>(
-            [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
-            s_delta,
-            s_i,
-            n_size);
+        at::vec::map<float>([m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta, s_i, n_size);
 
         // s' <- s' * m_delta + sum(s_delta)
         s_prime *= m_delta;
-        s_prime += at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return x + y; },
-            s_delta,
-            n_size);
+        s_prime += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta, n_size);
 
         m_prime = m_i;
 
@@ -559,16 +732,12 @@ void decode_attention_kernel_impl(
             /* ldb */ v_strideN,
             /* ldc */ 1,
             /* mtt */ max_total_num_tokens);
-      } // loop with KV blocks
+      }  // loop with KV blocks
 
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
         float s = 1 / s_prime;
-        at::vec::map<float>(
-            [s](Vec out) { return out * Vec(s); },
-            v_prime,
-            v_prime,
-            head_size_v);
+        at::vec::map<float>([s](Vec out) { return out * Vec(s); }, v_prime, v_prime, head_size_v);
 
         v_prime[head_size_v] = m_prime + std::log(s_prime);
       }
@@ -579,7 +748,7 @@ void decode_attention_kernel_impl(
   });
 
   // parallel on [batches, num_heads]
-  at::parallel_for(0, batches * num_heads, 0, [&] (int64_t begin, int64_t end) {
+  at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
     // NB: here we use logits[b][h][0] as acc, since
     // for the first kv split (kv_id == 0):
     //   m_delta = std::exp(-inf) = 0
@@ -601,8 +770,11 @@ void decode_attention_kernel_impl(
         float e_logic = std::exp(tlogic - m_i);
         if (kv_id != 0) {
           at::vec::map2<float>(
-              [m_delta, e_logic](Vec x, Vec y) { return x * Vec(m_delta) +  y * Vec(e_logic); },
-              acc, acc, tv, head_size_v);
+              [m_delta, e_logic](Vec x, Vec y) { return x * Vec(m_delta) + y * Vec(e_logic); },
+              acc,
+              acc,
+              tv,
+              head_size_v);
         }
 
         s_prime = s_prime * m_delta + e_logic;
@@ -639,7 +811,6 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens) {
-
   using Vec = at::vec::Vectorized<float>;
 
   // block length for k_buffer and v_buffer
@@ -737,9 +908,7 @@ void decode_attention_grouped_kernel_impl(
         for (int64_t h = 0; h < h_size; ++h) {
           // m_i: max value per row
           float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
-              s_i + h * BLOCK_N,
-              n_size);
+              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + h * BLOCK_N, n_size);
           m_i = std::max(m_i, m_prime[h]);
 
           // m_delta <- exp(m' - m_i)
@@ -747,17 +916,11 @@ void decode_attention_grouped_kernel_impl(
 
           // s_delta <- exp(s_i - m_i)
           at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
-              s_delta + h * BLOCK_N,
-              s_i + h * BLOCK_N,
-              n_size);
+              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_delta + h * BLOCK_N, s_i + h * BLOCK_N, n_size);
 
           // s' <- s' * m_delta + sum(s_delta)
           s_prime[h] *= m_delta[h];
-          s_prime[h] += at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return x + y; },
-              s_delta + h * BLOCK_N,
-              n_size);
+          s_prime[h] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
 
           m_prime[h] = m_i;
         }
@@ -776,17 +939,14 @@ void decode_attention_grouped_kernel_impl(
             /* ldb */ v_strideN,
             /* ldc */ l_stride1,
             /* mtt */ max_total_num_tokens);
-      } // loop with KV blocks
+      }  // loop with KV blocks
 
       // only update v' when kv_split_size > 0
       if (kv_end > kv_start) {
         for (int64_t h = 0; h < h_size; ++h) {
           float s = 1 / s_prime[h];
           at::vec::map<float>(
-              [s](Vec out) { return out * Vec(s); },
-              v_prime + h * l_stride1,
-              v_prime + h * l_stride1,
-              head_size_v);
+              [s](Vec out) { return out * Vec(s); }, v_prime + h * l_stride1, v_prime + h * l_stride1, head_size_v);
           (v_prime + h * l_stride1)[head_size_v] = m_prime[h] + std::log(s_prime[h]);
         }
       }
@@ -797,7 +957,7 @@ void decode_attention_grouped_kernel_impl(
   });
 
   // parallel on [batches, num_heads]
-  at::parallel_for(0, batches * num_heads, 0, [&] (int64_t begin, int64_t end) {
+  at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
     // NB: same as above
     for (int64_t i = begin; i < end; ++i) {
       float* __restrict__ acc = attn_logits + i * l_stride1;
@@ -815,8 +975,11 @@ void decode_attention_grouped_kernel_impl(
         float e_logic = std::exp(tlogic - m_i);
         if (kv_id != 0) {
           at::vec::map2<float>(
-              [m_delta, e_logic](Vec x, Vec y) { return x * Vec(m_delta) +  y * Vec(e_logic); },
-              acc, acc, tv, head_size_v);
+              [m_delta, e_logic](Vec x, Vec y) { return x * Vec(m_delta) + y * Vec(e_logic); },
+              acc,
+              acc,
+              tv,
+              head_size_v);
         }
 
         s_prime = s_prime * m_delta + e_logic;
@@ -828,7 +991,7 @@ void decode_attention_grouped_kernel_impl(
   });
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // query:            [num_tokens, num_heads, head_size]
 // output:           [num_tokens, num_heads, head_size]
@@ -851,7 +1014,9 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap) {
   RECORD_FUNCTION(
-    "sgl-kernel::decode_attention_cpu", std::vector<c10::IValue>({query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
+      "sgl-kernel::decode_attention_cpu",
+      std::vector<c10::IValue>(
+          {query, output, k_buffer, v_buffer, attn_logits, req_to_token, req_pool_indices, seq_lens}));
 
   CHECK_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_buffer);
@@ -885,13 +1050,13 @@ void decode_attention_cpu(
 
   // check index data types
   const auto index_dtype = req_to_token.scalar_type();
-  TORCH_CHECK(index_dtype == at::kInt || index_dtype == at::kLong,
+  TORCH_CHECK(
+      index_dtype == at::kInt || index_dtype == at::kLong,
       "decode: expect req_to_token to be int32 or int64, got ",
       index_dtype);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kLong,
-      "decode: expect req_lens to be int64, got ",
-      seq_lens.scalar_type());
-  TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong,
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "decode: expect req_lens to be int64, got ", seq_lens.scalar_type());
+  TORCH_CHECK(
+      req_pool_indices.scalar_type() == at::kLong,
       "decode: expect req_pool_indices to be int64, got ",
       req_pool_indices.scalar_type());
 
