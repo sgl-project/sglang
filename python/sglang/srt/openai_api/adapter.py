@@ -141,12 +141,8 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
             ), "unrecognized format of chat template file"
             with open(chat_template_arg, "r") as filep:
                 template = json.load(filep)
-                try:
-                    sep_style = SeparatorStyle[template["sep_style"]]
-                except KeyError:
-                    raise ValueError(
-                        f"Unknown separator style: {template['sep_style']}"
-                    ) from None
+            if sep_style := getattr(SeparatorStyle, template.get("sep_style")):
+                # infer conversation template from sep_style
                 register_conv_template(
                     Conversation(
                         name=template["name"],
@@ -156,10 +152,21 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
                         sep_style=sep_style,
                         sep=template.get("sep", "\n"),
                         stop_str=template["stop_str"],
-                    ),
-                    override=True,
+                    )
                 )
-            chat_template_name = template["name"]
+                chat_template_name = template["name"]
+            elif template_str := template.get("chat_template"):
+                logger.info(
+                    "cannot determine template format from chat_template.json[`sep_style`]. Trying jinja parsing."
+                )
+                template_str = template_str.replace("\\n", "\n")
+                tokenizer_manager.tokenizer.chat_template = template_str
+                chat_template_name = None
+
+            else:
+                raise ValueError(
+                    f"Failed to infer template format: sep_style: str=`{template.get('sep_style')}`, chat_template: jinja_str=`{template.get('chat_template')}`"
+                )
     else:
         chat_template_name = chat_template_arg
 
