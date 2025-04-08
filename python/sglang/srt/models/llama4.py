@@ -285,6 +285,9 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
+        self.dp_size = get_attention_dp_size()
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
 
         self.self_attn = Llama4Attention(
             config=config,
