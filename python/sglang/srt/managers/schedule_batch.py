@@ -198,8 +198,15 @@ class MultimodalDataItem:
         Set the pad value after first hashign the data
         """
 
+        def tensor_hash(f):
+            f_list = flatten_nested_list(f)
+            f_cat = torch.concat(f_list).contiguous().numpy().tobytes()
+            return hash(f_cat)
+
         def hash_feature(f):
             if isinstance(f, list):
+                if isinstance(f[0], torch.Tensor):
+                    return tensor_hash(f)
                 return hash(tuple(flatten_nested_list(f)))
             elif isinstance(f, np.ndarray):
                 arr = np.ascontiguousarray(f)
