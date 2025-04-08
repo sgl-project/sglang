@@ -30,9 +30,8 @@ def _get_deepep_buffer(
     num_experts: int = None,
 ):
     global _buffer
-
-    # if _buffer is not None and _buffer.low_latency_mode == low_latency_mode:
-    #     return _buffer
+    if _buffer is not None:
+        return _buffer
 
     num_nvl_bytes, num_rdma_bytes = 0, 0
     if deepep_mode.enable_normal():
@@ -58,17 +57,6 @@ def _get_deepep_buffer(
             ),
             num_rdma_bytes,
         )
-
-    if _buffer is not None and _buffer.group == group:
-        if deepep_mode.enable_normal() and (
-            _buffer.num_nvl_bytes >= num_nvl_bytes
-            and _buffer.num_rdma_bytes >= num_rdma_bytes
-        ):
-            return _buffer
-        if deepep_mode.enable_low_latency() and (
-            _buffer.low_latency_mode and _buffer.num_rdma_bytes >= num_rdma_bytes
-        ):
-            return _buffer
 
     _buffer = Buffer(
         group,
