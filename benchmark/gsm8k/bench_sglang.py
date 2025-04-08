@@ -47,7 +47,7 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
-    data_path = args.data_path
+    data_path = "/shared/public/data/gsm8k/test.jsonl"
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     if not os.path.isfile(data_path):
         data_path = download_and_cache_file(url)
