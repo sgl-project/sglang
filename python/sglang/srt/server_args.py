@@ -982,6 +982,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for Llama-4.",
         )
