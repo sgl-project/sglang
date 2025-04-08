@@ -31,6 +31,7 @@ The core features include:
    backend/server_arguments.md
    backend/sampling_params.md
    backend/hyperparameter_tuning.md
+   backend/structured_outputs_for_reasoning_models.ipynb
 
 .. toctree::
    :maxdepth: 1

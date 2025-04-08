@@ -44,6 +44,7 @@ class OutlinesGrammar(BaseGrammarObject):
         guide: RegexGuide,
         jump_forward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
+        super().__init__()
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0

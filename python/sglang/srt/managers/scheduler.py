@@ -113,6 +113,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -231,6 +232,15 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.tokenizer.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
