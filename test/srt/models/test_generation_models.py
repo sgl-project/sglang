@@ -15,8 +15,9 @@
 Usage:
 
 To test a specific model:
-1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others`
+1. Add it to ALL_MODELS
+2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels`
+    or `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_all_models`
 """
 
 import dataclasses
@@ -49,13 +50,9 @@ class ModelCase:
 
 
 # Popular models that run on the CI
-CI_MODELS = [
+ALL_MODELS = [
     ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
     ModelCase("google/gemma-2-2b"),
-]
-
-# All other models that do not run on the CI
-ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
@@ -64,7 +61,7 @@ ALL_OTHER_MODELS = [
         "THUDM/glm-4-9b-chat", tp_size=2, trust_remote_code=True, skip_long_prompt=True
     ),
     ModelCase("openai-community/gpt2"),
-    ModelCase("microsoft/Phi-3-small-8k-instruct"),
+    ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
     ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
     ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
     ModelCase("mistral-community/pixtral-12b", tp_size=2, skip_long_prompt=True),
@@ -119,26 +116,22 @@ class TestGenerationModels(CustomTestCase):
             debug_text=f"model_path={model_path} prompts={prompts}",
         )
 
+    @unittest.skipIf(not is_in_ci(), "Local test should run all models")
     def test_ci_models(self):
-        for model_case in CI_MODELS:
-            for torch_dtype in TORCH_DTYPES:
+        # randomly select a model from the list of all models
+        model_case = random.choice(ALL_MODELS)
+        for torch_dtype in TORCH_DTYPES:
+            # Skip long prompts for models that do not have a long context
+            prompts = DEFAULT_PROMPTS
+            if model_case.skip_long_prompt:
+                prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
-                # Skip long prompts for models that do not have a long context
-                prompts = DEFAULT_PROMPTS
-                if model_case.skip_long_prompt:
-                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+            # Assert the logits and output strs are close
+            self.assert_close_logits_and_output_strs(prompts, model_case, torch_dtype)
 
-                # Assert the logits and output strs are close
-                self.assert_close_logits_and_output_strs(
-                    prompts, model_case, torch_dtype
-                )
-
-    def test_others(self):
-        model_cases = (
-            ALL_OTHER_MODELS if not is_in_ci() else [random.choice(ALL_OTHER_MODELS)]
-        )
-        for model_case in model_cases:
-            # Only run a specified model
+    @unittest.skipIf(is_in_ci(), "CI only runs selected models for simplicity")
+    def test_all_models(self):
+        for model_case in ALL_MODELS:
             if (
                 "ONLY_RUN" in os.environ
                 and os.environ["ONLY_RUN"] != model_case.model_path
