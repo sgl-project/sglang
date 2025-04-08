@@ -227,12 +227,6 @@ __device__ void moe_fused_gate_impl(
     // For the last position, we need to set a random expert ID and adjust the weight
     int64_t last_idx = topk * thread_row + (topk - 1);
     
-    // Use curand to generate random number
-    curandStatePhilox4_32_10_t state;
-    curand_init(thread_row, 0, 0, &state);
-    int64_t random_offset = curand(&state) % n_share_experts_fusion;
-    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + random_offset);
-    
     // Calculate the sum of the first k-1 weights
     float prev_sum = 0.0f;
     for (int ii = 0; ii < topk - 1; ++ii) {
@@ -244,6 +238,8 @@ __device__ void moe_fused_gate_impl(
     
     // For renormalization, we only use the sum of the first k-1 weights
     output_sum = prev_sum;
+
+    __syncthreads();
   }
 
   ////////////////////// Rescale Output //////////////////////
