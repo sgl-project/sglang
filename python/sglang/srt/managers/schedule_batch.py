@@ -198,9 +198,11 @@ class MultimodalDataItem:
         Set the pad value after first hashign the data
         """
 
-        def hash_feature(f):
+        def hash_feature(f: Union[torch.Tensor, np.ndarray, List]) -> int:
             if isinstance(f, list):
                 f = tuple(map(hash_feature, flatten_nested_list(f)))
+            elif isinstance(f, torch.Tensor):
+                f = f.contiguous().numpy().data.tobytes()
             elif isinstance(f, np.ndarray):
                 f = np.ascontiguousarray(f).data.tobytes()
             return hash(f)
