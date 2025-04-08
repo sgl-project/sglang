@@ -46,7 +46,7 @@ CI_MODELS = [
     # dict(model_path="google/gemma-2-2b"),
 ]
 ALL_OTHER_MODELS = [
-    # dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
+    dict(model_path="meta-llama/Llama-3.2-1B-Instruct", tp_size=1),
     dict(model_path="Qwen/Qwen2-1.5B"),
     dict(
         model_path="Qwen/Qwen2.5-14B-Instruct",
@@ -164,19 +164,13 @@ class TestVerlEngine(CustomTestCase):
         Each model configuration specifies model path, memory settings,
         tensor-parallel size, and error tolerance bounds.
         """
+        test_models = ALL_OTHER_MODELS
         if is_in_ci():
             # Randomly select one model in CI for faster testing
-            if CI_MODELS:  # Make sure list is not empty
-                model_info = random.choice(CI_MODELS)
-                print(
-                    f"CI environment: Testing randomly selected model: {model_info['model_path']}"
-                )
-                self.assert_fragment_e2e_execution(index=0, **model_info)
-            return
-
+            test_models = [random.choice(ALL_OTHER_MODELS)]
         # Test all models in development environment
         print(f"Development environment: Testing all {len(ALL_OTHER_MODELS)} models")
-        for index, model_info in enumerate(ALL_OTHER_MODELS):
+        for index, model_info in enumerate(test_models):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
 
