@@ -59,7 +59,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 class HttpServerEngineForRL(EngineBase):
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
-        # self.server_args = copy.deepcopy(server_args)
         print(f"launch_server_from_verl_engine {self.server_args.port}")
         self.process = launch_server_process(self.server_args)
 
