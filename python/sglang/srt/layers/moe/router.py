@@ -5,10 +5,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.topk import fused_topk
-
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+
 
 @triton.jit
 def fused_moe_router_kernel(
