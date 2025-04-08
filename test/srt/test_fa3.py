@@ -143,7 +143,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "4",
+                "3",
                 "--dtype",
                 "float16",
             ]
