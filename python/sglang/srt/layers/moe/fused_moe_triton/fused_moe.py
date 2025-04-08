@@ -426,8 +426,14 @@ def fused_moe_kernel(
             )
         # tensor-wise
         else:
-            a_scale = tl.load(a_scale_ptr)
-            b_scale = tl.load(b_scale_ptr + off_experts)
+            # Load per-column scale for weights
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # Load per-token scale for activations
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
 
     if use_int8_w8a8:
         # block-wise
@@ -778,9 +784,9 @@ def invoke_fused_moe_kernel(
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             if _is_cuda:
-                A, A_scale = sgl_scaled_fp8_quant(A, A_scale)
+                A, A_scale = sgl_scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=True)
             else:
-                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale)
+                A, A_scale = vllm_ops.scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=True)
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
