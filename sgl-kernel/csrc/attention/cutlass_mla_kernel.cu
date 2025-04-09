@@ -153,13 +153,11 @@ void runMla(
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
+    at::Tensor const& workspace,
     cudaStream_t stream) {
   using MlaSm100Type = MlaSm100<Element>;
   typename MlaSm100Type::Fmha fmha;
   auto arguments = args_from_options<MlaSm100Type>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table);
-  size_t workspace_size = MlaSm100Type::Fmha::get_workspace_size(arguments);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(q_nope_and_q_pe.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
@@ -173,17 +171,35 @@ void cutlass_mla_decode(
     torch::Tensor const& q_nope_and_q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table) {
+    torch::Tensor const& page_table,
+    torch::Tensor const& workspace) {
   auto in_dtype = q_nope_and_q_pe.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope_and_q_pe.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope_and_q_pe.get_device());
   if (in_dtype == at::ScalarType::Half) {
-    runMla<cutlass::half_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, stream);
+    runMla<cutlass::half_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
   } else if (in_dtype == at::ScalarType::BFloat16) {
-    runMla<cutlass::bfloat16_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, stream);
+    runMla<cutlass::bfloat16_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
   } else if (in_dtype == at::ScalarType::Float8_e4m3fn) {
-    runMla<cutlass::float_e4m3_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, stream);
+    runMla<cutlass::float_e4m3_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
   } else {
     TORCH_CHECK(false, "Unsupported input data type of MLA");
   }
+}
+
+int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count) {
+  // Workspace size depends on ElementAcc and ElementLSE (same as ElementAcc)
+  // which are float, so Element type here doesn't matter.
+  using MlaSm100Type = MlaSm100<cutlass::half_t>;
+
+  // Get split kv. Requires problem shape and sm_count only.
+  typename MlaSm100Type::Fmha::Arguments arguments;
+  using TileShapeH = typename MlaSm100Type::TileShapeH;
+  using TileShapeD = typename MlaSm100Type::TileShapeD;
+  arguments.problem_shape = cute::make_tuple(TileShapeH{}, static_cast<int>(max_seq_len), TileShapeD{}, static_cast<int>(num_batches));
+  // Assumes device 0 when getting sm_count.
+  arguments.hw_info.sm_count  = sm_count <= 0 ? cutlass::KernelHardwareInfo::query_device_multiprocessor_count(/*device_id=*/0) : sm_count;
+  MlaSm100Type::Fmha::set_split_kv(arguments);
+
+  return MlaSm100Type::Fmha::get_workspace_size(arguments);
 }

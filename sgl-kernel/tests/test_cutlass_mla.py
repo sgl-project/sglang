@@ -1,7 +1,10 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import cutlass_mla_decode
+from sgl_kernel import (
+    cutlass_mla_decode,
+    cutlass_mla_get_workspace_size
+)
 from torch import Tensor
 
 if torch.cuda.get_device_capability() < (10, 0):
@@ -67,8 +70,16 @@ def test_cutlass_mla_decode(
 
     kv_cache = torch.randn(block_table.numel(), block_size, d)
 
+    workspace_size = cutlass_mla_get_workspace_size(block_num * block_size, bs)
+    workspace = torch.empty(
+        workspace_size, device="cuda", dtype=torch.uint8
+    )
+
     out_ref = q.new_zeros(bs, h_q, dv)
     ref_mla(out_ref, q, kv_cache, scale, block_table, seq_lens)
-    out = ops.cutlass_mla_decode(q, kv_cache, seq_lens, block_table)
+    out = cutlass_mla_decode(q, kv_cache, seq_lens, block_table, workspace)
 
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+if __name__ == "__main__":
+    pytest.main([__file__])

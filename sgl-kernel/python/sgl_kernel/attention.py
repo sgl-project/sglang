@@ -12,8 +12,8 @@ def cutlass_mla_decode(
     kv_c_and_k_pe_cache: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
+    workspace: torch.Tensor,
 ) -> torch.Tensor:
-    assert not current_platform.is_rocm()
     assert (
         q_nope_and_q_pe.ndim == 3
     ), f"q_nope_and_q_pe must be a 3D tensor, but got {q_nope_and_q_pe.ndim}"
@@ -55,6 +55,9 @@ def cutlass_mla_decode(
     )
 
     torch.ops.sgl_kernel.cutlass_mla_decode(
-        out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table
+        out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace
     )
     return out
+
+def cutlass_mla_get_workspace_size(max_seq_len: int, num_batches: int, sm_count: int = 0) -> int:
+    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size(max_seq_len, num_batches, sm_count)
