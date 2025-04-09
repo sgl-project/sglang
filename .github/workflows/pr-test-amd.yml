@@ -57,7 +57,7 @@ jobs:
 
           docker exec -w / ci_sglang mkdir -p /dummy-grok
           mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
-          docker cp ./dummy-grok ci_sglang:/dummy-grok/
+          docker cp ./dummy-grok ci_sglang:/
 
       - name: Evaluate Accuracy
         timeout-minutes: 20
