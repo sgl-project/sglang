@@ -29,6 +29,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
+from PIL.Image import Image
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -135,9 +136,19 @@ class Engine:
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
+        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+        # Can be formatted as:
+        # - Single image for a single request
+        # - List of images (one per request in a batch)
+        # - List of lists of images (multiple images per request)
+        # See also python/sglang/srt/utils.py:load_image for more details.
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -190,9 +201,19 @@ class Engine:
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        # The image input. It can be a file name, a url, or base64 encoded string.
-        # See also python/sglang/srt/utils.py:load_image.
-        image_data: Optional[Union[List[str], str]] = None,
+        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+        # Can be formatted as:
+        # - Single image for a single request
+        # - List of images (one per request in a batch)
+        # - List of lists of images (multiple images per request)
+        # See also python/sglang/srt/utils.py:load_image for more details.
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -228,7 +249,13 @@ class Engine:
     def encode(
         self,
         prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-        image_data: Optional[Union[List[str], str]] = None,
+        image_data: Optional[
+            Union[
+                List[List[Union[Image, str]]],
+                List[Union[Image, str]],
+                Union[Image, str],
+            ]
+        ] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
