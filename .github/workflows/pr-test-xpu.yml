@@ -15,7 +15,7 @@ jobs:
   build-and-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: BMG
+    runs-on: pvc-1100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,7 +23,8 @@ jobs:
       - name: Build Docker image
         run: |
           echo "[placeholder]: will usr build when base image ready"
-          docker pull gar-registry.caas.intel.com/pytorch/pytorch-ipex-spr:sglang_xpu_u2410
+          docker build --build-arg  \
+          -t sglang-xpu-test  -f docker/Dockerfile.xpu .0
 
       - name: Run container
         run: |
@@ -58,7 +59,7 @@ jobs:
   finish:
     if: always()
     needs: [build-and-test]
-    runs-on: BMG
+    runs-on: pvc-1100
     steps:
       - name: Check job status
         run: |
