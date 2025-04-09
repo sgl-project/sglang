@@ -61,6 +61,7 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (
