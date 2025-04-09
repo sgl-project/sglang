@@ -165,7 +165,7 @@ class _DeepEPDispatcherImplBase:
     def combine_b(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _get_buffer(self) -> Buffer:
+    def _get_buffer(self):
         raise NotImplementedError
 
 
