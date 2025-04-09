@@ -765,6 +765,8 @@ def invoke_fused_moe_kernel(
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
+    else:
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1

@@ -886,7 +886,7 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             logger.warning(
-                "FlashAttention v3 Backend is in Beta. Multimodal, FP8, and Speculative Decoding are not supported."
+                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
