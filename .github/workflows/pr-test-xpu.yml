@@ -22,7 +22,6 @@ jobs:
 
       - name: Build Docker image
         run: |
-          echo "[placeholder]: will usr build when base image ready"
           docker build --build-arg  \
           -t sglang-xpu-test  -f docker/Dockerfile.xpu .
 
