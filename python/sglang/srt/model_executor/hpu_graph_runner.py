@@ -32,8 +32,8 @@ from sglang.srt.utils import is_hpu
 _is_hpu = is_hpu()
 if _is_hpu:
     from vllm.utils import make_tensor_with_pad
-    from vllm_hpu_extension.bucketing import find_bucket
-    from vllm_hpu_extension.ops import batch2block, block2batch
+
+    os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
 
     from sglang.srt.hpu_utils import get_decode_batch_bucket, get_prefill_seq_len_bucket
 if TYPE_CHECKING:
