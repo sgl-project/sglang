@@ -1072,7 +1072,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
-            kv_a_normed = kv_a_normed.squeeze(1)
+            kv_a_normed = kv_a_normed.squeeze(1).contiguous()
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -1094,7 +1094,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             lse = torch.transpose(lse, 0, 1).contiguous()
-            print(accum_output.shape, accum_lse.shape, output.shape, lse.shape)
             accum_output, accum_lse = merge_state(accum_output, accum_lse, output, lse)
 
         return accum_output, accum_lse

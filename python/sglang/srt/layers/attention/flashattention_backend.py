@@ -621,7 +621,7 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_q=metadata.max_seq_len_q,
                     max_seqlen_k=metadata.max_seq_len_k,
                     softmax_scale=layer.scaling,
-                    causal=False,
+                    causal=True,
                 )
             return output, lse
 
