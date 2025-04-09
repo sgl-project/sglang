@@ -1101,6 +1101,7 @@ class ServerArgs:
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
