@@ -284,7 +284,7 @@ class TritonAttnBackend(AttentionBackend):
             # `max(spec_info.accept_length_cpu)`.
             # It might have been forgotten to update somewhere.
             max_extend_len = torch.max(spec_info.accept_length).item()
-            kv_last_page_len = torch.ones(bs, dtype=torch.int) 
+            kv_last_page_len = torch.ones(bs, dtype=torch.int)
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -558,7 +558,7 @@ class TritonAttnBackend(AttentionBackend):
                 max_extend_len,
                 layer.scaling,
                 layer.logit_cap,
-                attn_lse=layer.attn_lse, 
+                attn_lse=layer.attn_lse,
             )
             k = k.reshape(-1, 1, q.shape[-1])
         else:

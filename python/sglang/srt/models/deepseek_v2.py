@@ -204,7 +204,7 @@ class DeepseekV2MoE(nn.Module):
             num_experts=config.n_routed_experts + self.n_share_experts_fusion,
             num_shared_experts=(
                 config.n_shared_experts if get_bool_env_var("CK_MOE") and _is_hip else 0
-            ), 
+            ),
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -223,7 +223,11 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
-        if config.n_shared_experts is not None and self.n_share_experts_fusion == 0 and not get_bool_env_var("CK_MOE"):
+        if (
+            config.n_shared_experts is not None
+            and self.n_share_experts_fusion == 0
+            and not get_bool_env_var("CK_MOE")
+        ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             if not global_server_args_dict["enable_deepep_moe"]:

@@ -39,11 +39,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-<<<<<<< HEAD
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
-=======
-from sglang.srt.utils import DeepEPMode, is_cuda, is_hip, set_weight_attrs
->>>>>>> upstream/main
+from sglang.srt.utils import (
+    DeepEPMode,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_cuda = is_cuda()
 
