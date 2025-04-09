@@ -1,0 +1,50 @@
+FROM ubuntu:24.04
+SHELL ["/bin/bash", "-c"]
+
+RUN if [ -f /etc/apt/apt.conf.d/proxy.conf ]; then rm /etc/apt/apt.conf.d/proxy.conf; fi && \
+    if [ ! -z ${HTTPS_PROXY} ]; then echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" >> /etc/apt/apt.conf.d/proxy.conf; fi
+RUN apt-get update && \
+    apt-get full-upgrade -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+    ca-certificates \
+    git \
+    curl \
+    wget \
+    vim \
+    libnuma-dev \
+    gcc \
+    g++ \
+    make
+
+WORKDIR /root
+
+RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/24.11.3-2/Miniforge3-24.11.3-2-Linux-x86_64.sh && \
+    bash miniforge.sh -b -p ./miniforge3 && \
+    rm -f miniforge.sh && \
+    . miniforge3/bin/activate && \
+    conda install -y libsqlite=3.48.0 gperftools tbb
+
+ENV PATH=/root/miniforge3/bin:/root/miniforge3/condabin:${PATH}
+ENV PIP_ROOT_USER_ACTION=ignore
+
+RUN pip install cmake==3.31.2 \
+    "setuptools-scm>=8" \
+    intel-openmp \
+    triton==3.1
+RUN git clone https://github.com/vllm-project/vllm.git && \
+    cd vllm && \
+    git checkout v0.6.4.post1 && \
+    pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu && \
+    VLLM_TARGET_DEVICE=cpu python setup.py develop && \
+    cd ..
+RUN git clone https://github.com/mingfeima/sglang.git && \
+    cd sglang && \
+    git checkout cpu_opt_ww11 && \
+    pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu --force-reinstall && \
+    pip install -e "python[all_cpu]" && \
+    cd sgl-kernel && \
+    python setup.py install
+
+ENV LD_PRELOAD=/root/miniforge3/lib/libiomp5.so:/root/miniforge3/lib/libtcmalloc.so:/root/miniforge3/lib/libtbbmalloc.so.2
+
+WORKDIR /root/sglang
