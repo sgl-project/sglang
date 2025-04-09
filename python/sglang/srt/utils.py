@@ -2367,6 +2367,8 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    if module.use_intel_amx_backend and hasattr(module, "bias"):
+        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)    
 
 class PackWeightMethod:
     def __init__(self, weight_names, transpose_dims=None):
