@@ -29,31 +29,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch, CaptureHiddenMode
 )
-from vllm_hpu_extension.bucketing import find_bucket
-from vllm_hpu_extension.ops import batch2block, block2batch
-from vllm.utils import make_tensor_with_pad
+from collections import namedtuple
+from sglang.srt.utils import is_hpu
+_is_hpu = is_hpu()
+if _is_hpu:
+    from vllm_hpu_extension.bucketing import find_bucket
+    from vllm_hpu_extension.ops import batch2block, block2batch
+    from vllm.utils import make_tensor_with_pad
+    from sglang.srt.hpu_utils import get_prefill_seq_len_bucket, get_decode_batch_bucket
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-from typing import Optional
-from torch import Tensor
-from dataclasses import dataclass
-from collections import namedtuple
-
-_PAD_SLOT_ID = 0
-_PAD_BLOCK_ID = 0
-
-PREFILL_BUCKET_MIN = 512
-PREFILL_BUCKET_STEP = 512
-PREFILL_BUCKET_MAX = 4096
-DECODE_BLOCK_BUCKET_MIN = 128
-DECODE_BLOCK_BUCKET_STEP = 128
-DECODE_BLOCK_BUCKET_MAX = 4096
-
-DECODE_BATCH_BUCKET_MIN = 1
-DECODE_BATCH_BUCKET_STEP = 32
-DECODE_BATCH_BUCKET_MAX = 192
 
 
 HPUForwardBatch = namedtuple(
@@ -122,7 +107,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
     if forward_batch.forward_mode.is_extend():
         seq_len_list = forward_batch.extend_seq_lens
         sum_seq_len = seq_len_list.sum()
-        max_prompt_len = find_bucket(sum_seq_len, (PREFILL_BUCKET_MIN, PREFILL_BUCKET_STEP, PREFILL_BUCKET_MAX))
+        max_prompt_len = get_prefill_seq_len_bucket(sum_seq_len)
         attn_bias, seq_pos, seq_idx = make_hpu_attn_bias(
             seq_lens=seq_len_list,
             max_prompt_len=max_prompt_len,
@@ -140,7 +125,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         out_cache_loc = torch.nn.functional.pad(forward_batch.out_cache_loc.to("hpu"), (0, padding_len), value=0)
         batch_size = 1
     else:
-        padded_batch_size = find_bucket(batch_size, (DECODE_BATCH_BUCKET_MIN, DECODE_BATCH_BUCKET_STEP, DECODE_BATCH_BUCKET_MAX))
+        padded_batch_size = get_decode_batch_bucket(batch_size)
         padding_len = padded_batch_size - batch_size
         input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"), (0, padding_len), value=0)
         positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"), (0, padding_len), value=0)

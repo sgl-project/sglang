@@ -106,7 +106,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient, TpModelWorkerClientSingelThread
+from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -254,7 +254,7 @@ class Scheduler(
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
         else:
-            TpWorkerClass = TpModelWorkerClientSingelThread
+            TpWorkerClass = TpModelWorker
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,

@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_cuda,
     is_flashinfer_available,
+    is_hpu,
     is_hip,
     is_port_available,
     is_remote_url,
@@ -386,6 +387,12 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
         )
+
+        if is_hpu():
+            if self.max_running_requests is None:
+                self.max_running_requests = 128
+            
+            self.page_size = 128 # HPU only supports page size of 128 for now
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

@@ -55,6 +55,9 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import is_hpu
+
+_is_hpu = is_hpu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1496,7 +1499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         global bid
         bid += 1
-        return ModelWorkerBatch(
+        worker_batch = ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
@@ -1538,6 +1541,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
         )
+
+        if _is_hpu:
+            from sglang.srt.hpu_utils import create_hpu_specific_fields
+            create_hpu_specific_fields(worker_batch,
+                                       self.token_to_kv_pool_allocator.page_size,
+                                       self.req_to_token_pool)
+
+        return worker_batch
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
