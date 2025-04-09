@@ -7,6 +7,7 @@ from transformers import Llama4Config, Llama4VisionModel
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternImageTokens,
@@ -21,6 +22,7 @@ from sglang.srt.utils import add_prefix
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
     def __init__(
@@ -135,6 +137,15 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         num_experts = self.config.text_config.num_local_experts
 
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
         for name, loaded_weight in weights:
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
@@ -154,31 +165,54 @@ class Llama4ForConditionalGeneration(nn.Module):
                 break
             else:
                 if ".experts" in name:
-                    if ".gate_up_proj" in name:
-                        name_list = [
-                            name.replace(".experts.gate_up_proj", ".experts.w13_weight")
-                        ] * 2
-                        loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                        shard_id_list = ["w1", "w3"]
-                    else:
-                        name_list = [
-                            name.replace(".experts.down_proj", ".experts.w2_weight")
-                        ]
-                        shard_id_list = ["w2"]
-                        loaded_weight_list = [loaded_weight]
-                    for name, loaded_weight, shard_id in zip(
-                        name_list, loaded_weight_list, shard_id_list
+                    # NOTE: llama4 fp8 has different weight format for experts
+                    if (
+                        "experts.gate_up_proj" not in name
+                        and "experts.down_proj" not in name
                     ):
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        for expert_id in range(num_experts):
+                        for mapping in expert_params_mapping:
+                            param_name, weight_name, expert_id, shard_id = mapping
+                            if weight_name not in name:
+                                continue
+                            name = name.replace(weight_name, param_name)
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
                             weight_loader(
                                 param,
-                                loaded_weight[expert_id].T,
+                                loaded_weight,
                                 name,
                                 shard_id=shard_id,
                                 expert_id=expert_id,
                             )
+                            break
+                    else:
+                        if ".gate_up_proj" in name:
+                            name_list = [
+                                name.replace(
+                                    ".experts.gate_up_proj", ".experts.w13_weight"
+                                )
+                            ] * 2
+                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+                            shard_id_list = ["w1", "w3"]
+                        else:
+                            name_list = [
+                                name.replace(".experts.down_proj", ".experts.w2_weight")
+                            ]
+                            shard_id_list = ["w2"]
+                            loaded_weight_list = [loaded_weight]
+                        for name, loaded_weight, shard_id in zip(
+                            name_list, loaded_weight_list, shard_id_list
+                        ):
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            for expert_id in range(num_experts):
+                                weight_loader(
+                                    param,
+                                    loaded_weight[expert_id].T,
+                                    name,
+                                    shard_id=shard_id,
+                                    expert_id=expert_id,
+                                )
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
