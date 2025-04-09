@@ -3,7 +3,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-from sgl_kernel import awq_dequantize
 
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -191,6 +190,7 @@ class AWQLinearMethod(LinearMethodBase):
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
+        from sgl_kernel import awq_dequantize
 
         out = awq_dequantize(qweight, scales, qzeros)
         out = torch.matmul(reshaped_x, out)
