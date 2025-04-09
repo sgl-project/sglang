@@ -15,6 +15,7 @@
 
 import os
 import random
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -506,5 +507,7 @@ class PrefillAdder:
                 self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
+
+            req.queue_time_end = time.time()
 
         return self.budget_state()

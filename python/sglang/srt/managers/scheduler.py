@@ -1257,7 +1257,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            req.queue_time_end = time.time()
             if (
                 self.lora_paths
                 and len(
