@@ -298,7 +298,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl":
 
-        def sgl_moe_align_block_size_with_zeros(
+        def sgl_moe_align_block_size_with_empty(
             topk_ids,
             num_experts,
             block_size,
@@ -327,7 +327,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             )
 
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: sgl_moe_align_block_size_with_zeros(
+            lambda: sgl_moe_align_block_size_with_empty(
                 topk_ids,
                 num_experts,
                 block_size,
@@ -381,15 +381,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_experts",
         type=int,
-        default=8,
+        default=256,
         choices=[8, 16, 32, 64, 128, 256],
         help="Number of experts for benchmark",
     )
     parser.add_argument(
         "--topk",
         type=int,
-        default=1,
-        choices=[1, 2, 4, 8],
+        default=8,
+        choices=[2, 4, 8],
         help="Top-k value for benchmark",
     )
     parser.add_argument(
