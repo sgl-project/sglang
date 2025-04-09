@@ -11,14 +11,10 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.entrypoints.base_engine import EngineBase
+from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    HttpSerializer,
-    MultiprocessingSerializer,
-    kill_process_tree,
-)
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -87,13 +83,13 @@ class HttpServerEngineForRL(EngineBase):
         """
 
         print(f"update_weights_from_tensor of HttpServerEngineForRL")
-        serialized_named_tensors = HttpSerializer.serialize(named_tensors)
 
         return self._make_request(
             "update_weights_from_tensor",
             {
                 "serialized_named_tensors": [
-                    serialized_named_tensors for _ in range(self.server_args.tp_size)
+                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+                    for _ in range(self.server_args.tp_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,

@@ -25,8 +25,11 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
+from ast import Mult
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional, Union
+
+from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -81,7 +84,7 @@ from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
-    HttpSerializer,
+    MultiprocessingSerializer,
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
@@ -423,9 +426,6 @@ async def update_weights_from_tensor(
     2. HTTPS will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
     3. Any binary data in the named tensors should be base64 encoded.
     """
-    obj.serialized_named_tensors = [
-        HttpSerializer.deserialize(item) for item in obj.serialized_named_tensors
-    ]
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request

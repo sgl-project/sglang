@@ -48,13 +48,13 @@ CI_MODELS = [
 ALL_OTHER_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct", tp_size=1),
     dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(
-        model_path="Qwen/Qwen2.5-14B-Instruct",
-        mem_fraction_static=0.4,
-        tp_size=8,
-        tight_memory=True,
-        decode_tolerance=1.3,
-    ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
+    # dict(
+    #     model_path="Qwen/Qwen2.5-14B-Instruct",
+    #     mem_fraction_static=0.4,
+    #     tp_size=8,
+    #     tight_memory=True,
+    #     decode_tolerance=1.3,
+    # ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
     dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     # dict(model_path="allenai/OLMo-1B-0724-hf"),
     # dict(

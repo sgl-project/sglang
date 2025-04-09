@@ -1480,78 +1480,44 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj):
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        return buf.read()
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = base64.b64encode(output).decode("utf-8")
+
+        return output
 
     @staticmethod
     def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = base64.b64decode(data)
+
         return ForkingPickler.loads(data)
-
-
-class HttpSerializer:
-    @staticmethod
-    def serialize(data):
-        """Serialize data for HTTP transmission.
-        If data is bytes, it encodes it directly with base64.
-        For complex objects, it serializes them to JSON with base64 encoding for any binary data.
-        """
-        if isinstance(data, bytes):
-            # Directly encode bytes with base64
-            return base64.b64encode(data).decode("utf-8")
-
-        # For other types, convert to JSON-serializable format with base64 for any binary data
-        def encode_binary(obj):
-            if isinstance(obj, bytes):
-                # For bytes, encode as base64 and mark as binary
-                return {"__binary__": base64.b64encode(obj).decode("utf-8")}
-            elif isinstance(obj, dict):
-                # Process dictionaries recursively
-                return {k: encode_binary(v) for k, v in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                # Process lists and tuples recursively
-                return [encode_binary(item) for item in obj]
-            # Other types are returned as is (assuming they're JSON serializable)
-            return obj
-
-        # Encode the data and serialize to JSON
-        encoded_data = encode_binary(data)
-        return json.dumps(encoded_data)
-
-    @staticmethod
-    def deserialize(data):
-        """Deserialize data from HTTP transmission.
-        First tries to parse as JSON, if that fails, assumes it's base64-encoded bytes.
-        """
-        try:
-            # Try to parse as JSON
-            json_data = json.loads(data)
-
-            # Function to decode binary data recursively
-            def decode_binary(obj):
-                if isinstance(obj, dict):
-                    if "__binary__" in obj and len(obj) == 1:
-                        # This is a binary object encoded with base64
-                        return base64.b64decode(obj["__binary__"])
-                    # Process dictionaries recursively
-                    return {k: decode_binary(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    # Process lists recursively
-                    return [decode_binary(item) for item in obj]
-                # Other types are returned as is
-                return obj
-
-            return decode_binary(json_data)
-        except json.JSONDecodeError:
-            # If not JSON, assume it's base64-encoded bytes
-            try:
-                return base64.b64decode(data)
-            except:
-                raise ValueError(
-                    f"Failed to deserialize data: not valid JSON or base64"
-                )
 
 
 def debug_timing(func):
