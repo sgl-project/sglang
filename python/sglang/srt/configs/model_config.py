@@ -279,6 +279,7 @@ class ModelConfig:
             "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
