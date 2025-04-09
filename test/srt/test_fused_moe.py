@@ -44,7 +44,18 @@ class TestFusedMOE(CustomTestCase):
         else:
             return 1e-2, 1e-2  # Default values for other types
 
-    def torch_naive_moe(self, a, w1, w2, score, topk, w1_scale=None, w2_scale=None, a1_scale=None, a2_scale=None):
+    def torch_naive_moe(
+        self,
+        a,
+        w1,
+        w2,
+        score,
+        topk,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+    ):
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
         out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -52,7 +63,7 @@ class TestFusedMOE(CustomTestCase):
         topk_weight, topk_ids = torch.topk(score, topk)
         topk_weight = topk_weight.view(-1)
         topk_ids = topk_ids.view(-1)
-        
+
         # Handle FP8 mode
         if w1.dtype == torch.float8_e4m3fn:
             # Convert w1 and w2 to the same dtype as a for computation
@@ -72,14 +83,18 @@ class TestFusedMOE(CustomTestCase):
             for i in range(w1_orig.shape[0]):
                 mask = topk_ids == i
                 if mask.sum():
-                    out[mask] = SiluAndMul()(a[mask] @ w1_orig[i].transpose(0, 1)) @ w2_orig[i].transpose(0, 1).to(a.dtype)
+                    out[mask] = SiluAndMul()(
+                        a[mask] @ w1_orig[i].transpose(0, 1)
+                    ) @ w2_orig[i].transpose(0, 1).to(a.dtype)
         else:
             # Original logic for non-FP8 mode
             for i in range(w1.shape[0]):
                 mask = topk_ids == i
                 if mask.sum():
-                    out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
-                    
+                    out[mask] = SiluAndMul()(a[mask] @ w1[i].transpose(0, 1)) @ w2[
+                        i
+                    ].transpose(0, 1)
+
         return (
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
         ).sum(dim=1)
@@ -119,7 +134,9 @@ class TestFusedMOE(CustomTestCase):
                 a2_scale=a2_scale,
             )
 
-            torch_output = self.torch_naive_moe(a, w1, w2, score, topk, w1_scale, w2_scale, a1_scale, a2_scale)
+            torch_output = self.torch_naive_moe(
+                a, w1, w2, score, topk, w1_scale, w2_scale, a1_scale, a2_scale
+            )
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
