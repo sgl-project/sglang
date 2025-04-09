@@ -466,6 +466,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     ):
         super().__init__(config, quant_config, prefix)
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
     def _init_model(
         self,
         config: Llama4TextConfig,
