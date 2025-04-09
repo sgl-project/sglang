@@ -1,9 +1,8 @@
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.utils import set_weight_attrs
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -17,7 +16,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, set_weight_attrs
 
 _is_hip = is_hip()
 
@@ -63,7 +62,9 @@ class W8A8Fp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "W8A8Fp8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = "compressed-tensors" in quant_method or "fp8" in quant_method
+        is_checkpoint_fp8_serialized = (
+            "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
+        )
         return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
 
     def get_quant_method(
@@ -135,7 +136,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
-        **extra_weight_attrs
+        **extra_weight_attrs,
     ):
         weight_dtype = (
             torch.float8_e4m3fn
@@ -181,6 +182,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
+
 
 class W8A8FP8MoEMethod:
     """MoE method for FP8.
@@ -318,6 +320,7 @@ class W8A8FP8MoEMethod:
             inplace=inplace,
             activation=activation,
             use_fp8_w8a8=True,
+            per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,

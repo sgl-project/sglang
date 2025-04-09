@@ -3,9 +3,9 @@ import unittest
 
 import torch
 
+from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -60,12 +60,18 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
         if mask.sum():
             # First MLP layer: note that a_s is now per-token
             inter_out = native_w8a8_per_token_matmul(
-                fp8_mask(a_q, mask), w1[i], fp8_mask(a_s, mask), w1_s[i], output_dtype=a.dtype
+                fp8_mask(a_q, mask),
+                w1[i],
+                fp8_mask(a_s, mask),
+                w1_s[i],
+                output_dtype=a.dtype,
             )
             # Activation function
             act_out = SiluAndMul().forward_native(inter_out)
             # Quantize activation output with per-token
-            act_out_q, act_out_s = sgl_scaled_fp8_quant(act_out, use_per_token_if_dynamic=True)
+            act_out_q, act_out_s = sgl_scaled_fp8_quant(
+                act_out, use_per_token_if_dynamic=True
+            )
 
             # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(
@@ -130,6 +136,7 @@ class TestW8A8FP8FusedMoE(CustomTestCase):
                 use_fp8_w8a8=True,  # using fp8
                 use_int8_w8a16=False,
                 use_int8_w8a8=False,
+                per_channel_quant=True,
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 block_shape=None,  # Not using block quantization
