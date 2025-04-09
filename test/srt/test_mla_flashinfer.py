@@ -26,7 +26,8 @@ class TestFlashinferMLA(CustomTestCase):
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
-                    "--enable-flashinfer-mla",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         else:
@@ -71,8 +72,8 @@ class TestFlashinferMLANoRagged(CustomTestCase):
                     "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
                     "4",
-                    "--enable-flashinfer-mla",
-                    "--flashinfer-mla-disable-ragged",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         else:
@@ -129,7 +130,8 @@ class TestFlashinferMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-num-draft-tokens",
                     "4",
-                    "--enable-flashinfer-mla",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         else:

@@ -489,6 +489,14 @@ class DummyModelLoader(BaseModelLoader):
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)
+
+            # Model weight loading consists of two stages:
+            # 1. Initial weight loading.
+            # 2. Post-processing of weights, including assigning specific member variables.
+            # For `dummy_init`, only the second stage is required.
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
+
         return model.eval()
 
 
