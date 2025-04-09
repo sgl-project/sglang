@@ -294,6 +294,7 @@ class Llama4Attention(nn.Module):
             else None
         )
 
+        self.sliding_window_size = config.attention_chunk_size if self.use_rope else -1
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -302,6 +303,9 @@ class Llama4Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             use_irope=self.use_rope,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            )
         )
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
@@ -328,6 +332,9 @@ class Llama4Attention(nn.Module):
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
             del q_view, k_view, q_out_unused, k_out_unused
+
+        if forward_batch.hip_metadata_cache_pool is not None:
+            self.attn.sliding_window_size = self.sliding_window_size
 
         if self.qk_norm is not None:
             # TODO there are still 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous(), maybe we can fuse them later
@@ -504,9 +511,12 @@ class Llama4Model(nn.Module):
             hidden_states = input_embeds
         residual = None
         aux_hidden_states = []
+
+        forward_batch.on_model_start()
         for i in range(len(self.layers)):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -514,6 +524,9 @@ class Llama4Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -528,6 +541,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    hip_attention_supported = True
 
     def __init__(
         self,
