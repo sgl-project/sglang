@@ -50,7 +50,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -80,6 +79,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
+
+    from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 else:
     from vllm import _custom_ops as ops
 
@@ -325,6 +326,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.ep_size > 1:
+            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
                 hidden_states,
                 topk_idx,
@@ -337,7 +339,6 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                self.num_experts,
                 forward_mode=forward_mode,
             )
         final_hidden_states = (
@@ -490,6 +491,7 @@ class DeepseekV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -670,6 +672,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
 
@@ -680,6 +683,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
 
