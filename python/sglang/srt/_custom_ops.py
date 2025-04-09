@@ -13,6 +13,10 @@ use_vllm_custom_allreduce = get_bool_env_var(
     "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
 )
 
+if is_hpu():
+    use_vllm_custom_allreduce = True
+    os.environ["PT_HPU_ENABLE_LAZY_COLLECTIVES"] = "true"
+
 if not is_hpu():
     # ROCm does not use vllm custom allreduce
     if use_vllm_custom_allreduce and not is_hip():
