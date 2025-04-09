@@ -118,30 +118,54 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         seq_idx = seq_idx.to("hpu")
         padding_len = max_prompt_len - sum_seq_len
         max_prefill_seqs = model_runner.server_args.max_running_requests
-        input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"), (0, padding_len), value=0)
-        positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"), (0, padding_len), value=0)
+        input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"),
+                                            (0, padding_len),
+                                            value=0)
+        positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"),
+                                            (0, padding_len),
+                                            value=0)
         valid_seq_len = sum_seq_len.to("hpu")
-        extend_seq_lens_padded = torch.nn.functional.pad(forward_batch.extend_seq_lens.to("hpu"), (0, max_prefill_seqs - batch_size), value=0)
-        out_cache_loc = torch.nn.functional.pad(forward_batch.out_cache_loc.to("hpu"), (0, padding_len), value=0)
+        extend_seq_lens_padded = torch.nn.functional.pad(forward_batch.extend_seq_lens.to("hpu"),
+                                                         (0, max_prefill_seqs - batch_size),
+                                                         value=0)
+        out_cache_loc = torch.nn.functional.pad(forward_batch.out_cache_loc.to("hpu"),
+                                                (0, padding_len),
+                                                value=0)
         batch_size = 1
+        block_list = None
+        block_mapping = None
+        block_groups = None
+        block_usage = None
+        block_scales = None
     else:
         padded_batch_size = get_decode_batch_bucket(batch_size)
         padding_len = padded_batch_size - batch_size
-        input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"), (0, padding_len), value=0)
-        positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"), (0, padding_len), value=0)
+        input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"),
+                                            (0, padding_len),
+                                            value=0)
+        positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"),
+                                            (0, padding_len),
+                                            value=0)
         valid_seq_len = torch.ones(padded_batch_size, dtype=torch.int32, device="hpu")
-        out_cache_loc = torch.nn.functional.pad(forward_batch.out_cache_loc.to("hpu"), (0, padding_len), value=0)
+        out_cache_loc = torch.nn.functional.pad(forward_batch.out_cache_loc.to("hpu"),
+                                                (0, padding_len),
+                                                value=0)
         batch_size = padded_batch_size
         mask = torch.arange(0,
                            page_size,
                            device="hpu",
                            dtype=torch.int32).unsqueeze(0)
         mask = mask >= forward_batch.block_usage.to("hpu").unsqueeze(-1)
-        attn_bias = (torch.zeros_like(mask, dtype=model_runner.dtype).masked_fill_(
-            mask, -math.inf))
+        attn_bias = torch.zeros_like(mask,
+                                     dtype=model_runner.dtype).masked_fill_(mask, -math.inf)
         seq_pos = None
         seq_idx = None
         extend_seq_lens_padded = None
+        block_list = forward_batch.block_list.to("hpu")
+        block_mapping = forward_batch.block_mapping.to("hpu")
+        block_groups = forward_batch.block_groups.to("hpu")
+        block_usage = forward_batch.block_usage.to("hpu")
+        block_scales = forward_batch.block_scales.to("hpu")
 
     return HPUForwardBatch(
             forward_mode=forward_batch.forward_mode,
@@ -155,11 +179,11 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
             valid_seq_len=valid_seq_len,
             extend_seq_lens=extend_seq_lens_padded,
             page_size=page_size,
-            block_list=forward_batch.block_list.to("hpu") if forward_batch.block_list is not None else None,
-            block_mapping=forward_batch.block_mapping.to("hpu") if forward_batch.block_mapping is not None else None,
-            block_groups=forward_batch.block_groups.to("hpu") if forward_batch.block_groups is not None else None,
-            block_usage=forward_batch.block_usage.to("hpu") if forward_batch.block_usage is not None else None,
-            block_scales=forward_batch.block_scales.to("hpu") if forward_batch.block_scales is not None else None,
+            block_list=block_list,
+            block_mapping=block_mapping,
+            block_groups=block_groups,
+            block_usage=block_usage,
+            block_scales=block_scales,
             attn_backend=forward_batch.attn_backend,
             token_to_kv_pool=forward_batch.token_to_kv_pool,
             use_contiguous_pa=forward_batch.use_contiguous_pa,

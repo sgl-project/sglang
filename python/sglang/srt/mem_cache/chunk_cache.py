@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
