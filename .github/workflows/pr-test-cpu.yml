@@ -31,7 +31,7 @@ jobs:
             -v ${{ github.workspace }}:/sglang-checkout \
             -e https_proxy="http://proxy-dmz.intel.com:912/" \
             -e http_proxy="http://proxy-dmz.intel.com:912/" \
-            -e no_proxy=".intel.com" 
+            -e no_proxy=".intel.com" \
             -w /sglang-checkout \
             --name ci_sglang_cpu \
             sglang-cpu-test
