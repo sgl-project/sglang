@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 """
@@ -566,11 +565,6 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
 
-        # Use Flash Attention for prefill
-        causal = True
-        if layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
-
         # # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -599,7 +593,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=causal,
+                causal=True,
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
@@ -633,7 +627,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=causal,
+                causal=True,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,

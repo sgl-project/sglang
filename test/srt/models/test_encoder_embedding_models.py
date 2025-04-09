@@ -27,7 +27,7 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("facebook/contriever", 1, 1e-5)]
 
-ATTENTION_BACKEND = ["torch_native", "triton", "fa3"]
+ATTENTION_BACKEND = ["torch_native", "triton"]
 BATCH_SIZE = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TORCH_DTYPES = [torch.float32]
 sgl_to_st_ratio = []
