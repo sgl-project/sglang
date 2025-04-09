@@ -18,6 +18,8 @@ class TestDummyGrok1(CustomTestCase):
                 "fp8",
                 "--load-format",
                 "dummy",
+                "--json-model-override-args",
+                '{"num_hidden_layers": 2}',
             ],
         )
 
