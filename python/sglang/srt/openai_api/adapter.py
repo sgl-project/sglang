@@ -122,58 +122,48 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, mode
         f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
     )
 
-    if not chat_template_exists(chat_template_arg):
-        if not os.path.exists(chat_template_arg):
-            raise RuntimeError(
-                f"Chat template {chat_template_arg} is not a built-in template name "
-                "or a valid chat template file path."
-            )
-        if chat_template_arg.endswith(".jinja"):
-            with open(chat_template_arg, "r") as f:
-                chat_template = "".join(f.readlines()).strip("\n")
-            tokenizer_manager.tokenizer.chat_template = chat_template.replace(
-                "\\n", "\n"
-            )
-            chat_template_name = None
-        else:
-            assert chat_template_arg.endswith(
-                ".json"
-            ), "unrecognized format of chat template file"
-            with open(chat_template_arg, "r") as filep:
-                template = json.load(filep)
-            if sep_style := getattr(SeparatorStyle, template.get("sep_style")):
-                # infer conversation template from sep_style
-                register_conv_template(
-                    Conversation(
-                        name=template["name"],
-                        system_template=template["system"] + "\n{system_message}",
-                        system_message=template.get("system_message", ""),
-                        roles=(template["user"], template["assistant"]),
-                        sep_style=sep_style,
-                        sep=template.get("sep", "\n"),
-                        stop_str=template["stop_str"],
-                    )
-                )
-                chat_template_name = template["name"]
-            elif template_str := template.get("chat_template"):
-                logger.info(
-                    "cannot determine template format from chat_template.json[`sep_style`]. Trying jinja parsing."
-                )
-                template_str = template_str.replace("\\n", "\n")
-                tokenizer_manager.tokenizer.chat_template = template_str
-                chat_template_name = None
-
-            else:
-                raise ValueError(
-                    f"Failed to infer template format: sep_style: str=`{template.get('sep_style')}`, chat_template: jinja_str=`{template.get('chat_template')}`"
-                )
-    else:
+    if chat_template_exists(chat_template_arg):
         chat_template_name = chat_template_arg
+        return
 
-    # Check chat-template
-    # TODO:
-    # 1. Do not import any code from sglang.lang
-    # 2. For VLM, when chat_template_arg is None, set it automatically by guessing from model_path.
+    if not os.path.exists(chat_template_arg):
+        raise RuntimeError(
+            f"Chat template {chat_template_arg} is not a built-in template name "
+            "or a valid chat template file path."
+        )
+
+    with open(chat_template_arg, "r") as f:
+        payload = "".join(f.readlines())
+    match chat_template_arg.rsplit(".", 1):
+        case [_, "jinja"]:
+            tokenizer_manager.tokenizer.chat_template = payload.replace("\\n", "\n")
+            chat_template_name = None
+        case [_, "json"]:
+            match json.loads(payload):
+                case {"sep_style": sep, **fields} if sep in SeparatorStyle.__members__:
+                    register_conv_template(
+                        Conversation(
+                            name=fields["name"],
+                            system_template=fields["system"] + "\n{system_message}",
+                            system_message=fields.get("system_message", ""),
+                            roles=(fields["user"], fields["assistant"]),
+                            sep_style=SeparatorStyle[sep],
+                            sep=fields.get("sep", "\n"),
+                            stop_str=fields["stop_str"],
+                        )
+                    )
+                    chat_template_name = fields["name"]
+                case {"chat_template": chat_template_str}:
+                    tokenizer_manager.tokenizer.chat_template = (
+                        chat_template_str.replace("\\n", "\n")
+                    )
+                    chat_template_name = None
+                case _:
+                    raise ValueError(
+                        f"Unrecognized chat template format from {chat_template_arg}: "
+                        f"sep_type={json.loads(payload).get('sep_style')}, "
+                        f"chat_template_str={json.loads(payload).get('chat_template')}"
+                    )
 
 
 async def v1_files_create(
