@@ -54,8 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
-from sglang.srt.utils import is_hpu
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, is_hpu
 
 _is_hpu = is_hpu()
 
@@ -677,6 +676,7 @@ class Req:
 
 
 bid = 0
+
 
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
@@ -1543,9 +1543,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if _is_hpu:
             from sglang.srt.hpu_utils import create_hpu_specific_fields
-            create_hpu_specific_fields(worker_batch,
-                                       self.token_to_kv_pool_allocator.page_size,
-                                       self.req_to_token_pool)
+
+            create_hpu_specific_fields(
+                worker_batch,
+                self.token_to_kv_pool_allocator.page_size,
+                self.req_to_token_pool,
+            )
 
         return worker_batch
 

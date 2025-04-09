@@ -3,14 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from torch.nn.functional import scaled_dot_product_attention
 import vllm_hpu_extension.kernels as kernels
+import vllm_hpu_extension.ops as ops
+from torch.nn.functional import scaled_dot_product_attention
+from vllm_hpu_extension.utils import Matmul, ModuleFusedSDPA, Softmax, VLLMKVCache
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-import vllm_hpu_extension.ops as ops
-from vllm_hpu_extension.utils import (Matmul, ModuleFusedSDPA, Softmax,
-                                      VLLMKVCache)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -25,21 +24,20 @@ class HPUAttnBackend(AttentionBackend):
         self.k_cache = VLLMKVCache()
         self.v_cache = VLLMKVCache()
         from habana_frameworks.torch.hpex.kernels import FusedSDPA
-        self.fused_scaled_dot_product_attention = ModuleFusedSDPA(
-                    FusedSDPA)
+
+        self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA)
         self.matmul_qk = Matmul()
         self.softmax = Softmax()
         self.matmul_av = Matmul()
         self.batch2block_matmul = Matmul()
         self.block2batch_matmul = Matmul()
 
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         import vllm_hpu_extension.environment as environment
-        # TODO: remove the hardcoded model_type once we have a better way to handle this
-        environment.runtime_params['model_type'] = 'llama'
 
+        # TODO: remove the hardcoded model_type once we have a better way to handle this
+        environment.runtime_params["model_type"] = "llama"
 
     def forward_extend(
         self,
@@ -99,16 +97,23 @@ class HPUAttnBackend(AttentionBackend):
         value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
         query = q.view(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
-        key_cache = key_cache.view(-1, forward_batch.page_size, layer.tp_k_head_num, layer.qk_head_dim)
-        value_cache = value_cache.view(-1, forward_batch.page_size, layer.tp_v_head_num, layer.v_head_dim)
+        key_cache = key_cache.view(
+            -1, forward_batch.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        value_cache = value_cache.view(
+            -1, forward_batch.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
 
         if forward_batch.use_contiguous_pa:
+
             def fetch_key_cache(cache, blocks):
-                return cache[:blocks.size(0)]
+                return cache[: blocks.size(0)]
 
             def fetch_value_cache(cache, blocks):
-                return cache[:blocks.size(0)]
+                return cache[: blocks.size(0)]
+
         else:
+
             def fetch_key_cache(cache, blocks):
                 return cache.index_select(0, blocks)
 

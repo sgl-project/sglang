@@ -9,6 +9,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_hpu = is_hpu()
 
+
 class CustomOp(nn.Module):
     def __init__(self):
         super().__init__()

@@ -24,6 +24,7 @@ import triton.language as tl
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
+
 def alloc_extend_kernel_native(
     prefix_lens: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -50,7 +51,9 @@ def alloc_extend_kernel_native(
         sum_num_new_pages += num_page_start_loc_self
         new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
-        num_part1 = min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
+        num_part1 = (
+            min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
+        )
         assert num_part1 >= 0 and num_part1 <= page_size
         offset_part1 = torch.arange(0, num_part1)
         out_indices[output_start_loc + offset_part1] = last_loc + 1 + offset_part1
@@ -58,10 +61,15 @@ def alloc_extend_kernel_native(
         if pre_len + num_part1 == seq_len:
             continue
 
-        num_part2 = seq_len // page_size * page_size - (pre_len + page_size - 1) // page_size * page_size
+        num_part2 = (
+            seq_len // page_size * page_size
+            - (pre_len + page_size - 1) // page_size * page_size
+        )
         offset_part2 = torch.arange(0, num_part2)
         page_start = free_page[new_page_start_loc + offset_part2 // page_size]
-        out_indices[output_start_loc + num_part1 + offset_part2] = page_start * page_size + offset_part2 % page_size
+        out_indices[output_start_loc + num_part1 + offset_part2] = (
+            page_start * page_size + offset_part2 % page_size
+        )
 
         if pre_len + num_part1 + num_part2 == seq_len:
             continue
@@ -69,7 +77,9 @@ def alloc_extend_kernel_native(
         num_part3 = seq_len - seq_len // page_size * page_size
         start_loc = free_page[new_page_start_loc + num_page_start_loc_self - 1]
         offset_part3 = torch.arange(0, num_part3)
-        out_indices[output_start_loc + num_part1 + num_part2 + offset_part3] = start_loc * page_size + offset_part3
+        out_indices[output_start_loc + num_part1 + num_part2 + offset_part3] = (
+            start_loc * page_size + offset_part3
+        )
     ret_values.fill_((sum_num_new_pages << 32) | sum_extend_lens)
 
 
@@ -104,7 +114,7 @@ def alloc_decode_kernel_native(
             out_indices[i] = page * page_size
     ret_values.fill_(sum_num_new_pages)
 
-    
+
 @triton.jit
 def alloc_extend_kernel(
     pre_lens_ptr,
@@ -320,7 +330,7 @@ class PagedTokenToKVPoolAllocator:
                 self.ret_values,
                 next_power_of_2(bs),
                 self.page_size,
-                    next_power_of_2(extend_num_tokens),
+                next_power_of_2(extend_num_tokens),
             )
         else:
             alloc_extend_kernel_native(
@@ -364,7 +374,7 @@ class PagedTokenToKVPoolAllocator:
                 self.ret_values,
                 next_power_of_2(bs),
                 self.page_size,
-                )
+            )
         else:
             alloc_decode_kernel_native(
                 seq_lens,
@@ -391,7 +401,9 @@ class PagedTokenToKVPoolAllocator:
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
-            self.free_pages = torch.cat((free_page_indices, self.free_pages)).sort().values
+            self.free_pages = (
+                torch.cat((free_page_indices, self.free_pages)).sort().values
+            )
         else:
             self.free_group.append(free_index)
 
