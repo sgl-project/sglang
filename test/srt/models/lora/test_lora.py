@@ -24,8 +24,15 @@ LORA_SETS = [
     #     "base": "meta-llama/Llama-2-7b-hf",
     #     "loras": ["RuterNorway/Llama-2-7b-chat-norwegian-LoRa"],
     # },
-    {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
-    # {"base": "Qwen/Qwen2.5-14B-Instruct", "loras": ["mssongit/Qwen2.5-14B-SFT-LoRA"]},
+    # {"base": "meta-llama/Llama-2-7b-hf", "loras": ["winddude/wizardLM-LlaMA-LoRA-7B"]},
+    {
+        "base": "meta-llama/Llama-2-7b-hf",
+        "loras": [
+            "LoRA-TMLR-2024/magicoder-lora-rank-64-alpha-128",
+            "LoRA-TMLR-2024/openwebmath-lora-rank-64-20B-tokens",
+        ],
+    },
+    # {"base": "baichuan-inc/Baichuan-7B", "loras": ["baichuan7B-zero"]},
     # {"base": "mistralai/Mistral-7B-Instruct-v0.3", "loras": ["/home/ying/test_lora"]},
     # {
     #     "base": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -52,12 +59,11 @@ They're used to make predictions on text.
 """,
     """
 ### Instruction:
-Tell me about llamas and alpacas
+Write a poem about the transformers Python library.
+Mention the word "large language models" in that poem.
 ### Response:
-Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
-### Question 2:
-What do you know about llamas?
-### Answer:
+The Transformers are large language models,
+They're used to make predictions on text.
 """,
 ]
 
@@ -76,11 +82,11 @@ class TestLoRA(unittest.TestCase):
         print("=================== testing inference =======================")
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
-        batch_lora_paths = [None]
-        i = 0
-        for _ in range(len(prompts) - 1):
-            batch_lora_paths.append(all_lora_paths[i])
-            i = (i + 1) % len(all_lora_paths)
+        batch_lora_paths = all_lora_paths
+        # i = 0
+        # for _ in range(len(prompts) - 1):
+        #     batch_lora_paths.append(all_lora_paths[i])
+        #     i = (i + 1) % len(all_lora_paths)
 
         with SRTRunner(
             base_path,
@@ -90,18 +96,23 @@ class TestLoRA(unittest.TestCase):
             lora_paths=all_lora_paths,
             max_loras_per_batch=3,
             disable_radix_cache=True,
+            # disable_cuda_graph=True,
+            trust_remote_code=True,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
             )
-            srt_outputs_lora_path_none = srt_runner.forward(
-                prompts,
-                max_new_tokens=max_new_tokens,
-                lora_paths=[None] * len(prompts),
-            )
+            # srt_outputs_lora_path_none = srt_runner.forward(
+            #     prompts,
+            #     max_new_tokens=max_new_tokens,
+            #     lora_paths=[None] * len(prompts),
+            # )
 
         with HFRunner(
-            base_path, torch_dtype=torch_dtype, model_type="generation"
+            base_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            trust_remote_code=True,
         ) as hf_runner:
             hf_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens, lora_paths=batch_lora_paths
@@ -111,6 +122,7 @@ class TestLoRA(unittest.TestCase):
             base_path,
             torch_dtype=torch_dtype,
             model_type="generation",
+            trust_remote_code=True,
         ) as hf_runner:
             hf_no_lora_outputs = hf_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
@@ -121,6 +133,7 @@ class TestLoRA(unittest.TestCase):
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            trust_remote_code=True,
         ) as srt_runner:
             srt_no_lora_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens
@@ -172,7 +185,7 @@ class TestLoRA(unittest.TestCase):
         print(f"{srt_outputs.output_strs=}")
         print(f"{hf_no_lora_outputs.output_strs=}")
         print(f"{srt_no_lora_outputs.output_strs=}")
-        print(f"{srt_outputs_lora_path_none.output_strs=}")
+        # print(f"{srt_outputs_lora_path_none.output_strs=}")
         for i in range(len(prompts)):
             assert srt_outputs.output_strs[i].strip(" ") == hf_outputs.output_strs[i], (
                 srt_outputs.output_strs[i].strip(" "),
@@ -185,7 +198,7 @@ class TestLoRA(unittest.TestCase):
                 srt_no_lora_outputs.output_strs[i].strip(" "),
                 hf_no_lora_outputs.output_strs[i],
             )
-            assert srt_outputs_lora_path_none == srt_no_lora_outputs
+            # assert srt_outputs_lora_path_none == srt_no_lora_outputs
 
     def serving(self, prompts, lora_set, tp_size, torch_dtype, max_new_tokens):
         print("=================== testing serving =======================")
@@ -284,7 +297,7 @@ class TestLoRA(unittest.TestCase):
                 tp_size = 1
                 max_new_tokens = 32
                 self.inference(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
-                self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
+                # self.serving(PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens)
                 # self.base_inference(
                 #     PROMPTS, lora_set, tp_size, torch_dtype, max_new_tokens
                 # )

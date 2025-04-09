@@ -257,8 +257,11 @@ class CudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
-            if self.model_runner.server_args.lora_paths is not None:
-                self.lora_paths = [None] * self.max_bs
+            if self.model_runner.server_args.lora_paths:
+                print(f"{self.model_runner.server_args.lora_paths=}")
+                self.lora_paths = [
+                    next(iter(self.model_runner.server_args.lora_paths))
+                ] * self.max_bs
 
         # Capture
         try:
