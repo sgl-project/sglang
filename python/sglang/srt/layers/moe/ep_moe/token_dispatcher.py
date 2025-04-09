@@ -19,57 +19,88 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-_buffer = None
 
+class DeepEPBuffer:
+    
+    _buffer: Optional[Buffer] = None
+    _pd_state: Optional[str] = None
+    _hidden_size: Optional[int] = None
+    _num_max_dispatch_tokens_per_rank: Optional[int] = None
+    _num_experts: Optional[int] = None,
+    
+    @classmethod
+    def get_deepep_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        param_bytes: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int = None,
+        num_experts: int = None,
+    ):
+        if cls._buffer is not None:
+            return cls._buffer
 
-def _get_deepep_buffer(
-    group: dist.ProcessGroup,
-    hidden: int,
-    deepep_mode: DeepEPMode,
-    num_max_dispatch_tokens_per_rank: int = None,
-    num_experts: int = None,
-):
-    global _buffer
-    if _buffer is not None:
-        return _buffer
-
-    num_nvl_bytes, num_rdma_bytes = 0, 0
-    if deepep_mode.enable_normal():
-        hidden_bytes = hidden * 2
-        for config in (
-            Buffer.get_dispatch_config(group.size()),
-            Buffer.get_combine_config(group.size()),
-        ):
-            num_nvl_bytes = max(
-                config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                num_nvl_bytes,
-            )
+        cls._hidden_size = hidden_size
+        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        cls._num_experts = num_experts
+        
+        num_nvl_bytes, num_rdma_bytes = 0, 0
+        if deepep_mode.enable_normal():
+            hidden_bytes = hidden_size * param_bytes
+            for config in (
+                Buffer.get_dispatch_config(group.size()),
+                Buffer.get_combine_config(group.size()),
+            ):
+                num_nvl_bytes = max(
+                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
+                    num_nvl_bytes,
+                )
+                num_rdma_bytes = max(
+                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                    num_rdma_bytes,
+                )
+        if deepep_mode.enable_low_latency():
+            assert num_max_dispatch_tokens_per_rank is not None
+            assert num_experts is not None and num_experts % group.size() == 0
             num_rdma_bytes = max(
-                config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                Buffer.get_low_latency_rdma_size_hint(
+                    num_max_dispatch_tokens_per_rank, hidden_size, group.size(), num_experts
+                ),
                 num_rdma_bytes,
             )
-    if deepep_mode.enable_low_latency():
-        assert num_max_dispatch_tokens_per_rank is not None
-        assert num_experts is not None and num_experts % group.size() == 0
-        num_rdma_bytes = max(
-            Buffer.get_low_latency_rdma_size_hint(
-                num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
-            ),
+
+        cls._buffer = Buffer(
+            group,
+            num_nvl_bytes,
             num_rdma_bytes,
+            low_latency_mode=deepep_mode.enable_low_latency(),
+            num_qps_per_rank=(
+                num_experts // group.size() if deepep_mode.enable_low_latency() else 1
+            ),
         )
+        return cls._buffer
 
-    _buffer = Buffer(
-        group,
-        num_nvl_bytes,
-        num_rdma_bytes,
-        low_latency_mode=deepep_mode.enable_low_latency(),
-        num_qps_per_rank=(
-            num_experts // group.size() if deepep_mode.enable_low_latency() else 1
-        ),
-    )
-
-    return _buffer
-
+    @classmethod
+    def clean_buffer(cls):
+        if not cls._buffer.low_latency_mode:
+            return
+        cls._buffer.clean_low_latency_buffer(
+            cls._num_max_dispatch_tokens_per_rank,
+            cls._hidden_size,
+            cls._num_experts,
+        )
+    
+    @classmethod
+    def set_pd_state_as_prefill(cls):
+        cls._pd_state = "prefill"
+    
+    @classmethod
+    def set_pd_state_as_decode(cls):
+        if cls._pd_state == "prefill":
+            cls.clean_buffer()
+        cls._pd_state = "decode"
+    
 
 class _DeepEPDispatcherImplBase:
     def __init__(
@@ -167,14 +198,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             )
 
         masked_m = expected_m = None
-
-        if self.deepep_mode.enable_low_latency():
-            buffer = self._get_buffer()
-            buffer.clean_low_latency_buffer(
-                self.num_max_dispatch_tokens_per_rank,
-                self.hidden_size,
-                self.num_experts,
-            )
 
         return (
             hidden_states,
@@ -329,9 +352,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
-        return _get_deepep_buffer(
+        DeepEPBuffer.set_pd_state_as_prefill()
+        return DeepEPBuffer.get_deepep_buffer(
             self.group,
-            self.hidden_size,  #  * self.params_bytes
+            self.hidden_size,
+            self.params_bytes,
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
@@ -487,9 +512,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        return _get_deepep_buffer(
+        DeepEPBuffer.set_pd_state_as_decode()
+        return DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
+            self.params_bytes,
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
@@ -523,14 +550,14 @@ class DeepEPDispatcher:
             deepep_mode=deepep_mode,
         )
 
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
-                async_finish=async_finish,
-                **common_kwargs,
-            )
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
+                **common_kwargs,
+            )
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+                async_finish=async_finish,
                 **common_kwargs,
             )
 
@@ -580,7 +607,7 @@ class DeepEPDispatcher:
         del self._combine_intermediate_state
         return self._get_impl(forward_mode).combine_b(*inner_state)
 
-    def _get_impl(self, forward_mode: ForwardMode) -> "_DeepEPDispatcherImplBase":
+    def _get_impl(self, forward_mode: ForwardMode) -> _DeepEPDispatcherImplBase:
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
