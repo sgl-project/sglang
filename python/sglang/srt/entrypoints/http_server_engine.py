@@ -14,7 +14,11 @@ import torch.distributed as dist
 from sglang.srt.entrypoints.base_engine import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import HttpSerializer, kill_process_tree
+from sglang.srt.utils import (
+    HttpSerializer,
+    MultiprocessingSerializer,
+    kill_process_tree,
+)
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
