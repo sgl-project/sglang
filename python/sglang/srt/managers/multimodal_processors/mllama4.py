@@ -57,14 +57,13 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         processor = self._processor
 
         # Process the prompt and images
-        image_inputs = processor(
-            text=processed_data.input_text,
+        processor_output = self.process_mm_data(
+            input_text=processed_data.input_text,
             images=processed_data.images,
-            return_tensors="pt",
         )
 
         # Handle image resolutions and aspect ratios
-        if "pixel_values" in image_inputs:
+        if "pixel_values" in processor_output:
             image_processor = processor.image_processor
             tokenizer = self._processor.tokenizer
 
@@ -98,8 +97,8 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             ]
 
             # Add to image_inputs
-            image_inputs["aspect_ratios"] = aspect_ratios
-            image_inputs["patches_per_image"] = torch.tensor(patches_per_image)
+            processor_output["aspect_ratios"] = aspect_ratios
+            processor_output["patches_per_image"] = torch.tensor(patches_per_image)
 
             # Process embed_is_patch
             vocab = tokenizer.get_vocab()
@@ -107,7 +106,7 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             image_end_id = vocab.get(processor.end_of_img_token, -1)
 
             if patch_id != -1 and image_end_id != -1:
-                input_ids = image_inputs["input_ids"].view(-1)
+                input_ids = processor_output["input_ids"].view(-1)
 
                 # Remove BOS token if present
                 if input_ids.size(0) > 0 and input_ids[0] == tokenizer.bos_token_id:
@@ -127,21 +126,21 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
                     for per_image_input_ids in split_input_ids:
                         embed_is_patch.append(per_image_input_ids == patch_id)
 
-                    image_inputs["embed_is_patch"] = embed_is_patch
+                    processor_output["embed_is_patch"] = embed_is_patch
 
         # Convert to the format expected by SGLang
-        image_inputs["input_ids"] = image_inputs["input_ids"].tolist()[0]
+        processor_output["input_ids"] = processor_output["input_ids"].tolist()[0]
 
-        image_inputs["im_start_id"] = self.boi_token_index
-        image_inputs["im_end_id"] = self.eoi_token_index
-        image_inputs["im_token_id"] = self.image_token_index
+        processor_output["im_start_id"] = self.boi_token_index
+        processor_output["im_end_id"] = self.eoi_token_index
+        processor_output["im_token_id"] = self.image_token_index
 
         # Add metadata for image processing
-        image_inputs["mm_items"] = [
+        processor_output["mm_items"] = [
             MultimodalDataItem(
-                pixel_values=image_inputs["pixel_values"],
+                pixel_values=processor_output["pixel_values"],
                 modality=Modality.IMAGE,
             )
         ]
 
-        return image_inputs
+        return processor_output
