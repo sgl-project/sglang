@@ -508,6 +508,4 @@ class PrefillAdder:
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(prefix_len, trunc_len, 0)
 
-            req.queue_time_end = time.time()
-
         return self.budget_state()
