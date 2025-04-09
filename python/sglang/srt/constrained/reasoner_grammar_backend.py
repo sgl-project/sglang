@@ -22,11 +22,13 @@ from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(
+        self, grammar: BaseGrammarObject, think_end_id: int, is_in_reasoning=True
+    ):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = True
+        self.is_in_reasoning = is_in_reasoning
 
     @property
     def finished(self):
@@ -81,16 +83,26 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
-    def get_cached_value(self, key: Tuple[str, str]) -> Optional[ReasonerGrammarObject]:
+    def get_cached_value(
+        self, key: Tuple[str, str], is_in_reasoning: bool = True
+    ) -> Optional[ReasonerGrammarObject]:
         grammar = self.grammar_backend.get_cached_value(key)
-        return ReasonerGrammarObject(grammar, self.think_end_id) if grammar else None
+        return (
+            ReasonerGrammarObject(grammar, self.think_end_id, is_in_reasoning)
+            if grammar
+            else None
+        )
 
-    def get_future_value(self, key: Tuple[str, str]) -> Future:
+    def get_future_value(
+        self, key: Tuple[str, str], is_in_reasoning: bool = True
+    ) -> Future:
         grammar = Future()
 
         def callback(f: Future):
             if result := f.result():
-                grammar.set_result(ReasonerGrammarObject(result, self.think_end_id))
+                grammar.set_result(
+                    ReasonerGrammarObject(result, self.think_end_id, is_in_reasoning)
+                )
             else:
                 grammar.set_result(None)
 
