@@ -23,7 +23,7 @@ jobs:
       - name: Build Docker image
         run: |
           docker build --build-arg no_proxy=.intel.com --build-arg http_proxy=http://proxy-dmz.intel.com:912 --build-arg https_proxy=http://proxy-dmz.intel.com:912 \
-          -t sglang-cpu-test  -f Dockerfile .
+          -t sglang-cpu-test  -f ${{ github.workspace }}/docker/Dockerfile.xeon .
 
       - name: Run container
         run: |
