@@ -227,7 +227,11 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile(activities=["CPU", "HPU"])
+        if args.device == "hpu":
+            activities = ["CPU", "HPU"]
+        else:
+            activities = ["CPU", "GPU"]
+        backend.start_profile(activities=activities)
 
     st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
