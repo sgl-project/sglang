@@ -1408,7 +1408,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     w = self_attn.kv_b_proj.weight
                 # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
                 # This may affect the accuracy of fp8 model.
-                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz,):
+                if w.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
                     if hasattr(self.quant_config, "weight_block_size"):
                         weight_block_size = self.quant_config.weight_block_size
                         if weight_block_size is not None:
@@ -1430,9 +1433,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     else:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
-                        w, scale = channel_quant_to_tensor_quant(
-                            weight, weight_scale
-                        )
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                         self_attn.w_scale = scale
 
                 if w.dtype == torch.int8:
