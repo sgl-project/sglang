@@ -20,7 +20,8 @@ class TestDummyGrok1(CustomTestCase):
                 "8",
                 "--quantization",
                 "fp8",
-                "--load-format dummy",
+                "--load-format",
+                "dummy",
             ],
         )
 
