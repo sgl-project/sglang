@@ -9,7 +9,7 @@ class TestDummyGrok1(CustomTestCase):
             None,
             [
                 "--model",
-                "/dummy-grok"
+                "/dummy-grok",
                 "--batch-size",
                 "32",
                 "--input",
