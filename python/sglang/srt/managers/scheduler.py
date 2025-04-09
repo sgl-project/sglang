@@ -1058,10 +1058,8 @@ class Scheduler(
 
             total_queue_latency = 0
             for req in can_run_list:
-                if req.queue_time_start is not None and req.queue_time_end is not None:
-                    total_queue_latency += req.queue_time_end - req.queue_time_start
-            if total_queue_latency > 0:
-                self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
+                total_queue_latency += req.queue_time_end - req.queue_time_start
+            self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
 
