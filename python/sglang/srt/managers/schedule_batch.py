@@ -200,6 +200,7 @@ class MultimodalDataItem:
 
         def tensor_hash(f):
             f_list = flatten_nested_list(f)
+            f_list = [x.flatten() if isinstance(x, torch.Tensor) else x for x in f_list]
             f_cat = torch.concat(f_list).contiguous().numpy().tobytes()
             return hash(f_cat)
 

@@ -239,7 +239,7 @@ class ModelConfig:
             # check if is modelopt model -- modelopt doesn't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
-            is_local = os.path.isdir(self.model_path)
+            is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 from huggingface_hub import HfApi
@@ -279,6 +279,7 @@ class ModelConfig:
             "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }

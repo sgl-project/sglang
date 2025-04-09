@@ -26,7 +26,8 @@ MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
     ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
     ("marco/mcdse-2b-v1", 1, 1e-5),
-    ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
+    # Temporarily disable before this model is fixed
+    # ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
 ]
 TORCH_DTYPES = [torch.float16]
 
