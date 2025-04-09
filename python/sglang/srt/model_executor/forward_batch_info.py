@@ -315,27 +315,27 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode():
-            if ret.positions is None:	
+            if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32	
-            ).to(device, non_blocking=True)	
-            ret.extend_prefix_lens = torch.tensor(	
-                batch.extend_prefix_lens, dtype=torch.int32	
-            ).to(device, non_blocking=True)	
-            if model_runner.server_args.attention_backend not in ["torch_native", "hpu"]:	
-                ret.extend_num_tokens = batch.extend_num_tokens	
-                positions, ret.extend_start_loc = compute_position_triton(	
-                    ret.extend_prefix_lens,	
-                    ret.extend_seq_lens,	
-                    ret.extend_num_tokens,	
-                )	
+                batch.extend_seq_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.extend_prefix_lens = torch.tensor(
+                batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            if model_runner.server_args.attention_backend not in ["torch_native", "hpu"]:
+                ret.extend_num_tokens = batch.extend_num_tokens
+                positions, ret.extend_start_loc = compute_position_triton(
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
             else:
-                positions, ret.extend_start_loc = compute_position_torch(	
-                    ret.extend_prefix_lens, ret.extend_seq_lens	
-                )	
-            if ret.positions is None:	
+                positions, ret.extend_start_loc = compute_position_torch(
+                    ret.extend_prefix_lens, ret.extend_seq_lens
+                )
+            if ret.positions is None:
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
