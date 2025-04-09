@@ -1834,7 +1834,7 @@ def is_hopper_with_cuda_12_3():
     is_hopper = (
         torch.cuda.is_available()
         and torch.version.cuda
-        and torch.cuda.get_device_capability()[0] >= 9
+        and torch.cuda.get_device_capability()[0] == 9
     )
     cuda_version = torch.version.cuda.split(".")
     is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
