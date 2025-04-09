@@ -42,7 +42,6 @@ The capital of the
 I'm going to the park
 """
 
-import habana_frameworks.torch.core as htcore
 import argparse
 import dataclasses
 import itertools
@@ -55,7 +54,6 @@ from typing import Tuple
 
 import numpy as np
 import torch
-torch.hpu.current_device()
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -247,13 +245,9 @@ def extend(reqs, model_runner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    from sglang.srt.model_executor.forward_batch_info import create_hpu_forward_batch
-    hpu_forward_batch = create_hpu_forward_batch(forward_batch)
-    logits_output = model_runner.forward(hpu_forward_batch)
+    logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
-    next_token_ids = next_token_ids.to("cpu")
-    next_token_ids = next_token_ids[:forward_batch.real_batch_size]
-    return next_token_ids, None, batch
+    return next_token_ids, logits_output.next_token_logits, batch
 
 
 @torch.no_grad
@@ -263,13 +257,9 @@ def decode(input_token_ids, batch, model_runner):
     _maybe_prepare_dp_attn_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    from sglang.srt.model_executor.forward_batch_info import create_hpu_forward_batch
-    hpu_forward_batch = create_hpu_forward_batch(forward_batch)
-    logits_output = model_runner.forward(hpu_forward_batch)
+    logits_output = model_runner.forward(forward_batch)
     next_token_ids = model_runner.sample(logits_output, forward_batch)
-    next_token_ids = next_token_ids.to("cpu")
-    next_token_ids = next_token_ids[:forward_batch.real_batch_size]
-    return next_token_ids, None
+    return next_token_ids, logits_output.next_token_logits
 
 
 def _maybe_prepare_dp_attn_batch(batch: ScheduleBatch, model_runner):
@@ -372,7 +362,7 @@ def latency_test_run_once(
         profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.HPU,
+                torch.profiler.ProfilerActivity.CUDA,
             ],
             with_stack=True,
         )

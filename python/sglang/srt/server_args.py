@@ -370,9 +370,6 @@ class ServerArgs:
         # AMD-specific Triton attention KV splits default number
         if is_hip():
             self.triton_attention_num_kv_splits = 16
-        
-        if self.max_running_requests is None:
-            self.max_running_requests = 128
 
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
