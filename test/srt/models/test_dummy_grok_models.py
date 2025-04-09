@@ -12,6 +12,8 @@ class TestDummyGrok1(CustomTestCase):
                 "/dummy-grok",
                 "--tokenizer-path",
                 "Xenova/grok-1-tokenizer",
+                "--batch-size",
+                 "2",
                 "--tp",
                 "2",
                 "--quantization",
