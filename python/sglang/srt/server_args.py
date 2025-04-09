@@ -495,6 +495,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "gguf",
                 "modelopt",
+                "modelopt_fp4",
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
@@ -1100,6 +1101,7 @@ class ServerArgs:
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
+            default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
 
