@@ -550,10 +550,21 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    # List containing one serialized Dict[str, torch.Tensor] per TP worker
-    serialized_named_tensors: List[bytes]
-    load_format: Optional[str]
-    flush_cache: bool
+    """Update model weights from tensor input.
+
+    The serialization of tensor data uses HttpSerializer:
+    - Binary data like tensors are base64 encoded
+    - Data is structured in JSON for easy transmission over HTTP
+    - No pickle serialization is used for security reasons
+    """
+
+    # List containing serialized Dict[str, torch.Tensor] data for each TP worker
+    # Each item is serialized using HttpSerializer.serialize()
+    serialized_named_tensors: List[str]
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass

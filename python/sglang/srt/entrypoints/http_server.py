@@ -31,8 +31,6 @@ from typing import AsyncIterator, Callable, Dict, Optional, Union
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
-import base64
-import pickle
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -417,25 +415,17 @@ async def init_weights_update_group(
 
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(
-    obj: Union[UpdateWeightsFromTensorReqInput, str], request: Request
+    obj: UpdateWeightsFromTensorReqInput, request: Request
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
     1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
     2. HTTPS will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
+    3. Any binary data in the named tensors should be base64 encoded.
     """
-    if isinstance(obj, str):
-        try:
-            obj = HttpSerializer.deserialize(obj)
-        except Exception as e:
-            return ORJSONResponse(
-                {"success": False, "message": f"Failed to decode input: {str(e)}"},
-                status_code=HTTPStatus.BAD_REQUEST,
-            )
-    else:
-        obj.serialized_named_tensors = [
-            HttpSerializer.deserialize(item) for item in obj.serialized_named_tensors
-        ]
+    obj.serialized_named_tensors = [
+        HttpSerializer.deserialize(item) for item in obj.serialized_named_tensors
+    ]
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request

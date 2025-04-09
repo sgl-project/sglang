@@ -14,24 +14,16 @@ import torch.distributed as dist
 from sglang.srt.entrypoints.base_engine import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    HttpSerializer,
-    MultiprocessingSerializer,
-    kill_process_tree,
-)
-
-
-def launch_server_worker(server_args: ServerArgs):
-    launch_server(server_args)
+from sglang.srt.utils import HttpSerializer, kill_process_tree
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
-    p = multiprocessing.Process(target=launch_server_worker, args=(server_args,))
+    p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 
     base_url = server_args.url()
-    timeout = 180.0
+    timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
     start_time = time.time()
 
     with requests.Session() as session:
@@ -62,9 +54,20 @@ class HttpServerEngineForRL(EngineBase):
         print(f"launch_server_from_verl_engine {self.server_args.port}")
         self.process = launch_server_process(self.server_args)
 
-    def _url(self, path: str) -> str:
-        """Construct full URL for server endpoint."""
-        return f"http://{self.server_args.host}:{self.server_args.port}/{path}"
+    def _make_request(self, endpoint: str, payload: dict = None):
+        """Make a POST request to the specified endpoint with the given payload.
+
+        Args:
+            endpoint: The API endpoint to call
+            payload: The JSON payload to send (default: empty dict)
+
+        Returns:
+            The JSON response from the server
+        """
+        url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
+        response = requests.post(url, json=payload or {})
+        response.raise_for_status()
+        return response.json()
 
     def update_weights_from_tensor(
         self,
@@ -80,13 +83,11 @@ class HttpServerEngineForRL(EngineBase):
         """
 
         print(f"update_weights_from_tensor of HttpServerEngineForRL")
-        serialized_named_tensors = HttpSerializer.serialize(
-            MultiprocessingSerializer.serialize(named_tensors)
-        )
+        serialized_named_tensors = HttpSerializer.serialize(named_tensors)
 
-        response = requests.post(
-            self._url("update_weights_from_tensor"),
-            json={
+        return self._make_request(
+            "update_weights_from_tensor",
+            {
                 "serialized_named_tensors": [
                     serialized_named_tensors for _ in range(self.server_args.tp_size)
                 ],
@@ -94,8 +95,6 @@ class HttpServerEngineForRL(EngineBase):
                 "flush_cache": flush_cache,
             },
         )
-        response.raise_for_status()
-        return response.json()
 
     def shutdown(self):
         kill_process_tree(self.process.pid)
@@ -128,16 +127,10 @@ class HttpServerEngineForRL(EngineBase):
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}
 
-        response = requests.post(self._url("generate"), json=payload)
-        response.raise_for_status()
-        return response.json()
+        return self._make_request("generate", payload)
 
     def release_memory_occupation(self):
-        response = requests.post(self._url("release_memory_occupation"), json={})
-        response.raise_for_status()
-        return response.json()
+        return self._make_request("release_memory_occupation")
 
     def resume_memory_occupation(self):
-        response = requests.post(self._url("resume_memory_occupation"), json={})
-        response.raise_for_status()
-        return response.json()
+        return self._make_request("resume_memory_occupation")

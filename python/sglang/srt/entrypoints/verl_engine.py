@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh, DTensor
 
-from sglang.srt.entrypoints.http_server_engine import HttpServerEngineForRL
+from sglang.srt.entrypoints.http_server_engine import HttpServerEngine
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server import Engine
@@ -42,20 +42,21 @@ class VerlEngine:
         node_rank = self._tp_rank // tp_size_per_node
         first_rank_in_node = self._tp_rank % tp_size_per_node == 0
 
+        # Common engine keyword arguments
+        engine_kwargs = dict(
+            **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
+        )
+
         if backend == "engine":
             if first_rank_in_node:
                 os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-                self._engine = Engine(
-                    **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
-                )
+                self._engine = Engine(**engine_kwargs)
             else:
                 self._engine = None
 
         elif backend == "server":
             if self._tp_rank == 0:
-                self._engine = HttpServerEngineForRL(
-                    **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
-                )
+                self._engine = HttpServerEngine(**engine_kwargs)
             else:
                 self._engine = None
         else:
