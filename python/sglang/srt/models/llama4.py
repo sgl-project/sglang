@@ -414,7 +414,7 @@ class Llama4Model(nn.Module):
             lambda idx, prefix: Llama4DecoderLayer(
                 config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
-            prefix="model.layers",
+            prefix=add_prefix("layers", prefix),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
