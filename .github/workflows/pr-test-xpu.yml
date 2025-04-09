@@ -15,7 +15,7 @@ jobs:
   build-and-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: pvc-1100
+    runs-on: BMG
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,7 +58,7 @@ jobs:
   finish:
     if: always()
     needs: [build-and-test]
-    runs-on: pvc-1100
+    runs-on: BMG
     steps:
       - name: Check job status
         run: |
