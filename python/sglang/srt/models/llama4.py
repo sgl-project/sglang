@@ -81,6 +81,7 @@ class Llama4MoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
+        self.device_module = torch.get_device_module()
 
         intermediate_size_moe = config.intermediate_size
         self.router = ReplicatedLinear(
@@ -147,20 +148,20 @@ class Llama4MoE(nn.Module):
         return shared_out, routed_out
 
     def _forward_core_shared_routed_overlap(self, hidden_states):
-        alt_stream = _get_or_create_alt_stream()
+        alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(torch.cuda.current_stream())
+        alt_stream.wait_stream(self.device_module.current_stream())
 
         shared_out = self.shared_expert(hidden_states)
 
-        with torch.cuda.stream(alt_stream):
+        with self.device_module.stream(alt_stream):
             # router_scores: [num_tokens, num_experts]
             router_logits, _ = self.router(hidden_states)
             routed_out = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
-        torch.cuda.current_stream().wait_stream(alt_stream)
+        self.device_module.current_stream().wait_stream(alt_stream)
 
         return shared_out, routed_out
 
@@ -168,10 +169,10 @@ class Llama4MoE(nn.Module):
 _alt_stream = None
 
 
-def _get_or_create_alt_stream():
+def _get_or_create_alt_stream(device_module):
     global _alt_stream
     if _alt_stream is None:
-        _alt_stream = torch.cuda.Stream()
+        _alt_stream = device_module.Stream()
     return _alt_stream
 
 
