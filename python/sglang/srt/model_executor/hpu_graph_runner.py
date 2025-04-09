@@ -132,7 +132,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         seq_pos = seq_pos.to("hpu")
         seq_idx = seq_idx.to("hpu")
         padding_len = max_prompt_len - sum_seq_len
-        max_prefill_seqs = 128
+        max_prefill_seqs = model_runner.server_args.max_running_requests
         input_ids = torch.nn.functional.pad(forward_batch.input_ids.to("hpu"), (0, padding_len), value=0)
         positions = torch.nn.functional.pad(forward_batch.positions.to("hpu"), (0, padding_len), value=0)
         valid_seq_len = sum_seq_len.to("hpu")
