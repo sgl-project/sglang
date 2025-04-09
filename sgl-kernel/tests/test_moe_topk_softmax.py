@@ -43,7 +43,7 @@ def test_topk_softmax(num_tokens, num_experts, topk):
     ), f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
 
     assert torch.allclose(
-        topk_indices_ref, topk_indices, atol=0, rtol=0
+        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
     ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
 
 
