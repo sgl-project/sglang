@@ -94,11 +94,12 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = "bond1"
         kv_manager = KVManager(kv_args, mode="prefill")
         return kv_manager
 
     def add(self, req: Req) -> None:
+        logging.info("[wytdebug] bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -126,6 +127,7 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            logging.info(f"[wytdebug] req bootstrap room: {req.bootstrap_room}, poll result: {poll}")
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
@@ -134,11 +136,9 @@ class PrefillBootstrapQueue:
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                logging.info(f"[wytdebug] pop_bootstrapped: no available metadata buffer index")
                 break
-
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
+            req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert req.metadata_buffer_index is not None
             req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
 
@@ -148,7 +148,8 @@ class PrefillBootstrapQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
+        if len(bootstrapped_reqs) > 0:
+            logging.info(f"[wytdebug] pop_bootstrapped pop out: {len(bootstrapped_reqs)}")
         return bootstrapped_reqs
 
 
@@ -246,4 +247,5 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.allocate_token_id(
                 req.metadata_buffer_index, token_id
             )
+        logging.info(f"[wytdebug] send_kv_chunk: {req.req_pool_idx} {req.metadata_buffer_index} {kv_indices}")
         req.disagg_kv_sender.send(kv_indices)

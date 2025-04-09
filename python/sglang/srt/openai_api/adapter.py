@@ -1094,6 +1094,9 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
+
+        bootstrap_room=all_requests[0].bootstrap_room,
+        bootstrap_host=all_requests[0].bootstrap_host,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1296,6 +1299,11 @@ async def v1_chat_completions(
 ):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
+
+    for req in all_requests:
+        assert req.bootstrap_room is not None
+        logging.info(f"[wytdebug] request bootstrap_room {req.bootstrap_room}")
+
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 

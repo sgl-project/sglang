@@ -34,7 +34,7 @@ class ReqToMetadataIdxAllocator:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self) -> List[int]:
+    def alloc(self) -> int:
         if len(self.free_slots) == 0:
             return None
 

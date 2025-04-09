@@ -114,7 +114,7 @@ class DecodePreallocQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = "bond1"
         kv_manager = KVManager(kv_args, mode="decode")
         return kv_manager
 
@@ -192,6 +192,7 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
+            logging.info(f"[wytdebug] pop_reallocated kv_indices shape {kv_indices.shape}")
             decode_req.kv_receiver.init(kv_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -200,6 +201,8 @@ class DecodePreallocQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if len(preallocated_reqs) > 0:
+            logging.info(f"[wytdebug] pop preallocated_reqs {len(preallocated_reqs)}")
         return preallocated_reqs
 
     def _allocatable_tokens(self) -> int:

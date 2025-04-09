@@ -41,8 +41,8 @@ class MiniLoadBalancer:
         async with aiohttp.ClientSession() as session:
             # Create the tasks
             tasks = [
-                session.post(f"{prefill_server}/generate", json=modified_request),
-                session.post(f"{decode_server}/generate", json=modified_request),
+                session.post(f"{prefill_server}/v1/chat/completions", json=modified_request),
+                session.post(f"{decode_server}/v1/chat/completions", json=modified_request),
             ]
 
             prefill_response = None
@@ -154,7 +154,7 @@ async def get_model_info():
     return ORJSONResponse(content=model_info)
 
 
-@app.post("/generate")
+@app.post("/v1/chat/completions")
 async def handle_generate_request(request_data: dict):
     prefill_server, decode_server = load_balancer.select_pair()
 
@@ -169,6 +169,8 @@ async def handle_generate_request(request_data: dict):
         }
     )
 
+    print("[wytdebug] modified_request:", modified_request)
+
     # Check if streaming is requested
     if request_data.get("stream", False):
 
@@ -180,10 +182,10 @@ async def handle_generate_request(request_data: dict):
                     # Create the tasks
                     tasks = [
                         session.post(
-                            f"{prefill_server}/generate", json=modified_request
+                            f"{prefill_server}/v1/chat/completions", json=modified_request
                         ),
                         session.post(
-                            f"{decode_server}/generate", json=modified_request
+                            f"{decode_server}/v1/chat/completions", json=modified_request
                         ),
                     ]
 

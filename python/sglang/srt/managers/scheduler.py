@@ -787,6 +787,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        logging.info(f"[wytdebug] handle_generate_request recv_req.bootstrap_host: {recv_req.bootstrap_host}, recv_req.bootstrap_room: {recv_req.bootstrap_room}")
         # Create a new request
         if (
             recv_req.session_params is None

@@ -41,8 +41,8 @@ class KVManager:
         # Register buffers.
         kv_addrs = []
         for data_ptr, data_len in zip(self.args.kv_data_ptrs, self.args.kv_data_lens):
-            kv_addrs.append((data_ptr, data_len, self.args.engine_rank, ""))
-        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
+            kv_addrs.append((tmp.data_ptr(), data_len, self.args.engine_rank, ""))
+        self.kv_descs = self.agent.register_memory(kv_addrs, "DRAM", is_sorted=True)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = [(self.args.aux_data_ptrs[0], self.args.aux_data_lens[0], 0, "")]
@@ -80,6 +80,10 @@ class KVPoll:
     Success = 4
 
 
+import torch
+tmp=torch.zeros(64 * 1024 * 1024, dtype=torch.int32, device="cpu").contiguous()
+
+
 class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         """
@@ -95,16 +99,24 @@ class KVSender:
 
     def send(self, kv_indices: npt.NDArray[np.int32]):
         # Get descs
+        logging.info(f"[wytdebug] recving descs for bootstrap_room {self.bootstrap_room}")
         remote_kv_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
+        logging.info(f"[wytdebug] recving aux descs for bootstrap_room {self.bootstrap_room}")
         remote_aux_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
-                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
-        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
+                kv_addrs.append((tmp.data_ptr(), item_len, self.mgr.args.engine_rank))
+                # kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "DRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         
+        logging.info("[wytdebug] KVSender: kv_descs: %s", kv_descs)
+        logging.info("[wytdebug] KVSender: remote_kv_descs: %s", remote_kv_descs)
+        logging.info("[wytdebug] KVSender: peer_name: %s", self.mgr.peer_name)
+        logging.info("[wytdebug] KVSender: str(self.bootstrap_room) %s", str(self.bootstrap_room))
+
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
             "WRITE", kv_descs, remote_kv_descs, self.mgr.peer_name, str(self.bootstrap_room)
@@ -154,10 +166,11 @@ class KVReceiver:
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
-                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
-        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
+                kv_addrs.append((tmp.data_ptr() , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "DRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
+        logging.info(f'[wytdebug] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(kv_descs))
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(aux_descs))
         self.has_init = True

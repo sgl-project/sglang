@@ -359,6 +359,10 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    bootstrap_host: str = "0.0.0.0"
+    bootstrap_room: Optional[int] = None
+
+
 
 
 class FunctionResponse(BaseModel):
