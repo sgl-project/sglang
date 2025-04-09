@@ -83,7 +83,9 @@ class TestFusedMOE(CustomTestCase):
         for i in range(w1_orig.shape[0]):
             mask = topk_ids == i
             if mask.sum():
-                out[mask] = SiluAndMul()(a[mask] @ w1_orig[i].transpose(0, 1)) @ w2_orig[i].transpose(0, 1)
+                out[mask] = SiluAndMul()(
+                    a[mask] @ w1_orig[i].transpose(0, 1)
+                ) @ w2_orig[i].transpose(0, 1)
 
         return (
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
