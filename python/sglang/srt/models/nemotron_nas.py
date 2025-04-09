@@ -380,7 +380,7 @@ class DeciLMForCausalLM(nn.Module):
         self.lora_config = lora_config
 
         self.model = self._init_model(
-            config=config, quant_config=quant_config, prefix=add_prefix(prefix, "model")
+            config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
         if get_pp_group().is_last_rank:
@@ -399,7 +399,7 @@ class DeciLMForCausalLM(nn.Module):
                     else lora_config.lora_vocab_padding_size
                 ),
                 quant_config=quant_config,
-                prefix=add_prefix(prefix, "lm_head"),
+                prefix=add_prefix("lm_head", prefix),
             )
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
