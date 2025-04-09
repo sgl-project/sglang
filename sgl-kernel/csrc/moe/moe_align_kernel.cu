@@ -64,10 +64,10 @@ __global__ void moe_align_block_size_kernel(
 
   __syncthreads();
 
-  const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
-  const size_t start_idx = threadIdx.x * tokens_per_thread;
+  const size_t tid = threadIdx.x;
+  const size_t stride = blockDim.x;
 
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+  for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i];
     int warp_idx = expert_id / experts_per_warp;
     int expert_offset = expert_id % experts_per_warp;
@@ -107,8 +107,8 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t num_experts,
     int32_t block_size,
     size_t numel) {
-  const size_t tokens_per_thread = CEILDIV(numel, blockDim.x);
-  const size_t start_idx = threadIdx.x * tokens_per_thread;
+  const size_t tid = threadIdx.x;
+  const size_t stride = blockDim.x;
 
   extern __shared__ int32_t shared_mem[];
   int32_t* cumsum = shared_mem;
@@ -118,7 +118,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     tokens_cnts[(threadIdx.x + 1) * num_experts + i] = 0;
   }
 
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+  for (size_t i = tid; i < numel; i += stride) {
     ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
   }
 
@@ -149,7 +149,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     }
   }
 
-  for (int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i) {
+  for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
     int32_t rank_post_pad = tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
@@ -179,11 +179,11 @@ void moe_align_block_size(
     bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
 
     if (small_batch_expert_mode) {
-      const int32_t num_thread = max((int32_t)num_experts, WARP_SIZE);
-      const int32_t shared_mem_i32 = ((num_thread + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
+      const int32_t threads = max((int32_t)num_experts, WARP_SIZE);
+      const int32_t shared_mem_size = ((threads + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
 
       auto small_batch_expert_kernel = moe_align_block_size_small_batch_expert_kernel<scalar_t>;
-      small_batch_expert_kernel<<<1, num_thread, shared_mem_i32, stream>>>(
+      small_batch_expert_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           experts_ids.data_ptr<int32_t>(),
