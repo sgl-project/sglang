@@ -84,10 +84,10 @@ class EAGLEDraftCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. specify --dtype to the same dtype (e.g. bfloat16)\n"
+                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "2. disable torch compile by not using --enable-torch-compile\n"
+                "3. specify --dtype to the same dtype (e.g. bfloat16)\n"
+                "4. disable cuda graph by --disable-cuda-graph\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
