@@ -13,7 +13,7 @@ class TestDummyGrok1(CustomTestCase):
                 "--tokenizer-path",
                 "Xenova/grok-1-tokenizer",
                 "--tp",
-                "1",
+                "2",
                 "--quantization",
                 "fp8",
                 "--load-format",
