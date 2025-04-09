@@ -678,8 +678,8 @@ def run_bench_one_batch(model, other_args):
         *[str(x) for x in other_args],
     ]
     if model is not None:
-        command += ["--model-path", model]
-
+        command += [" --model-path", model]
+    print(command)
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
