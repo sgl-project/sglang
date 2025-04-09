@@ -78,17 +78,18 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_hpu,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
-    is_hpu,
 )
 
 logger = logging.getLogger(__name__)
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+
 
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
@@ -881,9 +882,7 @@ class ModelRunner:
 
             self.attn_backend = TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "hpu":
-            from sglang.srt.layers.attention.hpu_attn_backend import (
-                HPUAttnBackend,
-            )
+            from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
 
             self.attn_backend = HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":

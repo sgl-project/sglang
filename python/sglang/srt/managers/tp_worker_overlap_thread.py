@@ -45,7 +45,7 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
         input_ids,
-    )   
+    )
 
 
 class TpModelWorkerClient:

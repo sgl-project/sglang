@@ -32,8 +32,8 @@ from sglang.srt.utils import (
     get_nvgpu_memory_capacity,
     is_cuda,
     is_flashinfer_available,
-    is_hpu,
     is_hip,
+    is_hpu,
     is_port_available,
     is_remote_url,
     is_valid_ipv6_address,
@@ -391,8 +391,8 @@ class ServerArgs:
         if is_hpu():
             if self.max_running_requests is None:
                 self.max_running_requests = 128
-            
-            self.page_size = 128 # HPU only supports page size of 128 for now
+
+            self.page_size = 128  # HPU only supports page size of 128 for now
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

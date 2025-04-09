@@ -29,6 +29,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -37,8 +39,6 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-import os
-import math
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend, is_hpu
@@ -324,7 +324,10 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend not in ["torch_native", "hpu"]:
+            if model_runner.server_args.attention_backend not in [
+                "torch_native",
+                "hpu",
+            ]:
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -348,7 +351,6 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        
         if model_runner.server_args.attention_backend == "hpu":
             ret.block_list = batch.block_list
             ret.block_mapping = batch.block_mapping
@@ -466,6 +468,7 @@ class ForwardBatch:
             axis=1,
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
+
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
