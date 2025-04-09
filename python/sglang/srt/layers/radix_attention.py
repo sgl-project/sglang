@@ -13,8 +13,8 @@
 # ==============================================================================
 """Radix attention."""
 
-from typing import Optional
 from enum import Enum
+from typing import Optional
 
 from torch import nn
 
