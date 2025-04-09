@@ -37,9 +37,11 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+import os
+import math
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, is_hpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -97,7 +99,10 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
-    def is_cuda_graph(self):
+    def is_cuda_graph(self, device: str = "cuda"):
+        if device == "hpu":
+            # hpu will always use graph runner
+            return True
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -226,6 +231,14 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # For HPU paged attention
+    block_list: Optional[torch.Tensor] = None
+    block_mapping: Optional[torch.Tensor] = None
+    block_usage: Optional[torch.Tensor] = None
+    block_scales: Optional[torch.Tensor] = None
+    block_groups: Optional[torch.Tensor] = None
+    use_contiguous_pa: Optional[bool] = None
+
     @classmethod
     def init_new(
         cls,
@@ -302,27 +315,27 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode():
-            if ret.positions is None:
+            if ret.positions is None:	
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
-                ret.extend_num_tokens = batch.extend_num_tokens
-                positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens,
-                    ret.extend_seq_lens,
-                    ret.extend_num_tokens,
-                )
+                batch.extend_seq_lens, dtype=torch.int32	
+            ).to(device, non_blocking=True)	
+            ret.extend_prefix_lens = torch.tensor(	
+                batch.extend_prefix_lens, dtype=torch.int32	
+            ).to(device, non_blocking=True)	
+            if model_runner.server_args.attention_backend not in ["torch_native", "hpu"]:	
+                ret.extend_num_tokens = batch.extend_num_tokens	
+                positions, ret.extend_start_loc = compute_position_triton(	
+                    ret.extend_prefix_lens,	
+                    ret.extend_seq_lens,	
+                    ret.extend_num_tokens,	
+                )	
             else:
-                positions, ret.extend_start_loc = compute_position_torch(
-                    ret.extend_prefix_lens, ret.extend_seq_lens
-                )
-            if ret.positions is None:
+                positions, ret.extend_start_loc = compute_position_torch(	
+                    ret.extend_prefix_lens, ret.extend_seq_lens	
+                )	
+            if ret.positions is None:	
                 ret.positions = positions
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
@@ -335,6 +348,14 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        
+        if model_runner.server_args.attention_backend == "hpu":
+            ret.block_list = batch.block_list
+            ret.block_mapping = batch.block_mapping
+            ret.block_groups = batch.block_groups
+            ret.block_usage = batch.block_usage
+            ret.block_scales = batch.block_scales
+            ret.use_contiguous_pa = batch.use_contiguous_pa
         return ret
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
@@ -446,7 +467,6 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
-
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
 ):
@@ -520,6 +540,6 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=is_hpu())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)

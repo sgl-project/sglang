@@ -227,7 +227,7 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        backend.start_profile(activities=["CPU", "HPU"])
 
     st = time.perf_counter()
     gen_out = backend.generate(prompt=prompt, sampling_params=sampling_params)
@@ -303,6 +303,9 @@ def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
+    tokenizer_id = server_args.tokenizer_path or server_args.model_path
+    tokenizer = get_tokenizer(tokenizer_id)
+    input_requests = get_dataset(bench_args, tokenizer)
     if bench_args.backend == "engine":
         backend = Engine(**dataclasses.asdict(server_args))
         if not backend:
@@ -311,9 +314,6 @@ def throughput_test(
         backend = Runtime(**dataclasses.asdict(server_args))
     else:
         raise ValueError('Please set backend to either "engine" or "runtime"')
-
-    tokenizer_id = server_args.tokenizer_path or server_args.model_path
-    tokenizer = get_tokenizer(tokenizer_id)
 
     # Set global environmnets
     set_ulimit()
@@ -326,16 +326,16 @@ def throughput_test(
         extra_request_body = json.loads(args.extra_request_body)
 
     # Read dataset
-    input_requests = get_dataset(bench_args, tokenizer)
+    
 
-    warmup_requests = sample_random_requests(
-        input_len=256,
-        output_len=16,
-        num_prompts=min(bench_args.num_prompts, 16),
-        range_ratio=1.0,
-        tokenizer=tokenizer,
-        dataset_path=bench_args.dataset_path,
-    )
+    # warmup_requests = sample_random_requests(
+    #     input_len=256,
+    #     output_len=16,
+    #     num_prompts=min(bench_args.num_prompts, 16),
+    #     range_ratio=1.0,
+    #     tokenizer=tokenizer,
+    #     dataset_path=bench_args.dataset_path,
+    # )
 
     # Warm up
     if not bench_args.skip_warmup:
@@ -343,7 +343,7 @@ def throughput_test(
         throughput_test_once(
             backend_name=bench_args.backend,
             backend=backend,
-            reqs=warmup_requests,
+            reqs=input_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,
@@ -351,56 +351,58 @@ def throughput_test(
         time.sleep(0.5)
 
     logging.info("\nBenchmark...")
-    result = throughput_test_once(
-        backend_name=bench_args.backend,
-        backend=backend,
-        reqs=input_requests,
-        ignore_eos=not bench_args.disable_ignore_eos,
-        extra_request_body=extra_request_body,
-        profile=bench_args.profile,
-    )
+    for i in range(2):
+        result = throughput_test_once(
+            backend_name=bench_args.backend,
+            backend=backend,
+            reqs=input_requests,
+            ignore_eos=not bench_args.disable_ignore_eos,
+            extra_request_body=extra_request_body,
+            profile=bench_args.profile,
+        )
+        print(
+            "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
+        )
+        print("{:<40} {:<10}".format("Backend:", result["backend"]))
+        print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
+        print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
+        print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
+        print(
+            "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Last generation throughput (tok/s):", result["last_gen_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request throughput (req/s):", result["request_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input token throughput (tok/s):", result["input_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", result["output_throughput"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total token throughput (tok/s):", result["total_throughput"]
+            )
+        )
+        print("=" * 50)
     backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
 
-    print(
-        "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
-    )
-    print("{:<40} {:<10}".format("Backend:", result["backend"]))
-    print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
-    print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
-    print(
-        "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Last generation throughput (tok/s):", result["last_gen_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", result["request_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", result["input_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", result["output_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", result["total_throughput"]
-        )
-    )
-    print("=" * 50)
+
 
     return result
 
