@@ -242,7 +242,13 @@ class ModelRunner:
                 )
             else:
                 if is_hopper_with_cuda_12_3():
-                    server_args.attention_backend = "fa3"
+                    if server_args.speculative_eagle_topk is None or (
+                        server_args.speculative_eagle_topk is not None
+                        and server_args.speculative_eagle_topk == 1
+                    ):
+                        server_args.attention_backend = "fa3"
+                    else:
+                        server_args.attention_backend = "triton"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
