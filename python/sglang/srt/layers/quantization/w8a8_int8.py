@@ -230,6 +230,7 @@ class W8A8Int8MoEMethod:
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         inplace: bool = True,
         no_combine: bool = False,
     ) -> torch.Tensor:
@@ -257,6 +258,7 @@ class W8A8Int8MoEMethod:
             topk_ids=topk_ids,
             inplace=inplace,
             activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
