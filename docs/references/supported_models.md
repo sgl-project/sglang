@@ -102,8 +102,6 @@ You can add it to the `ALL_OTHER_MODELS` list in the [test_generation_models.py]
 For example, if the model is Qwen/Qwen2-1.5B
 ```
 ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels
-# or
-ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_all_models
 ```
 
 ### Port a model from vLLM to SGLang
