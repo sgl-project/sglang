@@ -1796,8 +1796,6 @@ def flatten_nested_list(nested_list):
         return [
             item for sublist in nested_list for item in flatten_nested_list(sublist)
         ]
-    elif isinstance(nested_list, torch.Tensor):
-        return [nested_list.flatten()]
     else:
         return [nested_list]
 
