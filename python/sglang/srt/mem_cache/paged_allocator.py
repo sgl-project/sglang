@@ -20,6 +20,7 @@ Page-aligned memory pool.
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
@@ -419,4 +420,3 @@ class PagedTokenToKVPoolAllocator:
         )
         self.is_not_in_free_group = True
         self.free_group = []
-

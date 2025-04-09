@@ -137,7 +137,9 @@ if _is_hpu:
                 slots = req_token_pool.req_to_token[ret.req_pool_indices[i], :ret.seq_lens[i]]
                 last_loc = slots[-1]
                 num_full_tables = (ret.seq_lens[i] - 1) // page_size
-                ranges = torch.arange(0, num_full_tables*page_size, step=page_size, device=ret.input_ids.device)
+                ranges = torch.arange(0, num_full_tables*page_size,
+                                      step=page_size,
+                                      device=ret.input_ids.device)
                 pages = slots[ranges] // page_size
                 pages = pages.flatten().tolist()
                 if last_loc % page_size != 0:
