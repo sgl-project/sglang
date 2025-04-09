@@ -65,27 +65,27 @@ class TestFusedMOE(CustomTestCase):
         topk_ids = topk_ids.view(-1)
 
         if w1.dtype == torch.float8_e4m3fn:
-            w1_orig = w1.to(a.dtype)
-            w2_orig = w2.to(a.dtype)
+            w1_compute = w1.to(a.dtype)
+            w2_compute = w2.to(a.dtype)
 
             if w1_scale is not None:
-                w1_orig = (w1_orig * w1_scale.view(-1, 1, 1)).to(a.dtype)
+                w1_compute = (w1_compute * w1_scale.view(-1, 1, 1)).to(a.dtype)
             if w2_scale is not None:
-                w2_orig = (w2_orig * w2_scale.view(-1, 1, 1)).to(a.dtype)
+                w2_compute = (w2_compute * w2_scale.view(-1, 1, 1)).to(a.dtype)
             if a1_scale is not None:
                 a = (a * a1_scale).to(a.dtype)
             if a2_scale is not None:
                 a = (a * a2_scale).to(a.dtype)
         else:
-            w1_orig = w1
-            w2_orig = w2
+            w1_compute = w1
+            w2_compute = w2
 
-        for i in range(w1_orig.shape[0]):
+        for i in range(w1_compute.shape[0]):
             mask = topk_ids == i
             if mask.sum():
                 out[mask] = SiluAndMul()(
-                    a[mask] @ w1_orig[i].transpose(0, 1)
-                ) @ w2_orig[i].transpose(0, 1)
+                    a[mask] @ w1_compute[i].transpose(0, 1)
+                ) @ w2_compute[i].transpose(0, 1)
 
         return (
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
