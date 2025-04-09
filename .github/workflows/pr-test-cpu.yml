@@ -1,0 +1,80 @@
+name: PR Test (CPU)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+      - "sgl-kernel/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/sglang/**"
+      - "test/**"
+      - "sgl-kernel/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    runs-on: emr-7470
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build --build-arg no_proxy=.intel.com --build-arg http_proxy=http://proxy-dmz.intel.com:912 --build-arg https_proxy=http://proxy-dmz.intel.com:912 \
+          -t sglang-cpu-test  -f Dockerfile .
+
+      - name: Run container
+        run: |
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout \
+            -e https_proxy="http://proxy-dmz.intel.com:912/" \
+            -e http_proxy="http://proxy-dmz.intel.com:912/" \
+            -e no_proxy=".intel.com" 
+            -w /sglang-checkout \
+            --name ci_sglang_cpu \
+            sglang-cpu-test
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout ci_sglang_cpu pip install pytest expecttest
+          
+      - name: Run standard tests
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sglang-checkout ci_sglang_cpu pytest -n auto sglang/test/
+
+      - name: Run benchmark tests
+        timeout-minutes: 15
+        run: |
+          docker exec -w /sglang-checkout ci_sglang_cpu python3 sglang/test/benchmark/test_benchmark.py
+
+      - name: Run accuracy tests
+        timeout-minutes: 15
+        run: |
+          docker exec -w /sglang-checkout ci_sglang_cpu python3 sglang/test/accuracy/test_accuracy.py
+          docker exec -w /sglang-checkout ci_sglang_cpu python3 sglang/test/accuracy/test_fp8_accuracy.py
+
+  finish:
+    if: always()
+    needs: [build-and-test]
+    runs-on: emr-7470
+    steps:
+      - name: Check job status
+        run: |
+          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
+            echo "Job failed with result: ${{ needs.build-and-test.result }}"
+            exit 1
+          fi
+          echo "All jobs completed successfully"
+          exit 0
