@@ -217,6 +217,15 @@ def block_quant_to_tensor_quant(
     return x_q_tensor, scale
 
 
+def channel_quant_to_tensor_quant(
+    x_q_channel: torch.Tensor,
+    x_s: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_dq_channel = x_q_channel.to(torch.float32) * x_s
+    x_q_tensor, scale = input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
+    return x_q_tensor, scale
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
