@@ -1014,8 +1014,10 @@ class DeepseekV2AttentionMLA(nn.Module):
 
 
 class _DecoderLayerExecutionMode(Enum):
-    MLP_ONE = auto()
-    MLP_ALL = auto()
+    # The MLP sublayer requires 1/tp_size tokens as input
+    MLP_INPUT_ONE = auto()
+    # The MLP sublayer requires all tokens as input
+    MLP_INPUT_ALL = auto()
 
 
 @dataclass
@@ -1113,7 +1115,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         self.input_is_scattered = (
-            previous_layer_info.execution_mode == _DecoderLayerExecutionMode.MLP_ONE
+            previous_layer_info.execution_mode
+            == _DecoderLayerExecutionMode.MLP_INPUT_ONE
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
@@ -1134,10 +1137,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % config.moe_layer_freq == 0
         )
         execution_mode = (
-            _DecoderLayerExecutionMode.MLP_ONE
+            _DecoderLayerExecutionMode.MLP_INPUT_ONE
             if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
             or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
-            else _DecoderLayerExecutionMode.MLP_ALL
+            else _DecoderLayerExecutionMode.MLP_INPUT_ALL
         )
         return _DecoderLayerInfo(is_sparse=is_sparse, execution_mode=execution_mode)
 
@@ -1148,18 +1151,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.info.execution_mode == _DecoderLayerExecutionMode.MLP_ONE:
-            return self.forward_mode_mlp_one(
+        if self.info.execution_mode == _DecoderLayerExecutionMode.MLP_INPUT_ONE:
+            return self.forward_mode_mlp_input_one(
                 positions, hidden_states, forward_batch, residual
             )
-        elif self.info.execution_mode == _DecoderLayerExecutionMode.MLP_ALL:
-            return self.forward_mode_mlp_all(
+        elif self.info.execution_mode == _DecoderLayerExecutionMode.MLP_INPUT_ALL:
+            return self.forward_mode_mlp_input_all(
                 positions, hidden_states, forward_batch, residual
             )
         else:
             raise NotImplementedError
 
-    def forward_mode_mlp_all(
+    def forward_mode_mlp_input_all(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1226,7 +1229,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_mode_mlp_one(
+    def forward_mode_mlp_input_one(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
