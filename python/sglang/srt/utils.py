@@ -108,6 +108,11 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name, default)
+    return int(value)
+
+
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
     return torch.version.hip is not None
@@ -1988,3 +1993,9 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+
+def get_scheduler_device(worker_device: str):
+    # HPU has higher overhead when running many small ops
+    # so we run all scheduler ops on CPU when using HPU
+    return "cpu" if is_hpu() else worker_device
