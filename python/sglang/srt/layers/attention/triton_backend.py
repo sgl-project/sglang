@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 if _is_hip and get_bool_env_var("CK_MOE"):
+    from aiter import flash_attn_varlen_func
     from aiter.mla import mla_prefill_fwd
 
 
@@ -284,7 +285,7 @@ class TritonAttnBackend(AttentionBackend):
             # `max(spec_info.accept_length_cpu)`.
             # It might have been forgotten to update somewhere.
             max_extend_len = torch.max(spec_info.accept_length).item()
-            kv_last_page_len = torch.ones(bs, dtype=torch.int)
+            kv_last_page_len = None
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -543,24 +544,25 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        if _is_hip and get_bool_env_var("CK_MOE"):
-            max_extend_len = self.forward_metadata.max_extend_len
-            kv_indptr = self.forward_metadata.kv_indptr
-            kv_indices = self.forward_metadata.kv_indices
-            kv_last_page_lens = self.forward_metadata.kv_last_page_len
-            o = mla_prefill_fwd(
+        max_extend_len = self.forward_metadata.max_extend_len
+        kv_indptr = self.forward_metadata.kv_indptr
+        kv_indices = self.forward_metadata.kv_indices
+        kv_last_page_lens = self.forward_metadata.kv_last_page_len
+        qo_indptr = self.forward_metadata.qo_indptr
+        if _is_hip and get_bool_env_var("CK_MOE") and kv_indices.shape[0] == 0:
+            o, _ = mla_prefill_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.view(-1, 1, 1, q.shape[-1]),
+                k.contiguous().view(-1, 1, 1, q.shape[-1]),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                qo_indptr,
                 kv_indptr,
                 kv_indices,
                 kv_last_page_lens,
                 max_extend_len,
                 layer.scaling,
                 layer.logit_cap,
-                attn_lse=layer.attn_lse,
             )
-            k = k.reshape(-1, 1, q.shape[-1])
+            k = k.reshape(-1, layer.tp_k_head_num, q.shape[-1])
         else:
             self.extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
