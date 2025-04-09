@@ -1342,8 +1342,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             or self.config.routed_scaling_factor != 2.5
             or global_server_args_dict["enable_deepep_moe"]
         ):
-            self.n_share_experts_fusion = None
-            global_server_args_dict["n_share_experts_fusion"] = None
+            self.n_share_experts_fusion = 0
+            global_server_args_dict["n_share_experts_fusion"] = 0
             logger.info(
                 "Only Deepseek V3/R1 tp mode can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
             )
