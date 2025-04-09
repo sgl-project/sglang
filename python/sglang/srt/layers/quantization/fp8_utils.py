@@ -253,7 +253,9 @@ def apply_fp8_linear(
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
             else:
-                qinput, x_scale = per_token_group_quant_fp8(input_2d, group)
+                qinput, x_scale = per_token_group_quant_fp8(
+                    input_2d, group_size=input_2d.shape[1]
+                )
 
     if cutlass_fp8_supported:
         try:
