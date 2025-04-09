@@ -28,7 +28,7 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
 
-    _buffer: Optional[Buffer] = None
+    _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -165,7 +165,7 @@ class _DeepEPDispatcherImplBase:
     def combine_b(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _get_buffer(self) -> Buffer:
+    def _get_buffer(self):
         raise NotImplementedError
 
 
