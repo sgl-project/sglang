@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.hpu_graph_runner import HPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
@@ -84,6 +85,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    is_hpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,7 +94,6 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 monkey_patch_torch_compile()
-
 
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
@@ -219,6 +220,9 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_cuda_graphs()
+        elif self.device == "hpu":
+            self.cuda_graph_runner = HPUGraphRunner(self)
+            self.init_attention_backend()
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
@@ -762,7 +766,7 @@ class ModelRunner:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
-                device=self.device,
+                device=self.device if self.device != "hpu" else "cpu",
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
         else:
@@ -817,7 +821,7 @@ class ModelRunner:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    device=self.device,
+                    device=self.device if self.device != "hpu" else "cpu",
                     kvcache=self.token_to_kv_pool,
                 )
         else:
@@ -880,6 +884,12 @@ class ModelRunner:
             )
 
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "hpu":
+            from sglang.srt.layers.attention.hpu_attn_backend import (
+                HPUAttnBackend,
+            )
+
+            self.attn_backend = HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
@@ -997,7 +1007,7 @@ class ModelRunner:
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ) -> LogitsProcessorOutput:
         if (
-            forward_batch.forward_mode.is_cuda_graph()
+            forward_batch.forward_mode.is_cuda_graph(self.device)
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         ):

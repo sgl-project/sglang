@@ -20,11 +20,93 @@ Page-aligned memory pool.
 import torch
 import triton
 import triton.language as tl
+from typing import List, Optional, Tuple
+import heapq
 
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
+def alloc_extend_kernel_native(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_locs: torch.Tensor,
+    free_page: torch.Tensor,
+    out_indices: torch.Tensor,
+    ret_values: torch.Tensor,
+    page_size: int,
+):
+    sum_num_new_pages = 0
+    sum_extend_lens = 0
+    for i in range(len(prefix_lens)):
+        pre_len = prefix_lens[i]
+        seq_len = seq_lens[i]
+        last_loc = last_locs[i]
 
+        extend_len = seq_len - pre_len
+        sum_extend_lens += seq_len - pre_len
+        output_start_loc = sum_extend_lens - extend_len
+
+        num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+            pre_len + page_size - 1
+        ) // page_size
+        sum_num_new_pages += num_page_start_loc_self
+        new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+
+        num_part1 = min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
+        assert num_part1 >= 0 and num_part1 <= page_size
+        offset_part1 = torch.arange(0, num_part1)
+        out_indices[output_start_loc + offset_part1] = last_loc + 1 + offset_part1
+
+        if pre_len + num_part1 == seq_len:
+            continue
+
+        num_part2 = seq_len // page_size * page_size - (pre_len + page_size - 1) // page_size * page_size
+        offset_part2 = torch.arange(0, num_part2)
+        page_start = free_page[new_page_start_loc + offset_part2 // page_size]
+        out_indices[output_start_loc + num_part1 + offset_part2] = page_start * page_size + offset_part2 % page_size
+
+        if pre_len + num_part1 + num_part2 == seq_len:
+            continue
+
+        num_part3 = seq_len - seq_len // page_size * page_size
+        start_loc = free_page[new_page_start_loc + num_page_start_loc_self - 1]
+        offset_part3 = torch.arange(0, num_part3)
+        out_indices[output_start_loc + num_part1 + num_part2 + offset_part3] = start_loc * page_size + offset_part3
+    ret_values.fill_((sum_num_new_pages << 32) | sum_extend_lens)
+
+
+def alloc_decode_kernel_native(
+    seq_lens: torch.Tensor,
+    last_locs: torch.Tensor,
+    free_page: torch.Tensor,
+    out_indices: torch.Tensor,
+    ret_values: torch.Tensor,
+    page_size: int,
+):
+    sum_num_new_pages = 0
+    for i in range(len(seq_lens)):
+        seq_len = seq_lens[i]
+        pre_len = seq_len - 1
+        last_loc = last_locs[i]
+
+        num_pages_after = (seq_len + page_size - 1) // page_size
+        num_pages_before = (pre_len + page_size - 1) // page_size
+        num_new_pages = num_pages_after - num_pages_before
+
+        num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+            pre_len + page_size - 1
+        ) // page_size
+        sum_num_new_pages += num_new_pages
+        new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+
+        if num_page_start_loc_self == 0:
+            out_indices[i] = last_loc + 1
+        else:
+            page = free_page[new_page_start_loc]
+            out_indices[i] = page * page_size
+    ret_values.fill_(sum_num_new_pages)
+
+    
 @triton.jit
 def alloc_extend_kernel(
     pre_lens_ptr,
@@ -230,21 +312,31 @@ class PagedTokenToKVPoolAllocator:
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.ret_values,
-            next_power_of_2(bs),
-            self.page_size,
-            next_power_of_2(extend_num_tokens),
-        )
+        if self.device != "cpu":
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+                    next_power_of_2(extend_num_tokens),
+            )
+        else:
+            alloc_extend_kernel_native(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
-
         merged_value = self.ret_values.item()
         num_new_pages = merged_value >> 32
         if num_new_pages > len(self.free_pages):
@@ -265,15 +357,25 @@ class PagedTokenToKVPoolAllocator:
 
         bs = len(seq_lens)
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.ret_values,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if self.device != "cpu":
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                next_power_of_2(bs),
+                self.page_size,
+                )
+        else:
+            alloc_decode_kernel_native(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.ret_values,
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -320,3 +422,147 @@ class PagedTokenToKVPoolAllocator:
         )
         self.is_not_in_free_group = True
         self.free_group = []
+
+
+class BlockManager():
+    def __init__(self, block_size, num_blocks):
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+        # Use a heap for free blocks to always get the smallest block ID
+        self.free_blocks = list(range(1, num_blocks))
+        heapq.heapify(self.free_blocks)
+        self.req_to_block_ids = {}
+        # Track sequence info: (block_ids, used_slots_in_last_block, slot_ids)
+        self.seq_info = {}
+
+    def clear(self):
+        self.free_blocks = list(range(1, self.num_blocks))
+        heapq.heapify(self.free_blocks)
+        self.req_to_block_ids = {}
+        self.seq_info = {}
+
+    def available_size(self):
+        return len(self.free_blocks) * self.block_size
+
+    def allocate(self, req_id, need_size: int) -> Optional[List[int]]:
+        """Allocate slots for a sequence.
+
+        Args:
+            req_id: Request ID for the sequence
+            need_size: Number of tokens needed for the sequence
+
+        Returns:
+            List of slot IDs, or None if allocation failed
+        """
+        remaining_tokens = need_size
+        allocated_slots = []
+        new_blocks = []
+
+        # If sequence exists, try to fill remaining space in last block
+        if req_id in self.seq_info:
+            block_ids, used_slots, slot_ids = self.seq_info[req_id]
+            last_block = block_ids[-1]
+            available_in_last = self.block_size - used_slots
+
+            tokens_to_add = min(remaining_tokens, available_in_last)
+            if tokens_to_add > 0:
+                start_slot = last_block * self.block_size + used_slots
+                new_slots = list(range(start_slot, start_slot + tokens_to_add))
+                allocated_slots.extend(new_slots)
+                remaining_tokens -= tokens_to_add
+                used_slots += tokens_to_add
+                self.seq_info[req_id] = (block_ids, used_slots, slot_ids + new_slots)
+
+        # Need new blocks
+        if remaining_tokens > 0:
+            blocks_needed = (remaining_tokens + self.block_size - 1) // self.block_size
+
+            if blocks_needed > len(self.free_blocks):
+                return None
+
+            # Get the smallest blocks using heap
+            new_blocks = [heapq.heappop(self.free_blocks) for _ in range(blocks_needed)]
+
+            # Calculate slots in new blocks
+            for i, block_id in enumerate(new_blocks):
+                tokens_in_block = min(self.block_size, remaining_tokens)
+                start_slot = block_id * self.block_size
+                new_slots = list(range(start_slot, start_slot + tokens_in_block))
+                allocated_slots.extend(new_slots)
+                remaining_tokens -= tokens_in_block
+
+                # Update sequence info
+                if req_id in self.seq_info:
+                    existing_blocks, _, existing_slot_ids = self.seq_info[req_id]
+                    all_blocks = existing_blocks + [block_id]
+                    all_slot_ids = existing_slot_ids + new_slots
+                else:
+                    all_blocks = [block_id]
+                    all_slot_ids = new_slots
+                self.seq_info[req_id] = (all_blocks, tokens_in_block, all_slot_ids)
+
+            # Update block mapping
+            if req_id in self.req_to_block_ids:
+                self.req_to_block_ids[req_id].extend(new_blocks)
+            else:
+                self.req_to_block_ids[req_id] = new_blocks
+
+        return allocated_slots, new_blocks
+
+    def free(self, req_id):
+        """Free all blocks allocated to a request.
+
+        Args:
+            req_id: Request ID whose blocks should be freed
+        """
+        if req_id in self.req_to_block_ids:
+            freed_blocks = self.req_to_block_ids[req_id]
+            # Push freed blocks back into the heap
+            for block in freed_blocks:
+                heapq.heappush(self.free_blocks, block)
+            del self.req_to_block_ids[req_id]
+            del self.seq_info[req_id]
+
+class HPUPagedTokenToKVPoolAllocator:
+
+    def __init__(self, size, page_size, dtype, device, kvcache):
+        self.block_manager = BlockManager(page_size, size // page_size)
+        self.kvcache = kvcache
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.page_size = page_size
+
+    def available_size(self):
+        return self.block_manager.available_size()
+
+    def alloc_extend(self, id_len_pairs: List[Tuple[int, int]]):
+        slot_ids = []
+        for seq_id, need_size in id_len_pairs:
+            slots, new_blocks = self.block_manager.allocate(seq_id, need_size)
+            # print(f"seq_id: {seq_id}, need_size: {need_size}, slots: {slots}")
+            # print(f"block_manager.seq_info: {self.block_manager.seq_info}")
+            slot_ids.extend(slots)
+        return slot_ids
+
+    def alloc_decode(self, seq_ids: List[int]):
+        slot_ids = []
+        for seq_id in seq_ids:
+            slots, new_blocks = self.block_manager.allocate(seq_id, 1)
+            # print(f"seq_id: {seq_id}, slots: {slots}")
+            # print(f"block_manager.seq_info: {self.block_manager.seq_info}")
+            slot_ids.extend(slots)
+        return slot_ids
+
+    def free(self, req_id: int):
+        self.block_manager.free(req_id)
+
+    def free_group_begin(self):
+        pass
+
+    def free_group_end(self):
+        pass
+
+    def clear(self):
+        self.block_manager.clear()
+
