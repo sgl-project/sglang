@@ -164,6 +164,7 @@ class HiPAttentionBackend(AttentionBackend):
             ),
             is_decode=False,
             offloading_metadata=offloading_metadata,
+            sliding_window_size=layer.sliding_window_size,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -251,16 +252,18 @@ class HiPAttentionBackend(AttentionBackend):
             ),
             is_decode=True,
             offloading_metadata=offloading_metadata,
+            sliding_window_size=layer.sliding_window_size,
         )
 
-        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer_id=layer.layer_id,
-            size=q.shape[0],
-            batch_size=forward_batch.batch_size,
-            metadata=metadata,
-        )
+        if metadata is not None:
+            forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
+                layer_id=layer.layer_id,
+                size=q.shape[0],
+                batch_size=forward_batch.batch_size,
+                metadata=metadata,
+            )
 
-        if self.is_kv_cache_offload_enabled:
-            offload_cache.handle_cache_miss(metadata)
+            if self.is_kv_cache_offload_enabled:
+                offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
