@@ -22,11 +22,7 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
-from sglang.srt.layers.quantization import (
-    BASE_QUANTIZATION_METHODS,
-    QUANTIZATION_METHODS,
-    VLLM_AVAILABLE,
-)
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -69,6 +65,9 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.attention_chunk_size = getattr(
+            self.hf_text_config, "attention_chunk_size", None
+        )
 
         # Check model type
         self.is_generation = is_generation_model(
@@ -239,12 +238,7 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        # Select supported quantization methods based on vllm availability
-        if VLLM_AVAILABLE:
-            supported_quantization = [*QUANTIZATION_METHODS]
-        else:
-            supported_quantization = [*BASE_QUANTIZATION_METHODS]
-
+        supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
             "gptq",
@@ -267,6 +261,7 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -282,11 +277,7 @@ class ModelConfig:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            # Only iterate through currently available quantization methods
-            available_methods = (
-                QUANTIZATION_METHODS if VLLM_AVAILABLE else BASE_QUANTIZATION_METHODS
-            )
-            for _, method in available_methods.items():
+            for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
                 )
@@ -467,6 +458,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
+        or "CLIPModel" in model_architectures
     ):
         return False
     else:
@@ -478,6 +470,7 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
+    # TODO: add multimodal support for "Llama4ForConditionalGeneration",
     "LlavaLlamaForCausalLM",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
@@ -488,6 +481,7 @@ multimodal_model_archs = [
     "MllamaForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "CLIPModel",
 ]
 
 

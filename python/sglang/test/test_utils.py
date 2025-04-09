@@ -25,11 +25,11 @@ from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.utils import get_bool_env_var, kill_process_tree
+from sglang.srt.utils import get_bool_env_var, kill_process_tree, retry
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback
 
-DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-FP8"
+DEFAULT_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_ACCURACY_TEST = "neuralmagic/Meta-Llama-3-8B-Instruct-FP8"
 DEFAULT_FP8_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST = (
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
@@ -76,11 +76,14 @@ def is_in_ci():
 
 
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 1157
-    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
+        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    )
+DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -1010,26 +1013,10 @@ def run_logprob_check(self: unittest.TestCase, arg: Tuple):
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        _retry_execution(
+        max_retry = int(
+            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
+        )
+        retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
-            max_retry=_get_max_retry(),
+            max_retry=max_retry,
         )
-
-
-def _get_max_retry():
-    return int(os.environ.get("SGLANG_TEST_MAX_RETRY", "2" if is_in_ci() else "0"))
-
-
-def _retry_execution(fn, max_retry: int):
-    if max_retry == 0:
-        fn()
-        return
-
-    try:
-        fn()
-    except Exception as e:
-        print(
-            f"retry_execution failed once and will retry. This may be an error or a flaky test. Error: {e}"
-        )
-        traceback.print_exc()
-        _retry_execution(fn, max_retry=max_retry - 1)

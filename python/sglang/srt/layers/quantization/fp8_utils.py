@@ -457,12 +457,9 @@ class Fp8LinearOp:
                 qinput, x_scale = sgl_scaled_fp8_quant(
                     input_2d,
                     input_scale,
+                    num_token_padding=self.output_padding,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
-                if self.output_padding:
-                    pad_size = max(self.output_padding - qinput.shape[0], 0)
-                    if pad_size > 0:
-                        qinput = torch.nn.functional.pad(qinput, (0, 0, 0, pad_size))
             else:
                 qinput, x_scale = ops.scaled_fp8_quant(
                     input_2d,

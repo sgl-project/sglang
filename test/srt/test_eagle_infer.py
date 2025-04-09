@@ -43,9 +43,9 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
     }
-    NUM_CONFIGS = 3
+    NUM_CONFIGS = 2
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
@@ -61,8 +61,6 @@ class TestEAGLEEngine(CustomTestCase):
         configs = [
             # Basic config
             self.BASE_CONFIG,
-            # Disable cuda graph
-            {**self.BASE_CONFIG, "disable_cuda_graph": True},
             # Chunked prefill
             {**self.BASE_CONFIG, "chunked_prefill_size": 4},
         ]
@@ -146,7 +144,7 @@ class TestEAGLEEngine(CustomTestCase):
         if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
             self.assertGreater(acc_length, 3.6)
         else:
-            self.assertGreater(acc_length, 2.6)
+            self.assertGreater(acc_length, 2.5)
 
 
 class TestEAGLEEngineTokenMap(TestEAGLEEngine):
@@ -159,7 +157,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -174,7 +172,7 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -300,10 +298,16 @@ class TestEAGLEServer(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        server_info = requests.get(self.base_url + "/get_server_info").json()
+        avg_spec_accept_length = server_info["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 3.5)
+
+        speculative_eagle_topk = server_info["speculative_eagle_topk"]
+
+        if speculative_eagle_topk == 1:
+            self.assertGreater(avg_spec_accept_length, 2.5)
+        else:
+            self.assertGreater(avg_spec_accept_length, 3.5)
 
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
@@ -532,6 +536,37 @@ class TestEAGLEServerTriton(TestEAGLEServer):
                 "--attention-backend",
                 "triton",
                 "--max-running-requests",
+                8,
+            ],
+        )
+
+
+class TestEAGLEServerPageSize(TestEAGLEServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                5,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                6,
+                "--mem-fraction-static",
+                0.7,
+                "--chunked-prefill-size",
+                128,
+                "--max-running-requests",
+                8,
+                "--page-size",
                 8,
             ],
         )

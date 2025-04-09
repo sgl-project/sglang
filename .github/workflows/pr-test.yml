@@ -4,19 +4,15 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
   pull_request:
     branches: [ main ]
     paths:
-      - "python/pyproject.toml"
-      - "python/sglang/**"
-      - "test/**"
-      - "docs/**"
+      - "python/**"
       - "scripts/**"
+      - "test/**"
   workflow_dispatch:
     inputs:
       version:
@@ -72,7 +68,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 7
@@ -91,47 +87,11 @@ jobs:
         run: |
           bash scripts/ci_install_dependency.sh
 
-      - name: Test data parallelism (DP=2)
-        timeout-minutes: 10
+      - name: Run test
+        timeout-minutes: 25
         run: |
           cd test/srt
-          python3 test_data_parallelism.py
-
-      - name: Test data parallelism attention (DP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_dp_attention.py
-
-      - name: Test update weights from distributed
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_update_weights_from_distributed.py
-
-      - name: Test VerlEngine
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_verl_engine.py
-
-      - name: Test expert parallelism (EP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_moe_ep.py
-
-      - name: Test torch compile (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt
-          python3 test_mla_tp.py
-
-      - name: Test lora tensor parallelism (TP=2)
-        timeout-minutes: 10
-        run: |
-          cd test/srt/models/lora
-          python3 test_lora_tp.py
+          python3 run_suite.py --suite per-commit-2-gpu
 
   performance-test-1-gpu-part-1:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
