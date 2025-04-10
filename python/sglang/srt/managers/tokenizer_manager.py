@@ -140,7 +140,7 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
         expert_location_metadata: ExpertLocationMetadata,
-        eplb_manager: EPLBManager,
+        eplb_manager: Optional[EPLBManager],
     ):
         # Parse args
         self.server_args = server_args
@@ -202,8 +202,10 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
-        eplb_manager.initialize(self)
-        self.eplb_manager = eplb_manager
+        if eplb_manager is not None:
+            TODO_async
+            eplb_manager.initialize(self)
+            self.eplb_manager = eplb_manager
 
         # Store states
         self.no_create_loop = False

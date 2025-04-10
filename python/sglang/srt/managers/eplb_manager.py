@@ -15,21 +15,6 @@ if TYPE_CHECKING:
 
 
 class EPLBManager:
-    @staticmethod
-    def init_new(server_args: ServerArgs):
-        if server_args.enable_eplb:
-            return _EPLBManagerReal(server_args)
-        else:
-            return _EPLBManagerNoop()
-
-    async def initialize(self, tokenizer_manager: TokenizerManager):
-        pass
-
-    def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
-        raise NotImplementedError
-
-
-class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
         super().__init__()
         self._server_args = server_args
