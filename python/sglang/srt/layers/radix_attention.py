@@ -90,6 +90,7 @@ class RadixAttention(nn.Module):
         if rope is not None:
             if isinstance(rope, (list, tuple)):
                 _, self.rope_cos, self.rope_sin = rope
+                self.rope_is_neox_style = True
             else:
                 assert isinstance(rope, RotaryEmbedding)
                 if hasattr(rope, "repeated_cos_sin_cache"):
@@ -100,8 +101,10 @@ class RadixAttention(nn.Module):
                     self.rope_cos = cos.repeat(1, 2)
                     self.rope_sin = sin.repeat(1, 2)
                     rope.repeated_cos_sin_cache = (self.rope_cos, self.rope_sin)
+                self.rope_is_neox_style = rope.is_neox_style
         else:
             self.rope_cos = self.rope_sin = None
+            self.rope_is_neox_style = None
 
         self.rope_range = rope_range
 

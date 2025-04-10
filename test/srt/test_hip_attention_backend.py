@@ -70,7 +70,7 @@ class TestHiPAttnBackend(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def _run_passkey(self, extra_args):
+    def _run_passkey(self, extra_args, model=DEFAULT_MODEL_NAME_FOR_TEST):
         target_length = int(os.getenv("SRT_TEST_PASSKEY_PROMPT_LENGTH", "35000"))
         correct_answer = "$000310$"
         query_string = "You need to find the passkey. Read the following text carefully and remember the passkey.\n\n"
@@ -82,7 +82,6 @@ class TestHiPAttnBackend(unittest.TestCase):
         query_string += filler * (target_length // 35)
         query_string += "What was the passkey? The passkey is"
 
-        model = os.getenv("SRT_TEST_MODEL_NAME", DEFAULT_MODEL_NAME_FOR_TEST)
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
             model,
@@ -104,7 +103,7 @@ class TestHiPAttnBackend(unittest.TestCase):
 
             sampler = ChatCompletionSampler(
                 model=model,
-                max_tokens=16,
+                max_tokens=128,
                 base_url=f"{base_url}/v1",
                 temperature=0.0,
             )
@@ -139,6 +138,35 @@ class TestHiPAttnBackend(unittest.TestCase):
 
     def test_passkey_offload(self):
         self._run_passkey(["--enable-hip-kv-cache-offload"])
+
+    def test_passkey_mla(self):
+        self._run_passkey(
+            [
+                "--hip-attention-config",
+                '{"block_sparse_block_size_q": 16}',
+                "--trust-remote-code",
+                "--tp-size",
+                "2",
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        )
+
+    def test_passkey_mla_offload(self):
+        self._run_passkey(
+            [
+                "--hip-attention-config",
+                '{"block_sparse_block_size_q": 16}',
+                "--trust-remote-code",
+                "--tp-size",
+                "2",
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+                "--enable-hip-kv-cache-offload",
+            ],
+            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        )
 
 
 if __name__ == "__main__":

@@ -104,7 +104,8 @@ class HiPAttentionBackend(AttentionBackend):
                 layer.layer_id
             )
             offload_cache = None
-            k_chunk = v_chunk = None
+            k_chunk = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
+            v_chunk = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
             offloading_metadata = None
 
         else:  # Offloading enabled
@@ -147,6 +148,7 @@ class HiPAttentionBackend(AttentionBackend):
             rope_cos=layer.rope_cos,
             rope_sin=layer.rope_sin,
             rope_range=layer.rope_range,
+            rope_is_neox_style=layer.rope_is_neox_style,
             layer_id=layer.layer_id,
             logit_cap=layer.logit_cap,
             orig_context_len=layer.orig_context_len,
@@ -154,6 +156,7 @@ class HiPAttentionBackend(AttentionBackend):
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             hip_config=self.hip_config,
+            is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
             online_update_cache=(
                 forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
                 if self.is_kv_cache_offload_enabled
@@ -218,11 +221,15 @@ class HiPAttentionBackend(AttentionBackend):
             )
 
         q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
+        v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         o, metadata = self.forward_paged_hip(
             query=q_reshaped,
             sm_scale=layer.scaling,
             batch_size=forward_batch.batch_size,
+            k=k_reshaped,
+            v=v_reshaped,
             k_cache=k_cache,
             v_cache=v_cache,
             offload_cache=offload_cache,
@@ -233,11 +240,13 @@ class HiPAttentionBackend(AttentionBackend):
             rope_cos=layer.rope_cos,
             rope_sin=layer.rope_sin,
             rope_range=layer.rope_range,
+            rope_is_neox_style=layer.rope_is_neox_style,
             layer_id=layer.layer_id,
             logit_cap=layer.logit_cap,
             orig_context_len=layer.orig_context_len,
             max_context_len=self.max_context_len,
             hip_config=self.hip_config,
+            is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
             cached_metadata=metadata,
             online_update_cache=(
                 forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
