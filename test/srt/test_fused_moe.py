@@ -100,9 +100,8 @@ class TestFusedMOE(CustomTestCase):
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            # Skip if GPU arch < 8.9
             capability = torch.cuda.get_device_capability()
-            if not (capability[0] >= 9 or capability == (8, 9)):
+            if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
                 return
 
             a = self.create_random_cuda_tensor((m, k), dtype)
@@ -195,12 +194,10 @@ class TestFusedMOE(CustomTestCase):
                     a1_scale,
                     a2_scale,
                 )
-            # Compare fused vs. naive
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
         else:
-            # Normal path (no float8)
             a = self.create_random_cuda_tensor((m, k), dtype)
             w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
             w2 = self.create_random_cuda_tensor((e, k, n), dtype)
