@@ -1831,11 +1831,9 @@ def fast_topk(values, topk, dim):
 
 
 def is_hopper_with_cuda_12_3():
-    is_hopper = (
-        torch.cuda.is_available()
-        and torch.version.cuda
-        and torch.cuda.get_device_capability()[0] == 9
-    )
+    if not is_cuda():
+        return False
+    is_hopper = torch.cuda.get_device_capability()[0] == 9
     cuda_version = torch.version.cuda.split(".")
     is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
     return is_hopper and is_cuda_compatible
