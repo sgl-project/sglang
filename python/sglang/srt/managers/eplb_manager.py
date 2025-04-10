@@ -15,6 +15,7 @@ class EPLBManager:
     def __init__(self, server_args: ServerArgs):
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage()
+        self.tokenizer_manager: Optional[TokenizerManager] = None
 
     async def rebalance_experts(self):
         TODO_may_or_may_not_save_current

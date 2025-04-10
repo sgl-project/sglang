@@ -32,6 +32,7 @@ import zmq.asyncio
 from PIL.Image import Image
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 # Fix a bug of Python threading
@@ -501,6 +502,7 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    eplb_manager = EPLBManager(server_args)
     model_config = ModelConfig.from_server_args(server_args)
     expert_location_metadata = ExpertLocationMetadata.from_model_config(model_config)
 
@@ -583,7 +585,7 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(
-        server_args, port_args, expert_location_metadata
+        server_args, port_args, expert_location_metadata, eplb_manager
     )
     if server_args.chat_template:
         load_chat_template_for_openai_api(
