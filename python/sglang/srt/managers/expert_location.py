@@ -53,7 +53,6 @@ class ExpertLocationMetadata:
 
     def update(self, other: "ExpertLocationMetadata"):
         for field in [
-            "is_dummy",
             "num_layers",
             "num_local_physical_experts",
             "num_logical_experts",
