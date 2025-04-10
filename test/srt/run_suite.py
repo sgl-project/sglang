@@ -84,6 +84,7 @@ suites = {
         TestFile("test_data_parallelism.py", 90),
         TestFile("test_dp_attention.py", 90),
         TestFile("test_expert_distribution.py", 100),
+        TestFile("test_eplb.py", 100),
         TestFile("test_mla_tp.py", 420),
         TestFile("test_moe_ep.py", 220),
         TestFile("test_patch_torch.py", 30),
