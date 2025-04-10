@@ -93,7 +93,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, UpdateExpertLocationReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -272,6 +272,9 @@ class TokenizerManager:
         self.expert_distribution_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_expert_location_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -324,6 +327,10 @@ class TokenizerManager:
                 (
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
+                ),
+                (
+                    UpdateExpertLocationReqOutput,
+                    self.update_expert_location_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]

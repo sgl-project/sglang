@@ -676,6 +676,9 @@ class FlushCacheReq:
 class UpdateExpertLocationReqInput:
     expert_location_metadata: "ExpertLocationMetadata"
 
+@dataclass
+class UpdateExpertLocationReqOutput:
+    pass
 
 @dataclass
 class UpdateWeightFromDiskReqInput:
