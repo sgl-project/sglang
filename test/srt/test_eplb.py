@@ -36,7 +36,8 @@ class TestEPLB(CustomTestCase):
         ret = engine.flush_cache()
         assert ret.success
 
-        engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"])
+        output = engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
+                                 sampling_params=dict(max_new_tokens=8, temperature=0.0))
 
         TODO
 
