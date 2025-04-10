@@ -47,11 +47,6 @@ class TestOpenAIVisionServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
-                "--chat-template",
-                "chatml-llava",
-                # "--log-requests",
-            ],
         )
         cls.base_url += "/v1"
 
