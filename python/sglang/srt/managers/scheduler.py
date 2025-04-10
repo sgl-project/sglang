@@ -838,7 +838,6 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
-            req.queue_time_start = time.time()
 
             if (
                 recv_req.session_params is not None
@@ -853,7 +852,6 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
-            req.queue_time_start = time.time()
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -956,6 +954,7 @@ class Scheduler(
             self.disagg_decode_prealloc_queue.add(req)
 
         else:
+            req.queue_time_start = time.time()
             self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
