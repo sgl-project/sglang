@@ -24,7 +24,6 @@ from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig

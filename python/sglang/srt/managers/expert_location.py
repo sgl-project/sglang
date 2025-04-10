@@ -119,6 +119,22 @@ class ExpertLocationMetadata:
             world_size=world_size,
         )
 
+    def update(self, other: "ExpertLocationMetadata"):
+        for field in [
+            "num_layers",
+            "num_local_physical_experts",
+            "num_logical_experts",
+        ]:
+            assert getattr(self, field) == getattr(other, field)
+
+        for field in [
+            "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_rank_dispatch_physical_map",
+        ]:
+            # Cannot update address to avoid breaking CUDA graph
+            getattr(self, field)[...] = getattr(other, field)
+
     # -------------------------------- usage ------------------------------------
 
     def local_physical_to_physical(self, rank: int, local_physical_expert_index: int):
