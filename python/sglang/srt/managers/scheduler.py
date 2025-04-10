@@ -102,6 +102,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -123,6 +124,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    enable_colocated_batch_gen,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -385,6 +387,13 @@ class Scheduler(
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
+        )
+
+        self.input_blocker = (
+            SchedulerInputBlocker(server_args, noop=self.attn_tp_rank != 0)
+            if enable_colocated_batch_gen()
+            or server_args.enable_scheduler_input_blocker
+            else None
         )
 
         # Init profiler
@@ -730,6 +739,9 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
+
+        if self.input_blocker is not None:
+            recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:

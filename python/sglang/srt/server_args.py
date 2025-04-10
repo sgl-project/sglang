@@ -189,6 +189,7 @@ class ServerArgs:
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
+    enable_scheduler_input_blocker: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1148,6 +1149,11 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+        )
+        parser.add_argument(
+            "--enable-scheduler-input-blocker",
+            action="store_true",
+            help="Enable input blocker for Scheduler.",
         )
 
         # Server warmups
