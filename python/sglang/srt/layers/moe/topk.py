@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
     global_expert_location_metadata,
     global_server_args_dict,
 )
@@ -249,6 +250,7 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
@@ -300,8 +302,9 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    # TODO this is inefficient, and I will fuse into existing kernels
-    topk_ids = global_expert_location_metadata.chosen_logical_to_physical_map[topk_ids]
+    if expert_logical_to_rank_dispatch_physical_map is not None:
+        # TODO this is inefficient, and I will fuse into existing kernels
+        topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
 
     expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
