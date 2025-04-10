@@ -207,6 +207,76 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 no_combine=no_combine,
             )
 
+    def forward_hpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+    ) -> torch.Tensor:
+
+        import habana_frameworks.torch as htorch
+        hidden_dim = x.shape[-1]
+        num_experts = layer.w13_weight.shape[0]
+        moe_n_slice = 8 if num_experts > 32 else 1
+        n_expert_slice = num_experts // moe_n_slice
+        assert n_expert_slice * moe_n_slice == num_experts
+        x = x.view(-1, hidden_dim)
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+        )
+        topk_weights = topk_weights.view(-1, top_k)
+        topk_ids = topk_ids.view(-1, top_k)
+
+        ep_rank = 0
+        assert ep_rank is not None
+        ep_shift = ep_rank * num_experts
+        for i in range(moe_n_slice):
+            min_expert = i * n_expert_slice
+            max_expert = (i + 1) * n_expert_slice
+            w13_list_slice = [
+                layer.w13_weight[j].data.squeeze()
+                for j in range(min_expert, max_expert)
+            ]
+            w2_list_slice = [
+                layer.w2_weight[j].data.squeeze()
+                for j in range(min_expert, max_expert)
+            ]
+            current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                hidden_states=x,
+                expert_routing_table=topk_ids.to(torch.int64),
+                router_weights=topk_weights.to(x.dtype),
+                w12=w13_list_slice,
+                w3=w2_list_slice,
+                permuted_weights=True,
+                activation=activation,
+                experts_min=min_expert + ep_shift,
+                experts_max=max_expert - 1 + ep_shift,)
+            htorch.core.mark_step()
+            if i == 0:
+                final_hidden_states = current_hidden_states
+            else:
+                final_hidden_states.add_(current_hidden_states)
+        return final_hidden_states.view(-1, x.shape[1])   
+
     def forward_cpu(
         self,
         layer: torch.nn.Module,
