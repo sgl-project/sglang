@@ -83,6 +83,10 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
 
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name, default)
+    return int(value)
+
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:

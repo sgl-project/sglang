@@ -4,30 +4,32 @@ import os
 
 import torch
 
-from sglang.srt.utils import is_hpu
+from sglang.srt.utils import is_hpu, get_int_env_var, get_bool_env_var
 
 _is_hpu = is_hpu()
 
 if _is_hpu:
     _PAD_BLOCK_ID = 0
 
-    PREFILL_BUCKET_MIN = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_MIN", 1024)
-    PREFILL_BUCKET_STEP = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_STEP", 1024)
-    PREFILL_BUCKET_MAX = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_MAX", 4096)
+    PREFILL_BUCKET_MIN = get_int_env_var("SGLANG_HPU_PREFILL_BUCKET_MIN", 1024)
+    PREFILL_BUCKET_STEP = get_int_env_var("SGLANG_HPU_PREFILL_BUCKET_STEP", 1024)
+    PREFILL_BUCKET_MAX = get_int_env_var("SGLANG_HPU_PREFILL_BUCKET_MAX", 5120)
 
-    DECODE_BLOCK_BUCKET_MIN = os.environ.get("SGLANG_HPU_DECODE_BLOCK_BUCKET_MIN", 128)
-    DECODE_BLOCK_BUCKET_STEP = os.environ.get(
+    DECODE_BLOCK_BUCKET_MIN = get_int_env_var("SGLANG_HPU_DECODE_BLOCK_BUCKET_MIN", 128)
+    DECODE_BLOCK_BUCKET_STEP = get_int_env_var(
         "SGLANG_HPU_DECODE_BLOCK_BUCKET_STEP", 128
     )
-    DECODE_BLOCK_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 2560)
-    DECODE_BATCH_BUCKET_MIN = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_MIN", 1)
-    DECODE_BATCH_BUCKET_STEP = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_STEP", 32)
-    DECODE_BATCH_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 128)
-
-    USE_CONTIGUOUS_PA = (
-        os.environ.get("SGLANG_HPU_USE_CONTIGUOUS_PA", "true").lower() == "true"
+    DECODE_BLOCK_BUCKET_MAX = get_int_env_var("SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 2560)
+    DECODE_BATCH_BUCKET_MIN = get_int_env_var("SGLANG_HPU_DECODE_BATCH_BUCKET_MIN", 1)
+    DECODE_BATCH_BUCKET_STEP = get_int_env_var(
+        "SGLANG_HPU_DECODE_BATCH_BUCKET_STEP", 32
     )
-    SKIP_WARMUP = os.environ.get("SGLANG_HPU_SKIP_WARMUP", "false").lower() == "true"
+    DECODE_BATCH_BUCKET_MAX = get_int_env_var(
+        "SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 128
+    )
+
+    USE_CONTIGUOUS_PA = get_bool_env_var("SGLANG_HPU_USE_CONTIGUOUS_PA", "true")
+    SKIP_WARMUP = get_bool_env_var("SGLANG_HPU_SKIP_WARMUP", "false")
 
     from vllm_hpu_extension.bucketing import find_bucket
     from vllm_hpu_extension.ops import batch2block, block2batch
@@ -207,22 +209,13 @@ if _is_hpu:
             block_tables = []
             slots_list = []
             for i in range(batch_size):
+                num_pages = (ret.seq_lens[i] + page_size - 1) // page_size
+                num_lots_aligned = num_pages * page_size
                 slots = req_token_pool.req_to_token[
-                    ret.req_pool_indices[i], : ret.seq_lens[i]
+                    ret.req_pool_indices[i], : num_lots_aligned
                 ]
-                last_loc = slots[-1]
-                num_full_tables = ret.seq_lens[i] // page_size
-                ranges = torch.arange(
-                    0,
-                    num_full_tables * page_size,
-                    step=page_size,
-                    device=ret.input_ids.device,
-                )
-                pages = slots[ranges] // page_size
-                pages = pages.flatten().tolist()
-                if ret.seq_lens[i] % page_size != 0:
-                    pages.append((last_loc // page_size).item())
-                block_tables.append(pages)
+                pages = (slots // page_size).view(-1, page_size)[:, 0]
+                block_tables.append(pages.flatten().tolist())
                 slots_list.append(slots)
             for i in range(padded_batch_size - batch_size):
                 block_tables.append([_PAD_BLOCK_ID])
