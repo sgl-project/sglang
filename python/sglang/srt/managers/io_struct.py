@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -667,6 +670,11 @@ class BatchEmbeddingOut:
 @dataclass
 class FlushCacheReq:
     pass
+
+
+@dataclass
+class UpdateExpertLocationMetadataReqInput:
+    expert_location_metadata: "ExpertLocationMetadata"
 
 
 @dataclass
