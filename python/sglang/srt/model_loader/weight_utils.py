@@ -883,7 +883,7 @@ def compute_shared_experts_fusion_weights(
                             expert_index=n_routed_experts + repeat_index,
                             suffix=suffix,
                         ),
-                        weights_dict[shared_expert_weight_name].clone(),
+                        weights_dict[shared_expert_weight_name],
                     )
                 )
                 names_to_remove += [shared_expert_weight_name]
