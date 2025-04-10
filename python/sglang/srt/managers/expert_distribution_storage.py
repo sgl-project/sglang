@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 

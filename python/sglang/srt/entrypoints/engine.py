@@ -31,6 +31,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -500,7 +501,9 @@ def _launch_subprocesses(
     )
 
     eplb_manager = EPLBManager(server_args) if server_args.enable_eplb else None
-    expert_location_metadata = _compute_initial_expert_location_metadata(server_args, eplb_manager)
+    expert_location_metadata = _compute_initial_expert_location_metadata(
+        server_args, eplb_manager
+    )
 
     scheduler_procs = []
     if server_args.dp_size == 1:
@@ -616,8 +619,9 @@ def _launch_subprocesses(
     return tokenizer_manager, scheduler_info
 
 
-def _compute_initial_expert_location_metadata(server_args: ServerArgs,
-                                              eplb_manager: EPLBManager) -> ExpertLocationMetadata:
+def _compute_initial_expert_location_metadata(
+    server_args: ServerArgs, eplb_manager: EPLBManager
+) -> ExpertLocationMetadata:
     if (data := server_args.init_expert_location) is not None:
         # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
         return ExpertLocationMetadata.init_by_mapping(server_args, **json.loads(data))
