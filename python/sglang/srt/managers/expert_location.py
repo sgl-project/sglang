@@ -14,7 +14,7 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-    logical_to_chosen_physical_map: torch.Tensor  # (layers, num_logical_experts)
+    logical_to_rank_chosen_physical_map: torch.Tensor  # (num_gpus, layers, num_logical_experts)
 
     # -------------------------------- construction and mutation ------------------------------------
 
