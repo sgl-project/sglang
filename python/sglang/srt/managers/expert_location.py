@@ -40,6 +40,9 @@ class ExpertLocationMetadata:
     def _init_dummy():
         return ExpertLocationMetadata.init_new(num_layers=1, num_logical_experts=1)
 
+    def local_physical_to_global_physical(self, rank: int, local_physical_expert_index: int):
+        return self.num_local_physical_experts * rank + local_physical_expert_index
+
     def global_physical_to_local_physical(self, global_physical_expert_index: int):
         return global_physical_expert_index % self.num_local_physical_experts
 
