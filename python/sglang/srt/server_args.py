@@ -1124,7 +1124,7 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
-            "--eplb-cache-dir",
+            "--eplb-storage-dir",
             type=str,
             default=ServerArgs.eplb_storage_dir,
             help="Storage directory of EPLB subsystem.",
