@@ -40,7 +40,7 @@ class ExpertLocationMetadata:
                 num_layers=num_layers,
                 num_physical_experts=num_physical_experts,
             ),
-            partial_logical_to_physical_map=None,
+            partial_logical_to_physical_map=TODO,
         )
         output._rebuild()
         return output
@@ -63,13 +63,14 @@ class ExpertLocationMetadata:
         return [logical_expert_id]  # TODO add a logical_to_physical_map
 
     def _rebuild(self):
-        self.partial_logical_to_physical_map = TODO
+        self.partial_logical_to_physical_map[...] = TODO
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:
             self._update_unconditionally(other)
         else:
             self._update_partial(other)
+        self._rebuild()
 
     def _update_unconditionally(self, other: "ExpertLocationMetadata"):
         for field in _UPDATE_FIELDS_TRIVIAL:
@@ -82,7 +83,7 @@ class ExpertLocationMetadata:
             assert getattr(self, field) == getattr(other, field)
         for field in _UPDATE_FIELDS_TENSOR:
             # Cannot update address to avoid breaking CUDA graph
-            getattr(self, field)[...] = getattr(other, field)
+            getattr(self, field) = getattr(other, field)
 
 
 _UPDATE_FIELDS_TRIVIAL = [
