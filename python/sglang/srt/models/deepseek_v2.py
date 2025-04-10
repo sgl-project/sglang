@@ -68,7 +68,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -88,8 +92,6 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +170,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_id: int = -1,
         prefix: str = "",
     ):
         super().__init__()
@@ -179,6 +182,7 @@ class DeepseekV2MoE(nn.Module):
             if global_server_args_dict["n_share_experts_fusion"] is not None
             else 0
         )
+        self.layer_id = layer_id
 
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -202,10 +206,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.experts = MoEImpl(
-            num_experts=config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=config.n_routed_experts
+            + self.n_share_experts_fusion
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -1085,6 +1092,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
             )
             self.is_sparse = True
         else:
@@ -1311,11 +1319,11 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
         for i in range(len(self.layers)):
-            expert_distribution_recorder.set_current_layer(i)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with expert_distribution_recorder.with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1612,6 +1620,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         if ".experts." in name:
             return "moe"
         return "others"
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_groups,
+        )
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

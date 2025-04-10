@@ -1,3 +1,4 @@
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.utils import DeepEPMode
 
 try:
@@ -248,7 +249,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
-            _,  # num_recv_tokens_per_expert_list
+            num_recv_tokens_per_expert_list,
             self.handle,
             event,
         ) = buffer.dispatch(
@@ -262,6 +263,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+        )
+
+        expert_distribution_recorder.on_deepep_dispatch_normal(
+            num_recv_tokens_per_expert_list
         )
 
         return (

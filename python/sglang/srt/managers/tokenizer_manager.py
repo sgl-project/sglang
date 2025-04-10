@@ -51,6 +51,9 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
+from sglang.srt.managers import expert_distribution
+from sglang.srt.managers.eplb_manager import EPLBManager
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -137,6 +140,8 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
+        eplb_manager: Optional[EPLBManager],
     ):
         # Parse args
         self.server_args = server_args
@@ -156,16 +161,7 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
+        self.model_config = ModelConfig.from_server_args(server_args)
 
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
@@ -207,6 +203,10 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
+        self.eplb_manager = eplb_manager
+        if eplb_manager is not None:
+            eplb_manager.bind(self)
+
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -229,6 +229,7 @@ class TokenizerManager:
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
+        self.expert_location_metadata = expert_location_metadata
 
         # Metrics
         if self.enable_metrics:
@@ -655,7 +656,15 @@ class TokenizerManager:
         await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
 
     async def dump_expert_distribution_record(self):
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        raw_outputs: List[ExpertDistributionReqOutput] = (
+            await self.expert_distribution_communicator(
+                ExpertDistributionReq.DUMP_RECORD
+            )
+        )
+        return expert_distribution.postprocess_dumps(
+            [output.dump_output for output in raw_outputs],
+            expert_location_metadata=self.expert_location_metadata,
+        )
 
     async def update_weights_from_disk(
         self,
@@ -885,6 +894,11 @@ class TokenizerManager:
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if self.eplb_manager is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
+            )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

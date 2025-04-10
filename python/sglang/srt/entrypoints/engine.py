@@ -20,6 +20,7 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -30,6 +31,10 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.eplb_manager import EPLBManager
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -497,6 +502,11 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    eplb_manager = EPLBManager(server_args) if server_args.enable_eplb else None
+    expert_location_metadata = _compute_initial_expert_location_metadata(
+        server_args, eplb_manager
+    )
+
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -518,7 +528,15 @@ def _launch_subprocesses(
             )
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                args=(
+                    server_args,
+                    port_args,
+                    expert_location_metadata,
+                    gpu_id,
+                    tp_rank,
+                    None,
+                    writer,
+                ),
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
@@ -530,7 +548,7 @@ def _launch_subprocesses(
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
             target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+            args=(server_args, port_args, expert_location_metadata, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
@@ -567,7 +585,9 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerManager(
+        server_args, port_args, expert_location_metadata, eplb_manager
+    )
     if server_args.chat_template:
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
@@ -599,3 +619,14 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, scheduler_info
+
+
+def _compute_initial_expert_location_metadata(
+    server_args: ServerArgs, eplb_manager: EPLBManager
+) -> ExpertLocationMetadata:
+    if (data := server_args.init_expert_location) is not None:
+        # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
+        return ExpertLocationMetadata.init_by_mapping(server_args, **json.loads(data))
+    if server_args.enable_eplb:
+        return eplb_manager.compute_expert_location_metadata()
+    return ExpertLocationMetadata.init_trivial(server_args)

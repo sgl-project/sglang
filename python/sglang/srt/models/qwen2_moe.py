@@ -44,12 +44,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -370,17 +372,16 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
-            expert_distribution_recorder.set_current_layer(i)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with expert_distribution_recorder.with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen2MoeForCausalLM(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -488,6 +489,14 @@ class Qwen2MoeForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen2MoeForCausalLM

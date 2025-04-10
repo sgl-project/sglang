@@ -53,7 +53,8 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -132,8 +133,6 @@ from sglang.srt.utils import (
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
-expert_distribution_recorder = ExpertDistributionRecorder()
-
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -167,6 +166,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -258,6 +258,7 @@ class Scheduler(
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
+            expert_location_metadata=expert_location_metadata,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -430,16 +431,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
 
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
+        self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -1960,15 +1952,16 @@ class Scheduler(
             )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        dump_output = None
         if recv_req == ExpertDistributionReq.START_RECORD:
             expert_distribution_recorder.start_record()
         elif recv_req == ExpertDistributionReq.STOP_RECORD:
             expert_distribution_recorder.stop_record()
         elif recv_req == ExpertDistributionReq.DUMP_RECORD:
-            expert_distribution_recorder.dump_record()
+            dump_output = expert_distribution_recorder.dump_record()
         else:
             raise ValueError("Unrecognized ExpertDistributionReq value")
-        return ExpertDistributionReqOutput()
+        return ExpertDistributionReqOutput(dump_output=dump_output)
 
     def open_session(self, recv_req: OpenSessionReqInput):
         # handle error
@@ -2015,6 +2008,7 @@ def _import_static_state(model, static_params):
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    expert_location_metadata: ExpertLocationMetadata,
     gpu_id: int,
     tp_rank: int,
     dp_rank: Optional[int],
@@ -2046,7 +2040,9 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank
+        )
         pipe_writer.send(
             {
                 "status": "ready",
