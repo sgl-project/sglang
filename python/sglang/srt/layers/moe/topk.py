@@ -17,7 +17,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict, global_expert_location_metadata
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
@@ -297,7 +297,7 @@ def select_experts(
         )
 
     # TODO this is inefficient, and I will fuse into existing kernels
-    topk_ids = partial_logical_to_physical_map[topk_ids]
+    topk_ids = global_expert_location_metadata.partial_logical_to_physical_map[topk_ids]
 
     expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
