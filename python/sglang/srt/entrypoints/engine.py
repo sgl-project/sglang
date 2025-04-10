@@ -621,5 +621,5 @@ def _compute_initial_expert_location_metadata(server_args: ServerArgs,
     if (data := server_args.init_expert_location) is not None:
         return ExpertLocationMetadata.init_by_mapping(**json.loads(data))
     if server_args.enable_eplb:
-        return TODO(eplb_manager)
+        return eplb_manager.compute_expert_location_metadata()
     return ExpertLocationMetadata.init_trivial()
