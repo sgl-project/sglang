@@ -850,6 +850,7 @@ def kv_cache_scales_loader(
     )
     return []
 
+
 def compute_shared_experts_fusion_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     n_share_experts_fusion: Optional[int],
@@ -868,7 +869,7 @@ def compute_shared_experts_fusion_weights(
     for moe_layer_id in tqdm(
         moe_layer_ids,
         desc=f"Cloning {n_share_experts_fusion} "
-             "replicas of the shared expert into MoE",
+        "replicas of the shared expert into MoE",
     ):
         for repeat_index in range(n_share_experts_fusion):
             for suffix in suffix_list:
