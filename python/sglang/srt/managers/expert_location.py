@@ -57,6 +57,8 @@ class ExpertLocationMetadata:
 
         for field in [
             "physical_to_logical_map",
+            "logical_to_all_physical_map",
+            "logical_to_rank_chosen_physical_map",
         ]:
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
