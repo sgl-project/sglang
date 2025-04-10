@@ -1,4 +1,4 @@
-class ExpertDistributionRecorder:
+class ExpertDistributionStorage:
     def __init__(self):
         TODO
 
