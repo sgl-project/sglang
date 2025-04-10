@@ -41,7 +41,6 @@ jobs:
           cd ..
           pip install --user -e "python[all_hpu]"
 
-
       - name: Evaluate Accuracy
         timeout-minutes: 20
         run: |
