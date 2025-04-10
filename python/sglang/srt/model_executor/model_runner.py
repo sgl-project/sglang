@@ -47,7 +47,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict, global_expert_location_metadata
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -173,14 +173,13 @@ class ModelRunner:
             }
         )
 
-        global global_expert_location_metadata
-        global_expert_location_metadata = expert_location_metadata
-
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        self.expert_location_metadata = expert_location_metadata.clone()
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
