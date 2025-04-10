@@ -300,7 +300,7 @@ def select_experts(
         )
 
     # TODO this is inefficient, and I will fuse into existing kernels
-    topk_ids = get_global_expert_location_metadata().logical_to_rank_chosen_physical_map[rank, layer_id, topk_ids]
+    topk_ids = get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[rank, layer_id, topk_ids]
 
     expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 

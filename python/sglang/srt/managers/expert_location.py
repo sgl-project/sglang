@@ -15,7 +15,7 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-    logical_to_rank_chosen_physical_map: (
+    logical_to_rank_dispatch_physical_map: (
         torch.Tensor
     )  # (num_gpus, layers, num_logical_experts)
 
@@ -46,7 +46,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=torch.arange(0, num_physical_experts).repeat(
                 num_layers, 1
             )[..., None],
-            logical_to_rank_chosen_physical_map=torch.arange(
+            logical_to_rank_dispatch_physical_map=torch.arange(
                 0, num_physical_experts
             ).repeat(num_layers, 1)[..., None],
         )
