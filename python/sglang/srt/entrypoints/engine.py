@@ -57,7 +57,7 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqInput, UpdateExpertLocationMetadataReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -359,8 +359,14 @@ class Engine:
         )
 
     def update_expert_location_metadata(self, expert_location_metadata: ExpertLocationMetadata):
-        TODO
-        
+        obj = UpdateExpertLocationMetadataReqInput(
+            expert_location_metadata=expert_location_metadata,
+        )
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_expert_location_metadata(obj, None)
+        )
+
     def update_weights_from_disk(
         self,
         model_path: str,
