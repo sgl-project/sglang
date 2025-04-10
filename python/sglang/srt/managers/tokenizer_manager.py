@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
-from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -141,7 +140,6 @@ class TokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
         expert_location_metadata: ExpertLocationMetadata,
-        eplb_manager: Optional[EPLBManager],
     ):
         # Parse args
         self.server_args = server_args
@@ -202,10 +200,6 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-
-        self.eplb_manager = eplb_manager
-        if eplb_manager is not None:
-            eplb_manager.bind(self)
 
         # Store states
         self.no_create_loop = False
@@ -894,11 +888,6 @@ class TokenizerManager:
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
-
-        if self.eplb_manager is not None:
-            self.asyncio_tasks.add(
-                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
-            )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
