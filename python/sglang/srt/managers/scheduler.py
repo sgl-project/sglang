@@ -165,6 +165,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -256,6 +257,7 @@ class Scheduler(
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
+            expert_location_metadata=expert_location_metadata,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -2037,7 +2039,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank)
         pipe_writer.send(
             {
                 "status": "ready",
