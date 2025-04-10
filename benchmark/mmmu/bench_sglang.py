@@ -50,7 +50,7 @@ def eval_mmmu(args):
         image_path = sample["image_path"]
 
         # Make API call based on mode
-        if eval_args.query_format == "chat":
+        if eval_args.query_format == "default":
             response = call_chat_completion(
                 sampling_params, client, prefix, suffix, image_path
             )
@@ -112,7 +112,8 @@ def call_generate(
 ):
     data = {
         "model": "pixtral",
-        "text": f"<s>[INST]{prefix}[IMG]{suffix}[/INST]",
+        # "text": f"<s>[INST]{prefix}[IMG]{suffix}[/INST]",
+        "text": f"<s>[INST]You are a helpful assistant. You need to analyze the multi-choice problem I give you, and ALL your response is one single letter: the best or correct answer's letter. Don't say any other bs. Now here's the problem:\n{prefix}[IMG]{suffix}[/INST]",
         "sampling_params": {
             "max_new_tokens": sampling_params["max_new_tokens"],
             "temperature": sampling_params["temperature"],

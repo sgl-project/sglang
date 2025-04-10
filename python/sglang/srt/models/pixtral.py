@@ -70,6 +70,7 @@ class PixtralHFInputPatcher:
         self.img_token_id = getattr(
             vision_config, "image_token_index", self.DEFAULT_IMG_TOKEN_ID
         )
+        self.pad_image_border = getattr(vision_config, "pad_image_border", True)
         assert self.img_token_id not in (self.IMG_BREAK_TOKEN_ID, self.IMG_END_TOKEN_ID)
 
     def pad_input_ids(
@@ -172,10 +173,10 @@ class PixtralHFInputPatcher:
             image_width = int(math.floor(image_width / ratio))
             image_height = int(math.floor(image_height / ratio))
 
-        nrows, ncols = _get_pixtral_hf_num_image_tokens(
-            (image_height, image_width),
-            (patch_height, patch_width),
-        )
+        approx = math.ceil if self.pad_image_border else math.floor
+
+        nrows = approx(image_height / patch_height)
+        ncols = approx(image_width / patch_width)
 
         return ncols, nrows
 
@@ -269,44 +270,19 @@ class PixtralHFTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         # Ensure hidden_states has the batch dimension [batch, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        print(
-            f"PixtralHFTransformerBlock.forward: hidden_states has shape: batch_size={batch_size}, seq_len={seq_len}, hidden_dim={hidden_dim}"
-        )
         # Apply attention norm - normalize along the last dimension
         attn_normalized = self.attention_norm(hidden_states.view(-1, hidden_dim)).view(
             batch_size, seq_len, hidden_dim
         )
 
         # Pass through attention layer
-        try:
-            attention_output = self.attention(
-                attn_normalized,
-                attention_mask=attention_mask,
-                cu_seqlens=None,
-                position_embeddings=position_embeddings,
-            )
-        except Exception as e:
-            print(f"Error in attention layer: {e}")
-            print(f"attn_normalized.shape: {attn_normalized.shape}")
-            print(f"attention_mask.shape: {attention_mask.shape}")
-            print(f"position_embeddings: {position_embeddings}")
-            print(f"hidden_states.shape: {hidden_states.shape}")
-            print(
-                f"batch_size: {batch_size}, seq_len: {seq_len}, hidden_dim: {hidden_dim}"
-            )
-            print(f"attention layer id: {self.layer_id}")
-            raise e
-        else:
-            print("-" * 100)
-            print(f"attn_normalized.shape: {attn_normalized.shape}")
-            print(f"attention_mask.shape: {attention_mask.shape}")
-            print(f"position_embeddings: {position_embeddings}")
-            print(f"hidden_states.shape: {hidden_states.shape}")
-            print(
-                f"batch_size: {batch_size}, seq_len: {seq_len}, hidden_dim: {hidden_dim}"
-            )
-            print(f"attention layer id: {self.layer_id}")
-            print("-" * 100)
+        attention_output = self.attention(
+            attn_normalized,
+            attention_mask=attention_mask,
+            cu_seqlens=None,
+            position_embeddings=position_embeddings,
+        )
+
         # Apply first residual connection
         hidden_states = hidden_states + attention_output
 
@@ -522,11 +498,6 @@ class PixtralHFVisionModel(nn.Module):
             self.patch_conv(img.unsqueeze(0).to(self.device).to(self.dtype))
             for img in pixel_values
         ]
-        print(
-            "PixtralHFVisionModel.forward: patch_embeds_list has {} elements".format(
-                len(patch_embeds_list)
-            )
-        )
 
         # => List[1, seq_len, C]
         patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
@@ -558,9 +529,6 @@ class PixtralHFVisionModel(nn.Module):
             output_hidden_states or feature_sample_layers is not None
         )
 
-        print(
-            f"All dimensions: patch_embeds.shape = {patch_embeds.shape}, attention_mask.shape = {attention_mask.shape}"
-        )
         transformer_outputs = self.transformer(
             patch_embeds,  # Already has shape [batch_size, seq_len, hidden_dim]
             attention_mask,

@@ -15,6 +15,7 @@ from sglang.srt.models.llava import (
     LlavaQwenForCausalLM,
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
+from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
@@ -26,6 +27,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
         LlavaForConditionalGeneration,
+        Mistral3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor):

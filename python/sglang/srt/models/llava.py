@@ -146,15 +146,6 @@ class LlavaBaseForCausalLM(nn.Module):
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
             )
         image_features = self.multi_modal_projector(selected_image_feature)
-        # print(f"LlavaBaseForCausalLM.encode_images: image_features has shape {image_features.shape}")
-        if hasattr(image_features, "shape"):
-            print(
-                f"LlavaBaseForCausalLM.encode_images: image_features has shape {image_features.shape}"
-            )
-        else:
-            print(
-                f"LlavaBaseForCausalLM.encode_images: image_features has shape {(image_features.shape for image_features in image_features)}"
-            )
         return image_features
 
     @torch.no_grad()
@@ -609,65 +600,6 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             )
 
 
-import numpy as np
-
-
-def register_shape_hooks(model, np):
-    """
-    Register forward pre-hooks on all submodules of the model to print input shapes
-    and parameter shapes.
-
-    Args:
-        model: PyTorch model with submodules
-    """
-
-    def print_shapes_hook(module, input_tensor, prefix):
-        """
-        Forward pre-hook function that prints input shape and parameter shapes.
-
-        Args:
-            module: The current module
-            input_tensor: Input tensor(s) to the module
-        """
-        # Print module name and type
-        module_name = module.__class__.__name__
-        print(f"\n{'='*80}\nModule: {module_name}")
-
-        # Print input tensor shape(s)
-        if isinstance(input_tensor, tuple):
-            for i, tensor in enumerate(input_tensor):
-                if isinstance(tensor, torch.Tensor):
-                    print(f"{prefix} {i} shape: {tuple(tensor.shape)}")
-        else:
-            print(f"{prefix} shape: {tuple(input_tensor.shape)}")
-
-        # Print parameter shapes
-        total_params = 0
-        for name, param in module.named_parameters(recurse=False):
-            print(f"Parameter '{name}' shape: {tuple(param.shape)}")
-            total_params += np.prod(param.shape)
-
-        print(f"Total parameters in this module: {total_params:,}")
-        print(f"{'='*80}\n")
-
-        # Don't modify the input
-        return None
-
-    def input_hook(module, input_tensor):
-        print_shapes_hook(module, input_tensor, "Input")
-
-    def output_hook(module, args, results):
-        print_shapes_hook(module, results, "Output")
-
-    # Register the hook for all submodules
-    for name, module in model.named_modules():
-        if list(module.parameters(recurse=False)):  # Only modules with parameters
-            module.register_forward_pre_hook(input_hook)
-            module.register_forward_hook(output_hook)
-
-    return model
-
-
 class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     """
     An adaptor class to enable support for multiple mmlm such as mistral-community/pixtral-12b
@@ -761,6 +693,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             self.config.image_token_index = 10
         if not hasattr(self.config, "projector_hidden_act"):
             self.config.projector_hidden_act = "gelu"
+        if not hasattr(self.config, "spatial_merge_size"):
+            self.config.spatial_merge_size = 1
+        self.vision_config.spatial_merge_size = self.config.spatial_merge_size
 
         self.vision_feature_layer = getattr(config, "vision_feature_layer", -1)
         self.vision_feature_select_strategy = getattr(
@@ -791,7 +726,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )
-        register_shape_hooks(self.vision_tower, np)
+
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
