@@ -59,7 +59,7 @@ Note: For Intel Gaudi2/3 accelerator, do following instead:
 ```
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-pip install -e "python[all_xpu]"
+pip install -e "python[all_hpu]"
 ```
 
 ## Method 3: Using docker
