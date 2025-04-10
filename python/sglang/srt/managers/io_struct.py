@@ -94,6 +94,8 @@ class GenerateReqInput:
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    # Whether generate till it reaches model's context length
+    use_model_length: bool = False
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
