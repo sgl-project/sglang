@@ -96,6 +96,29 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
+    def test_single_test_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Hi, who are you?",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+        )
+
+        assert response.choices[0].message.role == "assistant"
+        text = response.choices[0].message.content
+        assert isinstance(text, str)
+
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 

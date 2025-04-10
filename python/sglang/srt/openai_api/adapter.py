@@ -1013,6 +1013,8 @@ def v1_chat_generate_request(
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
+        if not prompt and tokenizer_manager.model_config.is_multimodal:
+            prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
         prompts.append(prompt)
 
         sampling_params = {
