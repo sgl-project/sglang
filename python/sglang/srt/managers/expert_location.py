@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -50,7 +51,25 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb():
-        return TODO
+        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
+            deepseek_eplb.rebalance_experts(
+                weight=logical_count,
+                num_replicas=num_physical_experts,
+                num_groups=model_config_for_expert_location.num_groups,
+                num_nodes=server_args.nnodes,
+                num_gpus=world_size,
+            )
+        )
+        return ExpertLocationMetadata(
+            num_layers=model_config_for_expert_location.num_layers,
+            num_local_physical_experts=num_local_physical_experts,
+            num_logical_experts=model_config_for_expert_location.num_logical_experts,
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map, num_gpus=world_size,
+            ),
+        )
 
     @staticmethod
     def _init_common(server_args: ServerArgs):
@@ -93,6 +112,28 @@ class ExpertLocationMetadata:
             ].tolist()
             if physical_expert_id != -1
         ]
+
+
+def _compute_logical_to_rank_dispatch_physical_map(
+        logical_to_all_physical_map: torch.Tensor,
+        num_gpus: int,
+):
+    # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
+    # This is rarely called, so we use for loops for maximum clarity
+
+    r = random.Random()
+
+    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+    logical_to_rank_dispatch_physical_map = torch.zeros((num_gpus, num_layers, num_logical_experts))
+
+    for layer_id in range(num_layers):
+        for logical_expert_id in range(num_logical_experts):
+            for gpu_id in range(num_gpus):
+                candidate_values = ExpertLocationMetadata.logical_to_all_physical_raw(
+                    logical_to_all_physical_map, layer_id, logical_expert_id)
+                logical_to_rank_dispatch_physical_map[gpu_id, layer_id, logical_expert_id] = r.choice(candidate_values)
+
+    return logical_to_rank_dispatch_physical_map
 
 
 @dataclass
