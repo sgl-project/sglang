@@ -688,10 +688,12 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         assert self.server_args.enable_scheduler_input_blocker, f"update_expert_location requires --enable-scheduler-input-blocker"
 
+        self.expert_location_metadata = None
         self._send_block_request(BlockReqType.BLOCK)
         await self.update_expert_location_communicator.call_send(obj)
         self._send_block_request(BlockReqType.UNBLOCK)
         await self.update_expert_location_communicator.call_await()
+        self.expert_location_metadata = obj.expert_location_metadata
 
     async def update_weights_from_disk(
         self,
