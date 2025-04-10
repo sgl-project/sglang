@@ -87,7 +87,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, FlushCacheReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -257,6 +257,9 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -306,6 +309,10 @@ class TokenizerManager:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    FlushCacheReqOutput,
+                    self.flush_cache_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
