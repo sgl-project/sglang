@@ -22,12 +22,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
-        TODO_this_function
-        model_class, _ = get_model_architecture(model_config)
-        if hasattr(model_class, "get_model_config_for_expert_location"):
-            model_config_for_expert_location = model_class.get_model_config_for_expert_location(model_config.hf_config)
-        else:
-            model_config_for_expert_location = ModelConfigForExpertLocation.init_dummy()
+        model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
         return TODO
 
     @staticmethod
@@ -87,3 +82,11 @@ class ModelConfigForExpertLocation:
     @staticmethod
     def init_dummy():
         return ModelConfigForExpertLocation(num_layers=1, num_logical_experts=1)
+
+    @staticmethod
+    def from_model_config(model_config: ModelConfig):
+        model_class, _ = get_model_architecture(model_config)
+        if hasattr(model_class, "get_model_config_for_expert_location"):
+            return model_class.get_model_config_for_expert_location(model_config.hf_config)
+        else:
+            return ModelConfigForExpertLocation.init_dummy()
