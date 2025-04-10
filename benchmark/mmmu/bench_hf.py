@@ -31,7 +31,6 @@ def eval_mmmu(args):
                 args.model_path,
                 torch_dtype="auto",
                 trust_remote_code=True,
-                init_tts=False,
             )
         except Exception as second_exception:
             raise RuntimeError(

@@ -4,7 +4,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import PIL
@@ -34,9 +34,21 @@ class BaseMultiModalProcessorOutput:
 
 @dataclasses.dataclass
 class MultimodalSpecialTokens:
-    image_token: Optional[str] = None
-    video_token: Optional[str] = None
-    audio_token: Optional[str] = None
+    image_token: Optional[Union[int, str]] = None
+    video_token: Optional[Union[int, str]] = None
+    audio_token: Optional[Union[int, str]] = None
+
+    def convert_to_str(self, token: Union[str, int], processor) -> str:
+        if token is None:
+            return token
+        if isinstance(token, str):
+            return token
+        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+
+    def convert_to_strs(self, processor):
+        self.image_token = self.convert_to_str(self.image_token, processor)
+        self.video_token = self.convert_to_str(self.video_token, processor)
+        self.audio_token = self.convert_to_str(self.audio_token, processor)
 
     def collect(self) -> list[str]:
         return [
@@ -52,6 +64,7 @@ class BaseMultimodalProcessor(ABC):
     def __init__(self, hf_config, server_args, _processor):
         self.hf_config = hf_config
         self._processor = _processor
+        self.arch = hf_config.architectures[0]
         self.server_args = server_args
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -130,14 +143,8 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel: if True, discards the alpha channel in the returned images
 
         """
-        if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = (
-                self._processor.tokenizer.convert_ids_to_tokens(
-                    multimodal_tokens.image_token
-                )
-            )
-        else:
-            multimodal_tokens.image_token = multimodal_tokens.image_token
+
+        multimodal_tokens.convert_to_strs(self._processor)
 
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -166,7 +173,7 @@ class BaseMultimodalProcessor(ABC):
         assert len(image_data) == len(estimated_frames_list)
 
         image_index, audio_index = 0, 0
-        hashes, image_sizes, images, audios = [], [], [], []
+        image_sizes, images, audios = [], [], [], []
         new_text = ""
         for index, text_part in enumerate(text_parts):
             try:
@@ -203,15 +210,6 @@ class BaseMultimodalProcessor(ABC):
 
                     image_sizes += frames[0].size * len(frames)
 
-                    # Generate a hashable value for the image file
-                    if isinstance(image_file, Image.Image):
-                        # For PIL.Image objects, use the ID as a hashable value
-                        hash_value = hash(id(image_file))
-                    else:
-                        # For other types (strings, etc.), use the regular hash
-                        hash_value = hash(image_file)
-
-                    hashes += [hash_value] * len(frames)
                     images += frames
                     image_index += 1
                     if frames_to_process != 0:
@@ -221,7 +219,6 @@ class BaseMultimodalProcessor(ABC):
                     # load as audio
                     audio_file = audio_data[audio_index]
                     audio = load_audio(audio_file)
-                    hashes += [hash(audio_file)]
                     audios += [audio]
                     audio_index += 1
                     new_text += multimodal_tokens.audio_token
@@ -235,9 +232,9 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(f"An exception occurred while loading images: {e}")
 
         out = BaseMultiModalProcessorOutput(
+            input_text=new_text,
             images=images,
             audios=audios,
-            input_text=new_text,
         )
         out.normalize()
         return out

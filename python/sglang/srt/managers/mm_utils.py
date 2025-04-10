@@ -2,6 +2,7 @@
     Multi-modality utils
 """
 
+import dataclasses
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
@@ -9,6 +10,7 @@ import torch
 from torch import nn
 
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     global_server_args_dict,
@@ -39,11 +41,26 @@ class MultiModalityDataPaddingPattern:
 class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be enclosed by special token pairs (e.g. <image>...</image>, data_token_pairs)
 
+    The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
+
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
     """
 
-    def __init__(self, data_token_pairs: Optional[List[Tuple[int, int]]]) -> None:
+    def __init__(
+        self,
+        data_token_pairs: Optional[List[Tuple[int, int]]],
+        data_start_token_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+
+        Args:
+            data_start_token_ids marks the start of a single multimodal data
+            See Minicpmo's slice_start_id for example
+        """
         self.data_token_id_pairs = data_token_pairs
+        self.data_start_token_ids = data_start_token_ids or [
+            s for s, _e in data_token_pairs
+        ]
 
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
@@ -77,7 +94,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
-            if input_ids[start_idx] in start_token_ids:
+            if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
                 mm_inputs.data_offsets += [start_idx]
 
@@ -152,7 +169,7 @@ def get_embedding_and_mask(
 
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text."
+            f"Number of tokens in multimodal embedding does not match those in the input text. "
             f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
             "tokens from multimodal embeddings."
         )
@@ -179,6 +196,12 @@ def get_embedding_and_mask(
     return embedding, special_multimodal_mask
 
 
+@dataclasses.dataclass
+class Modality2Token:
+    modality: Modality
+    token_id: int
+
+
 def embed_mm_inputs(
     mm_inputs: MultimodalInputs,
     input_ids: torch.Tensor,
@@ -189,13 +212,13 @@ def embed_mm_inputs(
     audio_data_embedding_func: Callable[
         [List[MultimodalDataItem]], torch.Tensor
     ] = None,
-    placeholder_token_ids: List[int] = None,
+    placeholder_tokens: dict[Modality, int] = None,
 ) -> Optional[torch.Tensor]:
     """
     Calculate the multimodal embeddings if necessary, then scatter the result with the help of a boolean mask denoting the embed locations
 
         Args:
-            placeholder_token_ids: denoting the token of multimodal data in input_ids.
+            placeholder_tokens: denoting the token of multimodal data in input_ids.
                 If none, the pad_values of multimodal items are used
 
         Returns:
@@ -204,12 +227,17 @@ def embed_mm_inputs(
 
     if mm_inputs is None:
         return None
-
     # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
     # we assume that multimodal data are represented with its pad_values in input_ids
-    placeholder_token_ids = placeholder_token_ids or [
-        item.pad_value for item in mm_inputs.mm_items
-    ]
+    placeholder_token_ids = []
+    if placeholder_tokens is not None:
+        placeholder_token_ids = [
+            placeholder_token for placeholder_token in placeholder_tokens.values()
+        ]
+    else:
+        placeholder_token_ids = [item.pad_value for item in mm_inputs.mm_items]
+
+    assert isinstance(placeholder_token_ids[0], int)
 
     placeholder_tensor = torch.tensor(placeholder_token_ids, device=input_ids.device)
 
@@ -252,7 +280,8 @@ def embed_mm_inputs(
                 data_embedding_func=image_data_embedding_func,
                 embedding_items=items,
                 placeholder_tensor=(
-                    placeholder_tensor
+                    # use the specified modality token to identify the location to embed
+                    placeholder_tokens[Modality.IMAGE]
                     if using_all_items
                     else torch.tensor(
                         [item.pad_value for item in items],
@@ -274,7 +303,7 @@ def embed_mm_inputs(
                 data_embedding_func=audio_data_embedding_func,
                 embedding_items=items,
                 placeholder_tensor=(
-                    placeholder_tensor
+                    placeholder_tokens[Modality.AUDIO]
                     if using_all_items
                     else torch.tensor(
                         [item.pad_value for item in items],
@@ -315,7 +344,7 @@ def general_mm_embed_routine(
     audio_data_embedding_func: Callable[
         [List[MultimodalDataItem]], torch.Tensor
     ] = None,
-    placeholder_token_ids: List[int] = None,
+    placeholder_tokens: dict[Modality, int] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -345,7 +374,7 @@ def general_mm_embed_routine(
             input_embedding=embed_tokens,
             image_data_embedding_func=image_data_embedding_func,
             audio_data_embedding_func=audio_data_embedding_func,
-            placeholder_token_ids=placeholder_token_ids,
+            placeholder_tokens=placeholder_tokens,
         )
         # once used, mm_inputs is useless
         # just being defensive here
