@@ -31,15 +31,15 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
         num_replicas=TODO,
-        num_groups=config.n_group,
+        num_groups=model_config_for_expert_location.num_groups,
         num_nodes=server_args.nnodes,
         # TODO Consider scenario when disabling DP attn + DP size > 1
         num_gpus=server_args.tp_size,
     )
     return ExpertLocationMetadata(
-        num_layers=TODO,
+        num_layers=model_config_for_expert_location.num_layers,
         num_local_physical_experts=TODO,
-        num_logical_experts=TODO,
+        num_logical_experts=model_config_for_expert_location.num_logical_experts,
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_physical_map,
         logical_to_rank_dispatch_physical_map=TODO_compute,
