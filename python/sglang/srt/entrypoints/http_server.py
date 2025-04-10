@@ -370,6 +370,12 @@ async def dump_expert_distribution_record_async():
     return ORJSONResponse(content, status_code=200)
 
 
+@app.post("/eplb_rebalance")
+async def eplb_rebalance():
+    await _global_state.tokenizer_manager.eplb_rebalance()
+    return ORJSONResponse({}, status_code=200)
+
+
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""

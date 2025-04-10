@@ -364,6 +364,10 @@ class Engine:
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
+    def eplb_rebalance(self):
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.eplb_rebalance())
+
     def update_expert_location(self, expert_location_metadata: ExpertLocationMetadata):
         obj = UpdateExpertLocationReqInput(
             expert_location_metadata=expert_location_metadata,

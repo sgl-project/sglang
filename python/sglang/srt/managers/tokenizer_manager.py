@@ -693,6 +693,10 @@ class TokenizerManager:
             expert_location_metadata=self.expert_location_metadata,
         )
 
+    async def eplb_rebalance(self):
+        self.auto_create_handle_loop()
+        await self.eplb_manager.rebalance()
+
     async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
         self.auto_create_handle_loop()
         assert (
