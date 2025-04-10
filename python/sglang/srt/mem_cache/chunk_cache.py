@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+import logging
+logging = logging.getLogger(__name__)
+
 class ChunkCacheEntry:
     def __init__(self, rid: str, value: torch.Tensor):
         self.rid = rid
@@ -39,6 +42,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
+        logging.info(f'[wytdebug] free req_to_token_pool {req.req_pool_idx}')
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req):

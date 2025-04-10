@@ -13,6 +13,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+random.seed(0)
+cnt = 0
 
 class MiniLoadBalancer:
     def __init__(self, prefill_servers, decode_servers):
@@ -22,7 +24,7 @@ class MiniLoadBalancer:
     def select_pair(self):
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
 
-    async def generate_request(self, request_data):
+    async def notstream_generate_request(self, request_data):
         prefill_server, decode_server = self.select_pair()
 
         # Parse and transform prefill_server
@@ -31,10 +33,13 @@ class MiniLoadBalancer:
         bootstrap_host = f"{hostname}"
 
         modified_request = request_data.copy()
+
+        global cnt 
+        cnt += 1
         modified_request.update(
             {
                 "bootstrap_host": bootstrap_host,
-                "bootstrap_room": random.randint(0, 2**63 - 1),
+                "bootstrap_room": cnt
             }
         )
 
@@ -162,10 +167,14 @@ async def handle_generate_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
+
+    global cnt 
+    cnt += 1
+
     modified_request.update(
         {
             "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": cnt,
         }
     )
 
@@ -241,7 +250,7 @@ async def handle_generate_request(request_data: dict):
         )
 
     # Non-streaming case
-    result = await load_balancer.generate_request(modified_request)
+    result = await load_balancer.notstream_generate_request(modified_request)
     return ORJSONResponse(content=result)
 
 

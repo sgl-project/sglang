@@ -94,7 +94,7 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "bond1"
+        kv_args.ib_device = "mock"
         kv_manager = KVManager(kv_args, mode="prefill")
         return kv_manager
 
@@ -116,6 +116,9 @@ class PrefillBootstrapQueue:
 
     def pop_bootstrapped(self) -> List[Req]:
         """pop the reqs which has finished bootstrapping"""
+
+        self.kv_manager.memdesc_collector.recv_msgs()
+
         bootstrapped_reqs = []
         indices_to_remove = set()
 
@@ -127,11 +130,11 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            logging.info(f"[wytdebug] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
+            logging.info(f"[wytdebug] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
 
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)

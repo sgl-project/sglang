@@ -114,7 +114,7 @@ class DecodePreallocQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "bond1"
+        kv_args.ib_device = "mock"
         kv_manager = KVManager(kv_args, mode="decode")
         return kv_manager
 
@@ -123,7 +123,7 @@ class DecodePreallocQueue:
 
         kv_receiver = KVReceiver(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            memdesc_collector_addr=f"127.0.0.1:9000", #TODO(wyt) currently for 1p1d, we fix it.
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))

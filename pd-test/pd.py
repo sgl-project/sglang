@@ -144,16 +144,16 @@ def do_exp():
 
   clean_up()
 
-  for bsz in tqdm.tqdm([1]):
+  for bsz in tqdm.tqdm([32]):
     filename = f"0408-pd-{bsz}.txt"
 
-    exp_varying_args = [
+    # setup sglang servers.
+    sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + PREFILL_ARGS.copy() + [
+      "--max-running-requests 1024"
+    ]
+    sglang_decode_args = SGLANG_COMMON_ARGS.copy() + DECODE_ARGS.copy() + [
       "--max-running-requests", f"{bsz}",
     ]
-
-    # setup sglang servers.
-    sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + PREFILL_ARGS.copy() + exp_varying_args.copy()
-    sglang_decode_args = SGLANG_COMMON_ARGS.copy() + DECODE_ARGS.copy() + exp_varying_args.copy()
 
     prefill_env = [
       "CUDA_VISIBLE_DEVICES=0",
@@ -195,13 +195,13 @@ def do_exp():
       "--port", f"{LB_SERVE_PORT}",
       "--endpoint", "/v1/chat/completions",
       "--dataset-name", "jsonl",
-      "--num-prompts", f"{ 10 }", 
+      "--num-prompts", f"{ bsz * 10 }", 
       # "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
       "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",
-      "--jsonl-output-len", "128",
+      "--jsonl-output-len", "4096",
       "--save-result",
       "--result-filename", filename
     ]
