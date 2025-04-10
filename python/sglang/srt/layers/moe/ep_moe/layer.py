@@ -3,6 +3,8 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.schedule_batch import global_expert_location_metadata
+
 try:
     from deep_gemm import (
         get_col_major_tma_aligned_tensor,
@@ -410,7 +412,7 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        physical_expert_ids = expert_location_metadata.logical_to_global_physical(
+        physical_expert_ids = global_expert_location_metadata.logical_to_global_physical(
             expert_id
         )
         for physical_expert_id in physical_expert_ids:
