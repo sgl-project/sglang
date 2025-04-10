@@ -19,16 +19,16 @@ class EPLBManager:
 
     async def rebalance_experts(self):
         TODO_may_or_may_not_save_current
-        expert_location_metadata = self.get_expert_location_metadata()
+        expert_location_metadata = self.compute_expert_location_metadata()
         await self.tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
 
-    def get_expert_location_metadata(self):
+    def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
-        return _compute_expert_location_metadata(self._server_args, logical_count)
+        return _compute_expert_location_metadata_raw(self._server_args, logical_count)
 
 
 # TODO maybe move to ExpertLocationMetadata static method?
-def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: torch.Tensor):
+def _compute_expert_location_metadata_raw(server_args: ServerArgs, logical_count: torch.Tensor):
     model_config = ModelConfig.from_server_args(server_args)
     model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(

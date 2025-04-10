@@ -503,7 +503,7 @@ def _launch_subprocesses(
     )
 
     eplb_manager = EPLBManager(server_args)
-    expert_location_metadata = eplb_manager.get_expert_location_metadata()
+    expert_location_metadata = eplb_manager.compute_expert_location_metadata()
 
     scheduler_procs = []
     if server_args.dp_size == 1:
