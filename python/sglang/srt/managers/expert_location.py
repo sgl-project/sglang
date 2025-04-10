@@ -37,10 +37,7 @@ class ExpertLocationMetadata:
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
             num_local_physical_experts=num_local_physical_experts,
-            physical_to_logical_map=_create_vanilla_physical_to_logical_map(
-                num_layers=num_layers,
-                num_physical_experts=num_physical_experts,
-            ),
+            physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1),
             logical_to_all_physical_map=TODO,
             logical_to_rank_chosen_physical_map=TODO,
         )
@@ -81,7 +78,3 @@ class ExpertLocationMetadata:
             for physical_expert_id in self.logical_to_all_physical_map[layer_id, logical_expert_id].tolist()
             if physical_expert_id != -1
         ]
-
-
-def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
-    return torch.arange(0, num_physical_experts).repeat(num_layers, 1)
