@@ -13,15 +13,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# P.S. DeepSeek-Coder-V2-Lite-Instruct has 64 routed experts
+_EP_NUM_REDUNDANT_EXPERTS = 4
+
 
 class TestEPLB(CustomTestCase):
     def test_eplb_e2e(self):
-        TODO_test_redundant_experts
-       
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                enable_eplb=True,
                 eplb_storage_dir=tmpdir,
+                ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
                 tp_size=2,
             )
 
