@@ -50,17 +50,6 @@ class _EPLBManagerNoop(EPLBManager):
 def _compute_expert_location_metadata_raw(
         server_args: ServerArgs, logical_count: torch.Tensor
 ):
-    model_config = ModelConfig.from_server_args(server_args)
-    model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
-        model_config
-    )
-
-    num_physical_experts = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
-    # TODO consider case when DP attention is disabled and DP > 1
-    world_size = server_args.tp_size
-    assert num_physical_experts % world_size == 0
-    num_local_physical_experts = num_physical_experts // world_size
-
     physical_to_logical_map, logical_to_all_physical_map, expert_count = (
         deepseek_eplb.rebalance_experts(
             weight=logical_count,

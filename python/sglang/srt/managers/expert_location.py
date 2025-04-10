@@ -5,6 +5,7 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader import get_model_architecture
+from sglang.srt.server_args import ServerArgs
 
 
 @dataclass
@@ -20,33 +21,45 @@ class ExpertLocationMetadata:
     # -------------------------------- construction and mutation ------------------------------------
 
     @staticmethod
-    def init_trivial():
+    def init_trivial(server_args: ServerArgs):
         """Trivial location - logical expert i corresponds to physical expert i"""
+        common = ExpertLocationMetadata._init_common(server_args)
+        physical_to_logical_map = torch.arange(0, num_physical_experts).repeat(num_layers, 1) % num_logical_experts
+        return ExpertLocationMetadata.init_by_mapping(server_args, physical_to_logical_map=physical_to_logical_map)
+
+    @staticmethod
+    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map):
+        if not isinstance(physical_to_logical_map, torch.Tensor):
+            physical_to_logical_map = torch.tensor(physical_to_logical_map)
+
         return ExpertLocationMetadata(
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
             num_local_physical_experts=num_local_physical_experts,
-            physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(
-                num_layers, 1
-            )
-                                    % num_logical_experts,
-            # Throw away the redundant experts here - highly inefficient, but we do not care since we will
-            # use EPLB distribution logic
-            logical_to_all_physical_map=torch.arange(0, num_logical_experts).repeat(
-                num_layers, 1
-            )[..., None],
-            logical_to_rank_dispatch_physical_map=torch.arange(
-                0, num_logical_experts
-            ).repeat(num_layers, 1)[..., None],
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=TODO,
+            logical_to_rank_dispatch_physical_map=TODO,
         )
-
-    @staticmethod
-    def init_by_mapping():
-        return TODO
 
     @staticmethod
     def init_by_eplb():
         return TODO
+
+    @staticmethod
+    def _init_common(server_args: ServerArgs):
+        model_config = ModelConfig.from_server_args(server_args)
+        model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
+
+        num_physical_experts = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
+        # TODO consider case when DP attention is disabled and DP > 1
+        world_size = server_args.tp_size
+        assert num_physical_experts % world_size == 0
+        num_local_physical_experts = num_physical_experts // world_size
+
+        return dict(
+            model_config_for_expert_location=model_config_for_expert_location,
+            num_local_physical_experts=num_local_physical_experts,
+        )
 
     # -------------------------------- usage ------------------------------------
 
