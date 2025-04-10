@@ -60,24 +60,27 @@ class ExpertLocationMetadata:
             self._update_partial(other)
 
     def _update_unconditionally(self, other: "ExpertLocationMetadata"):
-        for field in _TRIVIAL_UPDATE_FIELDS:
+        for field in _UPDATE_FIELDS_TRIVIAL:
             setattr(self, field, getattr(other, field))
-
-        self.physical_to_logical_map = other.physical_to_logical_map.detach().clone()
+        for field in _UPDATE_FIELDS_TENSOR:
+            setattr(self, field, getattr(other, field).detach().clone())
 
     def _update_partial(self, other: "ExpertLocationMetadata"):
-        for field in _TRIVIAL_UPDATE_FIELDS:
+        for field in _UPDATE_FIELDS_TRIVIAL:
             assert getattr(self, field) == getattr(other, field)
+        for field in _UPDATE_FIELDS_TENSOR:
+            # Cannot update address to avoid breaking CUDA graph
+            getattr(self, field)[...] = getattr(other, field)
 
-        # Cannot update address to avoid breaking CUDA graph
-        self.physical_to_logical_map[...] = other.physical_to_logical_map
 
-
-_TRIVIAL_UPDATE_FIELDS = [
+_UPDATE_FIELDS_TRIVIAL = [
     "is_dummy",
     "num_layers",
     "num_local_physical_experts",
     "num_logical_experts",
+]
+_UPDATE_FIELDS_TENSOR = [
+    "physical_to_logical_map",
 ]
 
 
