@@ -27,6 +27,7 @@ class SchedulerStats:
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
     spec_accept_length: float = 0.0
+    avg_request_queue_latency: float = 0.0
 
 
 class SchedulerMetricsCollector:
@@ -87,6 +88,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.avg_request_queue_latency = Gauge(
+            name="sglang:avg_request_queue_latency",
+            documentation="The average request queue latency for the last batch of requests in seconds.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -99,6 +107,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
         self.last_log_time = time.time()
 
 

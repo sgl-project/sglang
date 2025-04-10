@@ -702,7 +702,7 @@ def moe_align_block_size(
             num_tokens_post_pad,
         )
     else:
-        token_cnts_buffer = torch.zeros(
+        token_cnts_buffer = torch.empty(
             (num_experts + 1) * num_experts,
             dtype=torch.int32,
             device=topk_ids.device,
