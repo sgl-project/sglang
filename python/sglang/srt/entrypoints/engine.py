@@ -619,7 +619,8 @@ def _launch_subprocesses(
 def _compute_initial_expert_location_metadata(server_args: ServerArgs,
                                               eplb_manager: EPLBManager) -> ExpertLocationMetadata:
     if (data := server_args.init_expert_location) is not None:
-        return ExpertLocationMetadata.init_by_mapping(**json.loads(data))
+        # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
+        return ExpertLocationMetadata.init_by_mapping(server_args, **json.loads(data))
     if server_args.enable_eplb:
         return eplb_manager.compute_expert_location_metadata()
     return ExpertLocationMetadata.init_trivial()
