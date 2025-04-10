@@ -76,13 +76,14 @@ def _compute_expert_location_metadata_raw(
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_all_physical_map,
         logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
-            logical_to_all_physical_map
+            logical_to_all_physical_map, num_gpus=world_size,
         ),
     )
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
+        num_gpus: int,
 ):
     # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     # This is rarely called, so we use for loops for maximum clarity
@@ -90,4 +91,9 @@ def _compute_logical_to_rank_dispatch_physical_map(
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     logical_to_rank_dispatch_physical_map = torch.zeros((num_gpus, num_layers, num_logical_experts))
 
-    return TODO
+    for layer_id in range(num_layers):
+        for logical_expert_id in range(num_logical_experts):
+            for gpu_id in range(num_gpus):
+                TODO
+
+    return logical_to_rank_dispatch_physical_map
