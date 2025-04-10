@@ -20,14 +20,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
       - name: Build Docker image
         run: |
-          echo "[Placeholder] to build docker images "
+          echo "[Placeholder] to build docker images"
 
       - name: Run container
         run: |
