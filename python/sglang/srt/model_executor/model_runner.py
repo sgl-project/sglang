@@ -458,7 +458,7 @@ class ModelRunner:
             ) from None
 
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self, model_path: str, load_format: str, param_categories: Optional[List[str]]
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(

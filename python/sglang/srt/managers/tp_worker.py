@@ -191,7 +191,7 @@ class TpModelWorker:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path, recv_req.load_format, recv_req.param_categories
         )
         return success, message
 
