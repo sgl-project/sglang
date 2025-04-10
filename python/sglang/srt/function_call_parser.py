@@ -515,14 +515,17 @@ class DeepSeekV3Detector(BaseFormatDetector):
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_name = match_result.split("<｜tool▁sep｜>")[1].split(self.bop_token)[0].strip()
-                func_args = re.search(f"{self.bop_token}\n(.*?)\n{self.eop_token}", match_result).group(1)
+                func_name = (
+                    match_result.split("<｜tool▁sep｜>")[1]
+                    .split(self.bop_token)[0]
+                    .strip()
+                )
+                func_args = re.search(
+                    f"{self.bop_token}\n(.*?)\n{self.eop_token}", match_result
+                ).group(1)
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
-                match_result = {
-                    "name": func_name,
-                    "parameters": func_args
-                }
+                match_result = {"name": func_name, "parameters": func_args}
                 calls.extend(self.parse_base_json(match_result, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
@@ -532,11 +535,13 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin='<｜tool▁calls▁begin｜>｜tool▁call▁begin｜>function<｜tool▁sep｜>' + name + '\n```json\n',
+            begin="<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            + name
+            + "\n```json\n",
             end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
             trigger="<｜tool▁calls▁begin｜>",
         )
-    
+
 
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
