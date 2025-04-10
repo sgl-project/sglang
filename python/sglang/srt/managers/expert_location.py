@@ -57,7 +57,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_global_physical(self, logical_expert_id: int):
-        return logical_expert_id  # TODO add a logical_to_physical_map
+        return [logical_expert_id]  # TODO add a logical_to_physical_map
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:

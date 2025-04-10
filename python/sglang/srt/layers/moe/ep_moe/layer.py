@@ -412,8 +412,8 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        physical_expert_ids = global_expert_location_metadata.logical_to_global_physical(
-            expert_id
+        physical_expert_ids = (
+            global_expert_location_metadata.logical_to_global_physical(expert_id)
         )
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(
