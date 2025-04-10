@@ -29,7 +29,7 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
     model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
-        num_replicas=TODO,
+        num_replicas=num_physical_experts,
         num_groups=model_config_for_expert_location.num_groups,
         num_nodes=server_args.nnodes,
         num_gpus=world_size,
