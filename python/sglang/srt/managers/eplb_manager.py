@@ -14,17 +14,17 @@ class EPLBManager:
 
     async def rebalance_experts(self):
         TODO_may_or_may_not_save_current
-        self._expert_distribution_storage.get_last_snapshot()
-        expert_location_metadata = TODO
+        logical_count = self._expert_distribution_storage.get_last_snapshot()
+        expert_location_metadata = _compute_expert_location_metadata(logical_count)
         await self._tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
 
-    def get_expert_location_metadata(self):
-        logical_count = self._expert_distribution_storage.get_last_snapshot()
-        physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
-            weight=logical_count,
-            num_replicas=TODO,
-            num_groups=TODO,
-            num_nodes=TODO,
-            num_gpus=TODO,
-        )
-        return TODO
+
+def _compute_expert_location_metadata(logical_count):
+    physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
+        weight=logical_count,
+        num_replicas=TODO,
+        num_groups=TODO,
+        num_nodes=TODO,
+        num_gpus=TODO,
+    )
+    return TODO
