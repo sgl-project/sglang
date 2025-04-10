@@ -374,12 +374,13 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-            self.load_weights_and_postprocess(model_config, model, target_device)
+            self.load_weights_and_postprocess(model, self._get_all_weights(model_config, model), target_device)
 
         return model.eval()
 
-    def load_weights_and_postprocess(self, model_config, model, target_device):
-        model.load_weights(self._get_all_weights(model_config, model))
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
