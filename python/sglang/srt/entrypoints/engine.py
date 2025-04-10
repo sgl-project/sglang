@@ -30,7 +30,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -500,7 +499,7 @@ def _launch_subprocesses(
     )
 
     eplb_manager = EPLBManager.init_new(server_args)
-    expert_location_metadata = eplb_manager.compute_expert_location_metadata()
+    expert_location_metadata = _compute_initial_expert_location_metadata(server_args, eplb_manager)
 
     scheduler_procs = []
     if server_args.dp_size == 1:
@@ -614,3 +613,7 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, scheduler_info
+
+
+def _compute_initial_expert_location_metadata(server_args: ServerArgs, eplb_manager: EPLBManager):
+    return TODO
