@@ -25,10 +25,16 @@ class TestEPLB(CustomTestCase):
             ref_output = self._engine_generate(engine)
             self._assert_behavior(engine, ref_output)
 
+            engine.eplb_rebalance()
+            self._assert_behavior(engine, ref_output)
+
             engine.shutdown()
             del engine
 
             engine = sgl.Engine(**engine_kwargs)
+            self._assert_behavior(engine, ref_output)
+
+            engine.eplb_rebalance()
             self._assert_behavior(engine, ref_output)
 
             engine.shutdown()
