@@ -97,6 +97,7 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
+        expert_location_metadata: ExpertLocationMetadata,
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -178,6 +179,8 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        self.expert_location_metadata = expert_location_metadata
+
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
 
@@ -191,7 +194,6 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        self.expert_location_metadata = TODO
         expert_distribution_recorder.initialize(
             server_args,
             self.expert_location_metadata,
