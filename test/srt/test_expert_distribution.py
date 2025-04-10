@@ -3,7 +3,6 @@ import unittest
 
 import requests
 import torch
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST,
@@ -18,17 +17,15 @@ class TestExpertDistribution(CustomTestCase):
     def test_expert_distribution_record(self):
         # TODO: Add tests for DeepEP gatherer (currently our CI cannot run that)
         for info in [
-            dict(
-                model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-                mode_detail=False,
-            ),
-            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode_detail=False),
+            dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B"),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=1),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode_detail=True),
         ]:
             with self.subTest(info=info):
                 self._execute_core(**info)
 
-    def _execute_core(self, model_path: str, mode_detail: bool):
+    def _execute_core(self, model_path: str, mode_detail: bool = False, tp_size: int = 1):
         """Test expert distribution record endpoints"""
         os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DETAIL"] = (
             "1" if mode_detail else "0"
