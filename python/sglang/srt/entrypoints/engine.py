@@ -31,7 +31,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -359,6 +358,9 @@ class Engine:
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
 
+    def update_expert_location_metadata(self, expert_location_metadata: ExpertLocationMetadata):
+        TODO
+        
     def update_weights_from_disk(
         self,
         model_path: str,
