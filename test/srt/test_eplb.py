@@ -47,6 +47,7 @@ class TestEPLB(CustomTestCase):
         actual_output = self._engine_generate(engine)
         self.assertEqual(actual_output, ref_output)
 
+        physical_to_logical_map = engine.tokenizer_manager.expert_location_metadata.physical_to_logical_map
         TODO
 
     def _engine_generate(self, engine: sgl.Engine):
