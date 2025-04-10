@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import List
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
@@ -13,8 +12,6 @@ class ExpertLocationMetadata:
     num_local_physical_experts: int
     num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
-    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-    logical_to_rank_chosen_physical_map: torch.Tensor  # (num_gpus, layers, num_logical_experts)
 
     # -------------------------------- construction and mutation ------------------------------------
 
@@ -38,8 +35,6 @@ class ExpertLocationMetadata:
             num_logical_experts=num_logical_experts,
             num_local_physical_experts=num_local_physical_experts,
             physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1),
-            logical_to_all_physical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1)[..., None],
-            logical_to_rank_chosen_physical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1)[..., None],
         )
 
     @staticmethod
@@ -56,8 +51,6 @@ class ExpertLocationMetadata:
 
         for field in [
             "physical_to_logical_map",
-            "logical_to_all_physical_map",
-            "logical_to_rank_chosen_physical_map",
         ]:
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
@@ -71,10 +64,3 @@ class ExpertLocationMetadata:
 
     def physical_to_local_physical(self, global_physical_expert_index: int):
         return global_physical_expert_index % self.num_local_physical_experts
-
-    def logical_to_all_physical(self, layer_id: int, logical_expert_id: int) -> List[int]:
-        return [
-            physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map[layer_id, logical_expert_id].tolist()
-            if physical_expert_id != -1
-        ]
