@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 
 import sglang as sgl
@@ -13,22 +14,23 @@ from sglang.test.test_utils import (
 
 class TestEPLB(CustomTestCase):
     def test_eplb_e2e(self):
-        engine_kwargs = dict(
-            model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
-            eplb_storage_dir=TODO,
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine_kwargs = dict(
+                model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                eplb_storage_dir=tmpdir,
+            )
 
-        engine = sgl.Engine( **engine_kwargs)
-        self._assert_behavior(engine)
+            engine = sgl.Engine( **engine_kwargs)
+            self._assert_behavior(engine)
 
-        engine.shutdown()
-        del engine
+            engine.shutdown()
+            del engine
 
-        engine = sgl.Engine( **engine_kwargs)
-        self._assert_behavior(engine)
+            engine = sgl.Engine( **engine_kwargs)
+            self._assert_behavior(engine)
 
-        engine.shutdown()
-        del engine
+            engine.shutdown()
+            del engine
 
     def _assert_behavior(self, engine: sgl.Engine):
         ret = engine.flush_cache()
