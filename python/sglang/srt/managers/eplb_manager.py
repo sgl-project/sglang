@@ -30,7 +30,7 @@ class EPLBManager:
     async def handle_loop(self):
         await self._expert_distribution_storage.start()
         while True:
-            await asyncio.sleep(self._server_args.eplb_update_period)
+            await asyncio.sleep(self._server_args.eplb_rebalance_period or 100000000)
             self.rebalance()
 
     def rebalance(self):
