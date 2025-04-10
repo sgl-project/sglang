@@ -100,7 +100,6 @@ class DataParallelController:
                 )
 
         self.max_req_input_len = None
-        self.expert_location_metadata = None
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -220,7 +219,6 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.expert_location_metadata = scheduler_info[0]["expert_location_metadata"]
 
     def round_robin_scheduler(self, req):
         self.workers[self.round_robin_counter].send_pyobj(req)
@@ -267,7 +265,6 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
-                "expert_location_metadata": controller.expert_location_metadata,
             }
         )
         if server_args.node_rank == 0:
