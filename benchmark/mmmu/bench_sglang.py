@@ -50,12 +50,12 @@ def eval_mmmu(args):
         image_path = sample["image_path"]
 
         # Make API call based on mode
-        if eval_args.query_format == "chat":
+        if eval_args.query_format == "default":
             response = call_chat_completion(
                 sampling_params, client, prefix, suffix, image_path
             )
-        else:
-            response = call_generate(
+        elif eval_args.query_format == "mistral":
+            response = call_generate_mistral(
                 sampling_params, generate_url, prefix, suffix, image_path
             )
 
@@ -107,7 +107,7 @@ def eval_mmmu(args):
     run_benchmark(samples, eval_args, generate_url, client, sampling_params)
 
 
-def call_generate(
+def call_generate_mistral(
     sampling_params: dict, generate_url: str, prefix: str, suffix: str, image_path: str
 ):
     data = {
