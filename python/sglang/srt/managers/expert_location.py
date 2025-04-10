@@ -54,10 +54,13 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def update(self, other: "ExpertLocationMetadata"):
-        if self_is_empty:
-            TODO
+        if self.is_dummy:
+            self.num_layers = other.num_layers
+            self.num_local_physical_experts = other.num_local_physical_experts
+            self.num_logical_experts = other.num_logical_experts
+            self.physical_to_logical_map = other.physical_to_logical_map.detach().clone()
         else:
-            pass  # will handle later
+            raise NotImplementedError  # will handle later
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
