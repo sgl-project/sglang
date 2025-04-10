@@ -1742,51 +1742,131 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
-    original_input = request_json.get("input", "")
+    try:
+        request_json = await raw_request.json()
+        original_input = request_json.get("input", "")
 
-    is_batch = isinstance(original_input, list)
+        # Check if input type matches any of the allowed types
+        valid_input = isinstance(original_input, str) or (
+            isinstance(original_input, list)
+            and (
+                (len(original_input) == 0)  # Empty list is valid
+                or all(isinstance(item, int) for item in original_input)  # List[int]
+                or all(isinstance(item, str) for item in original_input)  # List[str]
+                or all(
+                    isinstance(item, list)  # List[List[int]]
+                    and all(isinstance(subitem, int) for subitem in item)
+                    for item in original_input
+                )
+                or all(
+                    isinstance(item, dict) for item in original_input
+                )  # List[MultimodalEmbeddingInput]
+            )
+        )
 
-    if is_batch:
-        batch_inputs = original_input
+        if not valid_input:
+            input_type = type(original_input).__name__
+            if isinstance(original_input, list) and len(original_input) > 0:
+                first_item_type = type(original_input[0]).__name__
+                return create_error_response(
+                    message=f"Invalid input type: expected one of [List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]], but got {input_type} containing {first_item_type}.",
+                    err_type="InvalidInputError",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            else:
+                return create_error_response(
+                    message=f"Invalid input type: expected one of [List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]], but got {input_type}.",
+                    err_type="InvalidInputError",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
-        all_results = []
-        for i, single_input in enumerate(batch_inputs):
-            single_request_json = request_json.copy()
-            single_request_json["input"] = single_input
+        try:
+            is_batch = isinstance(original_input, list)
 
-            single_request = EmbeddingRequest(**single_request_json)
-            all_requests = [single_request]
-            adapted_request, _ = v1_embedding_request(all_requests, tokenizer_manager)
+            if is_batch:
+                batch_inputs = original_input
 
-            try:
-                single_ret = await tokenizer_manager.generate_request(
+                if batch_inputs and isinstance(batch_inputs[0], int):
+                    all_requests = [EmbeddingRequest(**request_json)]
+                    adapted_request, _ = v1_embedding_request(
+                        all_requests, tokenizer_manager
+                    )
+
+                    ret = await tokenizer_manager.generate_request(
+                        adapted_request, raw_request
+                    ).__anext__()
+
+                    if not isinstance(ret, list):
+                        ret = [ret]
+                else:
+                    all_results = []
+                    for i, single_input in enumerate(batch_inputs):
+                        single_request_json = request_json.copy()
+                        single_request_json["input"] = single_input
+
+                        try:
+                            single_request = EmbeddingRequest(**single_request_json)
+                            all_requests = [single_request]
+                            adapted_request, _ = v1_embedding_request(
+                                all_requests, tokenizer_manager
+                            )
+
+                            single_ret = await tokenizer_manager.generate_request(
+                                adapted_request, raw_request
+                            ).__anext__()
+
+                            if not isinstance(single_ret, list):
+                                single_ret = [single_ret]
+                            all_results.extend(single_ret)
+                        except ValidationError as e:
+                            return create_error_response(
+                                message=f"Validation error in batch item {i+1}: {str(e)}",
+                                err_type="ValidationError",
+                                status_code=HTTPStatus.BAD_REQUEST,
+                            )
+                        except Exception as e:
+                            return create_error_response(
+                                message=f"Error processing batch item {i+1}: {str(e)}",
+                                err_type="ProcessingError",
+                                status_code=HTTPStatus.BAD_REQUEST,
+                            )
+
+                    ret = all_results
+            else:
+                all_requests = [EmbeddingRequest(**request_json)]
+                adapted_request, request = v1_embedding_request(
+                    all_requests, tokenizer_manager
+                )
+
+                ret = await tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ).__anext__()
 
-                if not isinstance(single_ret, list):
-                    single_ret = [single_ret]
-                all_results.extend(single_ret)
-            except ValueError as e:
-                return create_error_response(str(e))
+                if not isinstance(ret, list):
+                    ret = [ret]
 
-        ret = all_results
-    else:
-        all_requests = [EmbeddingRequest(**request_json)]
-        adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
-
-        try:
-            ret = await tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
-
-            if not isinstance(ret, list):
-                ret = [ret]
+        except ValidationError as e:
+            return create_error_response(
+                message=f"Input validation failed: {str(e)}",
+                err_type="ValidationError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
         except ValueError as e:
-            return create_error_response(str(e))
+            return create_error_response(
+                message=str(e),
+                err_type="ValueError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
 
-    response = v1_embedding_response(ret, tokenizer_manager.model_path)
-    return response
+        response = v1_embedding_response(ret, tokenizer_manager.model_path)
+        return response
+
+    except Exception as e:
+        return create_error_response(
+            message=f"Unexpected error: {str(e)}",
+            err_type="ServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 def to_openai_style_logprobs(
