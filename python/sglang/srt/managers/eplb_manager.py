@@ -1,8 +1,10 @@
 from typing import TYPE_CHECKING
 
+import torch
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -20,12 +22,12 @@ class EPLBManager:
         await self._tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
 
 
-def _compute_expert_location_metadata(logical_count):
+def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: torch.Tensor):
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
         num_replicas=TODO,
         num_groups=TODO,
-        num_nodes=TODO,
+        num_nodes=server_args.nnodes,
         num_gpus=TODO,
     )
     return ExpertLocationMetadata(
