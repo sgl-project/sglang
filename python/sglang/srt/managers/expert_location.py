@@ -43,6 +43,8 @@ class ExpertLocationMetadata:
             physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(
                 num_layers, 1
             ) % num_logical_experts,
+            # Throw away the redundant experts here - highly inefficient, but we do not care since we will
+            # use EPLB distribution logic
             logical_to_all_physical_map=torch.arange(0, num_physical_experts).repeat(
                 num_layers, 1
             )[..., None],
