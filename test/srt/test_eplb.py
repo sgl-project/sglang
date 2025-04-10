@@ -19,6 +19,7 @@ class TestEPLB(CustomTestCase):
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 eplb_storage_dir=tmpdir,
+                tp_size=2,
             )
 
             engine = sgl.Engine(**engine_kwargs)
