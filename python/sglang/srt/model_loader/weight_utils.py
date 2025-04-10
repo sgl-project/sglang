@@ -33,7 +33,11 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+    may_auto_override_quant_config,
+)
 from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
@@ -148,6 +152,26 @@ def get_quant_config(
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+
+    # Automatically detect and potentially override the quantization method
+    # based on the model's configuration. This enables compatibility with
+    # specialized implementations. For example, AWQ can be switched to
+    # AWQ Marlin for MOE fused layer support. This happens without
+    # requiring explicit user configuration. This only applies when the
+    # user hasn't explicitly specified a quantization method through
+    # parameters or CLI arguments (--quantization flag). This behavior
+    # aligns with VLLM's auto-detection mechanism:
+    # https://github.com/vllm-project/vllm/blob/c77620d22d43daa7e0440e6267cbdd83f849ac64/vllm/config.py#L633
+    #
+    # TODO: This ensures that DeepSeek v2/v3-awq models work correctly by transforming
+    # to awq-marlin quantization method. However, DeepSeek v2-Lite-awq requires special handling.
+    # Auto/manual adjustment of GPTQ_MARLIN_MIN_THREAD_K (128 -> 64) is required for DeepSeek v2-Lite-awq
+    # model using Marlin kernel. Need to investigate further to determine if this issue is more
+    # widespread and should be exposed as a configurable toggle in the future.
+    # Reference: https://github.com/sgl-project/sglang/pull/4426#issuecomment-2727350258
+    quant_cls, model_config.quantization = may_auto_override_quant_config(
+        hf_quant_config, model_config.quantization
+    )
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
