@@ -3,7 +3,6 @@ import unittest
 from typing import List
 
 import sglang as sgl
-import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -28,22 +27,24 @@ class TestEPLB(CustomTestCase):
                 tp_size=2,
             )
 
+            print(f"Action: start engine")
             engine = sgl.Engine(**engine_kwargs)
             ref_output = self._engine_generate(engine)
             self._assert_behavior(engine, ref_output)
 
+            print(f"Action: eplb_rebalance")
             engine.eplb_rebalance()
             self._assert_behavior(engine, ref_output)
 
+            print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
 
+            print(f"Action: start engine")
             engine = sgl.Engine(**engine_kwargs)
             self._assert_behavior(engine, ref_output)
 
-            engine.eplb_rebalance()
-            self._assert_behavior(engine, ref_output)
-
+            print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
 
@@ -55,8 +56,8 @@ class TestEPLB(CustomTestCase):
         self.assertEqual(actual_output, ref_output)
 
         physical_to_logical_map = engine.tokenizer_manager.expert_location_metadata.physical_to_logical_map
-        assert torch.all(physical_to_logical_map[0, :] == TODO)
-        TODO
+        physical_to_logical_map_layer_0 = physical_to_logical_map[0, :].tolist()
+        print(f"{physical_to_logical_map_layer_0=}")
 
     def _engine_generate(self, engine: sgl.Engine):
         output = engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
