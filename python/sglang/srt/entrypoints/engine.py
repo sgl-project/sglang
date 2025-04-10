@@ -521,7 +521,7 @@ def _launch_subprocesses(
             )
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                args=(server_args, port_args,expert_location_metadata, gpu_id, tp_rank, None, writer),
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
@@ -533,7 +533,7 @@ def _launch_subprocesses(
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
             target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+            args=(server_args, port_args,expert_location_metadata, writer),
         )
         proc.start()
         scheduler_procs.append(proc)
