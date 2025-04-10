@@ -47,6 +47,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.managers.schedule_batch import (
     get_global_expert_location_metadata,
     global_server_args_dict,
@@ -474,6 +475,9 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+    def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
+        TODO
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
