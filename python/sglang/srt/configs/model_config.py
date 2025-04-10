@@ -43,6 +43,7 @@ class ModelConfig:
         context_length: Optional[int] = None,
         model_override_args: Optional[str] = None,
         is_embedding: Optional[bool] = None,
+        disable_multimodal: Optional[bool] = False,
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
@@ -74,8 +75,8 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
-        self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
+        self.is_multimodal = not disable_multimodal and is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal_gen = not disable_multimodal and is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
