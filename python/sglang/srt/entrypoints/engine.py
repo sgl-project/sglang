@@ -358,6 +358,7 @@ class Engine:
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        param_categories: Optional[List[str]] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -368,6 +369,7 @@ class Engine:
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            param_categories=param_categories,
         )
 
         loop = asyncio.get_event_loop()
