@@ -27,9 +27,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build \
-            -t sglang-xpu-test \
-            -f docker/Dockerfile.xpu .
+          echo "[Placeholder] to build docker images"
 
       - name: Run container
         run: |
@@ -38,7 +36,7 @@ jobs:
             -v $PWD:/root/sglang \
             -w /root/sglang \
             --name ci_sglang_xpu \
-            sglang-xpu-test
+            sglang_xpu:u2410
 
       - name: Install Dependency
         timeout-minutes: 20
