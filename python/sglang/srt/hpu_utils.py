@@ -1,10 +1,24 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import itertools
 import math
 import os
 
 import torch
 
-from sglang.srt.utils import is_hpu, get_int_env_var, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hpu
 
 _is_hpu = is_hpu()
 
@@ -19,14 +33,14 @@ if _is_hpu:
     DECODE_BLOCK_BUCKET_STEP = get_int_env_var(
         "SGLANG_HPU_DECODE_BLOCK_BUCKET_STEP", 128
     )
-    DECODE_BLOCK_BUCKET_MAX = get_int_env_var("SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 2560)
+    DECODE_BLOCK_BUCKET_MAX = get_int_env_var(
+        "SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 2560
+    )
     DECODE_BATCH_BUCKET_MIN = get_int_env_var("SGLANG_HPU_DECODE_BATCH_BUCKET_MIN", 1)
     DECODE_BATCH_BUCKET_STEP = get_int_env_var(
         "SGLANG_HPU_DECODE_BATCH_BUCKET_STEP", 32
     )
-    DECODE_BATCH_BUCKET_MAX = get_int_env_var(
-        "SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 128
-    )
+    DECODE_BATCH_BUCKET_MAX = get_int_env_var("SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 128)
 
     USE_CONTIGUOUS_PA = get_bool_env_var("SGLANG_HPU_USE_CONTIGUOUS_PA", "true")
     SKIP_WARMUP = get_bool_env_var("SGLANG_HPU_SKIP_WARMUP", "false")
@@ -212,7 +226,7 @@ if _is_hpu:
                 num_pages = (ret.seq_lens[i] + page_size - 1) // page_size
                 num_lots_aligned = num_pages * page_size
                 slots = req_token_pool.req_to_token[
-                    ret.req_pool_indices[i], : num_lots_aligned
+                    ret.req_pool_indices[i], :num_lots_aligned
                 ]
                 pages = (slots // page_size).view(-1, page_size)[:, 0]
                 block_tables.append(pages.flatten().tolist())
