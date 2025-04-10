@@ -69,7 +69,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
-from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader

@@ -20,6 +20,9 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -42,12 +45,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
-from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-from torch import nn
-from transformers import PretrainedConfig
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -194,7 +198,7 @@ class Qwen2MoeAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 

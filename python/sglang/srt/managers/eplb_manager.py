@@ -1,10 +1,14 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
-from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+)
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -25,6 +29,7 @@ class EPLBManager:
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
         return TODO_trivial_output
 
+
 class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
         super().__init__()
@@ -43,15 +48,21 @@ class _EPLBManagerNoop(EPLBManager):
 
 
 # TODO maybe move to ExpertLocationMetadata static method?
-def _compute_expert_location_metadata_raw(server_args: ServerArgs, logical_count: torch.Tensor):
+def _compute_expert_location_metadata_raw(
+    server_args: ServerArgs, logical_count: torch.Tensor
+):
     model_config = ModelConfig.from_server_args(server_args)
-    model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
-    physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
-        weight=logical_count,
-        num_replicas=num_physical_experts,
-        num_groups=model_config_for_expert_location.num_groups,
-        num_nodes=server_args.nnodes,
-        num_gpus=world_size,
+    model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
+        model_config
+    )
+    physical_to_logical_map, logical_to_physical_map, expert_count = (
+        deepseek_eplb.rebalance_experts(
+            weight=logical_count,
+            num_replicas=num_physical_experts,
+            num_groups=model_config_for_expert_location.num_groups,
+            num_nodes=server_args.nnodes,
+            num_gpus=world_size,
+        )
     )
     return ExpertLocationMetadata(
         num_layers=model_config_for_expert_location.num_layers,
@@ -59,9 +70,13 @@ def _compute_expert_location_metadata_raw(server_args: ServerArgs, logical_count
         num_logical_experts=model_config_for_expert_location.num_logical_experts,
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_physical_map,
-        logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(logical_to_physical_map),
+        logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
+            logical_to_physical_map
+        ),
     )
 
 
-def _compute_logical_to_rank_dispatch_physical_map(logical_to_physical_map: torch.Tensor):
+def _compute_logical_to_rank_dispatch_physical_map(
+    logical_to_physical_map: torch.Tensor,
+):
     return TODO
