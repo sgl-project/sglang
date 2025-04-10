@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.model_loader import get_model_architecture
@@ -29,11 +28,10 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
-        # TODO handle more complex cases like duplicating experts on different GPUs
-        num_local_physical_experts = (
-            num_logical_experts // get_tensor_model_parallel_world_size()
-        )
-        num_physical_experts = num_logical_experts
+        num_physical_experts = TODO
+        world_size = get_tensor_model_parallel_world_size()
+        assert num_physical_experts % world_size == 0
+        num_local_physical_experts = num_physical_experts // world_size
 
         return ExpertLocationMetadata(
             num_layers=num_layers,
@@ -63,7 +61,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_all_physical(
-        self, layer_id: int, logical_expert_id: int
+            self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return [
             physical_expert_id
