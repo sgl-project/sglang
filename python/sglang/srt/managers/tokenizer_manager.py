@@ -711,7 +711,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.eplb_manager.rebalance_experts()
 
-    async def update_expert_location_metadata(self):
+    async def update_expert_location_metadata(self, expert_location_metadata: ExpertLocationMetadata):
         self.auto_create_handle_loop()
         TODO
 

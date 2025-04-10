@@ -18,9 +18,12 @@ class EPLBManager:
 
     async def rebalance_experts(self):
         TODO_may_or_may_not_save_current
-        logical_count = self._expert_distribution_storage.get_last_snapshot()
-        expert_location_metadata = _compute_expert_location_metadata(logical_count)
+        expert_location_metadata = self.get_expert_location_metadata()
         await self._tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
+
+    def get_expert_location_metadata(self):
+        logical_count = self._expert_distribution_storage.get_last_snapshot()
+        return _compute_expert_location_metadata(self._tokenizer_manager.server_args, logical_count)
 
 
 # TODO maybe move to ExpertLocationMetadata static method?
