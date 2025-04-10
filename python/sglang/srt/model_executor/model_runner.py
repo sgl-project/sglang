@@ -179,7 +179,7 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
-        self.expert_location_metadata = expert_location_metadata
+        self.expert_location_metadata = expert_location_metadata.clone()
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)

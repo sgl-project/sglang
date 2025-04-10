@@ -52,6 +52,13 @@ class ExpertLocationMetadata:
     def global_physical_to_local_physical(self, global_physical_expert_index: int):
         return global_physical_expert_index % self.num_local_physical_experts
 
+    def clone(self):
+        return ExpertLocationMetadata(
+            num_layers=self.num_layers,
+            num_local_physical_experts=self.num_local_physical_experts,
+            num_logical_experts=self.num_logical_experts,
+            physical_to_logical_map=self.physical_to_logical_map.clone(),
+        )
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
     return torch.arange(0, num_physical_experts).repeat(num_layers, 1)
