@@ -20,7 +20,7 @@ class ExpertLocationMetadata:
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_expert_location_metadata"):
             return model_class.get_expert_location_metadata(model_config.hf_config)
-        return ExpertLocationMetadata._init_dummy()
+        return ExpertLocationMetadata.init_empty()
 
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
@@ -41,7 +41,7 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def _init_dummy():
+    def init_empty():
         return ExpertLocationMetadata.init_new(num_layers=1, num_logical_experts=1)
 
     def local_physical_to_global_physical(
