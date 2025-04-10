@@ -502,7 +502,7 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    eplb_manager = EPLBManager(server_args)
+    eplb_manager = EPLBManager.init_new(server_args)
     expert_location_metadata = eplb_manager.compute_expert_location_metadata()
 
     scheduler_procs = []

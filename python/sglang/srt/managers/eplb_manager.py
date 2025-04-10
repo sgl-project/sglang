@@ -20,7 +20,7 @@ class EPLBManager:
             return _EPLBManagerNoop()
 
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
-        return TODO
+        return TODO_trivial_output
 
 class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
