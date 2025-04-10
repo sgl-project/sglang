@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.model_loader import get_model_architecture
 
 
 @dataclass
@@ -16,6 +17,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
+        model_class, _ = get_model_architecture(model_config)
         if hasattr(model_config, "get_expert_location_metadata"):
             return model_config.get_expert_location_metadata()
         return ExpertLocationMetadata._init_dummy()
