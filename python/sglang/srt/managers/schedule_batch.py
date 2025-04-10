@@ -86,7 +86,7 @@ global_server_args_dict = {
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
-global_expert_location_metadata = ExpertLocationMetadata.init_dummy()
+global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
 
 logger = logging.getLogger(__name__)
 
