@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union, Iterable
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
