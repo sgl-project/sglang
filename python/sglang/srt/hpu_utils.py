@@ -11,22 +11,71 @@ _is_hpu = is_hpu()
 if _is_hpu:
     _PAD_BLOCK_ID = 0
 
-    PREFILL_BUCKET_MIN = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_MIN", 512)
-    PREFILL_BUCKET_STEP = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_STEP", 512)
+    PREFILL_BUCKET_MIN = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_MIN", 1024)
+    PREFILL_BUCKET_STEP = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_STEP", 1024)
     PREFILL_BUCKET_MAX = os.environ.get("SGLANG_HPU_PREFILL_BUCKET_MAX", 4096)
 
     DECODE_BLOCK_BUCKET_MIN = os.environ.get("SGLANG_HPU_DECODE_BLOCK_BUCKET_MIN", 128)
     DECODE_BLOCK_BUCKET_STEP = os.environ.get(
         "SGLANG_HPU_DECODE_BLOCK_BUCKET_STEP", 128
     )
-    DECODE_BLOCK_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 4096)
-
+    DECODE_BLOCK_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BLOCK_BUCKET_MAX", 2560)
     DECODE_BATCH_BUCKET_MIN = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_MIN", 1)
     DECODE_BATCH_BUCKET_STEP = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_STEP", 32)
-    DECODE_BATCH_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 192)
+    DECODE_BATCH_BUCKET_MAX = os.environ.get("SGLANG_HPU_DECODE_BATCH_BUCKET_MAX", 128)
+
+    USE_CONTIGUOUS_PA = (
+        os.environ.get("SGLANG_HPU_USE_CONTIGUOUS_PA", "true").lower() == "true"
+    )
+    SKIP_WARMUP = os.environ.get("SGLANG_HPU_SKIP_WARMUP", "false").lower() == "true"
 
     from vllm_hpu_extension.bucketing import find_bucket
     from vllm_hpu_extension.ops import batch2block, block2batch
+
+    def get_prefill_all_seq_len_buckets():
+        return list(
+            range(PREFILL_BUCKET_MIN, PREFILL_BUCKET_MAX + 1, PREFILL_BUCKET_STEP)
+        )
+
+    def get_decode_all_batch_buckets():
+        buckets = []
+        batch = DECODE_BATCH_BUCKET_MIN
+        if batch < DECODE_BATCH_BUCKET_STEP:
+            while batch < DECODE_BATCH_BUCKET_STEP:
+                buckets.append(batch)
+                batch = batch * 2
+        buckets.extend(
+            range(
+                DECODE_BATCH_BUCKET_STEP,
+                DECODE_BATCH_BUCKET_MAX + 1,
+                DECODE_BATCH_BUCKET_STEP,
+            )
+        )
+        return buckets
+
+    def get_decode_all_seq_len_buckets():
+        return list(
+            range(
+                DECODE_BLOCK_BUCKET_MIN,
+                DECODE_BLOCK_BUCKET_MAX + 1,
+                DECODE_BLOCK_BUCKET_STEP,
+            )
+        )
+
+    def get_decode_all_buckets():
+        buckets = []
+        for batch_size in get_decode_all_batch_buckets():
+            for seq_len in get_decode_all_seq_len_buckets():
+                if seq_len == DECODE_BLOCK_BUCKET_MIN:
+                    buckets.append((batch_size, seq_len))
+                elif (
+                    seq_len // batch_size
+                    > DECODE_BLOCK_BUCKET_MAX // DECODE_BATCH_BUCKET_MAX
+                ):
+                    continue
+                else:
+                    buckets.append((batch_size, seq_len))
+        return buckets
 
     def flatten(in_list):
         return list(itertools.chain(*in_list))
@@ -88,7 +137,7 @@ if _is_hpu:
         assert len(block_list) == len(block_groups)
         assert len(block_list) == len(block_usage)
 
-        if ret.use_contiguous_pa:
+        if USE_CONTIGUOUS_PA:
             # Pad block metadata if needed
             block_bucket_size = max(max(block_list) + 1, len(block_list))
             block_bucket_size = find_bucket(
@@ -152,9 +201,7 @@ if _is_hpu:
 
         ret.page_size = page_size
         if ret.forward_mode.is_decode():
-            ret.use_contiguous_pa = os.environ.get(
-                "SGLANG_HPU_CONTIGUOUS_PA", "true"
-            ).lower() in ["true", "1"]
+            ret.use_contiguous_pa = USE_CONTIGUOUS_PA
             batch_size = len(ret.seq_lens)
             padded_batch_size = get_decode_batch_bucket(batch_size)
             block_tables = []

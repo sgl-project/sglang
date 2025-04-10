@@ -347,7 +347,7 @@ def throughput_test(
         throughput_test_once(
             backend_name=bench_args.backend,
             backend=backend,
-            reqs=input_requests,
+            reqs=warmup_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
             profile=False,

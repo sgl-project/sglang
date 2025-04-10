@@ -217,8 +217,8 @@ class ModelRunner:
             self.init_attention_backend()
             self.init_cuda_graphs()
         elif self.device == "hpu":
-            self.cuda_graph_runner = HPUGraphRunner(self)
             self.init_attention_backend()
+            self.cuda_graph_runner = HPUGraphRunner(self)
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
