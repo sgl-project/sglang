@@ -55,6 +55,12 @@ def _compute_expert_location_metadata_raw(
     model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
         model_config
     )
+
+    num_physical_experts = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
+    world_size = server_args.tp_size
+    assert num_physical_experts % world_size == 0
+    num_local_physical_experts = num_physical_experts // world_size
+
     physical_to_logical_map, logical_to_physical_map, expert_count = (
         deepseek_eplb.rebalance_experts(
             weight=logical_count,
@@ -66,7 +72,7 @@ def _compute_expert_location_metadata_raw(
     )
     return ExpertLocationMetadata(
         num_layers=model_config_for_expert_location.num_layers,
-        num_local_physical_experts=TODO,
+        num_local_physical_experts=num_local_physical_experts,
         num_logical_experts=model_config_for_expert_location.num_logical_experts,
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_physical_map,

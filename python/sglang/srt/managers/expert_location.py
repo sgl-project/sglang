@@ -23,13 +23,6 @@ class ExpertLocationMetadata:
     @staticmethod
     def init_trivial(num_layers: int, num_logical_experts: int):
         """Trivial location - logical expert i corresponds to physical expert i"""
-        num_physical_experts = (
-            num_logical_experts + global_server_args_dict["ep_num_redundant_experts"]
-        )
-        world_size = server_args.tp_size
-        assert num_physical_experts % world_size == 0
-        num_local_physical_experts = num_physical_experts // world_size
-
         return ExpertLocationMetadata(
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
