@@ -12,8 +12,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# P.S. DeepSeek-Coder-V2-Lite-Instruct has 64 routed experts
+_NUM_ROUTED_EXPERTS = 64  # DeepSeek-Coder-V2-Lite-Instruct
 _EP_NUM_REDUNDANT_EXPERTS = 4
+_NUM_OVERALL_PHYSICAL_EXPERTS = _NUM_ROUTED_EXPERTS + _EP_NUM_REDUNDANT_EXPERTS
 
 
 class TestEPLB(CustomTestCase):
@@ -60,9 +61,9 @@ class TestEPLB(CustomTestCase):
         print(f"{physical_to_logical_map_layer_0=}")
 
         if expect_physical_to_local_map == "equal_trivial":
-            self.assertEqual(physical_to_logical_map_layer_0, list(range(TODO)))
+            self.assertEqual(physical_to_logical_map_layer_0, list(range(_NUM_OVERALL_PHYSICAL_EXPERTS)))
         elif expect_physical_to_local_map == "not_equal_trivial":
-            self.assertNotEqual(physical_to_logical_map_layer_0, list(range(TODO)))
+            self.assertNotEqual(physical_to_logical_map_layer_0, list(range(_NUM_OVERALL_PHYSICAL_EXPERTS)))
         else:
             self.assertEqual(physical_to_logical_map_layer_0, expect_physical_to_local_map)
 
