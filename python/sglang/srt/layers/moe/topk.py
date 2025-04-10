@@ -297,7 +297,7 @@ def select_experts(
         )
 
     # TODO this is inefficient, and I will fuse into existing kernels
-    TODO
+    topk_ids = partial_logical_to_physical_map[topk_ids]
 
     expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
