@@ -33,5 +33,10 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
         num_gpus=server_args.tp_size,
     )
     return ExpertLocationMetadata(
-        TODO=TODO,
+        num_layers=TODO,
+        num_local_physical_experts=TODO,
+        num_logical_experts=TODO,
+        physical_to_logical_map=physical_to_logical_map,
+        logical_to_all_physical_map=logical_to_physical_map,
+        logical_to_rank_dispatch_physical_map=TODO,
     )
