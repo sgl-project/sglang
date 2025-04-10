@@ -40,19 +40,19 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec ci_sglang_xpu pip install --upgrade pip
-          docker exec ci_sglang_xpu pip install pytest expecttest ray
+          docker exec ci_sglang_xpu /miniforge3/envs/py310/bin/python3 -m pip install --upgrade pip
+          docker exec ci_sglang_xpu /miniforge3/envs/py310/bin/python3 -m pip install pytest expecttest ray
 
       - name: Run UT Cases
         timeout-minutes: 20
         run: |
-          docker exec -w /root/sglang ci_sglang_xpu pytest -v test/srt/test_custom_allreduce.py
+          docker exec -w /root/sglang ci_sglang_xpu /miniforge3/envs/py310/bin/python3 -m pytest -v test/srt/test_custom_allreduce.py
 
       - name: Run standard tests
         timeout-minutes: 20
         run: |
           docker exec -w /root/sglang ci_sglang_xpu \
-            python -m sglang.bench_one_batch \
+            /miniforge3/envs/py310/bin/python3 -m sglang.bench_one_batch \
             --batch-size 1 \
             --input 32 \
             --output 32 \
