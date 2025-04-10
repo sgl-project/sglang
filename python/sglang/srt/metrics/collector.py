@@ -27,13 +27,14 @@ class SchedulerStats:
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
     spec_accept_length: float = 0.0
+    avg_request_queue_latency: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
     def __init__(self, labels: Dict[str, str]) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Gauge
+        from prometheus_client import Gauge, Histogram
 
         self.labels = labels
         self.last_log_time = time.time()
@@ -87,6 +88,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.avg_request_queue_latency = Gauge(
+            name="sglang:avg_request_queue_latency",
+            documentation="The average request queue latency for the last batch of requests in seconds.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -99,6 +107,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
         self.last_log_time = time.time()
 
 
@@ -139,10 +148,10 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
             buckets=[
                 0.1,
-                0.3,
-                0.5,
-                0.7,
-                0.9,
+                0.2,
+                0.4,
+                0.6,
+                0.8,
                 1,
                 2,
                 4,
@@ -153,36 +162,9 @@ class TokenizerMetricsCollector:
                 40,
                 60,
                 80,
-                120,
-                160,
-            ],
-        )
-
-        self.histogram_time_per_output_token = Histogram(
-            name="sglang:time_per_output_token_seconds",
-            documentation="Histogram of time per output token in seconds.",
-            labelnames=labels.keys(),
-            buckets=[
-                0.002,
-                0.005,
-                0.010,
-                0.020,
-                0.030,
-                0.040,
-                0.050,
-                0.060,
-                0.070,
-                0.080,
-                0.090,
-                0.100,
-                0.150,
-                0.200,
-                0.300,
-                0.400,
-                0.600,
-                0.800,
-                1.000,
-                2.000,
+                100,
+                200,
+                400,
             ],
         )
 
@@ -202,17 +184,18 @@ class TokenizerMetricsCollector:
                 0.030,
                 0.035,
                 0.040,
-                0.050,
-                0.075,
+                0.060,
+                0.080,
                 0.100,
-                0.150,
                 0.200,
-                0.300,
                 0.400,
-                0.500,
-                0.750,
+                0.600,
+                0.800,
                 1.000,
                 2.000,
+                4.000,
+                6.000,
+                8.000,
             ],
         )
 
@@ -224,23 +207,22 @@ class TokenizerMetricsCollector:
                 0.1,
                 0.2,
                 0.4,
+                0.6,
                 0.8,
                 1,
                 2,
-                5,
+                4,
+                6,
+                8,
                 10,
                 20,
                 40,
                 60,
                 80,
                 100,
-                150,
                 200,
-                250,
-                300,
-                350,
-                500,
-                1000,
+                400,
+                800,
             ],
         )
 
@@ -256,13 +238,10 @@ class TokenizerMetricsCollector:
     ):
         self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
-        self.cached_tokens_total.labels(**self.labels).inc(cached_tokens)
+        if cached_tokens > 0:
+            self.cached_tokens_total.labels(**self.labels).inc(cached_tokens)
         self.num_requests_total.labels(**self.labels).inc(1)
         self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
-        if generation_tokens >= 1:
-            self.histogram_time_per_output_token.labels(**self.labels).observe(
-                e2e_latency / generation_tokens
-            )
 
     def observe_time_to_first_token(self, value: float):
         self.histogram_time_to_first_token.labels(**self.labels).observe(value)

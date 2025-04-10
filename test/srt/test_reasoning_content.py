@@ -20,11 +20,12 @@ from sglang.test.test_utils import (
     DEFAULT_REASONING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestReasoningContentAPI(unittest.TestCase):
+class TestReasoningContentAPI(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST
@@ -181,7 +182,7 @@ class TestReasoningContentAPI(unittest.TestCase):
         assert len(response.choices[0].message.content) > 0
 
 
-class TestReasoningContentWithoutParser(unittest.TestCase):
+class TestReasoningContentWithoutParser(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST

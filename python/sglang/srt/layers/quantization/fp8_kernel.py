@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -24,6 +25,7 @@ import triton.language as tl
 
 from sglang.srt.utils import (
     direct_register_custom_op,
+    get_bool_env_var,
     get_device_core_count,
     get_device_name,
     get_device_sm,
@@ -43,7 +45,7 @@ if _is_cuda:
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_quant_fp8
 
     sm_version = get_device_sm()
-    if sm_version >= 90 and int(os.getenv("SGL_ENABLE_JIT_DEEPGEMM", "1")):
+    if sm_version >= 90 and get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
         _enable_jit_deepgemm = True
 
 
@@ -58,7 +60,10 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+        M, K = A.shape
+        N, _ = B.shape
+        with _log_jit_build(M, N, K):
+            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -707,6 +712,25 @@ def get_w8a8_block_fp8_configs(
     return None
 
 
+@contextmanager
+def _log_jit_build(M: int, N: int, K: int):
+    from deep_gemm.jit.runtime import RuntimeCache
+
+    origin_func = RuntimeCache.__getitem__
+
+    def __patched_func(self, *args, **kwargs):
+        ret = origin_func(self, *args, **kwargs)
+        if ret is None:
+            logger.warning(
+                f"DeepGEMM JIT code generation <gemm_fp8_fp8_bf16_nt>: M={M}, N={N}, K={K}. Please wait."
+            )
+        return ret
+
+    RuntimeCache.__getitem__ = __patched_func
+    yield
+    RuntimeCache.__getitem__ = origin_func
+
+
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -781,7 +805,8 @@ def w8a8_block_fp8_matmul(
         if supports_custom_op():
             torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
         else:
-            deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
+            with _log_jit_build(M, N, K):
+                deep_gemm.gemm_fp8_fp8_bf16_nt((A, As), (B, Bs), C)
     else:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4

@@ -24,11 +24,13 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
 )
@@ -115,7 +117,7 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_manager = KVManager(kv_args, DisaggregationMode("decode"))
         return kv_manager
 
     def add(self, req: Req) -> None:
@@ -158,7 +160,7 @@ class DecodePreallocQueue:
 
         preallocated_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens(count_retracted=True)
+        allocatable_tokens = self._allocatable_tokens()
 
         for i, decode_req in enumerate(self.queue):
             if not decode_req.waiting_for_input:
@@ -186,6 +188,7 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
+                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (

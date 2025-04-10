@@ -1,9 +1,6 @@
 import itertools
 import os
-from typing import List
 
-import numpy as np
-import pytest
 import torch
 import triton
 import triton.language as tl
