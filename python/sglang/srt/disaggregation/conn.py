@@ -53,10 +53,20 @@ class KVManager:
         # Create socket connection between decode/prefill
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.PAIR)
+
+        # TODO(wyt) For 1P1D we just let D connect P now, and exchange metadata immediately.
+        # Possible future design:
+        # we may have many P and Ds, 
+        # every P will have a unique addr and port to serve a boostrap server
+        # Once D recv a req, it will:
+        # 1. connect to the corresponding P bootstrap server
+        # 2. exchange metadata, such as room number, memory desc, etc.
+        # 3. poll and wait until kvcache is ready.
+
         if mode == "prefill":
-            self.socket.connect("tcp://127.0.0.1:8998")
-        elif mode == "decode":
             self.socket.bind("tcp://127.0.0.1:8998")
+        elif mode == "decode":
+            self.socket.connect("tcp://127.0.0.1:8998")
 
         # Metadata exchange
         if mode == "prefill":
@@ -98,6 +108,10 @@ class KVSender:
         self.aux_index = aux_index
 
     def send(self, kv_indices: npt.NDArray[np.int32]):
+
+        # TODO(wyt) this is just for 1p1d and max parallelism = 1.
+        # TODO In future we will got those descs from our bootstrap server, given room number.
+
         # Get descs
         logging.info(f"[wytdebug] recving descs for bootstrap_room {self.bootstrap_room}")
         remote_kv_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
@@ -111,11 +125,7 @@ class KVSender:
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "DRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        
-        logging.info("[wytdebug] KVSender: kv_descs: %s", kv_descs)
-        logging.info("[wytdebug] KVSender: remote_kv_descs: %s", remote_kv_descs)
-        logging.info("[wytdebug] KVSender: peer_name: %s", self.mgr.peer_name)
-        logging.info("[wytdebug] KVSender: str(self.bootstrap_room) %s", str(self.bootstrap_room))
+        logging.info(f"[wytdebug] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
 
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
@@ -171,6 +181,13 @@ class KVReceiver:
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         logging.info(f'[wytdebug] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
+
+        # TODO(wyt) This is for 1P1D and max-parallelism = 1.
+        # In future, once D recv a req, it will:
+        # 1. do preallocate 
+        # 2. connect the bootstrap server and send metadata, such as room number, memory desc, etc.
+        # 3. poll and wait until kvcache is ready.
+        
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(kv_descs))
         self.mgr.socket.send(self.mgr.agent.get_serialized_descs(aux_descs))
         self.has_init = True

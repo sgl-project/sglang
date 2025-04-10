@@ -567,8 +567,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
+
+            # wyt: I believe it's large enough, with proper recycling
+            buffer_size = 1024 # self.max_running_requests * 2
+
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )

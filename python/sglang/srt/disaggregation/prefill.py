@@ -99,7 +99,7 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        logging.info("[wytdebug] bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
+        logging.info("[wytdebug] Bqueue enqueue. bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -127,7 +127,7 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            logging.info(f"[wytdebug] req bootstrap room: {req.bootstrap_room}, poll result: {poll}")
+            logging.info(f"[wytdebug] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
@@ -149,7 +149,7 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
         if len(bootstrapped_reqs) > 0:
-            logging.info(f"[wytdebug] pop_bootstrapped pop out: {len(bootstrapped_reqs)}")
+            logging.info(f"[wytdebug] Bbqueue pop out: {len(bootstrapped_reqs)}")
         return bootstrapped_reqs
 
 
@@ -215,6 +215,11 @@ class SchedulerDisaggregationPrefillMixin:
         # Stream requests which have finished transfer
         self.stream_output(done_reqs, False, None)
 
+        for req in done_reqs:
+            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+                req.metadata_buffer_index
+            )
+
         self.disagg_prefill_infight_queue = undone_reqs
 
     def process_prefill_chunk(self: Scheduler) -> None:
@@ -234,6 +239,8 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         """
         Send a prefilled chunk to the decode server
+
+        token_id is the first output token.
         """
         start_idx = req.start_send_idx
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
@@ -247,5 +254,5 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.allocate_token_id(
                 req.metadata_buffer_index, token_id
             )
-        logging.info(f"[wytdebug] send_kv_chunk: {req.req_pool_idx} {req.metadata_buffer_index} {kv_indices}")
+        logging.info(f"[wytdebug] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
         req.disagg_kv_sender.send(kv_indices)
