@@ -196,7 +196,7 @@ class ModelRunner:
 
         expert_distribution_recorder.initialize(
             server_args,
-            self.expert_location_metadata,
+            global_expert_location_metadata,
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )
