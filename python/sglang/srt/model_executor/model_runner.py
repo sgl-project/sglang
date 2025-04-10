@@ -517,8 +517,10 @@ class ModelRunner:
 
         if self.server_args.enable_hip_attention:
             orig_context_length = get_context_length(self.model_config.hf_config)
-            new_context_length = max(
-                orig_context_length, self.server_args.context_length
+            new_context_length = (
+                max(orig_context_length, self.server_args.context_length)
+                if self.server_args.context_length is not None
+                else orig_context_length
             )
             if self.server_args.context_length is None:
                 new_context_length = orig_context_length
