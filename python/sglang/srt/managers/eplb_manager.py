@@ -31,11 +31,6 @@ class _EPLBManagerReal(EPLBManager):
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage()
 
-    async def rebalance_experts(self):
-        TODO_may_or_may_not_save_current
-        expert_location_metadata = self.compute_expert_location_metadata()
-        await self.tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
-
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
         if logical_count is None:
