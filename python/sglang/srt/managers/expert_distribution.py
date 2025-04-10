@@ -192,7 +192,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         ] * self._expert_location_metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
-                local_physical_expert_idx = TODO
+                local_physical_expert_idx = self._expert_location_metadata.global_physical_to_local_physical(global_physical_expert_idx)
                 num_recv_tokens_per_expert_list[local_physical_expert_idx] += 1
 
         self._on_layer_data(layer_idx, num_recv_tokens_per_expert_list)
