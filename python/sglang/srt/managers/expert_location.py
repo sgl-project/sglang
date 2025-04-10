@@ -15,9 +15,8 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-    logical_to_rank_dispatch_physical_map: (
-        torch.Tensor
-    )  # (num_gpus, layers, num_logical_experts)
+    # (num_gpus, layers, num_logical_experts)
+    logical_to_rank_dispatch_physical_map: torch.Tensor
 
     # -------------------------------- construction and mutation ------------------------------------
 
@@ -32,7 +31,7 @@ class ExpertLocationMetadata:
     def init_new(num_layers: int, num_logical_experts: int):
         # TODO handle more complex cases like duplicating experts on different GPUs
         num_local_physical_experts = (
-            num_logical_experts // get_tensor_model_parallel_world_size()
+                num_logical_experts // get_tensor_model_parallel_world_size()
         )
         num_physical_experts = num_logical_experts
 
@@ -64,7 +63,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_all_physical(
-        self, layer_id: int, logical_expert_id: int
+            self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return [
             physical_expert_id
