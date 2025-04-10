@@ -26,7 +26,9 @@ class TestEPLB(CustomTestCase):
         del engine
 
     def _assert_behavior(self, engine: sgl.Engine):
-        engine.flu
+        ret = engine.flush_cache()
+        assert ret.success
+
         TODO
 
 
