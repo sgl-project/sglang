@@ -173,7 +173,7 @@ class ModelConfig:
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
     @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str=None):
+    def from_server_args(server_args: ServerArgs, model_path: str = None):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
