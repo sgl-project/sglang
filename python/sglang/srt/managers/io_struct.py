@@ -668,11 +668,15 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
     pass
 
 
 @dataclass
+class FlushCacheReqOutput:
+    success: bool
+
+
 class UpdateExpertLocationReqInput:
     expert_location_metadata: "ExpertLocationMetadata"
 
