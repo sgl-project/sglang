@@ -41,6 +41,8 @@ class ExpertLocationMetadata:
                 num_layers=num_layers,
                 num_physical_experts=num_physical_experts,
             ),
+            logical_to_all_physical_map=TODO,
+            logical_to_rank_chosen_physical_map=TODO,
         )
 
     @staticmethod
