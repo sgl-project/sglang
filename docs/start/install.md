@@ -52,6 +52,16 @@ cd ..
 pip install -e "python[all_hip]"
 ```
 
+Note: For Intel Gaudi2/3 accelerator, do following instead:
+
+1. Follow the instructions in [Intel Gaudi Installation Guide](https://github.com/HabanaAI/vllm-fork/releases/tag/v0.6.6.post1%2BGaudi-1.20.0) to install the dependencies.
+2. Install SGLang with the following command:
+```
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[all_xpu]"
+```
+
 ## Method 3: Using docker
 The docker images are available on Docker Hub as [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
 Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
