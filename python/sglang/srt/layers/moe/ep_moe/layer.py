@@ -2,6 +2,7 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
+
 from sglang.srt.managers.schedule_batch import get_global_expert_location_metadata
 
 try:
@@ -224,7 +225,9 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
-            expert_logical_to_rank_dispatch_physical_map=get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[self.tp_rank, self.layer_id, :],
+            expert_logical_to_rank_dispatch_physical_map=get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[
+                self.tp_rank, self.layer_id, :
+            ],
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -262,7 +265,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -415,7 +418,9 @@ class EPMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         physical_expert_ids = (
-            get_global_expert_location_metadata().logical_to_all_physical(self.layer_id, expert_id)
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
         )
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(
@@ -459,7 +464,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -491,11 +496,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                    : (self.intermediate_size + block_n - 1) // block_n, :
+                        : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                    (self.intermediate_size + block_n - 1) // block_n:, :
+                        (self.intermediate_size + block_n - 1) // block_n :, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
