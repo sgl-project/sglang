@@ -31,6 +31,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -55,9 +56,10 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    UpdateExpertLocationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput, UpdateExpertLocationReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -363,7 +365,9 @@ class Engine:
             expert_location_metadata=expert_location_metadata,
         )
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.update_expert_location(obj))
+        return loop.run_until_complete(
+            self.tokenizer_manager.update_expert_location(obj)
+        )
 
     def update_weights_from_disk(
         self,
