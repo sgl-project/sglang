@@ -673,7 +673,7 @@ class FlushCacheReq:
 
 
 @dataclass
-class UpdateExpertLocationMetadataReqInput:
+class UpdateExpertLocationReqInput:
     expert_location_metadata: "ExpertLocationMetadata"
 
 
