@@ -1333,27 +1333,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        # Only Deepseek V3/R1 tp mode can use shared experts fusion optimization now.
-        if (
-            global_server_args_dict.get("disable_shared_experts_fusion", False)
-            or self.config.architectures[0] != "DeepseekV3ForCausalLM"
-            or self.config.n_routed_experts != 256
-            or self.config.routed_scaling_factor != 2.5
-            or global_server_args_dict["enable_deepep_moe"]
-        ):
-            self.n_share_experts_fusion = 0
-            global_server_args_dict["n_share_experts_fusion"] = 0
-            logger.info(
-                "Only Deepseek V3/R1 tp mode can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
-            )
-        elif self.n_share_experts_fusion is None:
-            global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-            self.n_share_experts_fusion = self.tp_size
-            logger.info(
-                f"Shared experts fusion optimization is default enabled in DeepSeek V3/R1, and n_share_experts_fusion is set to {self.tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
-            )
-
+        
+        self.n_share_experts_fusion = self._initialize_shared_experts_fusion(config, self.tp_size)
+        
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1365,6 +1347,31 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_attention_dp_size()
+
+    @staticmethod
+    def _initialize_shared_experts_fusion(config, tp_size) -> int:
+        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        
+        if (
+            global_server_args_dict.get("disable_shared_experts_fusion", False)
+            or config.architectures[0] != "DeepseekV3ForCausalLM"
+            or config.n_routed_experts != 256
+            or global_server_args_dict["enable_deepep_moe"]
+        ):
+            n_share_experts_fusion = 0
+            global_server_args_dict["n_share_experts_fusion"] = 0
+            logger.info(
+                "Only Deepseek V3/R1 tp mode can use shared experts fusion optimization. Shared experts fusion optimization is disabled."
+            )
+        elif n_share_experts_fusion is None:
+            n_share_experts_fusion = tp_size
+            global_server_args_dict["n_share_experts_fusion"] = tp_size
+            global_server_args_dict["routed_scaling_factor"] = config.routed_scaling_factor
+            logger.info(
+                f"Shared experts fusion optimization is default enabled in DeepSeek V3/R1, and n_share_experts_fusion is set to {tp_size}. You can tune it by setting --n_share_experts_fusion or disable it by setting --disable_shared_experts_fusion."
+            )
+            
+        return n_share_experts_fusion
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

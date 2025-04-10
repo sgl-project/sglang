@@ -163,6 +163,7 @@ class ModelRunner:
                 "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
+                "routed_scaling_factor": server_args.routed_scaling_factor,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
                 "use_mla_backend": self.use_mla_backend,
             }

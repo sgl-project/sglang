@@ -60,6 +60,7 @@ __device__ void moe_fused_gate_impl(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
+    float routed_scaling_factor,
     Params params) {
   int tidx = threadIdx.x;
   int64_t thread_row =
@@ -213,8 +214,8 @@ __device__ void moe_fused_gate_impl(
         indices_ptr[idx] = static_cast<int32_t>(expert);
       }
 
-      // accumulate sum
-      if (thread_group_idx == 0) {
+      // accumulate sum for first k-1 elements only
+      if (thread_group_idx == 0 && k_idx < topk - 1) {
         output_sum += output_ptr[idx];
       }
     }
@@ -224,30 +225,19 @@ __device__ void moe_fused_gate_impl(
 
   // Handle n_share_experts_fusion if needed
   if (n_share_experts_fusion > 0 && thread_group_idx == 0) {
-    // For the last position, we need to set a random expert ID and adjust the weight
     int64_t last_idx = topk * thread_row + (topk - 1);
+    
+    // Use round-robin to select expert
+    int64_t expert_offset = thread_row % n_share_experts_fusion;
+    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
-    // Use curand to generate random number
-    curandStatePhilox4_32_10_t state;
-    curand_init(thread_row, 0, 0, &state);
-    int64_t random_offset = curand(&state) % n_share_experts_fusion;
-    indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + random_offset);
-
-    // Calculate the sum of the first k-1 weights
-    float prev_sum = 0.0f;
-    for (int ii = 0; ii < topk - 1; ++ii) {
-      prev_sum += output_ptr[topk * thread_row + ii];
-    }
+    // Set the weight to the sum of the first k-1 weights divided by routed_scaling_factor
+    output_ptr[last_idx] = output_sum / routed_scaling_factor;
 
     __syncthreads();
-
-    // Set the weight to the sum of the first k-1 weights divided by 2.5 (as in the Python implementation)
-    output_ptr[last_idx] = prev_sum / 2.5f;
-
-    // For renormalization, we only use the sum of the first k-1 weights
-    output_sum = prev_sum;
-
-    __syncthreads();
+  } else if (thread_group_idx == 0) {
+    // If not using shared experts, add the last weight to output_sum
+    output_sum += output_ptr[topk * thread_row + (topk - 1)];
   }
 
   ////////////////////// Rescale Output //////////////////////
@@ -289,10 +279,11 @@ __global__ void moe_fused_gate_kernel(
     int64_t num_rows,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion) {
+    int64_t n_share_experts_fusion,
+    float routed_scaling_factor) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
   moe_fused_gate_impl<T>(
-      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
+      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, routed_scaling_factor, params);
 }
 
 // Macro to compute compile-time constants and launch the kernel.
@@ -311,7 +302,8 @@ __global__ void moe_fused_gate_kernel(
             num_rows,                                                                                    \
             topk_group,                                                                                  \
             topk,                                                                                        \
-            n_share_experts_fusion);                                                                     \
+            n_share_experts_fusion,                                                                      \
+            routed_scaling_factor);                                                                      \
     dispatched = true;                                                                                   \
   } while (0)
 
@@ -338,7 +330,8 @@ __global__ void moe_fused_gate_kernel_dynamic(
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion) {
+    int64_t n_share_experts_fusion,
+    float routed_scaling_factor) {
   KernelParamsDynamic params;
   params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
   params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
@@ -348,7 +341,7 @@ __global__ void moe_fused_gate_kernel_dynamic(
   params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
   moe_fused_gate_impl<T>(
-      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, params);
+      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, routed_scaling_factor, params);
 }
 
 //------------------------------------------------------------------------------
@@ -360,7 +353,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion) {
+    int64_t n_share_experts_fusion,
+    float routed_scaling_factor) {
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
@@ -458,7 +452,8 @@ std::vector<at::Tensor> moe_fused_gate(
           num_expert_group,
           topk_group,
           topk,
-          n_share_experts_fusion);
+          n_share_experts_fusion,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kHalf) {
       moe_fused_gate_kernel_dynamic<float16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -470,7 +465,8 @@ std::vector<at::Tensor> moe_fused_gate(
           num_expert_group,
           topk_group,
           topk,
-          n_share_experts_fusion);
+          n_share_experts_fusion,
+          routed_scaling_factor);
     } else if (input.scalar_type() == at::kFloat) {
       moe_fused_gate_kernel_dynamic<float32_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
@@ -482,7 +478,8 @@ std::vector<at::Tensor> moe_fused_gate(
           num_expert_group,
           topk_group,
           topk,
-          n_share_experts_fusion);
+          n_share_experts_fusion,
+          routed_scaling_factor);
     } else {
       TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
     }

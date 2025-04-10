@@ -184,6 +184,7 @@ class ServerArgs:
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     n_share_experts_fusion: Optional[int] = None
+    routed_scaling_factor: Optional[float] = None
     disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps

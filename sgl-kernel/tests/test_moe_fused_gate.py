@@ -36,6 +36,7 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, n_share_experts_fusi
         topk_group=topk_group,
         topk=topk,
         n_share_experts_fusion=n_share_experts_fusion,
+        routed_scaling_factor=2.5,
     )
     ref_output, ref_indices = biased_grouped_topk(
         scores,

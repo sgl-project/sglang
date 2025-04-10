@@ -219,25 +219,34 @@ def biased_grouped_topk(
     topk_group: int = 0,
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: float = 2.5,
 ):
-    biased_grouped_topk_fn = (
-        torch.compile(
-            biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
-        )
-        if compiled
-        else biased_grouped_topk_impl
-    )
-    return biased_grouped_topk_fn(
-        hidden_states,
-        gating_output,
-        correction_bias,
-        topk,
-        renormalize,
-        num_expert_group,
-        topk_group,
-        n_share_experts_fusion=n_share_experts_fusion,
-    )
-
+    # biased_grouped_topk_fn = (
+    #     torch.compile(
+    #         biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+    #     )
+    #     if compiled
+    #     else biased_grouped_topk_impl
+    # )
+    # return biased_grouped_topk_fn(
+    #     hidden_states,
+    #     gating_output,
+    #     correction_bias,
+    #     topk,
+    #     renormalize,
+    #     num_expert_group,
+    #     topk_group,
+    #     n_share_experts_fusion=n_share_experts_fusion,
+    # )
+    from sgl_kernel import moe_fused_gate
+    topk_weights, topk_ids = moe_fused_gate(gating_output,
+                                            correction_bias,
+                                            num_expert_group,
+                                            topk_group,
+                                            topk,
+                                            n_share_experts_fusion,
+                                            routed_scaling_factor)
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -250,10 +259,12 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    routed_scaling_factor: float = 2.5,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
         n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        routed_scaling_factor = global_server_args_dict["routed_scaling_factor"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
@@ -278,6 +289,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                routed_scaling_factor=routed_scaling_factor,
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(
