@@ -28,7 +28,8 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
         num_replicas=TODO,
         num_groups=TODO,
         num_nodes=server_args.nnodes,
-        num_gpus=TODO,
+        # TODO Consider scenario when disabling DP attn + DP size > 1
+        num_gpus=server_args.tp_size,
     )
     return ExpertLocationMetadata(
         TODO=TODO,
