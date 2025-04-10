@@ -85,7 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, FlushCacheReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
