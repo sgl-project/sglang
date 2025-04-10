@@ -30,6 +30,8 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -495,7 +497,8 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    expert_location_metadata = ExpertLocationMetadata.from_model(TODO)
+    model_config = ModelConfig.from_server_args(server_args)
+    expert_location_metadata = ExpertLocationMetadata.from_model_config(model_config)
 
     scheduler_procs = []
     if server_args.dp_size == 1:
