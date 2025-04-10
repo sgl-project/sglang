@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -47,7 +46,6 @@ class _EPLBManagerNoop(EPLBManager):
     pass
 
 
-# TODO maybe move to ExpertLocationMetadata static method?
 def _compute_expert_location_metadata_raw(
         server_args: ServerArgs, logical_count: torch.Tensor
 ):
