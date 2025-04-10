@@ -33,11 +33,7 @@ class HPUAttnBackend(AttentionBackend):
         self.block2batch_matmul = Matmul()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        import vllm_hpu_extension.environment as environment
-
-        # TODO: remove the hardcoded model_type once we have a better way to handle this
-        environment.runtime_params["model_type"] = "llama"
+        pass
 
     def forward_extend(
         self,
