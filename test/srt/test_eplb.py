@@ -1,5 +1,6 @@
 import unittest
 
+import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -8,13 +9,24 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-import sglang as sgl
 
 
 class TestEPLB(CustomTestCase):
     def test_eplb_e2e(self):
         engine = sgl.Engine(model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST)
+        self._assert_behavior(engine)
+
         engine.shutdown()
+        del engine
+
+        engine = sgl.Engine(model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST)
+        self._assert_behavior(engine)
+
+        engine.shutdown()
+        del engine
+
+    def _assert_behavior(self, engine: sgl.Engine):
+        TODO
 
 
 if __name__ == "__main__":
