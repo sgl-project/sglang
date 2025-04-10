@@ -131,7 +131,7 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
     curl -L -H "Authorization: token $GITHUB_TOKEN" -C - \
         --retry 5 \
         -o $ARTIFACT_NAME.zip $LATEST_ARTIFACT_URL && \
-    unzip -t $ARTIFACT_NAME.zip && \ 
+    unzip -t $ARTIFACT_NAME.zip && \
     unzip $ARTIFACT_NAME.zip -d $TEMP_DIR && \
     echo  "Installing Triton wheels..." && \
     pip install $TEMP_DIR/*.whl --root-user-action=ignore && \
@@ -146,7 +146,7 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
     pip install setuptools_scm --root-user-action=ignore && \
     pip install setuptools==75.6.0 packaging==24.2 --root-user-action=ignore && \
     VLLM_TARGET_DEVICE=xpu python setup.py install && \
-    # Install SGlang from source 
+    # Install SGlang from source
     cd /root && \
     git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && \
@@ -156,7 +156,7 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION_STRING}; . /opt/intel/oneapi/setvars.sh; cd /root/" >> /root/.bashrc;
-    
+
 
 # Set the default shell to bash
 SHELL ["bash", "-c"]
