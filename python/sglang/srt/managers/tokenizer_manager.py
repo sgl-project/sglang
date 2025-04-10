@@ -202,9 +202,9 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
+        self.eplb_manager = eplb_manager
         if eplb_manager is not None:
             eplb_manager.bind(self)
-            self.eplb_manager = eplb_manager
 
         # Store states
         self.no_create_loop = False
@@ -893,6 +893,11 @@ class TokenizerManager:
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if self.eplb_manager is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.eplb_manager.handle_loop))
+            )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
