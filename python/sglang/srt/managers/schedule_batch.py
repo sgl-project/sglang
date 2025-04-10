@@ -271,17 +271,17 @@ class MultimodalDataItem:
 
     def is_audio(self):
         return (
-                self.modality == Modality.AUDIO
+            self.modality == Modality.AUDIO
         ) and not MultimodalDataItem.is_empty_list(self.audio_features)
 
     def is_image(self):
         return (
-                self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
+            self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
     def is_video(self):
         return (
-                self.modality == Modality.VIDEO
+            self.modality == Modality.VIDEO
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
     def validate(self):
@@ -390,24 +390,24 @@ class Req:
     """The input and output status of a request."""
 
     def __init__(
-            self,
-            rid: str,
-            origin_input_text: str,
-            origin_input_ids: Tuple[int],
-            sampling_params: SamplingParams,
-            return_logprob: bool = False,
-            top_logprobs_num: int = 0,
-            token_ids_logprob: List[int] = None,
-            stream: bool = False,
-            origin_input_ids_unpadded: Optional[Tuple[int]] = None,
-            lora_path: Optional[str] = None,
-            input_embeds: Optional[List[List[float]]] = None,
-            session_id: Optional[str] = None,
-            custom_logit_processor: Optional[str] = None,
-            return_hidden_states: bool = False,
-            eos_token_ids: Optional[Set[int]] = None,
-            bootstrap_host: Optional[str] = None,
-            bootstrap_room: Optional[int] = None,
+        self,
+        rid: str,
+        origin_input_text: str,
+        origin_input_ids: Tuple[int],
+        sampling_params: SamplingParams,
+        return_logprob: bool = False,
+        top_logprobs_num: int = 0,
+        token_ids_logprob: List[int] = None,
+        stream: bool = False,
+        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
+        lora_path: Optional[str] = None,
+        input_embeds: Optional[List[List[float]]] = None,
+        session_id: Optional[str] = None,
+        custom_logit_processor: Optional[str] = None,
+        return_hidden_states: bool = False,
+        eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -573,9 +573,9 @@ class Req:
         return self.finished_reason is not None
 
     def init_next_round_input(
-            self,
-            tree_cache: Optional[BasePrefixCache] = None,
-            enable_hierarchical_cache=False,
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        enable_hierarchical_cache=False,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
@@ -621,7 +621,7 @@ class Req:
             )
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
-        return all_ids[self.surr_offset:], self.read_offset - self.surr_offset
+        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self):
         if self.finished():
@@ -653,7 +653,7 @@ class Req:
                 matched_eos |= last_token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= (
-                            last_token_id in self.tokenizer.additional_stop_token_ids
+                        last_token_id in self.tokenizer.additional_stop_token_ids
                     )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
@@ -662,7 +662,7 @@ class Req:
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1):]
+                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
             )
 
             for stop_str in self.sampling_params.stop_strs:
@@ -778,15 +778,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @classmethod
     def init_new(
-            cls,
-            reqs: List[Req],
-            req_to_token_pool: ReqToTokenPool,
-            token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-            tree_cache: BasePrefixCache,
-            model_config: ModelConfig,
-            enable_overlap: bool,
-            spec_algorithm: SpeculativeAlgorithm,
-            enable_custom_logit_processor: bool,
+        cls,
+        reqs: List[Req],
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        tree_cache: BasePrefixCache,
+        model_config: ModelConfig,
+        enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm,
+        enable_custom_logit_processor: bool,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -850,17 +850,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return out_cache_loc
 
     def alloc_paged_token_slots_extend(
-            self,
-            prefix_lens: torch.Tensor,
-            seq_lens: torch.Tensor,
-            last_loc: torch.Tensor,
-            extend_num_tokens: int,
-            backup_state: bool = False,
+        self,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        backup_state: bool = False,
     ):
         if (
-                self.token_to_kv_pool_allocator.available_size()
-                < extend_num_tokens
-                + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+            self.token_to_kv_pool_allocator.available_size()
+            < extend_num_tokens
+            + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
         ):
             if self.tree_cache is not None:
                 self.tree_cache.evict(
@@ -891,15 +891,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return out_cache_loc
 
     def alloc_paged_token_slots_decode(
-            self,
-            seq_lens: torch.Tensor,
-            last_loc: torch.Tensor,
-            backup_state: bool = False,
+        self,
+        seq_lens: torch.Tensor,
+        last_loc: torch.Tensor,
+        backup_state: bool = False,
     ):
         if self.tree_cache is not None:
             if (
-                    self.token_to_kv_pool_allocator.available_size()
-                    < len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+                self.token_to_kv_pool_allocator.available_size()
+                < len(seq_lens) * self.token_to_kv_pool_allocator.page_size
             ):
                 self.tree_cache.evict(
                     len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
@@ -958,15 +958,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
-                encoder_out_cache_loc.append(self.out_cache_loc[pt: pt + encoder_len])
+                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len: pt + req.extend_input_len]
+                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt: pt + req.extend_input_len]
+                    self.out_cache_loc[pt : pt + req.extend_input_len]
                 )
                 self.prefix_lens[i] -= encoder_len
 
@@ -1005,7 +1005,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -1080,8 +1080,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     global_start_idx = req.logprob_start_len
 
                 logprob_token_ids = req.origin_input_ids[
-                                    global_start_idx + 1: global_end_idx + 1
-                                    ]
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
@@ -1089,9 +1089,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
-                            req.extend_input_len
-                            - req.extend_logprob_start_len
-                            - len(logprob_token_ids)
+                        req.extend_input_len
+                        - req.extend_logprob_start_len
+                        - len(logprob_token_ids)
                     )
                 )
 
@@ -1155,7 +1155,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for i in range(bs):
                 self.req_to_token_pool.write(
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc[pt: pt + extend_lens[i]],
+                    out_cache_loc[pt : pt + extend_lens[i]],
                 )
                 pt += extend_lens[i]
 
@@ -1206,9 +1206,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
-                self.new_page_count_next_decode()
-                * buf_multiplier
-                * self.token_to_kv_pool_allocator.page_size
+            self.new_page_count_next_decode()
+            * buf_multiplier
+            * self.token_to_kv_pool_allocator.page_size
         )
 
         if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
@@ -1240,27 +1240,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             headroom_for_spec_decode = 0
             if server_args.speculative_algorithm:
                 headroom_for_spec_decode += (
-                        num_reqs
-                        * server_args.speculative_eagle_topk
-                        * server_args.speculative_num_steps
-                        + num_reqs * server_args.speculative_num_draft_tokens
+                    num_reqs
+                    * server_args.speculative_eagle_topk
+                    * server_args.speculative_num_steps
+                    + num_reqs * server_args.speculative_num_draft_tokens
                 )
             return (
-                    num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
+                num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while (
-                self.token_to_kv_pool_allocator.available_size()
-                < get_required_tokens(len(sorted_indices))
-                or first_iter
+            self.token_to_kv_pool_allocator.available_size()
+            < get_required_tokens(len(sorted_indices))
+            or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
+                    self.token_to_kv_pool_allocator.available_size() > 0
                 ), "No space left for only one request"
                 break
 
@@ -1272,18 +1272,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
                 token_indices = self.req_to_token_pool.req_to_token[
-                                req.req_pool_idx, : seq_lens_cpu[idx]
-                                ]
+                    req.req_pool_idx, : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
             else:
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = (
-                                            len(req.prefix_indices) // server_args.page_size
-                                    ) * server_args.page_size
+                    len(req.prefix_indices) // server_args.page_size
+                ) * server_args.page_size
                 token_indices = self.req_to_token_pool.req_to_token[
-                                req.req_pool_idx, last_uncached_pos: seq_lens_cpu[idx]
-                                ]
+                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+                ]
                 self.token_to_kv_pool_allocator.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
 
@@ -1292,8 +1292,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
-                        len(sorted_indices) * global_config.retract_decode_steps
-                        - self.token_to_kv_pool_allocator.available_size()
+                    len(sorted_indices) * global_config.retract_decode_steps
+                    - self.token_to_kv_pool_allocator.available_size()
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size)
@@ -1307,8 +1307,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
-                                     total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
-                             ) / total_max_new_tokens
+            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+        ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
@@ -1396,16 +1396,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def filter_batch(
-            self,
-            chunked_req_to_exclude: Optional[Req] = None,
-            keep_indices: Optional[List[int]] = None,
+        self,
+        chunked_req_to_exclude: Optional[Req] = None,
+        keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                   and self.reqs[i] is not chunked_req_to_exclude
+                and self.reqs[i] is not chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1494,12 +1494,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-                (
-                        global_server_args_dict["use_mla_backend"]
-                        and global_server_args_dict["attention_backend"] == "flashinfer"
-                )
-                or global_server_args_dict["enable_flashmla"]
-                or global_server_args_dict["attention_backend"] == "fa3"
+            (
+                global_server_args_dict["use_mla_backend"]
+                and global_server_args_dict["attention_backend"] == "flashinfer"
+            )
+            or global_server_args_dict["enable_flashmla"]
+            or global_server_args_dict["attention_backend"] == "fa3"
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
@@ -1639,13 +1639,13 @@ class ModelWorkerBatch:
 
 @triton.jit
 def write_req_to_token_pool_triton(
-        req_to_token_ptr,  # [max_batch, max_context_len]
-        req_pool_indices,
-        pre_lens,
-        seq_lens,
-        extend_lens,
-        out_cache_loc,
-        req_to_token_ptr_stride: tl.constexpr,
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices,
+    pre_lens,
+    seq_lens,
+    extend_lens,
+    out_cache_loc,
+    req_to_token_ptr_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(0)
