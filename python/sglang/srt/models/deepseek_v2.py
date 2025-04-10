@@ -167,6 +167,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_id: int = -1,
         prefix: str = "",
     ):
         super().__init__()
@@ -178,6 +179,7 @@ class DeepseekV2MoE(nn.Module):
             if global_server_args_dict["n_share_experts_fusion"] is not None
             else 0
         )
+        self.layer_id = layer_id
 
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.tp_size > config.n_routed_experts:
@@ -205,6 +207,7 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -1084,6 +1087,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=self.layer_id,
             )
             self.is_sparse = True
         else:
