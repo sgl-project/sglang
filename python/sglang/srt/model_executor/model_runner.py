@@ -191,7 +191,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model()
 
-        self.expert_location_metadata = ExpertLocationMetadata.from_model(self.model)
+        self.expert_location_metadata = TODO
         expert_distribution_recorder.initialize(
             server_args,
             self.expert_location_metadata,

@@ -145,7 +145,6 @@ class TpModelWorker:
             self.random_seed,
             self.device,
             global_server_args_dict,
-            self.model_runner.expert_location_metadata,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
