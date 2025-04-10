@@ -164,6 +164,8 @@ class ServerArgs:
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     init_expert_location: Optional[str] = None
+    enable_eplb: bool = False
+    eplb_storage_dir: str = "/tmp/eplb_storage"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -1115,6 +1117,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.init_expert_location,
             help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-cache-dir",
+            type=str,
+            default=ServerArgs.eplb_storage_dir,
+            help="Storage directory of EPLB subsystem.",
         )
         parser.add_argument(
             "--deepep-mode",
