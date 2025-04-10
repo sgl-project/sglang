@@ -62,7 +62,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -258,6 +259,9 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.start_profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -307,6 +311,10 @@ class TokenizerManager:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    FlushCacheReqOutput,
+                    self.flush_cache_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -616,9 +624,8 @@ class TokenizerManager:
                     except StopAsyncIteration:
                         pass
 
-    def flush_cache(self):
-        req = FlushCacheReq()
-        self.send_to_scheduler.send_pyobj(req)
+    async def flush_cache(self) -> FlushCacheReqOutput:
+        return await self.flush_cache_communicator(FlushCacheReqInput())
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
