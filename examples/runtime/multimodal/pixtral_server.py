@@ -7,7 +7,7 @@ python -m sglang.launch_server --model-path mistral-community/pixtral-12b --port
 python -m sglang.launch_server --model-path AI-ModelScope/pixtral-12b --port=30000
 
 # Then test it with:
-python http_pixtral_generation_test.py
+python pixtral_server.py
 
 This script tests Pixtral model with both single and multiple images.
 """
@@ -21,7 +21,6 @@ import requests
 
 IMAGE_TOKEN_SEP = "\n[IMG]"
 ROUTE = "/generate"
-__ARCH = "LlavaForConditionalGeneration"
 
 
 async def send_request(url, data, delay=0):
@@ -44,7 +43,7 @@ async def test_concurrent(args):
     else:
         image_urls = [
             "https://picsum.photos/id/237/400/300",
-            "https://picsum.photos/id/27/400/300",
+            "https://picsum.photos/id/27/500/500",
         ]
         prompt = f"<s>[INST]How many photos are there? Describe each in a very short sentence.{IMAGE_TOKEN_SEP * len(image_urls)}[/INST]"
         image_url = image_urls
@@ -81,7 +80,7 @@ def test_streaming(args):
     else:
         image_urls = [
             "https://picsum.photos/id/237/400/300",
-            "https://picsum.photos/id/27/400/300",
+            "https://picsum.photos/id/27/500/500",
         ]
         prompt = f"<s>[INST]How many photos are there? Describe each in a very short sentence.{IMAGE_TOKEN_SEP * len(image_urls)}[/INST]"
         image_data = image_urls

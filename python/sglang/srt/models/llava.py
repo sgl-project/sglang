@@ -797,7 +797,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def get_image_features(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> List[torch.Tensor]:
         """Extract features from image inputs.
 
         Args:
@@ -837,7 +837,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             forward_batch=forward_batch,
             get_embedding=get_embedding,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_features,
+            image_data_embedding_func=self.get_image_feature,
             placeholder_token_ids=None,  # using mm_item.pad_value
             positions=positions,
         )

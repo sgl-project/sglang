@@ -31,11 +31,15 @@ from sglang.srt.speculative.eagle_utils import (
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
-    fast_topk,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda_available
+from sglang.srt.utils import (
+    empty_context,
+    fast_topk,
+    get_available_gpu_memory,
+    is_cuda_available,
+)
 
 if is_cuda_available():
     from sgl_kernel import segment_packbits

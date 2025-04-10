@@ -48,7 +48,6 @@ from sglang.srt.utils import flatten_nested_list
 
 class PixtralHFInputPatcher:
     """
-    TODO: refactor as multimodal data padding for Mistral's models.
     Pad input_ids with Mistral-exclusive formats.
     The multimodal special tokens:
     [IMG]: placeholder token, one per patch_size x patch_size grid
@@ -587,8 +586,8 @@ class PixtralHFVisionModel(nn.Module):
         else:
             out = transformer_outputs
 
-        # Split back into separate tensors for each image
-        final_outputs = torch.split(out.squeeze(0), embed_sizes)
+        # return concat image features
+        final_outputs = out.squeeze(0)
 
         # Format return to be compatible with HuggingFace vision models
         if output_hidden_states:

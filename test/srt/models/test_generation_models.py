@@ -14,10 +14,9 @@
 """
 Usage:
 
-To test a specific model:
-1. Add it to ALL_MODELS
+To test a specific model locally:
+1. Add it to ALL_MODELS, for example, `ModelCase("Qwen/Qwen2-1.5B")`
 2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels`
-    or `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_all_models`
 """
 
 import dataclasses

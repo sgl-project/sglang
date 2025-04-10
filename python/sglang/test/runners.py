@@ -19,7 +19,9 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import transformers
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
@@ -216,30 +218,17 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            try:
-                self.base_model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch_dtype,
-                    trust_remote_code=self.trust_remote_code,
-                    low_cpu_mem_usage=True,
-                ).cuda()
-            except:
-                # automodel classes might not recognize architectures like "ModelForConditionalGeneration"
-                # if so, we use the architecture specified in pretrained config
-                config = AutoConfig.from_pretrained(model_path)
-                model_arch = config.architectures[0]
-                model_cls = getattr(importlib.import_module("transformers"), model_arch)
-                if model_cls:
-                    self.base_model = model_cls.from_pretrained(
-                        model_path,
-                        torch_dtype=torch_dtype,
-                        trust_remote_code=self.trust_remote_code,
-                        low_cpu_mem_usage=True,
-                    ).cuda()
-                else:
-                    raise Exception(
-                        f"Unrecognized transformers model architecture: {model_arch}"
-                    )
+            config = AutoConfig.from_pretrained(model_path)
+            if model_archs := getattr(config, "architectures"):
+                model_cls = getattr(transformers, model_archs[0])
+            else:
+                model_cls = AutoModelForCausalLM
+            self.base_model = model_cls.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.trust_remote_code,
+                low_cpu_mem_usage=True,
+            ).cuda()
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(

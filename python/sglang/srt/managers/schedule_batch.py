@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from enum import Enum, auto
 
 # Copyright 2023-2024 SGLang Team
@@ -157,7 +158,7 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or other
+    A single multimodal data, from a single image/video/audio or others
     """
 
     modality: Modality
@@ -195,17 +196,56 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashign the data
+        Set the pad value after first hashing the data
         """
 
-        def hash_feature(f: Union[torch.Tensor, np.ndarray, List]) -> int:
+        def data_hash(data: bytes) -> int:
+            hash_bytes = hashlib.sha256(data).digest()[:8]
+            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+        def tensor_hash(tensor_list) -> int:
+            """
+            hash a tensor or a tensor list
+            """
+            tensor = tensor_list
+            if isinstance(tensor_list, list):
+                tensor_list = flatten_nested_list(tensor_list)
+                tensor_list = [
+                    x.flatten() if isinstance(x, torch.Tensor) else x
+                    for x in tensor_list
+                ]
+                tensor = torch.concat(tensor_list)
+
+            tensor = tensor.detach().contiguous()
+
+            if tensor.dtype == torch.bfloat16:
+                # memoryview() doesn't support PyTorch's BFloat16 dtype
+                tensor = tensor.float()
+
+            if tensor.is_cuda:
+                tensor_cpu = torch.frombuffer(
+                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
+                ).clone()
+            else:
+                tensor_cpu = tensor
+
+            mv = memoryview(tensor_cpu.numpy())
+            return data_hash(mv.tobytes())
+
+        def hash_feature(f):
             if isinstance(f, list):
-                f = tuple(map(hash_feature, flatten_nested_list(f)))
-            elif isinstance(f, torch.Tensor):
-                f = f.contiguous().numpy().data.tobytes()
+                if isinstance(f[0], torch.Tensor):
+                    return tensor_hash(f)
+                elif isinstance(f[0], np.ndarray):
+                    concat_arr = np.concatenate([arr.reshape(-1) for arr in f])
+                    return data_hash(np.ascontiguousarray(concat_arr).data.tobytes())
             elif isinstance(f, np.ndarray):
-                f = np.ascontiguousarray(f).data.tobytes()
-            return hash(f)
+                arr = np.ascontiguousarray(f)
+                arr_bytes = arr.data.tobytes()
+                return data_hash(arr_bytes)
+            elif isinstance(f, torch.Tensor):
+                return tensor_hash([f])
+            return data_hash(f)
 
         if self.is_audio():
             self.hash = hash_feature(self.audio_features)
@@ -248,7 +288,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
-    im_token_id: Optional[torch.Tensor] = None
+    im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
@@ -322,10 +362,8 @@ class MultimodalInputs:
 
         # args needed to be merged
         optional_args = [
-            "items",
-            "image_offsets",
+            "mm_items",
             "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
