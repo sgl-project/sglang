@@ -41,14 +41,17 @@ class ExpertLocationMetadata:
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
+        logical_to_all_physical_map = TODO
 
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             num_local_physical_experts=common["num_local_physical_experts"],
             physical_to_logical_map=physical_to_logical_map,
-            logical_to_all_physical_map=TODO,
-            logical_to_rank_dispatch_physical_map=TODO,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map, num_gpus=common["world_size"],
+            ),
         )
 
     @staticmethod
