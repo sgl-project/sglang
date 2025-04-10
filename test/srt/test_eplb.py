@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from typing import List
 
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
@@ -21,25 +22,32 @@ class TestEPLB(CustomTestCase):
             )
 
             engine = sgl.Engine(**engine_kwargs)
-            self._assert_behavior(engine)
+            ref_output = self._engine_generate(engine)
+            self._assert_behavior(engine, ref_output)
 
             engine.shutdown()
             del engine
 
             engine = sgl.Engine(**engine_kwargs)
-            self._assert_behavior(engine)
+            self._assert_behavior(engine, ref_output)
 
             engine.shutdown()
             del engine
 
-    def _assert_behavior(self, engine: sgl.Engine):
+    def _assert_behavior(self, engine: sgl.Engine, ref_output: List[str]):
         ret = engine.flush_cache()
         assert ret.success
 
-        output = engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
-                                 sampling_params=dict(max_new_tokens=8, temperature=0.0))
+        actual_output = self._engine_generate(engine)
+        self.assertEqual(actual_output, ref_output)
 
         TODO
+
+    def _engine_generate(self, engine: sgl.Engine):
+        output = engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
+                                 sampling_params=dict(max_new_tokens=8, temperature=0.0))
+        print(f"engine_generate {output=}")
+        return [x["text"] for x in output]
 
 
 if __name__ == "__main__":
