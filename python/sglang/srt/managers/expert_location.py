@@ -31,17 +31,18 @@ class ExpertLocationMetadata:
 
         physical_to_logical_map = torch.arange(0, num_physical_experts).repeat(
             model_config_for_expert_location.num_layers, 1) % model_config_for_expert_location.num_logical_experts
+        logical_to_all_physical_map = TODO
 
-        return ExpertLocationMetadata.init_by_mapping(server_args, physical_to_logical_map=physical_to_logical_map)
+        return ExpertLocationMetadata.init_by_mapping(server_args, physical_to_logical_map=physical_to_logical_map,
+                                                      logical_to_all_physical_map=logical_to_all_physical_map)
 
     @staticmethod
-    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map):
+    def init_by_mapping(server_args: ServerArgs, physical_to_logical_map, logical_to_all_physical_map):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        logical_to_all_physical_map = TODO
 
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
