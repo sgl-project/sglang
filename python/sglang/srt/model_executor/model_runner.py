@@ -24,7 +24,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -173,13 +172,14 @@ class ModelRunner:
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
         set_global_expert_location_metadata(expert_location_metadata)
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -926,7 +926,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
