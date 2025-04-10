@@ -24,7 +24,12 @@ class ExpertLocationMetadata:
     def init_trivial(server_args: ServerArgs):
         """Trivial location - logical expert i corresponds to physical expert i"""
         common = ExpertLocationMetadata._init_common(server_args)
-        physical_to_logical_map = torch.arange(0, num_physical_experts).repeat(num_layers, 1) % num_logical_experts
+        num_physical_experts = common["num_physical_experts"]
+        model_config_for_expert_location = common["model_config_for_expert_location"]
+
+        physical_to_logical_map = torch.arange(0, num_physical_experts).repeat(
+            model_config_for_expert_location.num_layers, 1) % model_config_for_expert_location.num_logical_experts
+
         return ExpertLocationMetadata.init_by_mapping(server_args, physical_to_logical_map=physical_to_logical_map)
 
     @staticmethod
@@ -60,6 +65,7 @@ class ExpertLocationMetadata:
 
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
+            num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
         )
 
