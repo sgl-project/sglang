@@ -7,7 +7,7 @@
 | **FlashInfer (Default)** | ✅                | ✅                | ✅     | ✅                 |
 | **FA3**                  | ✅                | ✅                | ✅     | ✅                 |
 | **FlashMLA**             | ✅                | ❌                | ✅     | ❌                 |
-| **Triton**               | ❌                | ✅                | ❌     | ❌                 |
+| **Triton**               | ❌                | ✅                | ✅     | ❌                 |
 | **Torch Native**         | ❌                | ❌                | ❌     | ❌                 |
 
 *Note: FlashMLA only supports page size = 64 case.*
