@@ -616,4 +616,8 @@ def _launch_subprocesses(
 
 
 def _compute_initial_expert_location_metadata(server_args: ServerArgs, eplb_manager: EPLBManager):
+    if server_args.init_expert_location is not None:
+        return TODO
+    if server_args.enable_eplb:
+        return TODO(eplb_manager)
     return TODO
