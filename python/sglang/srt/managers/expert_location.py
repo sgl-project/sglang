@@ -41,6 +41,7 @@ class ExpertLocationMetadata:
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
+
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
