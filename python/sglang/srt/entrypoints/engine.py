@@ -20,6 +20,7 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -617,8 +618,8 @@ def _launch_subprocesses(
 
 def _compute_initial_expert_location_metadata(server_args: ServerArgs,
                                               eplb_manager: EPLBManager) -> ExpertLocationMetadata:
-    if server_args.init_expert_location is not None:
-        return TODO
+    if (data := server_args.init_expert_location) is not None:
+        return ExpertLocationMetadata.init_by_mapping(**json.loads(data))
     if server_args.enable_eplb:
         return TODO(eplb_manager)
-    return TODO
+    return ExpertLocationMetadata.init_trivial()
