@@ -15,5 +15,5 @@ class ExpertDistributionStorage:
         data = await self._tokenizer_manager.dump_expert_distribution_record()
         TODO_write_data
 
-    async def get_last_snapshot(self):
+    def get_last_snapshot(self):
         return TODO_read_data

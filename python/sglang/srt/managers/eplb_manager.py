@@ -24,6 +24,9 @@ class EPLBManager:
     def __init__(self):
         self.tokenizer_manager: Optional[TokenizerManager] = None
 
+    async def initialize(self):
+        pass
+
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
         raise NotImplementedError
 
@@ -32,8 +35,10 @@ class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
         super().__init__()
         self._server_args = server_args
-        TODO_init_later
+
+    async def initialize(self):
         self._expert_distribution_storage = ExpertDistributionStorage(TODO)
+        await self._expert_distribution_storage.initialize()
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
