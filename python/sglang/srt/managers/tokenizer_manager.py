@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.conn import KVBootstrapServer
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers import expert_distribution
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -200,6 +201,8 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+
+        self.eplb_manager = EPLBManager()
 
         # Store states
         self.no_create_loop = False
