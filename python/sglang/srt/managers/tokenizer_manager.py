@@ -203,7 +203,7 @@ class TokenizerManager:
                 )
 
         if eplb_manager is not None:
-            eplb_manager.initialize(self)
+            eplb_manager.bind(self)
             self.eplb_manager = eplb_manager
 
         # Store states

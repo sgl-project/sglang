@@ -10,11 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 class ExpertDistributionStorage:
-    def __init__(self, dir_data, tokenizer_manager: TokenizerManager):
+    def __init__(self, dir_data):
         self._dir_data = Path(dir_data)
-        self._tokenizer_manager = tokenizer_manager
         if not self._dir_data.exists():
             self._dir_data.mkdir(parents=True, exist_ok=True)
+
+    def bind(self, tokenizer_manager: TokenizerManager):
+        self._tokenizer_manager = tokenizer_manager
 
     async def initialize(self):
         await self._tokenizer_manager.start_expert_distribution_record()
