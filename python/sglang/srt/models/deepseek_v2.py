@@ -1608,10 +1608,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def get_expert_location_metadata(self):
+    @classmethod
+    def get_expert_location_metadata(cls, config):
         return ExpertLocationMetadata.init_new(
-            num_layers=self.config.num_hidden_layers,
-            num_logical_experts=self.config.n_routed_experts,
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
         )
 
 
