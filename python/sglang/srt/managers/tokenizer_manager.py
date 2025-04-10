@@ -45,7 +45,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
@@ -156,16 +155,7 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
+        self.model_config = ModelConfig.from_server_args(server_args)
 
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
@@ -959,8 +949,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
