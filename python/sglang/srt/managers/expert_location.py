@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import List
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
@@ -70,8 +71,12 @@ class ExpertLocationMetadata:
     def global_physical_to_local_physical(self, global_physical_expert_index: int):
         return global_physical_expert_index % self.num_local_physical_experts
 
-    def logical_to_global_physical(self, logical_expert_id: int):
-        return [logical_expert_id]  # TODO add a logical_to_physical_map
+    def logical_to_global_physical(self, layer_id: int, logical_expert_id: int) -> List[int]:
+        return [
+            physical_expert_id
+            for physical_expert_id in self.logical_to_physical_map[layer_id, logical_expert_id].tolist()
+            if physical_expert_id != -1
+        ]
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
