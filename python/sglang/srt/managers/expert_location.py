@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List
 
 import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -30,7 +31,7 @@ class ExpertLocationMetadata:
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
         num_physical_experts = (
-                num_logical_experts + global_server_args_dict["ep_num_redundant_experts"]
+            num_logical_experts + global_server_args_dict["ep_num_redundant_experts"]
         )
         world_size = get_tensor_model_parallel_world_size()
         assert num_physical_experts % world_size == 0
@@ -43,7 +44,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(
                 num_layers, 1
             )
-                                    % num_logical_experts,
+            % num_logical_experts,
             # Throw away the redundant experts here - highly inefficient, but we do not care since we will
             # use EPLB distribution logic
             logical_to_all_physical_map=torch.arange(0, num_logical_experts).repeat(
@@ -67,7 +68,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_all_physical(
-            self, layer_id: int, logical_expert_id: int
+        self, layer_id: int, logical_expert_id: int
     ) -> List[int]:
         return [
             physical_expert_id
