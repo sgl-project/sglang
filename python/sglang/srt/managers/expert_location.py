@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
@@ -82,4 +82,4 @@ class ExpertLocationMetadata:
 class ModelConfigForExpertLocation:
     num_layers: int
     num_logical_experts: int
-    num_groups: int
+    num_groups: Optional[int] = None
