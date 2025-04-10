@@ -14,7 +14,7 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     # will have a `logical_to_physical_map` later
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
-    partial_logical_to_physical_map: torch.Tensor  # (layers, num_logical_experts)
+    chosen_logical_to_physical_map: torch.Tensor  # (layers, num_logical_experts)
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
@@ -40,7 +40,7 @@ class ExpertLocationMetadata:
                 num_layers=num_layers,
                 num_physical_experts=num_physical_experts,
             ),
-            partial_logical_to_physical_map=TODO,
+            chosen_logical_to_physical_map=TODO,
         )
         output._rebuild()
         return output
@@ -63,7 +63,7 @@ class ExpertLocationMetadata:
         return [logical_expert_id]  # TODO add a logical_to_physical_map
 
     def _rebuild(self):
-        self.partial_logical_to_physical_map[...] = TODO
+        self.chosen_logical_to_physical_map[...] = TODO
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:
