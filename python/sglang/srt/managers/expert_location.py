@@ -57,14 +57,28 @@ class ExpertLocationMetadata:
         if self.is_dummy:
             self._update_unconditionally(other)
         else:
-            raise NotImplementedError  # will handle later
+            self._update_partial(other)
 
     def _update_unconditionally(self, other: "ExpertLocationMetadata"):
-        self.is_dummy = other.is_dummy
-        self.num_layers = other.num_layers
-        self.num_local_physical_experts = other.num_local_physical_experts
-        self.num_logical_experts = other.num_logical_experts
+        for field in _TRIVIAL_UPDATE_FIELDS:
+            setattr(self, field, getattr(other, field))
+
         self.physical_to_logical_map = other.physical_to_logical_map.detach().clone()
+
+    def _update_partial(self, other: "ExpertLocationMetadata"):
+        for field in _TRIVIAL_UPDATE_FIELDS:
+            assert getattr(self, field) == getattr(other, field)
+
+        # Cannot update address to avoid breaking CUDA graph
+        self.physical_to_logical_map[...] = other.physical_to_logical_map
+
+
+_TRIVIAL_UPDATE_FIELDS = [
+    "is_dummy",
+    "num_layers",
+    "num_local_physical_experts",
+    "num_logical_experts",
+]
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
