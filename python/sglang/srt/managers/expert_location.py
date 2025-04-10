@@ -31,7 +31,8 @@ class ExpertLocationMetadata:
         return TODO
 
     @staticmethod
-    def init_new(num_layers: int, num_logical_experts: int):
+    def init_trivial(num_layers: int, num_logical_experts: int):
+        """Trivial location - logical expert i corresponds to physical expert i"""
         num_physical_experts = (
                 num_logical_experts + global_server_args_dict["ep_num_redundant_experts"]
         )
