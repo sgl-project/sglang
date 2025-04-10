@@ -241,6 +241,7 @@ def biased_grouped_topk(
         routed_scaling_factor=routed_scaling_factor,
     )
 
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
