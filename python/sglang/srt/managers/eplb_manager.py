@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
@@ -21,10 +21,7 @@ class EPLBManager:
         else:
             return _EPLBManagerNoop()
 
-    def __init__(self):
-        self.tokenizer_manager: Optional[TokenizerManager] = None
-
-    async def initialize(self):
+    async def initialize(self, tokenizer_manager: TokenizerManager):
         pass
 
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
@@ -36,8 +33,9 @@ class _EPLBManagerReal(EPLBManager):
         super().__init__()
         self._server_args = server_args
 
-    async def initialize(self):
-        self._expert_distribution_storage = ExpertDistributionStorage(TODO)
+    async def initialize(self, tokenizer_manager: TokenizerManager):
+        self._expert_distribution_storage = ExpertDistributionStorage(dir_data=TODO,
+                                                                      tokenizer_manager=tokenizer_manager)
         await self._expert_distribution_storage.initialize()
 
     def compute_expert_location_metadata(self):
