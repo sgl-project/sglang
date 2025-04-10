@@ -624,7 +624,7 @@ class TokenizerManager:
                     except StopAsyncIteration:
                         pass
 
-    async def flush_cache(self):
+    async def flush_cache(self) -> FlushCacheReqOutput:
         return await self.flush_cache_communicator(FlushCacheReqInput())
 
     def abort_request(self, rid: str):
