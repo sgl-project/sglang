@@ -55,12 +55,16 @@ class ExpertLocationMetadata:
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:
-            self.num_layers = other.num_layers
-            self.num_local_physical_experts = other.num_local_physical_experts
-            self.num_logical_experts = other.num_logical_experts
-            self.physical_to_logical_map = other.physical_to_logical_map.detach().clone()
+            self._update_by_assign(other)
         else:
             raise NotImplementedError  # will handle later
+
+    def _update_by_assign(self, other: "ExpertLocationMetadata"):
+        self.is_dummy = other.is_dummy
+        self.num_layers = other.num_layers
+        self.num_local_physical_experts = other.num_local_physical_experts
+        self.num_logical_experts = other.num_logical_experts
+        self.physical_to_logical_map = other.physical_to_logical_map.detach().clone()
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
