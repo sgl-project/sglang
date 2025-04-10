@@ -84,4 +84,5 @@ def _compute_expert_location_metadata_raw(
 def _compute_logical_to_rank_dispatch_physical_map(
         logical_to_physical_map: torch.Tensor,
 ):
+    # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     return TODO
