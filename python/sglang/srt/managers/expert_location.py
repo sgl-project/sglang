@@ -38,8 +38,8 @@ class ExpertLocationMetadata:
             num_logical_experts=num_logical_experts,
             num_local_physical_experts=num_local_physical_experts,
             physical_to_logical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1),
-            logical_to_all_physical_map=TODO,
-            logical_to_rank_chosen_physical_map=TODO,
+            logical_to_all_physical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1)[..., None],
+            logical_to_rank_chosen_physical_map=torch.arange(0, num_physical_experts).repeat(num_layers, 1)[..., None],
         )
 
     @staticmethod
