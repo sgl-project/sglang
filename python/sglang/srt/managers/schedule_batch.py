@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 from enum import Enum, auto
 
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -84,6 +86,8 @@ global_server_args_dict = {
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
+
+global_expert_location_metadata = ExpertLocationMetadata.init_dummy()
 
 logger = logging.getLogger(__name__)
 
