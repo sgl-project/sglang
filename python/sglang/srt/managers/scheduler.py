@@ -59,7 +59,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -400,7 +400,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (FlushCacheReq, self.flush_cache_wrapped),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1652,7 +1652,7 @@ class Scheduler(
         time.sleep(5)
         self.parent_process.send_signal(signal.SIGQUIT)
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReq):
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         self.flush_cache()
 
     def flush_cache(self):

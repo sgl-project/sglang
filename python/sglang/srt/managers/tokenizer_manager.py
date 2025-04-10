@@ -62,7 +62,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
-    FlushCacheReq,
+    FlushCacheReqInput,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -617,7 +617,7 @@ class TokenizerManager:
                         pass
 
     def flush_cache(self):
-        req = FlushCacheReq()
+        req = FlushCacheReqInput()
         self.send_to_scheduler.send_pyobj(req)
 
     def abort_request(self, rid: str):
