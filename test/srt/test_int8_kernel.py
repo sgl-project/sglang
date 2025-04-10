@@ -124,6 +124,7 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                 use_fp8_w8a8=False,  # Not using fp8
                 use_int8_w8a16=False,  # Not using int8-w8a16
                 use_int8_w8a8=True,  # Using int8-w8a8
+                per_channel_quant=True,
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 block_shape=None,  # Not using block quantization

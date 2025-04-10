@@ -156,6 +156,14 @@ unset CCACHE_READONLY
 python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
+##### Configuring CMake Build Options
+Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
+For example, to enable building FP4 kernels, use:
+```bash
+python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
+```
+See CMakeLists.txt for more options.
+
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
