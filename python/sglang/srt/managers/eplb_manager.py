@@ -34,12 +34,16 @@ class EPLBManager:
         await self._expert_distribution_storage.start()
         while True:
             await asyncio.sleep(self._server_args.eplb_rebalance_period or 100000000)
+            self.save_expert_distribution()
             await self.rebalance()
 
     async def rebalance(self):
         logger.info("rebalance start")
         TODO
         logger.info("rebalance end")
+
+    def save_expert_distribution(self):
+        self._expert_distribution_storage.save_current()
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()[
