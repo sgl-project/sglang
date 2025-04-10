@@ -20,13 +20,13 @@ class TestEPLB(CustomTestCase):
                 eplb_storage_dir=tmpdir,
             )
 
-            engine = sgl.Engine( **engine_kwargs)
+            engine = sgl.Engine(**engine_kwargs)
             self._assert_behavior(engine)
 
             engine.shutdown()
             del engine
 
-            engine = sgl.Engine( **engine_kwargs)
+            engine = sgl.Engine(**engine_kwargs)
             self._assert_behavior(engine)
 
             engine.shutdown()
@@ -35,6 +35,8 @@ class TestEPLB(CustomTestCase):
     def _assert_behavior(self, engine: sgl.Engine):
         ret = engine.flush_cache()
         assert ret.success
+
+        engine.generate(prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"])
 
         TODO
 
