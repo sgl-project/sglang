@@ -211,7 +211,7 @@ if _is_hpu:
                     ret.req_pool_indices[i], : ret.seq_lens[i]
                 ]
                 last_loc = slots[-1]
-                num_full_tables = (ret.seq_lens[i] - 1) // page_size
+                num_full_tables = ret.seq_lens[i] // page_size
                 ranges = torch.arange(
                     0,
                     num_full_tables * page_size,
@@ -220,7 +220,7 @@ if _is_hpu:
                 )
                 pages = slots[ranges] // page_size
                 pages = pages.flatten().tolist()
-                if last_loc % page_size != 0:
+                if ret.seq_lens[i] % page_size != 0:
                     pages.append((last_loc // page_size).item())
                 block_tables.append(pages)
                 slots_list.append(slots)
