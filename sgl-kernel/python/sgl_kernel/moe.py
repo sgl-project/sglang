@@ -35,7 +35,13 @@ def topk_softmax(
 
 
 def moe_fused_gate(
-    input_tensor, bias, num_expert_group, topk_group, topk, n_share_experts_fusion=0, routed_scaling_factor=2.5
+    input_tensor,
+    bias,
+    num_expert_group,
+    topk_group,
+    topk,
+    n_share_experts_fusion=0,
+    routed_scaling_factor=2.5,
 ):
     # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
     # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
@@ -45,5 +51,11 @@ def moe_fused_gate(
     # for non-supported case, we suggestion to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
     # n_share_experts_fusion: if > 0, the last expert will be replaced with a random shared expert
     return torch.ops.sgl_kernel.moe_fused_gate.default(
-        input_tensor, bias, num_expert_group, topk_group, topk, n_share_experts_fusion, routed_scaling_factor
+        input_tensor,
+        bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        n_share_experts_fusion,
+        routed_scaling_factor,
     )

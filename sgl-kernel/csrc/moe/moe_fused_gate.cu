@@ -226,7 +226,7 @@ __device__ void moe_fused_gate_impl(
   // Handle n_share_experts_fusion if needed
   if (n_share_experts_fusion > 0 && thread_group_idx == 0) {
     int64_t last_idx = topk * thread_row + (topk - 1);
-    
+
     // Use round-robin to select expert
     int64_t expert_offset = thread_row % n_share_experts_fusion;
     indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
@@ -283,7 +283,16 @@ __global__ void moe_fused_gate_kernel(
     double routed_scaling_factor) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
   moe_fused_gate_impl<T>(
-      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, routed_scaling_factor, params);
+      input,
+      bias,
+      output_ptr,
+      indices_ptr,
+      num_rows,
+      topk_group,
+      topk,
+      n_share_experts_fusion,
+      routed_scaling_factor,
+      params);
 }
 
 // Macro to compute compile-time constants and launch the kernel.
@@ -341,7 +350,16 @@ __global__ void moe_fused_gate_kernel_dynamic(
   params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
   moe_fused_gate_impl<T>(
-      input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, routed_scaling_factor, params);
+      input,
+      bias,
+      output_ptr,
+      indices_ptr,
+      num_rows,
+      topk_group,
+      topk,
+      n_share_experts_fusion,
+      routed_scaling_factor,
+      params);
 }
 
 //------------------------------------------------------------------------------

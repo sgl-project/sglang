@@ -54,22 +54,22 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, n_share_experts_fusi
     if n_share_experts_fusion > 0:
         original_indices = indices.clone()
         original_ref_indices = ref_indices.clone()
-        
+
         indices = indices[:, :-1]
         ref_indices = ref_indices[:, :-1]
-        
+
         valid_min = num_experts
         valid_max = num_experts + n_share_experts_fusion
         shared_indices = original_indices[:, -1]
         shared_ref_indices = original_ref_indices[:, -1]
         if shared_indices is not None:
-            assert torch.all((shared_indices >= valid_min) & (shared_indices < valid_max)), (
-                f"Shared expert indices out of range: found values outside [{valid_min}, {valid_max})"
-            )
+            assert torch.all(
+                (shared_indices >= valid_min) & (shared_indices < valid_max)
+            ), f"Shared expert indices out of range: found values outside [{valid_min}, {valid_max})"
         if shared_ref_indices is not None:
-            assert torch.all((shared_ref_indices >= valid_min) & (shared_ref_indices < valid_max)), (
-                f"Shared expert reference indices out of range: found values outside [{valid_min}, {valid_max})"
-            )
+            assert torch.all(
+                (shared_ref_indices >= valid_min) & (shared_ref_indices < valid_max)
+            ), f"Shared expert reference indices out of range: found values outside [{valid_min}, {valid_max})"
 
     idx_check = torch.allclose(
         ref_indices.sort()[0].to(torch.int32),
