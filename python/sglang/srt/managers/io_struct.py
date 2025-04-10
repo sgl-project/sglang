@@ -671,7 +671,7 @@ class FlushCacheReqInput:
 
 @dataclass
 class FlushCacheReqOutput:
-    pass
+    success: bool
 
 
 @dataclass

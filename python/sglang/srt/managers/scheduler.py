@@ -1652,7 +1652,8 @@ class Scheduler(
         self.parent_process.send_signal(signal.SIGQUIT)
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        self.flush_cache()
+        success = self.flush_cache()
+        return FlushCacheReqOutput(success=success)
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
