@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,8 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
@@ -31,10 +34,12 @@ class EPLBManager:
         await self._expert_distribution_storage.start()
         while True:
             await asyncio.sleep(self._server_args.eplb_rebalance_period or 100000000)
-            self.rebalance()
+            await self.rebalance()
 
-    def rebalance(self):
+    async def rebalance(self):
+        logger.info("rebalance start")
         TODO
+        logger.info("rebalance end")
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()[
