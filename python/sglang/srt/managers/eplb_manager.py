@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 
+from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 
 if TYPE_CHECKING:
@@ -16,3 +17,14 @@ class EPLBManager:
         self._expert_distribution_storage.get_last_snapshot()
         expert_location_metadata = TODO
         await self._tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
+
+    def get_expert_location_metadata(self):
+        logical_count = self._expert_distribution_storage.get_last_snapshot()
+        physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
+            weight=logical_count,
+            num_replicas=TODO,
+            num_groups=TODO,
+            num_nodes=TODO,
+            num_gpus=TODO,
+        )
+        return TODO
