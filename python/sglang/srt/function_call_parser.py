@@ -477,6 +477,62 @@ class Llama32Detector(BaseFormatDetector):
         )
 
 
+class DeepSeekDetector(BaseFormatDetector):
+    """
+    Detector for DeepSeekV3-0324 models.
+    Assumes function call format:
+        https://huggingface.co/deepseek-ai/DeepSeek-V2.5#function-calling
+    """
+
+    def _parse_function_call(input_str):
+        try:
+            func_name, json_part = input_str.split("\n", 1)
+        except ValueError:
+            raise ValueError("Invalid input format")
+
+        json_str = json_part.strip()
+        json_str = json_str.lstrip("```json").strip()
+        json_str = json_str.rstrip("```").strip()
+
+        try:
+            params = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format: {e}")
+        return func_name.strip(), params
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.funcbot_token = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+        self.funceot_token = "<｜tool▁call▁end｜>"
+        self.eot_token = "<｜tool▁calls▁end｜>"
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a DeepSeek format tool call."""
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        """
+        idx = text.find(self.funcbot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if self.eot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+        pattern = rf"{self.funcbot_token}(.*?){self.funceot_token}"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        calls = []
+        for match_result in match_result_list:
+            func_name, func_args = self._parse_function_call(match_result)
+            func_call_struct = {"name": func_name, "arg": func_args}
+            calls.extend(self.parse_base_json(func_call_struct, tools))
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
 class MultiFormatParser:
     def __init__(self, detectors: List[BaseFormatDetector]):
         """
