@@ -301,6 +301,9 @@ class Engine:
             "version": __version__,
         }
 
+    def rebalance_experts(self):
+        self.tokenizer_manager.rebalance_experts()
+
     def init_weights_update_group(
         self,
         master_address: str,

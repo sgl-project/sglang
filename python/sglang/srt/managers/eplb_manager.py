@@ -1,3 +1,3 @@
 class EPLBManager:
-    def rebalance_experts(self):
+    async def rebalance_experts(self):
         TODO

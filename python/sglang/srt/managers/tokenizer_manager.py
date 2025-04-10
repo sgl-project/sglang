@@ -707,6 +707,10 @@ class TokenizerManager:
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
 
+    async def rebalance_experts(self):
+        self.auto_create_handle_loop()
+        await self.eplb_manager.rebalance_experts()
+
     async def init_weights_update_group(
         self,
         obj: InitWeightsUpdateGroupReqInput,
