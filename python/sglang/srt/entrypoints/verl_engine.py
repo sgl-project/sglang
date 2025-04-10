@@ -19,7 +19,7 @@ import torch.distributed as dist
 from PIL.Image import Image
 from torch.distributed.tensor import DeviceMesh, DTensor
 
-from sglang.srt.entrypoints.http_server_engine import HttpServerEngineForRL
+from sglang.srt.entrypoints.http_server_engine import HttpServerEngineAdapter
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server import Engine
@@ -57,7 +57,7 @@ class VerlEngine:
 
         elif backend == "server":
             if self._tp_rank == 0:
-                self._engine = HttpServerEngineForRL(**engine_kwargs)
+                self._engine = HttpServerEngineAdapter(**engine_kwargs)
             else:
                 self._engine = None
         else:

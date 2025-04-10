@@ -48,7 +48,13 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
-class HttpServerEngineForRL(EngineBase):
+class HttpServerEngineAdapter(EngineBase):
+    """
+    You can use this class to launch a server from a VerlEngine instance.
+    We recommend using this class only you need to use http server.
+    Otherwise, you can use Engine directly.
+    """
+
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
         print(f"launch_server_from_verl_engine {self.server_args.port}")
@@ -81,8 +87,6 @@ class HttpServerEngineForRL(EngineBase):
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
-
-        print(f"update_weights_from_tensor of HttpServerEngineForRL")
 
         return self._make_request(
             "update_weights_from_tensor",
