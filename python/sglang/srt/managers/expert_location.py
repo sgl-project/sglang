@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.model_loader import get_model_architecture
@@ -15,6 +14,7 @@ class ExpertLocationMetadata:
     num_logical_experts: int
     # will have a `logical_to_physical_map` later
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    partial_logical_to_physical_map: torch.Tensor  # (layers, num_logical_experts)
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
@@ -27,11 +27,11 @@ class ExpertLocationMetadata:
     def init_new(num_layers: int, num_logical_experts: int, is_dummy: bool = False):
         # TODO handle more complex cases like duplicating experts on different GPUs
         num_local_physical_experts = (
-            num_logical_experts // get_tensor_model_parallel_world_size()
+                num_logical_experts // get_tensor_model_parallel_world_size()
         )
         num_physical_experts = num_logical_experts
 
-        return ExpertLocationMetadata(
+        output = ExpertLocationMetadata(
             is_dummy=is_dummy,
             num_layers=num_layers,
             num_logical_experts=num_logical_experts,
@@ -40,7 +40,10 @@ class ExpertLocationMetadata:
                 num_layers=num_layers,
                 num_physical_experts=num_physical_experts,
             ),
+            partial_logical_to_physical_map=None,
         )
+        output._rebuild()
+        return output
 
     @staticmethod
     def init_dummy():
@@ -49,7 +52,7 @@ class ExpertLocationMetadata:
         )
 
     def local_physical_to_global_physical(
-        self, rank: int, local_physical_expert_index: int
+            self, rank: int, local_physical_expert_index: int
     ):
         return self.num_local_physical_experts * rank + local_physical_expert_index
 
@@ -58,6 +61,9 @@ class ExpertLocationMetadata:
 
     def logical_to_global_physical(self, logical_expert_id: int):
         return [logical_expert_id]  # TODO add a logical_to_physical_map
+
+    def _rebuild(self):
+        self.partial_logical_to_physical_map = TODO
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:
