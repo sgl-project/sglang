@@ -666,6 +666,8 @@ class TokenizerManager:
         )
 
     async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
+        self.auto_create_handle_loop()
+
         TODO
 
     async def update_weights_from_disk(
