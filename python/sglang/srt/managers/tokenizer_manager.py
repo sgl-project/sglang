@@ -203,7 +203,6 @@ class TokenizerManager:
                 )
 
         if eplb_manager is not None:
-            TODO_async
             eplb_manager.initialize(self)
             self.eplb_manager = eplb_manager
 

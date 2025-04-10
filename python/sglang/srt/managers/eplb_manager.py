@@ -19,12 +19,15 @@ class EPLBManager:
         super().__init__()
         self._server_args = server_args
 
-    async def initialize(self, tokenizer_manager: TokenizerManager):
+    def initialize(self, tokenizer_manager: TokenizerManager):
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir) / "expert_distribution_storage",
             tokenizer_manager=tokenizer_manager,
         )
+
+    async def handle_loop(self):
         await self._expert_distribution_storage.initialize()
+        TODO
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()["logical_count"]
