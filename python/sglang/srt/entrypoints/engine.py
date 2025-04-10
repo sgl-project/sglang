@@ -503,7 +503,6 @@ def _launch_subprocesses(
     )
 
     eplb_manager = EPLBManager(server_args)
-    model_config = ModelConfig.from_server_args(server_args)
     expert_location_metadata = eplb_manager.get_expert_location_metadata()
 
     scheduler_procs = []
