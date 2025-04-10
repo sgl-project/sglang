@@ -18,7 +18,7 @@ class ExpertDistributionStorage:
     def bind(self, tokenizer_manager: TokenizerManager):
         self._tokenizer_manager = tokenizer_manager
 
-    async def initialize(self):
+    async def start(self):
         await self._tokenizer_manager.start_expert_distribution_record()
 
     async def save_current(self):
