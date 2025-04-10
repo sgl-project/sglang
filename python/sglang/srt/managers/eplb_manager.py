@@ -60,7 +60,7 @@ def _compute_expert_location_metadata_raw(
     assert num_physical_experts % world_size == 0
     num_local_physical_experts = num_physical_experts // world_size
 
-    physical_to_logical_map, logical_to_physical_map, expert_count = (
+    physical_to_logical_map, logical_to_all_physical_map, expert_count = (
         deepseek_eplb.rebalance_experts(
             weight=logical_count,
             num_replicas=num_physical_experts,
@@ -74,15 +74,15 @@ def _compute_expert_location_metadata_raw(
         num_local_physical_experts=num_local_physical_experts,
         num_logical_experts=model_config_for_expert_location.num_logical_experts,
         physical_to_logical_map=physical_to_logical_map,
-        logical_to_all_physical_map=logical_to_physical_map,
+        logical_to_all_physical_map=logical_to_all_physical_map,
         logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
-            logical_to_physical_map
+            logical_to_all_physical_map
         ),
     )
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
-        logical_to_physical_map: torch.Tensor,
+        logical_to_all_physical_map: torch.Tensor,
 ):
     # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
     return TODO
