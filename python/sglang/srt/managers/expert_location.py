@@ -52,7 +52,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_global_physical(self, logical_expert_id: int):
-        return logical_expert_id  # TODO support arbitrary mapping
+        return logical_expert_id  # TODO add a logical_to_physical_map
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
