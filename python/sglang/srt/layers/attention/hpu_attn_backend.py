@@ -17,17 +17,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import vllm_hpu_extension.kernels as kernels
-import vllm_hpu_extension.ops as ops
-from torch.nn.functional import scaled_dot_product_attention
-from vllm_hpu_extension.utils import Matmul, ModuleFusedSDPA, Softmax, VLLMKVCache
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_hpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    import vllm_hpu_extension.kernels as kernels
+    import vllm_hpu_extension.ops as ops
+    from vllm_hpu_extension.utils import Matmul, ModuleFusedSDPA, Softmax, VLLMKVCache
 
 
 class HPUAttnBackend(AttentionBackend):
