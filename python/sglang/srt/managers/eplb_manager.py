@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,7 @@ class EPLBManager:
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
-            / "expert_distribution_storage"
+                     / "expert_distribution_storage"
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
@@ -28,7 +29,12 @@ class EPLBManager:
 
     async def handle_loop(self):
         await self._expert_distribution_storage.start()
-        # TODO auto call rebalance, etc, when Engine supports that
+        while True:
+            await asyncio.sleep(TODO)
+            self.rebalance()
+
+    def rebalance(self):
+        TODO
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()[
