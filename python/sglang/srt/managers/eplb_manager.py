@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -27,4 +28,6 @@ def _compute_expert_location_metadata(logical_count):
         num_nodes=TODO,
         num_gpus=TODO,
     )
-    return TODO
+    return ExpertLocationMetadata(
+        TODO=TODO,
+    )
