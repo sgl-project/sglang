@@ -1218,6 +1218,10 @@ class _Communicator(Generic[T]):
         self._ready_queue: Deque[asyncio.Future] = deque()
 
     async def __call__(self, obj):
+        await self.call_send(obj)
+        return await self.call_await()
+
+    async def call_send(self, obj):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
@@ -1228,6 +1232,7 @@ class _Communicator(Generic[T]):
         if obj:
             self._sender.send_pyobj(obj)
 
+    async def call_await(self):
         self._result_event = asyncio.Event()
         self._result_values = []
         await self._result_event.wait()
