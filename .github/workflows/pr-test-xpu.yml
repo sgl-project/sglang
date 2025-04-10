@@ -27,7 +27,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          echo "[Placeholder] to build docker images"
+          echo "[Placeholder] to build docker images "
 
       - name: Run container
         run: |
