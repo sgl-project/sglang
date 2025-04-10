@@ -3,9 +3,9 @@ import unittest
 
 import torch
 
+from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -31,12 +31,17 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
     return C.reshape(origin_C_shape).to(output_dtype)
 
 
+def fp8_mask(a, mask):
+    dtype = a.dtype
+    return a.view(torch.int8)[mask].view(dtype)
+
+
 def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     """This function performs fused moe with per-column int8 quantization using native torch."""
 
     B, D = a.shape
     # Perform per-token quantization
-    a_q, a_s = per_token_quant_int8(a)
+    a_q, a_s = sgl_scaled_fp8_quant(a, use_per_token_if_dynamic=True)
     # Repeat tokens to match topk
     a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     # Also repeat the scale
@@ -55,12 +60,18 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
         if mask.sum():
             # First MLP layer: note that a_s is now per-token
             inter_out = native_w8a8_per_token_matmul(
-                a_q[mask], w1[i], a_s[mask], w1_s[i], output_dtype=a.dtype
+                fp8_mask(a_q, mask),
+                w1[i],
+                fp8_mask(a_s, mask),
+                w1_s[i],
+                output_dtype=a.dtype,
             )
             # Activation function
             act_out = SiluAndMul().forward_native(inter_out)
             # Quantize activation output with per-token
-            act_out_q, act_out_s = per_token_quant_int8(act_out)
+            act_out_q, act_out_s = sgl_scaled_fp8_quant(
+                act_out, use_per_token_if_dynamic=True
+            )
 
             # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(
@@ -72,7 +83,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     ).sum(dim=1)
 
 
-class TestW8A8Int8FusedMoE(CustomTestCase):
+class TestW8A8FP8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33]
     N = [128, 1024]
@@ -89,12 +100,13 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _w8a8_int8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed):
+    def _w8a8_fp8_fused_moe(self, M, N, K, E, topk, block_size, dtype, seed):
         torch.manual_seed(seed)
         # Initialize int8 quantization parameters
         factor_for_scale = 1e-2
-        int8_max = 127
-        int8_min = -128
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        fp8_max = finfo.max
+        fp8_min = finfo.min
 
         # Input tensor
         # M * K
@@ -102,10 +114,10 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
 
         # Generate int8 weights
         w1_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2
-        w1 = (w1_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
         w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2
-        w2 = (w2_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
         # Generate scale for each column (per-column quantization)
         w1_s = torch.rand(E, 2 * N, device=w1_fp32.device) * factor_for_scale
@@ -121,9 +133,9 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                 score,
                 topk,
                 renormalize=False,
-                use_fp8_w8a8=False,  # Not using fp8
-                use_int8_w8a16=False,  # Not using int8-w8a16
-                use_int8_w8a8=True,  # Using int8-w8a8
+                use_fp8_w8a8=True,  # using fp8
+                use_int8_w8a16=False,
+                use_int8_w8a8=False,
                 per_channel_quant=True,
                 w1_scale=w1_s,
                 w2_scale=w2_s,
@@ -137,7 +149,7 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
             < 0.05
         )
 
-    def test_w8a8_int8_fused_moe(self):
+    def test_w8a8_fp8_fused_moe(self):
         for params in itertools.product(
             self.M,
             self.N,
@@ -158,7 +170,7 @@ class TestW8A8Int8FusedMoE(CustomTestCase):
                 dtype=params[6],
                 seed=params[7],
             ):
-                self._w8a8_int8_fused_moe(*params)
+                self._w8a8_fp8_fused_moe(*params)
 
 
 if __name__ == "__main__":
