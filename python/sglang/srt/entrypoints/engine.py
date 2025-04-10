@@ -30,6 +30,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 
@@ -521,7 +522,15 @@ def _launch_subprocesses(
             )
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, expert_location_metadata, gpu_id, tp_rank, None, writer),
+                args=(
+                    server_args,
+                    port_args,
+                    expert_location_metadata,
+                    gpu_id,
+                    tp_rank,
+                    None,
+                    writer,
+                ),
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
@@ -570,7 +579,9 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args, expert_location_metadata)
+    tokenizer_manager = TokenizerManager(
+        server_args, port_args, expert_location_metadata
+    )
     if server_args.chat_template:
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path

@@ -60,5 +60,6 @@ class ExpertLocationMetadata:
             physical_to_logical_map=self.physical_to_logical_map.clone(),
         )
 
+
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
     return torch.arange(0, num_physical_experts).repeat(num_layers, 1)
