@@ -19,14 +19,17 @@ class EPLBManager:
         else:
             return _EPLBManagerNoop()
 
+    def __init__(self):
+        self.tokenizer_manager: Optional[TokenizerManager] = None
+
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
         return TODO_trivial_output
 
 class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
+        super().__init__()
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage()
-        self.tokenizer_manager: Optional[TokenizerManager] = None
 
     async def rebalance_experts(self):
         TODO_may_or_may_not_save_current
