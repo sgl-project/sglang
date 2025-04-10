@@ -203,7 +203,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
-    float routed_scaling_factor);
+    double routed_scaling_factor);
 
 /*
  * From csrc/speculative

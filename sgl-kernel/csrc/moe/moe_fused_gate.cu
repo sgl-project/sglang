@@ -60,7 +60,7 @@ __device__ void moe_fused_gate_impl(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
-    float routed_scaling_factor,
+    double routed_scaling_factor,
     Params params) {
   int tidx = threadIdx.x;
   int64_t thread_row =
@@ -280,7 +280,7 @@ __global__ void moe_fused_gate_kernel(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
-    float routed_scaling_factor) {
+    double routed_scaling_factor) {
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA> params;
   moe_fused_gate_impl<T>(
       input, bias, output_ptr, indices_ptr, num_rows, topk_group, topk, n_share_experts_fusion, routed_scaling_factor, params);
@@ -331,7 +331,7 @@ __global__ void moe_fused_gate_kernel_dynamic(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
-    float routed_scaling_factor) {
+    double routed_scaling_factor) {
   KernelParamsDynamic params;
   params.NUM_EXPERTS = num_experts;             // e.g, for deepseek v3, this is 256
   params.VPT = num_experts / num_expert_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
@@ -354,7 +354,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t n_share_experts_fusion,
-    float routed_scaling_factor) {
+    double routed_scaling_factor) {
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);

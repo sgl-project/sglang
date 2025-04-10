@@ -1114,6 +1114,12 @@ class ServerArgs:
             "we use tp_size by default.",
         )
         parser.add_argument(
+            "--routed-scaling-factor",
+            type=float,
+            default=None,
+            help="The scaling factor for routed experts in deepseek v3/r1.",
+        )
+        parser.add_argument(
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
