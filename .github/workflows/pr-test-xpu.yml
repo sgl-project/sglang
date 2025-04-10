@@ -31,7 +31,6 @@ jobs:
 
       - name: Run container
         run: |
-          docker rm -f ci_sglang_xpu || true  
           docker run -dt \
             -v $PWD:/root/sglang \
             -w /root/sglang \
