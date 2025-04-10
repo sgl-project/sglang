@@ -25,7 +25,7 @@ class EPLBManager:
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage(
             dir_data=Path(self._server_args.eplb_storage_dir)
-                     / "expert_distribution_storage"
+            / "expert_distribution_storage"
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
@@ -36,7 +36,9 @@ class EPLBManager:
         await self._expert_distribution_storage.start()
         while True:
             sleep_time = self._server_args.eplb_rebalance_period or 1000000000
-            logger.info(f"Sleep {sleep_time} seconds before automatically trigger rebalancing")
+            logger.info(
+                f"Sleep {sleep_time} seconds before automatically trigger rebalancing"
+            )
             await asyncio.sleep(sleep_time)
             self.save_expert_distribution()
             await self.rebalance()
@@ -44,7 +46,10 @@ class EPLBManager:
     async def rebalance(self):
         expert_location_metadata = self.compute_expert_location_metadata()
         await self._tokenizer_manager.update_expert_location(
-            UpdateExpertLocationReqInput(expert_location_metadata=expert_location_metadata))
+            UpdateExpertLocationReqInput(
+                expert_location_metadata=expert_location_metadata
+            )
+        )
 
     def save_expert_distribution(self):
         self._expert_distribution_storage.save_current()
