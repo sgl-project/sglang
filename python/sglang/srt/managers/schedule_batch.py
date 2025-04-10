@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from enum import Enum, auto
 
 # Copyright 2023-2024 SGLang Team
@@ -76,11 +77,12 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
 
 logger = logging.getLogger(__name__)
@@ -156,7 +158,7 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or other
+    A single multimodal data, from a single image/video/audio or others
     """
 
     modality: Modality
@@ -194,17 +196,54 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashign the data
+        Set the pad value after first hashing the data
         """
+
+        def data_hash(data) -> int:
+            hash_bytes = hashlib.sha256(data).digest()[:8]
+            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+        def tensor_hash(tensor_list) -> int:
+            """
+            hash a tensor or a tensor list
+            """
+            tensor = tensor_list
+            if isinstance(tensor_list, list):
+                tensor_list = flatten_nested_list(tensor_list)
+                tensor_list = [
+                    x.flatten() if isinstance(x, torch.Tensor) else x
+                    for x in tensor_list
+                ]
+                tensor = torch.concat(tensor_list)
+
+            tensor = tensor.detach().contiguous()
+
+            if tensor.dtype == torch.bfloat16:
+                # memoryview() doesn't support PyTorch's BFloat16 dtype
+                tensor = tensor.float()
+
+            if tensor.is_cuda:
+                tensor_cpu = torch.frombuffer(
+                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
+                ).clone()
+            else:
+                tensor_cpu = tensor
+
+            mv = memoryview(tensor_cpu.numpy())
+            return data_hash(mv.tobytes())
 
         def hash_feature(f):
             if isinstance(f, list):
-                return hash(tuple(flatten_nested_list(f)))
+                if isinstance(f[0], torch.Tensor):
+                    return tensor_hash(f)
+                return data_hash(tuple(flatten_nested_list(f)))
             elif isinstance(f, np.ndarray):
                 arr = np.ascontiguousarray(f)
                 arr_bytes = arr.tobytes()
-                return hash(arr_bytes)
-            return hash(f)
+                return data_hash(arr_bytes)
+            elif isinstance(f, torch.Tensor):
+                return tensor_hash([f])
+            return data_hash(f)
 
         if self.is_audio():
             self.hash = hash_feature(self.audio_features)
@@ -247,7 +286,7 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
 
     # image
-    im_token_id: Optional[torch.Tensor] = None
+    im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
     im_end_id: Optional[int] = None
     slice_start_id: Optional[int] = None
@@ -321,10 +360,8 @@ class MultimodalInputs:
 
         # args needed to be merged
         optional_args = [
-            "items",
-            "image_offsets",
+            "mm_items",
             "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)
@@ -353,6 +390,8 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -437,6 +476,10 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
+        # Latency Breakdown
+        self.queue_time_start = None
+        self.queue_time_end = None
+
         # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
@@ -482,8 +525,8 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init
@@ -1435,7 +1478,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["enable_flashinfer_mla"]
+            (
+                global_server_args_dict["use_mla_backend"]
+                and global_server_args_dict["attention_backend"] == "flashinfer"
+            )
             or global_server_args_dict["enable_flashmla"]
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
