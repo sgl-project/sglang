@@ -36,6 +36,8 @@ class TestExpertDistribution(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--tp-size",
+                str(tp_size),
             ],
         )
 
