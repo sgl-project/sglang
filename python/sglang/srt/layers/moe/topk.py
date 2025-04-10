@@ -12,17 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -102,11 +104,13 @@ def grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    n_share_experts_fusion: int = 0,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
     num_token = scores.shape[0]
+    num_experts = scores.shape[1]
     group_scores = (
         scores.view(num_token, num_expert_group, -1).max(dim=-1).values
     )  # [n, n_group]
@@ -122,15 +126,30 @@ def grouped_topk(
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+    if n_share_experts_fusion:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + n_share_experts_fusion,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = (
+            topk_weights[:, :-1].sum(dim=-1) / 2.5
+        )  # 2.5 is the routed_scaling_factor.
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if n_share_experts_fusion == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def biased_grouped_topk(
+def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -138,11 +157,13 @@ def biased_grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    n_share_experts_fusion: int = 0,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
+    num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
@@ -165,10 +186,57 @@ def biased_grouped_topk(
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
 
+    if n_share_experts_fusion:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + n_share_experts_fusion,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        topk_weights[:, -1] = (
+            topk_weights[:, :-1].sum(dim=-1) / 2.5
+        )  # 2.5 is the routed_scaling_factor.
+
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True)
+            if n_share_experts_fusion == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        )
+        topk_weights = topk_weights / topk_weights_sum
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def biased_grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    compiled: bool = True,
+    n_share_experts_fusion: int = 0,
+):
+    biased_grouped_topk_fn = (
+        torch.compile(
+            biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
+        )
+        if compiled
+        else biased_grouped_topk_impl
+    )
+    return biased_grouped_topk_fn(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        n_share_experts_fusion=n_share_experts_fusion,
+    )
 
 
 def select_experts(
@@ -183,7 +251,10 @@ def select_experts(
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
 ):
-    # DeekSeekv2 uses grouped_top_k
+    n_share_experts_fusion = 0
+    if global_server_args_dict["n_share_experts_fusion"] is not None:
+        n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+    # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -195,6 +266,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                n_share_experts_fusion=n_share_experts_fusion,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -205,6 +277,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                n_share_experts_fusion=n_share_experts_fusion,
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(

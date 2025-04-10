@@ -26,13 +26,14 @@ def _sgemm_lora_b_kernel(
     seg_lens,
     seg_indptr,
     weight_indices,
+    lora_ranks,
     # Meta parameters
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     # For fused output scaling and adding
     fuse_scaling_add,
-    scaling,
+    scalings,
 ):
     # x: (s, K), s is the sum of sequence lengths
     # weights: (num_lora, N, K)
@@ -45,6 +46,10 @@ def _sgemm_lora_b_kernel(
     seg_len = tl.load(seg_lens + batch_id)
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+    scaling = tl.load(scalings + w_index)
+    # Adjust K (rank) according to the specific LoRA adapter
+    K = tl.minimum(K, rank)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -100,12 +105,11 @@ def sgemm_lora_b_fwd(
     weights: torch.Tensor,
     batch_info: LoRABatchInfo,
     base_output: torch.Tensor = None,
-    scaling: float = 1.0,
 ) -> torch.Tensor:
-    # x: (s, r)
-    # weights: (num_lora, output_dim, r)
+    # x: (s, max_r)
+    # weights: (num_lora, output_dim, max_r)
     # output: (s, output_dim)
-    # output_dim is much larger than r
+    # output_dim is much larger than max_r
 
     assert x.is_contiguous()
     assert weights.is_contiguous()
@@ -150,10 +154,11 @@ def sgemm_lora_b_fwd(
         batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
+        batch_info.lora_ranks,
         BLOCK_S,
         BLOCK_N,
         BLOCK_R,
         fuse_scaling_add,
-        scaling,
+        batch_info.scalings,
     )
     return output

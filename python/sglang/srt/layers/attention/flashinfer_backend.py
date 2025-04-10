@@ -14,7 +14,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
-import triton
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -22,7 +21,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -83,6 +82,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -392,6 +393,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        k_scale = layer.k_scale_float if self.kv_cache_dtype_str != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype_str != "auto" else None
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -408,7 +411,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
 
             o = prefill_wrapper_paged.forward(
@@ -418,8 +421,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
                 logits_soft_cap=logits_soft_cap,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         else:
             o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
@@ -446,7 +449,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -460,6 +463,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        k_scale = layer.k_scale_float if self.kv_cache_dtype_str != "auto" else None
+        v_scale = layer.v_scale_float if self.kv_cache_dtype_str != "auto" else None
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -473,7 +478,7 @@ class FlashInferAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer, cache_loc, k, v, k_scale, v_scale
                 )
 
         o = decode_wrapper.forward(
@@ -481,8 +486,8 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -932,6 +937,7 @@ class FlashInferMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+        self.page_size = model_runner.page_size
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -985,9 +991,9 @@ class FlashInferMultiStepDraftBackend:
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
         )
 
         assert forward_batch.spec_info is not None
@@ -1018,8 +1024,6 @@ class FlashInferMultiStepDraftBackend:
         )
 
         def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             forward_batch.spec_info.kv_indptr = (
                 forward_batch.spec_info.kv_indptr.clone()
             )

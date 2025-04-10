@@ -26,7 +26,8 @@ class TestFlashinferMLA(CustomTestCase):
                     "--enable-torch-compile",
                     "--cuda-graph-max-bs",
                     "2",
-                    "--enable-flashinfer-mla",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         cls.process = popen_launch_server(
@@ -69,8 +70,8 @@ class TestFlashinferMLANoRagged(CustomTestCase):
                     "--disable-cuda-graph",
                     "--cuda-graph-max-bs",
                     "4",
-                    "--enable-flashinfer-mla",
-                    "--flashinfer-mla-disable-ragged",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         cls.process = popen_launch_server(
@@ -125,7 +126,8 @@ class TestFlashinferMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-num-draft-tokens",
                     "4",
-                    "--enable-flashinfer-mla",
+                    "--attention-backend",
+                    "flashinfer",
                 ]
             )
         cls.process = popen_launch_server(
@@ -157,6 +159,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/get_server_info")
+        print(f"{server_info=}")
         avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 2.5)
