@@ -495,6 +495,8 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    expert_location_metadata = TODO
+
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -565,7 +567,7 @@ def _launch_subprocesses(
     detoken_proc.start()
 
     # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerManager(server_args, port_args, expert_location_metadata)
     if server_args.chat_template:
         load_chat_template_for_openai_api(
             tokenizer_manager, server_args.chat_template, server_args.model_path
