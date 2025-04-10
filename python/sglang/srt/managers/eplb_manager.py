@@ -49,7 +49,7 @@ class _EPLBManagerNoop(EPLBManager):
 
 # TODO maybe move to ExpertLocationMetadata static method?
 def _compute_expert_location_metadata_raw(
-    server_args: ServerArgs, logical_count: torch.Tensor
+        server_args: ServerArgs, logical_count: torch.Tensor
 ):
     model_config = ModelConfig.from_server_args(server_args)
     model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
@@ -57,6 +57,7 @@ def _compute_expert_location_metadata_raw(
     )
 
     num_physical_experts = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
+    # TODO consider case when DP attention is disabled and DP > 1
     world_size = server_args.tp_size
     assert num_physical_experts % world_size == 0
     num_local_physical_experts = num_physical_experts // world_size
@@ -83,6 +84,6 @@ def _compute_expert_location_metadata_raw(
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
-    logical_to_physical_map: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
 ):
     return TODO
