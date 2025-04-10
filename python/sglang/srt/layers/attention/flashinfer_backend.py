@@ -10,7 +10,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial, wraps
+from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch

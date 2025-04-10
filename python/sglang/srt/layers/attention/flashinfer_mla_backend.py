@@ -40,15 +40,6 @@ if is_flashinfer_available():
         BatchPrefillWithRaggedKVCacheWrapper,
     )
 
-# Add this function to make custom ops opaque to torch.compile/dynamo
-def make_custom_op_dynamo_safe(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Disable tracing for this function
-        with torch._dynamo.disable():
-            return func(*args, **kwargs)
-    return wrapper
-
 
 @dataclass
 class DecodeMetadata:
@@ -409,21 +400,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     v,
                 )
         
-        # Use dynamo-safe wrapper for the run call
-        @make_custom_op_dynamo_safe
-        def safe_run_call(reshaped_q, k_buffer):
-            return decode_wrapper.run(
-                reshaped_q[:, :, : layer.v_head_dim],
-                reshaped_q[:, :, layer.v_head_dim :],
-                k_buffer[:, :, : layer.v_head_dim],
-                k_buffer[:, :, layer.v_head_dim :],
-            )
-        
+        # Reshape inputs
         reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        reshaped_k = k_buffer.view(-1, 1, layer.head_dim)
         
-        o = safe_run_call(reshaped_q, k_buffer)
+        # Direct call to run without the wrapper
+        o = decode_wrapper.run(
+            reshaped_q[:, :, : layer.v_head_dim],
+            reshaped_q[:, :, layer.v_head_dim :],
+            k_buffer[:, :, : layer.v_head_dim],
+            k_buffer[:, :, layer.v_head_dim :],
+        )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
