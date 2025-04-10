@@ -18,6 +18,20 @@ docker run --rm \
    -v $(pwd):/sgl-kernel \
    ${DOCKER_IMAGE} \
    bash -c "
+   # Install CMake (version >= 3.26) - Robust Installation
+   export CMAKE_VERSION_MAJOR=3.31
+   export CMAKE_VERSION_MINOR=1
+   echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz\"
+   wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
+   tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64.tar.gz
+   mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-x86_64 /opt/cmake
+   export PATH=/opt/cmake/bin:\$PATH
+
+   # Debugging CMake
+   echo \"PATH: \$PATH\"
+   which cmake
+   cmake --version
+
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
    export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
