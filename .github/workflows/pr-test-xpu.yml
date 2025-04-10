@@ -32,8 +32,7 @@ jobs:
       - name: Run container
         run: |
           docker run -dt \
-            -v $PWD:/root/sglang \
-            -w /root/sglang \
+            --device /dev/dri/ \
             --name ci_sglang_xpu \
             sglang_xpu:u2410
 
