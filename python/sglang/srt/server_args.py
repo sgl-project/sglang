@@ -73,7 +73,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
-    max_prefill_tokens: int = 16384
+    max_prefill_tokens: Optional[int] = None
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
@@ -394,6 +394,10 @@ class ServerArgs:
 
             self.page_size = 128  # Currently, HPU only supports page size of 128
             self.disable_radix_cache = True # Currently, HPU does not support radix cache
+            if self.max_prefill_tokens is None:
+                self.max_prefill_tokens = 4096 # Currently, HPU prefer smaller prefill batches
+        else:
+            self.max_prefill_tokens = 16384
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
