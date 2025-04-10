@@ -23,7 +23,7 @@ class EPLBManager:
             / "expert_distribution_storage"
         )
 
-    def bind(self, tokenizer_manager: TokenizerManager):
+    def bind(self, tokenizer_manager: "TokenizerManager"):
         self._expert_distribution_storage.bind(tokenizer_manager)
 
     async def handle_loop(self):
@@ -39,7 +39,3 @@ class EPLBManager:
         return ExpertLocationMetadata.init_by_eplb(
             self._server_args, logical_count=logical_count
         )
-
-
-class _EPLBManagerNoop(EPLBManager):
-    pass
