@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with cuda graph and torch.compile."""
+"""Run the model with hpu graph."""
 
 from __future__ import annotations
 
