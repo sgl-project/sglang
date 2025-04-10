@@ -896,14 +896,12 @@ void decode_attention_grouped_kernel_impl(
 
   // partition the heads into blocks for parallel
   const int64_t num_groups = num_heads / num_heads_kv;
-  const int64_t num_blocks = div_up(num_heads, std::min(BLOCK_H, num_groups));
-  const int64_t num_groups_per_block = div_up(num_groups, BLOCK_H);
-  const int64_t num_heads_per_block = std::min(num_groups, BLOCK_H);
+  const int64_t num_blocks = div_up(num_groups, BLOCK_H);
 
-  // parallel on [batches, num_blocks, num_kv_splits]
-  at::parallel_for(0, batches * num_blocks * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
-    int64_t bs{0}, head_id{0}, kv_id{0};
-    data_index_init(begin, bs, batches, head_id, num_blocks, kv_id, num_kv_splits);
+  // parallel on [batches, num_heads_kv, num_blocks, num_kv_splits]
+  at::parallel_for(0, batches * num_heads_kv * num_blocks * num_kv_splits, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_kv_id{0}, block_id{0}, kv_id{0};
+    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv, block_id, num_blocks, kv_id, num_kv_splits);
 
     alignas(64) float s_i[BLOCK_H * BLOCK_N];
     float* __restrict__ s_delta = s_i;
@@ -913,15 +911,13 @@ void decode_attention_grouped_kernel_impl(
     alignas(64) float m_delta[BLOCK_H];
 
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t h_start = head_id * num_heads_per_block;
-      const int64_t h_end = std::min(h_start + num_heads_per_block, num_heads);
+      const int64_t h_start = head_kv_id * num_groups + block_id * BLOCK_H;
+      const int64_t h_end = head_kv_id * num_groups + std::min(block_id * BLOCK_H + BLOCK_H, num_groups);
       const int64_t h_size = h_end - h_start;
 
       // get query
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideM + h_start * q_strideH;
 
-      // kv head id and valid block head size
-      int64_t head_kv_id = head_id / num_groups_per_block;
       int64_t seq_len_kv = seq_lens[bs];
       int64_t req_pool_id = req_pool_indices[bs];
       TORCH_CHECK(seq_len_kv <= max_context_len, "seq_len_kv out of scope!");
@@ -1015,7 +1011,7 @@ void decode_attention_grouped_kernel_impl(
       }
 
       // move to the next index
-      data_index_step(bs, batches, head_id, num_blocks, kv_id, num_kv_splits);
+      data_index_step(bs, batches, head_kv_id, num_heads_kv, block_id, num_blocks, kv_id, num_kv_splits);
     }
   });
 
