@@ -886,7 +886,7 @@ class ModelRunner:
                 "Please use `--attention-backend flashinfer`."
             )
             logger.warning(
-                "FlashAttention v3 Backend is in Beta. Multimodal, FP8, and Speculative Decoding are not supported."
+                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
@@ -924,6 +924,12 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
+            logger.warning(
+                "\n\nCUDA Graph is DISABLED.\n"
+                "This will cause significant performance degradation.\n"
+                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
+                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
+            )
             return
 
         tic = time.time()

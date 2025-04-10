@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 class GuidanceGrammar(BaseGrammarObject):
 
     def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
+        super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
 

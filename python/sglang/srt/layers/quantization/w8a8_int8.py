@@ -260,6 +260,7 @@ class W8A8Int8MoEMethod:
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_int8_w8a8=True,
+            per_channel_quant=True,
             w1_scale=(layer.w13_weight_scale),
             w2_scale=(layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,

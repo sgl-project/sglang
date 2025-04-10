@@ -15,6 +15,7 @@
 import json
 import logging
 import math
+import os
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -234,6 +235,20 @@ class ModelConfig:
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
+        if quant_cfg is None:
+            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
+            # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            is_local = os.path.exists(self.model_path)
+            modelopt_quant_config = {"quant_method": "modelopt"}
+            if not is_local:
+                from huggingface_hub import HfApi
+
+                hf_api = HfApi()
+                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                    quant_cfg = modelopt_quant_config
+            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+                quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -264,6 +279,7 @@ class ModelConfig:
             "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -470,8 +486,8 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
-    # TODO: add multimodal support for "Llama4ForConditionalGeneration",
     "LlavaLlamaForCausalLM",
+    "Llama4ForConditionalGeneration",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
     "LlavaVidForCausalLM",
