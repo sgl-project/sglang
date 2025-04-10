@@ -165,6 +165,7 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     init_expert_location: Optional[str] = None
     enable_eplb: bool = False
+    eplb_storage_dir: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -1106,21 +1107,27 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
-            "--init-expert-location",
-            type=str,
-            default=ServerArgs.init_expert_location,
-            help="Initial location of EP experts.",
-        )
-        parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
             help="Allocate this number of redundant experts in expert parallel.",
         )
         parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-cache-dir",
+            type=str,
+            default=ServerArgs.eplb_storage_dir,
+            help="Storage directory of EPLB subsystem.",
         )
         parser.add_argument(
             "--deepep-mode",
