@@ -411,8 +411,11 @@ class EPMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         physical_expert_ids = TODO
-        for physical_expert_ids in physical_expert_ids:
-            TODO
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param, loaded_weight=loaded_weight, weight_name=weight_name, shard_id=shard_id,
+                expert_id=physical_expert_id
+            )
 
     def _weight_loader_physical(
         self,
