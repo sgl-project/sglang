@@ -2,8 +2,8 @@ from pathlib import Path
 
 
 class ExpertDistributionStorage:
-    def __init__(self, dir_data: Path):
-        TODO
+    def __init__(self, dir_data):
+        self._dir_data = Path(dir_data)
 
     def save_current(self):
         TODO
