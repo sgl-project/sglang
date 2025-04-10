@@ -299,7 +299,7 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert (
-                    self.dp_size > 1
+                self.dp_size > 1
             ), "Please set a dp-size > 1. You can use 1 < dp-size <= tp-size "
             assert self.tp_size % self.dp_size == 0
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
@@ -322,14 +322,17 @@ class ServerArgs:
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.ep_num_redundant_experts > 0:
+            assert self.enable_deepep_moe, "ep_num_redundant_experts currently requires DeepEP MoE"
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE
             self.speculative_algorithm = "EAGLE"
 
         if (
-                self.speculative_algorithm == "EAGLE"
-                or self.speculative_algorithm == "EAGLE3"
+            self.speculative_algorithm == "EAGLE"
+            or self.speculative_algorithm == "EAGLE3"
         ):
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -342,8 +345,8 @@ class ServerArgs:
             # Auto choose parameters
             if self.speculative_num_steps is None:
                 assert (
-                        self.speculative_eagle_topk is None
-                        and self.speculative_num_draft_tokens is None
+                    self.speculative_eagle_topk is None
+                    and self.speculative_num_draft_tokens is None
                 )
                 (
                     self.speculative_num_steps,
@@ -361,7 +364,7 @@ class ServerArgs:
 
         # GGUF
         if (
-                self.load_format == "auto" or self.load_format == "gguf"
+            self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
@@ -1185,16 +1188,16 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (
-                self.tp_size % self.nnodes == 0
+            self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
-                self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
+            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
         assert (
-                self.max_loras_per_batch > 0
-                # FIXME
-                and (self.lora_paths is None or self.disable_cuda_graph)
-                and (self.lora_paths is None or self.disable_radix_cache)
+            self.max_loras_per_batch > 0
+            # FIXME
+            and (self.lora_paths is None or self.disable_cuda_graph)
+            and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
@@ -1277,14 +1280,14 @@ class PortArgs:
                 dist_init_addr = server_args.dist_init_addr.split(":")
 
             assert (
-                    len(dist_init_addr) == 2
+                len(dist_init_addr) == 2
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
                 scheduler_input_port = (
-                        port_base + 3
+                    port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
                 scheduler_input_port = port_base + 3 + 1 + dp_rank
