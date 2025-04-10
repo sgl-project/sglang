@@ -54,6 +54,7 @@ from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -165,6 +166,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -256,6 +258,7 @@ class Scheduler(
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
+            expert_location_metadata=expert_location_metadata,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             dp_rank=dp_rank,
@@ -2005,6 +2008,7 @@ def _import_static_state(model, static_params):
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    expert_location_metadata: ExpertLocationMetadata,
     gpu_id: int,
     tp_rank: int,
     dp_rank: Optional[int],
@@ -2036,7 +2040,9 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(
+            server_args, port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank
+        )
         pipe_writer.send(
             {
                 "status": "ready",

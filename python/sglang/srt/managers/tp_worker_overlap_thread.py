@@ -23,6 +23,7 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -54,13 +55,16 @@ class TpModelWorkerClient:
     def __init__(
         self,
         server_args: ServerArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
+        self.worker = TpModelWorker(
+            server_args, expert_location_metadata, gpu_id, tp_rank, dp_rank, nccl_port
+        )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
