@@ -24,8 +24,11 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVSender
+from sglang.srt.disaggregation.conn import KVManager, KVPoll
+from sglang.srt.disaggregation.transfer_engines import load_transfer_engine_classes
+
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
 )
@@ -55,6 +58,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -63,6 +67,10 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.scheduler = scheduler
+        self.kvmgr_cls, self.kvsender_cls, self.kvrecv_cls, self.kvarg_cls, self.kvbootstrap_cls = load_transfer_engine_classes(
+            scheduler.server_args.disaggregation_kv_engine)
+
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -74,7 +82,7 @@ class PrefillBootstrapQueue:
         output_id_buffer[idx] = token_id
 
     def _init_kv_manager(self) -> KVManager:
-        kv_args = KVArgs()
+        kv_args = self.kvarg_cls()
         kv_args.engine_rank = self.tp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -95,11 +103,12 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_manager = self.kvmgr_cls(kv_args, DisaggregationMode("prefill"))
         return kv_manager
 
     def add(self, req: Req) -> None:
-        req.disagg_kv_sender = KVSender(
+        req.disagg_kv_sender = self.kvsender_cls(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,

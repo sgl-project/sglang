@@ -361,6 +361,8 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
 
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
 
 class FunctionResponse(BaseModel):
     """Function response."""

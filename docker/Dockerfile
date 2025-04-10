@@ -46,3 +46,45 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.5/flashinfer-python
 
 ENV DEBIAN_FRONTEND=interactive
+
+RUN apt-get update &&  apt-get install -y \
+               rdma-core  \
+               infiniband-diags \
+               openssh-server \
+               perftest \
+               ibverbs-providers \
+               libibumad3 \
+               libibverbs1 \
+               libnl-3-200  \
+               libnl-route-3-200 \
+               librdmacm1  \
+               build-essential \
+               cmake \
+               netcat \
+               libibverbs-dev \
+               libnl-route-3-dev \
+               libnl-3-dev \
+               librdmacm1 \
+               libgoogle-glog-dev \
+               libgtest-dev \
+               libjsoncpp-dev \
+               libcpprest \
+               libnuma-dev \
+               libibverbs-dev \
+               libunwind-dev \
+               libgoogle-glog-dev \
+               libpython3-dev \
+               libboost-all-dev \
+               libssl-dev \
+               libgrpc-dev \
+               libgrpc++-dev \
+               libprotobuf-dev \
+               protobuf-compiler-grpc \
+               pybind11-dev \
+               libcurl4-openssl-dev \
+               libhiredis-dev \
+               pkg-config \
+               patchelf \
+               ccache \
+               libcurl4-openssl-dev \
+               libhiredis-dev  && rm -rf /var/lib/apt/lists/*

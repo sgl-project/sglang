@@ -1828,3 +1828,13 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+def get_local_ip_by_remote(addr="8.8.8.8:8888"):
+    """
+    Get Local IP Connecting Remote Addr
+    """
+
+    host, port = addr.split(":")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, int(port.strip())))  # connecting fake server to get ip host
+        return s.getsockname()[0]

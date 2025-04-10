@@ -734,6 +734,10 @@ def _wait_and_warmup(
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
+    if server_args.disaggregation_mode != "null":
+        logger.warning(f"No need warm UP in mode : {server_args.disaggregation_mode}")
+
+        return
     # Wait until the server is launched
     success = False
     for _ in range(120):

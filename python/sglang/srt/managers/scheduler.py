@@ -590,6 +590,7 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_infight_queue: List[Req] = []
@@ -836,6 +837,8 @@ class Scheduler(
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
             req.queue_time_start = time.time()

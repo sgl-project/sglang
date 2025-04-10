@@ -49,6 +49,7 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
+from sglang.srt.disaggregation.transfer_engines import load_transfer_engine_classes
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.managers.io_struct import (
@@ -327,10 +328,12 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
+        _, _, _, _, kvbootstrap_cls = load_transfer_engine_classes(
+            self.server_args.disaggregation_kv_engine)
         # for disaggregtion, start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
-            self.bootstrap_server = KVBootstrapServer(
+            self.bootstrap_server = kvbootstrap_cls(
                 self.server_args.disaggregation_bootstrap_port
             )
 
@@ -452,6 +455,8 @@ class TokenizerManager:
                 top_logprobs_num,
                 token_ids_logprob,
                 obj.stream,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
@@ -957,8 +962,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
