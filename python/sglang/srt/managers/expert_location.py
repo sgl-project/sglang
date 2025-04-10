@@ -83,7 +83,7 @@ class ExpertLocationMetadata:
             assert getattr(self, field) == getattr(other, field)
         for field in _UPDATE_FIELDS_TENSOR:
             # Cannot update address to avoid breaking CUDA graph
-            getattr(self, field) = getattr(other, field)
+            getattr(self, field)[...] = getattr(other, field)
 
 
 _UPDATE_FIELDS_TRIVIAL = [
