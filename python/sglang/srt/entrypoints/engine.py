@@ -340,7 +340,7 @@ class Engine:
         flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
-        to avoid duplicated cache clearning operation."""
+        to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[
                 MultiprocessingSerializer.serialize(named_tensors)
