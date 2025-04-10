@@ -90,7 +90,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorReqOutput, UpdateExpertLocationMetadataReqInput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -665,7 +665,8 @@ class TokenizerManager:
             expert_location_metadata=self.expert_location_metadata,
         )
 
-    async def update_expert_location_metadata(self, obj:):
+    async def update_expert_location_metadata(self, obj: UpdateExpertLocationMetadataReqInput):
+        TODO
 
     async def update_weights_from_disk(
         self,
