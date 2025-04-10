@@ -3,6 +3,7 @@ import unittest
 from typing import List
 
 import sglang as sgl
+import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -15,6 +16,8 @@ from sglang.test.test_utils import (
 
 class TestEPLB(CustomTestCase):
     def test_eplb_e2e(self):
+        TODO_test_redundant_experts
+       
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -49,6 +52,7 @@ class TestEPLB(CustomTestCase):
         self.assertEqual(actual_output, ref_output)
 
         physical_to_logical_map = engine.tokenizer_manager.expert_location_metadata.physical_to_logical_map
+        assert torch.all(physical_to_logical_map[0, :] == TODO)
         TODO
 
     def _engine_generate(self, engine: sgl.Engine):
