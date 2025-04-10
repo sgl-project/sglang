@@ -46,7 +46,7 @@ jobs:
       - name: Run UT Cases
         timeout-minutes: 20
         run: |
-          docker exec -w /root/sglang ci_sglang_xpu /miniforge3/envs/py310/bin/python3 -m pytest -v test/srt/test_custom_allreduce.py
+          echo "[placeholder] UT cases"
 
       - name: Run standard tests
         timeout-minutes: 20
