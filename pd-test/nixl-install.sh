@@ -41,9 +41,9 @@ source ~/.bashrc
 
 cd ~
 rm -rf nixl
-git clone https://github.com/ai-dynamo/nixl.git
+git clone https://github.com/jokerwyt/nixl
 cd nixl
-git checkout 1c943627d66777e30a81632e3c577c27c0509257
+git checkout 250409/fix-check_remote_xfer_done
 rm -rf build
 mkdir build
 meson setup build
