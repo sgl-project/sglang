@@ -14,6 +14,8 @@ class ExpertLocationMetadata:
     # will have a `logical_to_physical_map` later
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
 
+    # -------------------------------- construction and mutation ------------------------------------
+
     @staticmethod
     def from_model_config(model_config: ModelConfig):
         model_class, _ = get_model_architecture(model_config)
@@ -43,14 +45,6 @@ class ExpertLocationMetadata:
     def _init_dummy():
         return ExpertLocationMetadata.init_new(num_layers=1, num_logical_experts=1)
 
-    def local_physical_to_global_physical(
-            self, rank: int, local_physical_expert_index: int
-    ):
-        return self.num_local_physical_experts * rank + local_physical_expert_index
-
-    def global_physical_to_local_physical(self, global_physical_expert_index: int):
-        return global_physical_expert_index % self.num_local_physical_experts
-
     def update(self, other: "ExpertLocationMetadata"):
         for field in [
             "num_layers",
@@ -64,6 +58,16 @@ class ExpertLocationMetadata:
         ]:
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
+
+    # -------------------------------- usage ------------------------------------
+
+    def local_physical_to_global_physical(
+            self, rank: int, local_physical_expert_index: int
+    ):
+        return self.num_local_physical_experts * rank + local_physical_expert_index
+
+    def global_physical_to_local_physical(self, global_physical_expert_index: int):
+        return global_physical_expert_index % self.num_local_physical_experts
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
