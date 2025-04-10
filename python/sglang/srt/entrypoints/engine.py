@@ -495,7 +495,7 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
-    expert_location_metadata = TODO
+    expert_location_metadata = ExpertLocationMetadata.from_model(TODO)
 
     scheduler_procs = []
     if server_args.dp_size == 1:
