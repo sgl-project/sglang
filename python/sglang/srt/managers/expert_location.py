@@ -4,6 +4,7 @@ from typing import List
 import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader import get_model_architecture
 
 
@@ -28,7 +29,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
-        num_physical_experts = TODO
+        num_physical_experts = num_logical_experts + global_server_args_dict["ep_num_redundant_experts"]
         world_size = get_tensor_model_parallel_world_size()
         assert num_physical_experts % world_size == 0
         num_local_physical_experts = num_physical_experts // world_size
