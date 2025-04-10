@@ -22,6 +22,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
+        TODO_this_function
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_model_config_for_expert_location"):
             model_config_for_expert_location = model_class.get_model_config_for_expert_location(model_config.hf_config)
