@@ -55,11 +55,11 @@ class ExpertLocationMetadata:
 
     def update(self, other: "ExpertLocationMetadata"):
         if self.is_dummy:
-            self._update_by_assign(other)
+            self._update_unconditionally(other)
         else:
             raise NotImplementedError  # will handle later
 
-    def _update_by_assign(self, other: "ExpertLocationMetadata"):
+    def _update_unconditionally(self, other: "ExpertLocationMetadata"):
         self.is_dummy = other.is_dummy
         self.num_layers = other.num_layers
         self.num_local_physical_experts = other.num_local_physical_experts
