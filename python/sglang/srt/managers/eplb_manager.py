@@ -94,6 +94,8 @@ def _compute_logical_to_rank_dispatch_physical_map(
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
             for gpu_id in range(num_gpus):
-                TODO
+                candidate_values = ExpertLocationMetadata.logical_to_all_physical_raw(logical_to_all_physical_map,
+                                                                                      layer_id, logical_expert_id)
+                logical_to_rank_dispatch_physical_map[gpu_id, layer_id, logical_expert_id] = TODO
 
     return logical_to_rank_dispatch_physical_map
