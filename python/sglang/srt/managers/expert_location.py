@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 
@@ -14,9 +15,9 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
 
     @staticmethod
-    def from_model(model):
-        if hasattr(model, "get_expert_location_metadata"):
-            return model.get_expert_location_metadata()
+    def from_model_config(model_config: ModelConfig):
+        if hasattr(model_config, "get_expert_location_metadata"):
+            return model_config.get_expert_location_metadata()
         return ExpertLocationMetadata._init_dummy()
 
     @staticmethod
