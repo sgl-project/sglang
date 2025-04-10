@@ -615,7 +615,8 @@ def _launch_subprocesses(
     return tokenizer_manager, scheduler_info
 
 
-def _compute_initial_expert_location_metadata(server_args: ServerArgs, eplb_manager: EPLBManager):
+def _compute_initial_expert_location_metadata(server_args: ServerArgs,
+                                              eplb_manager: EPLBManager) -> ExpertLocationMetadata:
     if server_args.init_expert_location is not None:
         return TODO
     if server_args.enable_eplb:
