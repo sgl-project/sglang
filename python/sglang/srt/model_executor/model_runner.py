@@ -481,8 +481,8 @@ class ModelRunner:
 
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
         self.update_weights_from_disk(
-            model_path=TODO,
-            load_format=TODO,
+            model_path=self.model_config.model_path,
+            load_format=self.server_args.load_format,
             param_categories=["moe"],
         )
 
