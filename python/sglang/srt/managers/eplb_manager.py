@@ -10,6 +10,7 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     ModelConfigForExpertLocation,
 )
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ class EPLBManager:
         )
 
     def bind(self, tokenizer_manager: "TokenizerManager"):
+        self._tokenizer_manager = tokenizer_manager
         self._expert_distribution_storage.bind(tokenizer_manager)
 
     async def handle_loop(self):
@@ -38,9 +40,9 @@ class EPLBManager:
             await self.rebalance()
 
     async def rebalance(self):
-        logger.info("rebalance start")
-        TODO
-        logger.info("rebalance end")
+        expert_location_metadata = self.compute_expert_location_metadata()
+        await self._tokenizer_manager.update_expert_location(
+            UpdateExpertLocationReqInput(expert_location_metadata=expert_location_metadata))
 
     def save_expert_distribution(self):
         self._expert_distribution_storage.save_current()
