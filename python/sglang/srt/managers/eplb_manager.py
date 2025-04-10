@@ -27,7 +27,7 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
         num_replicas=TODO,
-        num_groups=TODO,
+        num_groups=config.n_group,
         num_nodes=server_args.nnodes,
         # TODO Consider scenario when disabling DP attn + DP size > 1
         num_gpus=server_args.tp_size,
