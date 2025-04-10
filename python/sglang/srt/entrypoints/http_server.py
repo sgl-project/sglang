@@ -310,10 +310,10 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
-    _global_state.tokenizer_manager.flush_cache()
+    await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -637,10 +637,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
