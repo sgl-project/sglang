@@ -617,9 +617,9 @@ class FlashAttentionBackend(AttentionBackend):
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k=metadata.cu_seqlens_k,
+                    cu_seqlens_k=metadata.cu_seqlens_q,
                     max_seqlen_q=metadata.max_seq_len_q,
-                    max_seqlen_k=metadata.max_seq_len_k,
+                    max_seqlen_k=metadata.max_seq_len_q,
                     softmax_scale=layer.scaling,
                     causal=True,
                 )

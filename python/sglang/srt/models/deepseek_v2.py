@@ -1096,7 +1096,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             lse = torch.transpose(lse, 0, 1).contiguous()
             accum_output, accum_lse = merge_state(accum_output, accum_lse, output, lse)
 
-        return accum_output, accum_lse
+        return accum_output
 
     def forward_normal_chunked_kv(
         self,
@@ -1156,7 +1156,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
 
             forward_batch.set_attn_attend_prefix_cache(True)
-            attn_output, _ = self._chunked_prefix_attn_mha(
+            attn_output = self._chunked_prefix_attn_mha(
                 q=q,
                 accum_output=attn_output,
                 accum_lse=lse,
