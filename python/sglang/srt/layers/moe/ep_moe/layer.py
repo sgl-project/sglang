@@ -224,7 +224,8 @@ class EPMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
-            layer_id=self.layer_id,
+            expert_logical_to_rank_dispatch_physical_map=
+            get_global_expert_location_metadata().logical_to_rank_dispatch_physical_map[rank, self.layer_id, :],
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
