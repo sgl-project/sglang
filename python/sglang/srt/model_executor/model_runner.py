@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Iterable
 
 import torch
 import torch.distributed as dist
@@ -488,7 +488,7 @@ class ModelRunner:
             )
             return iter
 
-        def filter_weight_iter(iter):
+        def filter_weight_iter(iter: Iterable[Tuple[str, torch.Tensor]]):
             for name, weight in iter:
                 if TODO:
                     yield name, weight
