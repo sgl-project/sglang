@@ -480,7 +480,11 @@ class ModelRunner:
         torch.distributed.barrier()
 
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
-        TODO
+        self.update_weights_from_disk(
+            model_path=TODO,
+            load_format=TODO,
+            param_categories=["moe"],
+        )
 
         torch.distributed.barrier()
         logger.info("update_expert_location end")
