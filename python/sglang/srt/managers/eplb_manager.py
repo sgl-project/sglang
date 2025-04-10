@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 
 
 class EPLBManager:
+    @staticmethod
+    def init_new(server_args: ServerArgs):
+        if server_args.enable_eplb:
+            return _EPLBManagerReal(server_args)
+        else:
+            return _EPLBManagerNoop()
+
+    def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
+        return TODO
+
+class _EPLBManagerReal(EPLBManager):
     def __init__(self, server_args: ServerArgs):
         self._server_args = server_args
         self._expert_distribution_storage = ExpertDistributionStorage()
@@ -25,8 +36,12 @@ class EPLBManager:
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
         if logical_count is None:
-            return TODO_default
+            return super().compute_expert_location_metadata()
         return _compute_expert_location_metadata_raw(self._server_args, logical_count)
+
+
+class _EPLBManagerNoop(EPLBManager):
+    pass
 
 
 # TODO maybe move to ExpertLocationMetadata static method?
