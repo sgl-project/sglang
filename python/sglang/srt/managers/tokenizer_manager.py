@@ -45,7 +45,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.conn import KVBootstrapServer
@@ -202,7 +201,7 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
-        self.eplb_manager = EPLBManager()
+        self.eplb_manager = EPLBManager(self)
 
         # Store states
         self.no_create_loop = False
@@ -712,6 +711,10 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.eplb_manager.rebalance_experts()
 
+    async def update_expert_location_metadata(self):
+        self.auto_create_handle_loop()
+        TODO
+
     async def init_weights_update_group(
         self,
         obj: InitWeightsUpdateGroupReqInput,
@@ -969,8 +972,8 @@ class TokenizerManager:
             elif isinstance(recv_obj, BatchTokenIDOut):
                 if self.server_args.stream_output and state.obj.stream:
                     output_token_ids = recv_obj.output_ids[i][
-                        state.last_output_offset :
-                    ]
+                                       state.last_output_offset:
+                                       ]
                     state.last_output_offset = len(recv_obj.output_ids[i])
                 else:
                     output_token_ids = recv_obj.output_ids[i]
