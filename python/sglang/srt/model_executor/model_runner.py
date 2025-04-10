@@ -486,8 +486,8 @@ class ModelRunner:
             param_categories=["moe"],
         )
 
-        torch.distributed.barrier()
         logger.info("update_expert_location end")
+        torch.distributed.barrier()
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
