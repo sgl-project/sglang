@@ -489,9 +489,12 @@ class ModelRunner:
             return iter
 
         def filter_weight_iter(iter: Iterable[Tuple[str, torch.Tensor]]):
-            for name, weight in iter:
-                if TODO:
-                    yield name, weight
+            if param_categories is None:
+                yield from iter
+            else:
+                for name, weight in iter:
+                    if self.model.get_:
+                        yield name, weight
 
         def model_load_weights(model, iter):
             DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)

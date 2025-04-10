@@ -1608,6 +1608,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def get_param_category(self, name):
+        return TODO
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
