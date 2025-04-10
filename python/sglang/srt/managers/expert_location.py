@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
@@ -50,24 +51,28 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_eplb():
+    def init_by_eplb(server_args: ServerArgs, logical_count: torch.Tensor):
+        common = ExpertLocationMetadata._init_common(server_args)
+        model_config_for_expert_location = common["model_config_for_expert_location"]
+
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             deepseek_eplb.rebalance_experts(
                 weight=logical_count,
-                num_replicas=num_physical_experts,
+                num_replicas=common["num_physical_experts"],
                 num_groups=model_config_for_expert_location.num_groups,
                 num_nodes=server_args.nnodes,
-                num_gpus=world_size,
+                num_gpus=common["world_size"],
             )
         )
+
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
-            num_local_physical_experts=num_local_physical_experts,
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
+            num_local_physical_experts=common["num_local_physical_experts"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map, num_gpus=world_size,
+                logical_to_all_physical_map, num_gpus=common["world_size"],
             ),
         )
 
@@ -86,6 +91,7 @@ class ExpertLocationMetadata:
             model_config_for_expert_location=model_config_for_expert_location,
             num_physical_experts=num_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
+            world_size=world_size,
         )
 
     # -------------------------------- usage ------------------------------------
