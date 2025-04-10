@@ -1,7 +1,5 @@
-import random
 from typing import TYPE_CHECKING, Optional
 
-import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -27,7 +25,7 @@ class EPLBManager:
         self.tokenizer_manager: Optional[TokenizerManager] = None
 
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
-        return ExpertLocationMetadata.init_trivial(TODO)
+        raise NotImplementedError
 
 
 class _EPLBManagerReal(EPLBManager):
@@ -39,10 +37,9 @@ class _EPLBManagerReal(EPLBManager):
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
         if logical_count is None:
-            return super().compute_expert_location_metadata()
-        return _compute_expert_location_metadata_raw(self._server_args, logical_count)
+            return ExpertLocationMetadata.init_trivial(self._server_args)
+        return ExpertLocationMetadata.init_by_eplb(self._server_args, logical_count=logical_count)
 
 
 class _EPLBManagerNoop(EPLBManager):
     pass
-
