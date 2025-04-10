@@ -26,8 +26,9 @@ class ExpertLocationMetadata:
         model_class, _ = get_model_architecture(model_config)
         if hasattr(model_class, "get_model_config_for_expert_location"):
             model_config_for_expert_location = model_class.get_model_config_for_expert_location(model_config.hf_config)
-            return TODO
-        return ExpertLocationMetadata._init_dummy()
+        else:
+            model_config_for_expert_location = ModelConfigForExpertLocation.init_dummy()
+        return TODO
 
     @staticmethod
     def init_new(num_layers: int, num_logical_experts: int):
@@ -56,10 +57,6 @@ class ExpertLocationMetadata:
             ).repeat(num_layers, 1)[..., None],
         )
 
-    @staticmethod
-    def _init_dummy():
-        return ExpertLocationMetadata.init_new(num_layers=1, num_logical_experts=1)
-
     # -------------------------------- usage ------------------------------------
 
     def local_physical_to_physical(self, rank: int, local_physical_expert_index: int):
@@ -85,3 +82,7 @@ class ModelConfigForExpertLocation:
     num_layers: int
     num_logical_experts: int
     num_groups: Optional[int] = None
+
+    @staticmethod
+    def init_dummy():
+        return ModelConfigForExpertLocation(num_layers=1, num_logical_experts=1)
