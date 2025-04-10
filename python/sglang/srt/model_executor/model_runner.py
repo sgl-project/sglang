@@ -488,13 +488,18 @@ class ModelRunner:
             )
             return iter
 
+        def filter_weight_iter(iter):
+            for name, weight in iter:
+                if TODO:
+                    yield name, weight
+
         def model_load_weights(model, iter):
             DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = filter_weight_iter(get_weight_iter(self.model_config))
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
