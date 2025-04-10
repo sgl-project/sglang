@@ -165,7 +165,7 @@ class ServerArgs:
     ep_num_redundant_experts: int = 0
     init_expert_location: Optional[str] = None
     enable_eplb: bool = False
-    eplb_storage_dir: Optional[str] = None
+    eplb_storage_dir: str = "/tmp/eplb_storage"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None

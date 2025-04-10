@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -34,8 +35,10 @@ class _EPLBManagerReal(EPLBManager):
         self._server_args = server_args
 
     async def initialize(self, tokenizer_manager: TokenizerManager):
-        self._expert_distribution_storage = ExpertDistributionStorage(dir_data=TODO,
-                                                                      tokenizer_manager=tokenizer_manager)
+        self._expert_distribution_storage = ExpertDistributionStorage(
+            dir_data=Path(self._server_args.eplb_storage_dir) / "expert_distribution_storage",
+            tokenizer_manager=tokenizer_manager,
+        )
         await self._expert_distribution_storage.initialize()
 
     def compute_expert_location_metadata(self):
