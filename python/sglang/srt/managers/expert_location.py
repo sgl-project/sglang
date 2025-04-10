@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.model_loader import get_model_architecture
@@ -12,8 +11,9 @@ class ExpertLocationMetadata:
     num_layers: int
     num_local_physical_experts: int
     num_logical_experts: int
-    # will have a `logical_to_physical_map` later
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    logical_to_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    chosen_logical_to_physical_map: torch.Tensor  # (layers, num_logical_experts)
 
     # -------------------------------- construction and mutation ------------------------------------
 
@@ -28,7 +28,7 @@ class ExpertLocationMetadata:
     def init_new(num_layers: int, num_logical_experts: int):
         # TODO handle more complex cases like duplicating experts on different GPUs
         num_local_physical_experts = (
-            num_logical_experts // get_tensor_model_parallel_world_size()
+                num_logical_experts // get_tensor_model_parallel_world_size()
         )
         num_physical_experts = num_logical_experts
 
@@ -63,12 +63,15 @@ class ExpertLocationMetadata:
     # -------------------------------- usage ------------------------------------
 
     def local_physical_to_global_physical(
-        self, rank: int, local_physical_expert_index: int
+            self, rank: int, local_physical_expert_index: int
     ):
         return self.num_local_physical_experts * rank + local_physical_expert_index
 
     def global_physical_to_local_physical(self, global_physical_expert_index: int):
         return global_physical_expert_index % self.num_local_physical_experts
+
+    def logical_to_global_physical(self, logical_expert_id: int):
+        return [logical_expert_id]  # TODO add a logical_to_physical_map
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
