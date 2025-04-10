@@ -22,7 +22,6 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
-        model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
         return TODO
 
     @staticmethod

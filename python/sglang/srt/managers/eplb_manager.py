@@ -1,9 +1,11 @@
 from typing import TYPE_CHECKING
 
 import torch
+
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.expert_location import ExpertLocationMetadata, ModelConfigForExpertLocation
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -24,6 +26,8 @@ class EPLBManager:
 
 # TODO maybe move to ExpertLocationMetadata static method?
 def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: torch.Tensor):
+    model_config = ModelConfig.from_server_args(server_args)
+    model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(model_config)
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
         num_replicas=TODO,
@@ -38,5 +42,5 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
         num_logical_experts=TODO,
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_physical_map,
-        logical_to_rank_dispatch_physical_map=TODO,
+        logical_to_rank_dispatch_physical_map=TODO_compute,
     )
