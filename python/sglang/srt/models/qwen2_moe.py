@@ -487,10 +487,11 @@ class Qwen2MoeForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-    def get_expert_location_metadata(self):
+    @classmethod
+    def get_expert_location_metadata(cls, config):
         return ExpertLocationMetadata.init_new(
-            num_layers=self.config.num_hidden_layers,
-            num_logical_experts=self.config.num_experts,
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
         )
 
 
