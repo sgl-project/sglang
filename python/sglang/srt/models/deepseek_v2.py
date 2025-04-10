@@ -22,10 +22,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -73,6 +69,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -412,7 +411,7 @@ class DeepseekV2Attention(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = self.qk_head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -525,12 +524,12 @@ class DeepseekV2Attention(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
         q = torch.nn.functional.pad(q, [0, 256 - self.qk_head_dim], value=0).view(
             -1, self.num_local_heads * 256
         )
@@ -542,8 +541,8 @@ class DeepseekV2Attention(nn.Module):
         )
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, 256)[
-            ..., : self.v_head_dim
-        ].reshape(-1, self.num_local_heads * self.v_head_dim)
+                      ..., : self.v_head_dim
+                      ].reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -584,7 +583,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.scaling = self.qk_head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -771,16 +770,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        v = kv[..., self.qk_nope_head_dim:]
+        k_pe = latent_cache[:, :, self.kv_lora_rank:]
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q[..., self.qk_nope_head_dim :] = q_pe
+        q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k[..., self.qk_nope_head_dim:] = k_pe
 
         latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+        latent_cache[:, :, self.kv_lora_rank:] = k_pe
 
         # Save latent cache
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -833,11 +832,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank :]
+        k_pe = k_input[..., self.kv_lora_rank:]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_input[..., self.kv_lora_rank :] = q_pe
-        k_input[..., self.kv_lora_rank :] = k_pe
+        q_input[..., self.kv_lora_rank:] = q_pe
+        k_input[..., self.kv_lora_rank:] = k_pe
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -913,15 +912,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., : self.kv_lora_rank] = v_input
 
         if not enable_rope_fusion:
-            k_pe = k_input[..., self.kv_lora_rank :]
+            k_pe = k_input[..., self.kv_lora_rank:]
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-            q_input[..., self.kv_lora_rank :] = q_pe
-            k_input[..., self.kv_lora_rank :] = k_pe
+            q_input[..., self.kv_lora_rank:] = q_pe
+            k_input[..., self.kv_lora_rank:] = k_pe
             k_pe_output = None
         else:
-            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank :])
+            k_pe_output = torch.empty_like(k_input[..., self.kv_lora_rank:])
 
-        q_input[..., self.kv_lora_rank :] = q_pe
+        q_input[..., self.kv_lora_rank:] = q_pe
 
         # attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         # Use Fused ROPE with use_rope=OFF.
@@ -978,7 +977,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         if enable_rope_fusion:
-            k_input[..., self.kv_lora_rank :] = k_pe_output
+            k_input[..., self.kv_lora_rank:] = k_pe_output
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mqa, forward_batch.out_cache_loc, k_input, None
             )
@@ -1496,7 +1495,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self.config.moe_layer_freq,
                 ),
                 desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
+                     "replicas of the shared expert into MoE",
             ):
                 for num_repeat in range(self.n_share_experts_fusion):
                     for suffix in suffix_list:
@@ -1527,11 +1526,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.n_share_experts_fusion
-                if self.n_share_experts_fusion is not None
-                else 0
-            ),
+                        + (
+                            self.n_share_experts_fusion
+                            if self.n_share_experts_fusion is not None
+                            else 0
+                        ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1609,7 +1608,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def get_param_category(self, name):
-        return TODO
+        if ".experts." in name:
+            return "moe"
+        return "others"
+
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass

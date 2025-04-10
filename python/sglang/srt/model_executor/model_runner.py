@@ -493,7 +493,7 @@ class ModelRunner:
                 yield from iter
             else:
                 for name, weight in iter:
-                    if self.model.get_:
+                    if self.model.get_param_category(name) in param_categories:
                         yield name, weight
 
         def model_load_weights(model, iter):
