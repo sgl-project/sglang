@@ -21,10 +21,6 @@ class ExpertLocationMetadata:
     # -------------------------------- construction and mutation ------------------------------------
 
     @staticmethod
-    def from_model_config(model_config: ModelConfig):
-        return TODO
-
-    @staticmethod
     def init_trivial(num_layers: int, num_logical_experts: int):
         """Trivial location - logical expert i corresponds to physical expert i"""
         num_physical_experts = (
