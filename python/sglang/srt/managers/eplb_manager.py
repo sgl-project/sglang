@@ -85,6 +85,7 @@ def _compute_logical_to_rank_dispatch_physical_map(
         logical_to_all_physical_map: torch.Tensor,
 ):
     # TODO maybe improve this algorithm (e.g. ensure it is really balanced)
+    # This is rarely called, so we use for loops for maximum clarity
 
     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     logical_to_rank_dispatch_physical_map = torch.zeros((num_gpus, num_layers, num_logical_experts))
