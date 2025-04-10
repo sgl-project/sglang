@@ -26,7 +26,7 @@ class EPLBManager:
         self.tokenizer_manager: Optional[TokenizerManager] = None
 
     def compute_expert_location_metadata(self) -> ExpertLocationMetadata:
-        return TODO_trivial_output
+        return ExpertLocationMetadata.init_trivial(TODO)
 
 
 class _EPLBManagerReal(EPLBManager):
