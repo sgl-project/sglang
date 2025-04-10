@@ -24,6 +24,8 @@ class EPLBManager:
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()
+        if logical_count is None:
+            return TODO_default
         return _compute_expert_location_metadata_raw(self._server_args, logical_count)
 
 
