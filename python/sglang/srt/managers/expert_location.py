@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.model_loader import get_model_architecture
@@ -53,7 +52,7 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def logical_to_global_physical(self, logical_expert_id: int):
-        return TODO
+        return logical_expert_id  # TODO support arbitrary mapping
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
