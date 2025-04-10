@@ -42,7 +42,7 @@ if _is_cuda:
     from sglang.srt.custom_op import scaled_fp8_quant as sgl_scaled_fp8_quant
 
 elif _is_hip:
-    from vllm import _custom_ops as vllm_ops # TODO: merge #4432, and replace moe_sum
+    from vllm import _custom_ops as vllm_ops # TODO: merge #4432
     from sglang.srt.layers.quantization.fp8_kernel import (
         per_token_group_quant_fp8,
     )
@@ -1500,7 +1500,8 @@ def fused_experts_impl(
         if no_combine:
             pass
         elif _is_hip:
-            vllm_ops.moe_sum(
+            from aiter import moe_sum
+            moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states[begin_chunk_idx:end_chunk_idx],
             )
