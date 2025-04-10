@@ -171,6 +171,7 @@ def input_to_float8(
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     fp8_max = finfo.max
     if _is_hip:
+        dtype = torch.float8_e4m3fnuz
         fp8_max = 224.0
     scale = fp8_max / amax
     x_scl_sat = (x * scale).clamp(min=-fp8_max, max=fp8_max)
@@ -216,6 +217,15 @@ def block_quant_to_tensor_quant(
     return x_q_tensor, scale
 
 
+def channel_quant_to_tensor_quant(
+    x_q_channel: torch.Tensor,
+    x_s: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_dq_channel = x_q_channel.to(torch.float32) * x_s
+    x_q_tensor, scale = input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
+    return x_q_tensor, scale
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -242,9 +252,19 @@ def apply_fp8_linear(
         if _is_cuda:
             qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
         else:
-            qinput, x_scale = per_token_group_quant_fp8(
-                input_2d, group_size=input_2d.shape[1]
-            )
+            # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+            # final solution should be: 1. add support to per-tensor activation scaling.
+            # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+            if _is_hip and weight_scale.numel() == 1:
+                qinput, x_scale = ops.scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
+            else:
+                qinput, x_scale = per_token_group_quant_fp8(
+                    input_2d, group_size=input_2d.shape[1]
+                )
 
     if cutlass_fp8_supported:
         try:
@@ -457,12 +477,9 @@ class Fp8LinearOp:
                 qinput, x_scale = sgl_scaled_fp8_quant(
                     input_2d,
                     input_scale,
+                    num_token_padding=self.output_padding,
                     use_per_token_if_dynamic=use_per_token_if_dynamic,
                 )
-                if self.output_padding:
-                    pad_size = max(self.output_padding - qinput.shape[0], 0)
-                    if pad_size > 0:
-                        qinput = torch.nn.functional.pad(qinput, (0, 0, 0, pad_size))
             else:
                 qinput, x_scale = ops.scaled_fp8_quant(
                     input_2d,

@@ -193,6 +193,7 @@ class Gemma3Attention(nn.Module):
             # Module must also define `get_attention_sliding_window_size` to correctly initialize
             # attention backend in `ForwardBatch`.
             sliding_window_size=self.sliding_window,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
