@@ -48,8 +48,9 @@ from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.expert_distribution import expert_distribution_recorder
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import (
-    global_expert_location_metadata,
+    get_global_expert_location_metadata,
     global_server_args_dict,
+    set_global_expert_location_metadata,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -175,7 +176,7 @@ class ModelRunner:
                 "use_mla_backend": self.use_mla_backend,
             }
         )
-        global_expert_location_metadata.update(expert_location_metadata)
+        set_global_expert_location_metadata(expert_location_metadata)
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -198,7 +199,7 @@ class ModelRunner:
 
         expert_distribution_recorder.initialize(
             server_args,
-            global_expert_location_metadata,
+            get_global_expert_location_metadata(),
             # TODO handle DP!=TP case
             rank=self.tp_rank,
         )

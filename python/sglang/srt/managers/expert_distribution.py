@@ -193,7 +193,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 local_physical_expert_idx = (
-                    self._expert_location_metadata.global_physical_to_local_physical(
+                    self._expert_location_metadata.physical_to_local_physical(
                         global_physical_expert_idx
                     )
                 )
@@ -334,7 +334,7 @@ class _StatAccumulator(_Accumulator):
                     expert_location_metadata.num_local_physical_experts
                 ):
                     global_physical_expert_index = (
-                        expert_location_metadata.local_physical_to_global_physical(
+                        expert_location_metadata.local_physical_to_physical(
                             rank=physical_dump["rank"],
                             local_physical_expert_index=local_physical_expert_index,
                         )
