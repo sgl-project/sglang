@@ -226,6 +226,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
 
         import habana_frameworks.torch as htorch
+
         hidden_dim = x.shape[-1]
         num_experts = layer.w13_weight.shape[0]
         moe_n_slice = 8 if num_experts > 32 else 1
@@ -257,8 +258,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 for j in range(min_expert, max_expert)
             ]
             w2_list_slice = [
-                layer.w2_weight[j].data.squeeze()
-                for j in range(min_expert, max_expert)
+                layer.w2_weight[j].data.squeeze() for j in range(min_expert, max_expert)
             ]
             current_hidden_states = torch.ops.hpu.mixture_of_experts(
                 hidden_states=x,
@@ -269,13 +269,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 permuted_weights=True,
                 activation=activation,
                 experts_min=min_expert + ep_shift,
-                experts_max=max_expert - 1 + ep_shift,)
+                experts_max=max_expert - 1 + ep_shift,
+            )
             htorch.core.mark_step()
             if i == 0:
                 final_hidden_states = current_hidden_states
             else:
                 final_hidden_states.add_(current_hidden_states)
-        return final_hidden_states.view(-1, x.shape[1])   
+        return final_hidden_states.view(-1, x.shape[1])
 
     def forward_cpu(
         self,

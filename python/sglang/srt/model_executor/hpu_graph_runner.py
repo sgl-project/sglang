@@ -253,7 +253,10 @@ class HPUGraphRunner:
         self.model_runner = model_runner
         import habana_frameworks.torch as htorch
         import vllm_hpu_extension.environment as environment
-        environment.runtime_params["model_type"] = model_runner.model_config.hf_config.model_type
+
+        environment.runtime_params["model_type"] = (
+            model_runner.model_config.hf_config.model_type
+        )
 
         self.model = (
             htorch.hpu.wrap_in_hpu_graph(
