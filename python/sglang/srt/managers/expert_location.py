@@ -52,22 +52,19 @@ class ExpertLocationMetadata:
         return global_physical_expert_index % self.num_local_physical_experts
 
     def update(self, other: "ExpertLocationMetadata"):
-        for field in _UPDATE_FIELDS_TRIVIAL:
+        for field in [
+            "is_dummy",
+            "num_layers",
+            "num_local_physical_experts",
+            "num_logical_experts",
+        ]:
             assert getattr(self, field) == getattr(other, field)
-        for field in _UPDATE_FIELDS_TENSOR:
+
+        for field in [
+            "physical_to_logical_map",
+        ]:
             # Cannot update address to avoid breaking CUDA graph
             getattr(self, field)[...] = getattr(other, field)
-
-
-_UPDATE_FIELDS_TRIVIAL = [
-    "is_dummy",
-    "num_layers",
-    "num_local_physical_experts",
-    "num_logical_experts",
-]
-_UPDATE_FIELDS_TENSOR = [
-    "physical_to_logical_map",
-]
 
 
 def _create_vanilla_physical_to_logical_map(num_layers: int, num_physical_experts: int):
