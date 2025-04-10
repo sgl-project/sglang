@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -42,5 +41,9 @@ def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: to
         num_logical_experts=model_config_for_expert_location.num_logical_experts,
         physical_to_logical_map=physical_to_logical_map,
         logical_to_all_physical_map=logical_to_physical_map,
-        logical_to_rank_dispatch_physical_map=TODO_compute,
+        logical_to_rank_dispatch_physical_map=_compute_logical_to_rank_dispatch_physical_map(logical_to_physical_map),
     )
+
+
+def _compute_logical_to_rank_dispatch_physical_map(logical_to_physical_map: torch.Tensor):
+    return TODO
