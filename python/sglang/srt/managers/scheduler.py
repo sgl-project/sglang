@@ -836,6 +836,8 @@ class Scheduler(
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_room=recv_req.bootstrap_room,
             )
             req.tokenizer = self.tokenizer
             req.queue_time_start = time.time()
