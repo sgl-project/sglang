@@ -201,7 +201,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.experts = MoEImpl(
-            num_experts=config.n_routed_experts + self.n_share_experts_fusion + TODO,
+            num_experts=config.n_routed_experts + self.n_share_experts_fusion + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
