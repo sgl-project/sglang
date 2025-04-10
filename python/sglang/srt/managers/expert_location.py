@@ -20,7 +20,7 @@ class ExpertLocationMetadata:
     # -------------------------------- construction and mutation ------------------------------------
 
     @staticmethod
-    def init_trivial(num_layers: int, num_logical_experts: int):
+    def init_trivial():
         """Trivial location - logical expert i corresponds to physical expert i"""
         return ExpertLocationMetadata(
             num_layers=num_layers,
@@ -39,6 +39,14 @@ class ExpertLocationMetadata:
                 0, num_logical_experts
             ).repeat(num_layers, 1)[..., None],
         )
+
+    @staticmethod
+    def init_by_mapping():
+        return TODO
+
+    @staticmethod
+    def init_by_eplb():
+        return TODO
 
     # -------------------------------- usage ------------------------------------
 
