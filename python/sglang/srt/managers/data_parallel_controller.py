@@ -209,7 +209,7 @@ class DataParallelController:
             )
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, rank_port_args, gpu_id, tp_rank, dp_rank, writer),
+                args=(server_args, rank_port_args, expert_location_metadata, gpu_id, tp_rank, dp_rank, writer),
             )
             proc.start()
             self.scheduler_procs.append(proc)
