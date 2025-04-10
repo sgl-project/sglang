@@ -181,7 +181,7 @@ class ModelRunner:
         set_global_expert_location_metadata(expert_location_metadata)
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -477,7 +477,13 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
+        logger.info("update_expert_location start")
+        torch.distributed.barrier()
+
         TODO
+
+        torch.distributed.barrier()
+        logger.info("update_expert_location end")
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str, param_categories: Optional[List[str]]
@@ -934,7 +940,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
