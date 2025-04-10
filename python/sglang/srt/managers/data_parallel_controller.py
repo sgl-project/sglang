@@ -22,8 +22,8 @@ from enum import Enum, auto
 import psutil
 import setproctitle
 import zmq
-
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -54,7 +54,8 @@ class LoadBalanceMethod(Enum):
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs,
+                 expert_location_metadata: ExpertLocationMetadata) -> None:
         # Parse args
         self.max_total_num_tokens = None
         self.server_args = server_args
@@ -83,10 +84,10 @@ class DataParallelController:
         self.workers = [None] * server_args.dp_size
 
         if server_args.enable_dp_attention:
-            dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
+            dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args, expert_location_metadata)
             self.control_message_step = server_args.tp_size
         else:
-            dp_port_args = self.launch_dp_schedulers(server_args, port_args)
+            dp_port_args = self.launch_dp_schedulers(server_args, port_args, expert_location_metadata)
             self.control_message_step = 1
 
         # Only node rank 0 runs the real data parallel controller that dispatches the requests.
@@ -101,7 +102,7 @@ class DataParallelController:
 
         self.max_req_input_len = None
 
-    def launch_dp_schedulers(self, server_args, port_args):
+    def launch_dp_schedulers(self, server_args, port_args, expert_location_metadata):
         base_gpu_id = 0
 
         threads = []
@@ -124,7 +125,7 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(server_args, tmp_port_args, expert_location_metadata, base_gpu_id, dp_rank, ready_event),
             )
             threads.append(thread)
             base_gpu_id += server_args.tp_size * server_args.gpu_id_step
@@ -145,11 +146,12 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         base_gpu_id: int,
         dp_rank: int,
         ready_event: threading.Event,
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
+        self.launch_tensor_parallel_group(server_args, port_args, expert_location_metadata, base_gpu_id, dp_rank)
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
@@ -157,8 +159,8 @@ class DataParallelController:
         while True:
             pass
 
-    def launch_dp_attention_schedulers(self, server_args, port_args):
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+    def launch_dp_attention_schedulers(self, server_args, port_args, expert_location_metadata):
+        self.launch_tensor_parallel_group(server_args, port_args, expert_location_metadata, 0, None)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
@@ -168,6 +170,7 @@ class DataParallelController:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        expert_location_metadata: ExpertLocationMetadata,
         base_gpu_id: int,
         dp_rank: int,
     ):
@@ -252,6 +255,7 @@ class DataParallelController:
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
+    expert_location_metadata: ExpertLocationMetadata,
     pipe_writer,
 ):
     setproctitle.setproctitle("sglang::data_parallel_controller")
@@ -259,7 +263,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     try:
-        controller = DataParallelController(server_args, port_args)
+        controller = DataParallelController(server_args, port_args, expert_location_metadata)
         pipe_writer.send(
             {
                 "status": "ready",
