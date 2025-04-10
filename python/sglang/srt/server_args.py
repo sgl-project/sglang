@@ -2084,6 +2084,8 @@ class ServerArgs:
             args.hip_attention_config = HiPAttentionConfig(
                 json_or_path=args.hip_attention_config
             )
+        else:
+            args.hip_attention_config = None
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
