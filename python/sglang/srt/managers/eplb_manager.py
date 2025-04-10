@@ -22,6 +22,7 @@ class EPLBManager:
         await self._tokenizer_manager.update_expert_location_metadata(expert_location_metadata)
 
 
+# TODO maybe move to ExpertLocationMetadata static method?
 def _compute_expert_location_metadata(server_args: ServerArgs, logical_count: torch.Tensor):
     physical_to_logical_map, logical_to_physical_map, expert_count = deepseek_eplb.rebalance_experts(
         weight=logical_count,
