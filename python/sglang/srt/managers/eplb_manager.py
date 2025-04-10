@@ -26,7 +26,7 @@ class EPLBManager:
 
     async def handle_loop(self):
         await self._expert_distribution_storage.start()
-        # TODO
+        # TODO auto call rebalance, etc, when Engine supports that
 
     def compute_expert_location_metadata(self):
         logical_count = self._expert_distribution_storage.get_last_snapshot()["logical_count"]
