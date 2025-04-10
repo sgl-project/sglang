@@ -14,7 +14,7 @@ rm ucx-1.18.0 -rf
 tar xzf ucx-1.18.0.tar.gz
 cd ucx-1.18.0
 
-./configure                          \
+./configure                         \
     --prefix=/opt/ucx-1.18.0          \
     --enable-shared                    \
     --disable-static                   \
@@ -23,10 +23,13 @@ cd ucx-1.18.0
     --enable-cma                       \
     --enable-devel-headers             \
     --with-verbs                       \
-    --with-gdr                         \
+    --with-gdrcopy                     \
     --with-cuda=/usr/local/cuda        \
     --with-dm                          \
-    --enable-mt
+    --enable-mt                        \
+    --without-knem                     \
+    --with-xpmem                       \
+    --without-java               
 
 make -j
 make -j install-strip
@@ -56,6 +59,6 @@ popd
 
 
 
-
-UCX_TLS=tcp,cuda UCX_NET_DEVICES=bond1 ucx_perftest
-UCX_TLS=tcp,cuda UCX_NET_DEVICES=bond1 ucx_perftest -t ucp_am_bw -s 8192 -w 1000 -i 10000 -f 127.0.0.1 -m cuda,cuda
+# test ucx with this command:
+# UCX_TLS=tcp,cuda UCX_NET_DEVICES=eth0 ucx_perftest &
+# UCX_TLS=tcp,cuda UCX_NET_DEVICES=eth0 ucx_perftest -t ucp_am_bw -s 8192 -w 1000 -i 10000 -f 127.0.0.1 -m cuda,cuda

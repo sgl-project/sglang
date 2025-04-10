@@ -30,7 +30,9 @@ DECODE_SERVE_PORT = "8090"
 LB_ADDR = "127.0.0.1"
 LB_SERVE_PORT = "8100"
 
-EXTRA_SSH_ARGS = "-i ~/ytwu/.ssh/id_ed25519"
+EXTRA_SSH_ARGS = "" # "-i ~/ytwu/.ssh/id_ed25519"
+
+NETDEVICE = "eth0"
 
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # MODEL="/home/qspace/upload/luban_cache/model/luban-llm_deepseek_v3-model_path/DeepSeek-V3/"
@@ -48,6 +50,7 @@ SGLANG_COMMON_ARGS = [
   "--mem-fraction-static", "0.70",
   "--disable-overlap-schedule",
   "--chunked-prefill-size 32768",
+  "--allow-auto-truncate" if MODEL == 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B' else ''
 ]
 
 # in future we will have multiple nodes in P or D instances.
@@ -89,13 +92,15 @@ remotes = [
 def runCommand(cmd: list[str], remoteAddr: tuple[str, str] = None, outputStream = subprocess.DEVNULL) -> subprocess.Popen:
     if remoteAddr is not None:
       # source ~/.bashrc fails to alias proxy_on. Dirty hack to fix.
-      PROXY_ON = "export HTTP_PROXY=http://hk-mmhttpproxy.woa.com:11113 && \
-        export HTTPS_PROXY=http://hk-mmhttpproxy.woa.com:11113 && \
-        export http_proxy=http://hk-mmhttpproxy.woa.com:11113 && \
-        export https_proxy=http://hk-mmhttpproxy.woa.com:11113"
+      # PROXY_ON = "&& export HTTP_PROXY=http://hk-mmhttpproxy.woa.com:11113 && \
+      #   export HTTPS_PROXY=http://hk-mmhttpproxy.woa.com:11113 && \
+      #   export http_proxy=http://hk-mmhttpproxy.woa.com:11113 && \
+      #   export https_proxy=http://hk-mmhttpproxy.woa.com:11113"
       
+      PROXY_ON = ""
+
       # PS1=[] dirtyhack to bypass ~/.bashrc checking
-      remote_cmd = ' '.join(['ssh', EXTRA_SSH_ARGS, '-p', remoteAddr[1], f'root@{remoteAddr[0]}', f'"PS1=[] source ~/.bashrc && {PROXY_ON} && env && (', *cmd, ')"'])
+      remote_cmd = ' '.join(['ssh', EXTRA_SSH_ARGS, '-p', remoteAddr[1], f'root@{remoteAddr[0]}', f'"PS1=[] source ~/.bashrc {PROXY_ON} && env && (', *cmd, ')"'])
       logger.info(f"runCommand remotely: {remote_cmd}")
       proc = subprocess.Popen(remote_cmd, shell=True, stdout=outputStream, stderr=outputStream)
       return proc
@@ -152,15 +157,15 @@ def do_exp():
 
     prefill_env = [
       "CUDA_VISIBLE_DEVICES=0",
-      "UCX_TLS=tcp",
-      "UCX_NET_DEVICES=bond1",
+      "UCX_TLS=tcp,cuda",
+      f"UCX_NET_DEVICES={NETDEVICE}",
       "UCX_LOG_LEVEL=info"
     ]
 
     decode_env = [
       "CUDA_VISIBLE_DEVICES=1",
-      "UCX_TLS=tcp",
-      "UCX_NET_DEVICES=bond1",
+      "UCX_TLS=tcp,cuda",
+      f"UCX_NET_DEVICES={NETDEVICE}",
       "UCX_LOG_LEVEL=info"
     ]
 
@@ -196,7 +201,7 @@ def do_exp():
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",
-      "--jsonl-output-len", "4096",
+      "--jsonl-output-len", "128",
       "--save-result",
       "--result-filename", filename
     ]

@@ -41,8 +41,9 @@ class KVManager:
         # Register buffers.
         kv_addrs = []
         for data_ptr, data_len in zip(self.args.kv_data_ptrs, self.args.kv_data_lens):
-            kv_addrs.append((tmp.data_ptr(), data_len, self.args.engine_rank, ""))
-        self.kv_descs = self.agent.register_memory(kv_addrs, "DRAM", is_sorted=True)
+            kv_addrs.append((data_ptr, data_len, self.args.engine_rank, ""))
+            # kv_addrs.append((tmp.data_ptr(), data_len, self.args.engine_rank, ""))
+        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = [(self.args.aux_data_ptrs[0], self.args.aux_data_lens[0], 0, "")]
@@ -120,9 +121,9 @@ class KVSender:
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
-                kv_addrs.append((tmp.data_ptr(), item_len, self.mgr.args.engine_rank))
-                # kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
-        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "DRAM", is_sorted=True)
+                # kv_addrs.append((tmp.data_ptr(), item_len, self.mgr.args.engine_rank))
+                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         logging.info(f"[wytdebug] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
@@ -176,8 +177,9 @@ class KVReceiver:
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
-                kv_addrs.append((tmp.data_ptr() , item_len, self.mgr.args.engine_rank))
-        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "DRAM", is_sorted=True)
+                kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+                # kv_addrs.append((tmp.data_ptr() , item_len, self.mgr.args.engine_rank))
+        kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
         logging.info(f'[wytdebug] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')

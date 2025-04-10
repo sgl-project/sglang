@@ -2,9 +2,14 @@
 
 1. gemini上手动执行
 ```bash
-echo -e "PermitRootLogin yes\nPasswordAuthentication yes\nPort 2222" | sudo tee -a /etc/ssh/sshd_config > /dev/null
-sudo service ssh restart
+apt update
+apt install -y openssh-server
+echo -e "PermitRootLogin yes\nPasswordAuthentication yes\nPort 2222" | tee -a /etc/ssh/sshd_config > /dev/null
+service ssh restart
 echo "root:914554688wyt" | chpasswd
+
+ssh-keygen
+ssh-copy-id -p 2222 127.0.0.1
 ```
 
 

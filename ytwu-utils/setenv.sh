@@ -30,8 +30,8 @@ source ~/.bashrc
 
 proxy_on
 
-pip3 uninstall -y sgl_kernel && pip3 install sgl_kernel
-pip3 uninstall -y flashinfer-python && pip3 install flashinfer-python #  -i https://flashinfer.ai/whl/cu124/torch2.5
+pip3 uninstall -y sgl_kernel && pip3 install sgl_kernel==0.0.5.post3
+pip3 uninstall -y flashinfer-python && pip3 install flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.5
 pip3 install "nvidia-nccl-cu12==2.25.1" --no-deps
 
 
