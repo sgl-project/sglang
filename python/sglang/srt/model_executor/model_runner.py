@@ -480,6 +480,8 @@ class ModelRunner:
         torch.distributed.barrier()
 
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
+
+        # We may be able to further reduce lock time by faster copying, pre-transfering, etc
         self.update_weights_from_disk(
             model_path=self.model_config.model_path,
             load_format=self.server_args.load_format,
