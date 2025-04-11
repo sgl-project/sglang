@@ -269,10 +269,10 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable cuda graph by --disable-cuda-graph\n"
-                "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "2. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
                 "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
+                "4. disable cuda graph by --disable-cuda-graph\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 

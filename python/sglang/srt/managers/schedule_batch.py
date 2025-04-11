@@ -390,6 +390,8 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -474,6 +476,10 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
+        # Latency Breakdown
+        self.queue_time_start = None
+        self.queue_time_end = None
+
         # Logprobs (return values)
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
@@ -519,8 +525,8 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init
