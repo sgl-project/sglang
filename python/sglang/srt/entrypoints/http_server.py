@@ -796,7 +796,6 @@ def _wait_and_warmup(
         else:
             # Warmup request currently hangs in disaggregation mode, so we skip it.
             logger.info("Skipping warmup request in disaggregation mode")
-            pass
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
