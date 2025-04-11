@@ -688,7 +688,7 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
-    random_sample: bool,
+    random_sample: bool = True,
 ) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
