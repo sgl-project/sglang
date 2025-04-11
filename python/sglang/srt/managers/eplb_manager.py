@@ -43,7 +43,7 @@ class EPLBManager:
             await self.rebalance()
 
     async def rebalance(self):
-        self.save_expert_distribution()
+        await self.save_expert_distribution()
         expert_location_metadata = self.compute_expert_location_metadata()
         await self._tokenizer_manager.update_expert_location(
             UpdateExpertLocationReqInput(
@@ -51,8 +51,8 @@ class EPLBManager:
             )
         )
 
-    def save_expert_distribution(self):
-        self._expert_distribution_storage.save_current()
+    async def save_expert_distribution(self):
+        await self._expert_distribution_storage.save_current()
 
     def compute_expert_location_metadata(self):
         snapshot = self._expert_distribution_storage.get_last_snapshot()
