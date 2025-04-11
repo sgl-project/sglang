@@ -55,11 +55,7 @@ class EPLBManager:
         self._expert_distribution_storage.save_current()
 
     def compute_expert_location_metadata(self):
-        logical_count = self._expert_distribution_storage.get_last_snapshot()[
-            "logical_count"
-        ]
-        if logical_count is None:
+        snapshot = self._expert_distribution_storage.get_last_snapshot()
+        if snapshot is None:
             return ExpertLocationMetadata.init_trivial(self._server_args)
-        return ExpertLocationMetadata.init_by_eplb(
-            self._server_args, logical_count=logical_count
-        )
+        return ExpertLocationMetadata.init_by_eplb(self._server_args, **snapshot)
