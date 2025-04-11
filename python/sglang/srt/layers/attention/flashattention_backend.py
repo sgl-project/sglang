@@ -527,7 +527,9 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         k_descale, v_descale = None, None
-        if self.kv_cache_dtype_str != "auto":
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
             descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
             k_descale = layer.k_scale.expand(descale_shape)
             v_descale = layer.v_scale.expand(descale_shape)
@@ -670,7 +672,9 @@ class FlashAttentionBackend(AttentionBackend):
         causal = not layer.is_cross_attention
 
         k_descale, v_descale = None, None
-        if self.kv_cache_dtype_str != "auto":
+        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
+        # has corresponding quantization method so that layer.k_scale is not None
+        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
             descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
             k_descale = layer.k_scale.expand(descale_shape)
             v_descale = layer.v_scale.expand(descale_shape)
