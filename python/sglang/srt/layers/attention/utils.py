@@ -12,6 +12,10 @@ def create_flashinfer_kv_indices_triton(
     kv_indices_ptr,
     req_to_token_ptr_stride: tl.constexpr,
 ):
+    """
+    Fill kv_indices with token page indices from `req_to_token_pool`, which
+    will be used to index into `token_to_kv_pool`.
+    """
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
 
@@ -27,6 +31,7 @@ def create_flashinfer_kv_indices_triton(
     kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    # Load all kv indices for a request
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
@@ -90,3 +95,35 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+@triton.jit
+def create_casual_mask_from_page_triton(
+    mask_ptr,  # [qo_len, kv_len]
+    qo_indptr,  # [bs + 1], cumulative ranges for each req
+    kv_indptr,  # [bs + 1]
+    prefix_lens_ptr,  # [bs + 1]
+    stride_mask_qo: tl.constexpr,
+    bs: tl.constexpr,
+):
+    """Each program handles a row of qo"""
+    pid_qo = tl.program_id(axis=0)
+    # qo_indices = tl.load(qo_indptr + tl.arange(0, bs + 1)).to(tl.int32)
+
+    # Find which req this row belongs to
+    req_id = 0
+    for i in range(bs + 1):
+        # qo_start = qo_indices[req_id]
+        # qo_end = qo_indices[req_id + 1]
+        qo_start = tl.load(qo_indptr + i).to(tl.int32)
+        qo_end = tl.load(qo_indptr + i + 1).to(tl.int32)
+        if qo_start <= pid_qo and pid_qo < qo_end:
+            req_id = i
+
+    kv_start = tl.load(kv_indptr + req_id).to(tl.int32)
+    kv_end = tl.load(kv_indptr + req_id + 1).to(tl.int32)
+    kv_len = kv_end - kv_start
+    mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, kv_len)
+    qo_index = pid_qo + tl.load(prefix_lens_ptr + pid_qo)
+    mask = tl.arange(kv_start, kv_end) < qo_index
+    tl.store(mask_ptr + mask_offset, mask)
