@@ -21,6 +21,7 @@
 - DBRX
 - Grok
 - ChatGLM
+- Snowflake Arctic
 - InternLM 2
 - Exaone 3
 - BaiChuan2
