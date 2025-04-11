@@ -15,11 +15,6 @@ from sglang.test.test_utils import (
 )
 
 _NUM_ROUTED_EXPERTS = 64  # DeepSeek-Coder-V2-Lite-Instruct
-_EP_NUM_REDUNDANT_EXPERTS = 4
-_NUM_OVERALL_PHYSICAL_EXPERTS = _NUM_ROUTED_EXPERTS + _EP_NUM_REDUNDANT_EXPERTS
-_TRIVIAL_EXPERT_LOCATIONS = list(
-    x % _NUM_ROUTED_EXPERTS for x in range(_NUM_OVERALL_PHYSICAL_EXPERTS)
-)
 
 
 class TestEPLB(CustomTestCase):
@@ -30,7 +25,7 @@ class TestEPLB(CustomTestCase):
                 trust_remote_code=True,
                 enable_eplb=True,
                 eplb_storage_dir=tmpdir,
-                ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                ep_num_redundant_experts=4,
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
@@ -74,7 +69,7 @@ class TestEPLB(CustomTestCase):
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 trust_remote_code=True,
                 enable_eplb=True,
-                ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                ep_num_redundant_experts=4,
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
@@ -131,12 +126,12 @@ class TestEPLB(CustomTestCase):
         physical_to_logical_map_layer_0 = physical_to_logical_map[0, :].tolist()
         print(f"{physical_to_logical_map_layer_0=}")
 
+        trivial_expert_locations = _compute_trivial_expert_locations(engine.server_args.ep_num_redundant_experts)
+
         if expect_physical_to_local_map == "equal_trivial":
-            self.assertEqual(physical_to_logical_map_layer_0, _TRIVIAL_EXPERT_LOCATIONS)
+            self.assertEqual(physical_to_logical_map_layer_0, trivial_expert_locations)
         elif expect_physical_to_local_map == "not_equal_trivial":
-            self.assertNotEqual(
-                physical_to_logical_map_layer_0, _TRIVIAL_EXPERT_LOCATIONS
-            )
+            self.assertNotEqual(physical_to_logical_map_layer_0, trivial_expert_locations)
         else:
             self.assertEqual(
                 physical_to_logical_map_layer_0, expect_physical_to_local_map
@@ -156,6 +151,9 @@ class TestEPLB(CustomTestCase):
         ret = engine.flush_cache()
         assert ret.success
 
+def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
+    return list(x % _NUM_ROUTED_EXPERTS for x in range(_NUM_ROUTED_EXPERTS + ep_num_redundant_experts))
 
 if __name__ == "__main__":
     unittest.main()
+
