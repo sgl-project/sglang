@@ -28,6 +28,7 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hpu
 @dataclass
 class HPUBlockMetadata:
     """HPU-specific metadata for paged attention."""
+
     page_size: Optional[int] = None
     use_contiguous_pa: Optional[bool] = None
     block_list: Optional[torch.Tensor] = None
@@ -61,8 +62,8 @@ if _is_hpu:
     USE_CONTIGUOUS_PA = get_bool_env_var("SGLANG_HPU_USE_CONTIGUOUS_PA", "true")
     SKIP_WARMUP = get_bool_env_var("SGLANG_HPU_SKIP_WARMUP", "false")
 
+    from vllm.utils import make_tensor_with_pad
     from vllm_hpu_extension.bucketing import find_bucket
-    from vllm_hpu_extension.ops import batch2block, block2batch
 
     def get_prefill_all_seq_len_buckets():
         return list(
@@ -254,3 +255,44 @@ if _is_hpu:
                 hpu_metadata, block_tables, slot_mapping, page_size, padded_batch_size
             )
         return hpu_metadata
+
+    def make_cpu_tensor(data, max_len, pad, dtype, flat):
+        if flat:
+            data = [flatten(data)]
+        result = make_tensor_with_pad(
+            data, max_len=max_len, pad=pad, dtype=dtype, device="cpu"
+        )
+        return result
+
+    def prepare_hpu_attn_bias_prefill(seq_lens, max_prompt_len, dtype):
+        seq_pos = [list(range(sl)) for sl in seq_lens]
+        seq_idx = [[i] * sl for i, sl in enumerate(seq_lens)]
+        seq_pos = make_cpu_tensor(
+            seq_pos, max_len=max_prompt_len, pad=-1, dtype=torch.long, flat=True
+        )
+        seq_idx = make_cpu_tensor(
+            seq_idx, max_len=max_prompt_len, pad=-1, dtype=torch.long, flat=True
+        )
+        attn_bias = torch.zeros(1, 1, max_prompt_len, max_prompt_len, dtype=dtype)
+        return attn_bias, seq_pos, seq_idx
+
+    def compute_hpu_attn_bias_prefill(seq_pos, seq_idx, dtype):
+        q_seq_idx = seq_idx.unsqueeze(-1)
+        kv_seq_idx = seq_idx.unsqueeze(-2)
+        q_seq_pos = seq_pos.unsqueeze(-1)
+        kv_seq_pos = seq_pos.unsqueeze(-2)
+        seq_idx = q_seq_idx != kv_seq_idx
+        seq_pos = kv_seq_pos > q_seq_pos
+        attn_mask = seq_idx | seq_pos
+        attn_bias = torch.zeros_like(attn_mask, dtype=dtype)
+        attn_bias.masked_fill_(attn_mask, -math.inf)
+        return attn_bias.unsqueeze(1)
+
+    def to_hpu_and_pad_1d(tensor, pad_len, pad_value=0):
+        return torch.nn.functional.pad(tensor.to("hpu"), (0, pad_len), value=pad_value)
+
+    def compute_hpu_attn_bias_decode(page_size, block_usage, dtype):
+        mask = torch.arange(0, page_size, device="hpu", dtype=torch.int32).unsqueeze(0)
+        mask = mask >= block_usage.to("hpu").unsqueeze(-1)
+        attn_bias = torch.zeros_like(mask, dtype).masked_fill_(mask, -math.inf).clone()
+        return attn_bias
