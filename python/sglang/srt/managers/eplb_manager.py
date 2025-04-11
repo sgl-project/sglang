@@ -37,7 +37,7 @@ class EPLBManager:
         while True:
             sleep_time = self._server_args.eplb_rebalance_period or 1000000000
             logger.info(
-                f"Sleep {sleep_time} seconds before automatically trigger rebalancing"
+                f"EPLBManager: Sleep {sleep_time} seconds before next automatic rebalancing"
             )
             await asyncio.sleep(sleep_time)
             await self.rebalance()
