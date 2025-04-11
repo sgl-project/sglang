@@ -32,7 +32,7 @@ class _ExpertDistributionRecorder:
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ):
-        assert server_args.disable_overlap_schedule, "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
+        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
@@ -100,6 +100,7 @@ class _ExpertDistributionRecorder:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
             )
+        assert self._server_args.disable_overlap_schedule, "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
         self._reset()
         self._recording = True
 
