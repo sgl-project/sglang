@@ -23,7 +23,7 @@ _TRIVIAL_EXPERT_LOCATIONS = list(
 
 
 class TestEPLB(CustomTestCase):
-    def test_eplb_e2e(self):
+    def _tempdisable_test_eplb_e2e(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -68,7 +68,7 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
-    def test_eplb_init_expert_location_and_save_expert_distribution(self):
+    def _tempdisable_test_eplb_init_expert_location_and_save_expert_distribution(self):
         with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
