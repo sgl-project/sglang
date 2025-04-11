@@ -254,7 +254,10 @@ class DeepseekV2MoE(nn.Module):
         if global_server_args_dict["enable_deepep_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
-            self.num_experts = config.n_routed_experts
+            self.num_experts = (
+                config.n_routed_experts
+                + global_server_args_dict["ep_num_redundant_experts"]
+            )
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -269,7 +272,8 @@ class DeepseekV2MoE(nn.Module):
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
-                num_experts=config.n_routed_experts,
+                num_experts=config.n_routed_experts
+                + global_server_args_dict["ep_num_redundant_experts"],
                 num_local_experts=config.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
