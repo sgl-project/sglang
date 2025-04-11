@@ -23,16 +23,16 @@ import tempfile
 from typing import List, Literal, Optional
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.platforms import (
+    available_platforms,
+    recommended_platform,
+    set_current_platform,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
-    get_amdgpu_memory_capacity,
-    get_device,
-    get_hpu_memory_capacity,
-    get_nvgpu_memory_capacity,
-    is_cuda,
+    configure_logger,
     is_flashinfer_available,
-    is_hip,
     is_port_available,
     is_remote_url,
     is_valid_ipv6_address,
@@ -56,7 +56,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
-    device: Optional[str] = None
+    device: Optional[str] = recommended_platform()
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
@@ -197,6 +197,22 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
+        configure_logger(self)
+
+        # Init Platform
+        set_current_platform(self.device)
+
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_unspecified():
+            logger.error(f"SGLang cannot launch unspecified platform server")
+            raise NotImplementedError()
+
+        logger.info(
+            f'Use device type "{current_platform.device_type}" for {current_platform.device_name} platform'
+        )
+        self.device = current_platform.device_type
+
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -208,26 +224,13 @@ class ServerArgs:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
 
-        if self.device is None:
-            self.device = get_device()
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
-        if is_cuda():
-            gpu_mem = get_nvgpu_memory_capacity()
-        elif is_hip():
-            gpu_mem = get_amdgpu_memory_capacity()
-        elif self.device == "hpu":
-            gpu_mem = get_hpu_memory_capacity()
-        else:
-            # GPU memory is not known yet or no GPU is available.
-            gpu_mem = None
-
-        if is_hip():
+        if current_platform.is_hip():
             self.disable_shared_experts_fusion = True
 
         # Set mem fraction static, which depends on the tensor parallelism size
@@ -244,6 +247,7 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
 
         # Set chunked prefill size, which depends on the gpu memory capacity
+        gpu_mem = current_platform.get_memory_capacity()
         if self.chunked_prefill_size is None:
             if gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
@@ -371,7 +375,7 @@ class ServerArgs:
             self.load_format = "remote"
 
         # AMD-specific Triton attention KV splits default number
-        if is_hip():
+        if current_platform.is_hip():
             self.triton_attention_num_kv_splits = 16
 
         # PD disaggregation
@@ -524,7 +528,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help=f"The device to use {available_platforms()}. Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",
