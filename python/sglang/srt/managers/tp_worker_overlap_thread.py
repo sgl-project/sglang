@@ -118,7 +118,7 @@ class TpModelWorkerClient:
 
     def forward_thread_func(self):
         try:
-            with torch.get_device_module(self.device).stream(self.forward_stream):
+            with torch.get_device_module(self.worker_device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
             traceback = get_exception_traceback()
