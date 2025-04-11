@@ -32,6 +32,7 @@ class _ExpertDistributionRecorder:
         expert_location_metadata: "ExpertLocationMetadata",
         rank: int,
     ):
+        assert server_args.disable_overlap_schedule, "ExpertDistributionRecorder needs disable_overlap_schedule currently (will implement this later)"
         self._expert_location_metadata = expert_location_metadata
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
