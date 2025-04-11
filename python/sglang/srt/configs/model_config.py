@@ -48,12 +48,6 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
     ) -> None:
-        
-        if enable_multimodal is None:
-            if self.hf_config.architectures == "Llama4ForConditionalGeneration":
-                enable_multimodal = False
-            else:
-                enable_multimodal = True
 
         self.model_path = model_path
         self.revision = revision
@@ -77,6 +71,12 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
+        
+        if enable_multimodal is None:
+            if self.hf_config.architectures == "Llama4ForConditionalGeneration":
+                enable_multimodal = False
+            else:
+                enable_multimodal = True
 
         # Check model type
         self.is_generation = is_generation_model(

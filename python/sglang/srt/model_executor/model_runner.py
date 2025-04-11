@@ -282,7 +282,7 @@ class ModelRunner:
                 f"because this is a multimodal model."
             )
             logger.info(
-                "Automatically disabling --chunked-prefill-size for multimodal models. Use --disable-multimodal if only language model functionality is required."
+                "Automatically turn off --chunked-prefill-size for multimodal model."
             )
             server_args.chunked_prefill_size = -1
 
