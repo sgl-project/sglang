@@ -29,7 +29,6 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hpu
 class HPUBlockMetadata:
     """HPU-specific metadata for paged attention."""
 
-    page_size: Optional[int] = None
     use_contiguous_pa: Optional[bool] = None
     block_list: Optional[torch.Tensor] = None
     block_mapping: Optional[torch.Tensor] = None
@@ -226,7 +225,7 @@ if _is_hpu:
         )
 
     def create_hpu_block_metadata(worker_batch, page_size, req_token_pool):
-        hpu_metadata = HPUBlockMetadata(page_size=page_size)
+        hpu_metadata = HPUBlockMetadata()
         if worker_batch.forward_mode.is_decode():
             batch_size = len(worker_batch.seq_lens)
             padded_batch_size = get_decode_batch_bucket(batch_size)

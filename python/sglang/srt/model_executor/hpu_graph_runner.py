@@ -89,7 +89,7 @@ HPUForwardBatch = namedtuple(
 
 def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRunner):
     batch_size = forward_batch.batch_size
-    page_size = forward_batch.hpu_metadata.page_size
+    page_size = model_runner.token_to_kv_pool_allocator.page_size
     if forward_batch.forward_mode.is_extend():
         seq_len_list = forward_batch.extend_seq_lens
         sum_seq_len = seq_len_list.sum()

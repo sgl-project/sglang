@@ -1633,7 +1633,6 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
-    # HPU-specific fields
     hpu_metadata: Optional[HPUBlockMetadata] = None
 
 
