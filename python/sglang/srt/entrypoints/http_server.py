@@ -313,7 +313,7 @@ async def flush_cache():
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -373,6 +373,12 @@ async def dump_expert_distribution_record_async():
 @app.post("/eplb_rebalance")
 async def eplb_rebalance():
     await _global_state.tokenizer_manager.eplb_rebalance()
+    return ORJSONResponse({}, status_code=200)
+
+
+@app.post("/eplb_save_expert_distribution")
+async def eplb_save_expert_distribution():
+    await _global_state.tokenizer_manager.eplb_save_expert_distribution()
     return ORJSONResponse({}, status_code=200)
 
 
@@ -640,10 +646,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
