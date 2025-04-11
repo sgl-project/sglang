@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 )
 
 _NUM_ROUTED_EXPERTS = 64  # DeepSeek-Coder-V2-Lite-Instruct
+_REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
 
 
 class TestEPLB(CustomTestCase):
@@ -37,14 +38,13 @@ class TestEPLB(CustomTestCase):
 
             print(f"Action: start engine")
             engine = sgl.Engine(**engine_kwargs)
-            ref_output = self._engine_generate(engine)
-            self._assert_behavior(engine, ref_output, "equal_trivial")
+            self._assert_behavior(engine, "equal_trivial")
 
             print(f"Action: eplb_rebalance")
             engine.eplb_rebalance()
             self._engine_flush_cache(engine)
             physical_to_logical_map_layer_0_after_first_rebalance = (
-                self._assert_behavior(engine, ref_output, "not_equal_trivial")
+                self._assert_behavior(engine, "not_equal_trivial")
             )
 
             print(f"Action: shutdown engine")
@@ -55,7 +55,6 @@ class TestEPLB(CustomTestCase):
             engine = sgl.Engine(**engine_kwargs)
             self._assert_behavior(
                 engine,
-                ref_output,
                 physical_to_logical_map_layer_0_after_first_rebalance,
             )
 
@@ -79,8 +78,7 @@ class TestEPLB(CustomTestCase):
 
             print(f"Action: start engine")
             engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a)
-            ref_output = self._engine_generate(engine)
-            self._assert_behavior(engine, ref_output, "equal_trivial")
+            self._assert_behavior(engine, "equal_trivial")
 
             print(f"Action: eplb_save_expert_distribution")
             engine.eplb_save_expert_distribution()
@@ -100,7 +98,7 @@ class TestEPLB(CustomTestCase):
                 eplb_storage_dir=eplb_storage_dir_b,
                 init_expert_location=str(snapshot_path),
             )
-            self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            self._assert_behavior(engine, "not_equal_trivial")
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
@@ -109,7 +107,7 @@ class TestEPLB(CustomTestCase):
                 f"Action: start engine to check automatically loading from storage dir"
             )
             engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a)
-            self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            self._assert_behavior(engine, "not_equal_trivial")
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
@@ -127,15 +125,15 @@ class TestEPLB(CustomTestCase):
         )
 
         engine = sgl.Engine(**engine_kwargs)
-        self._assert_behavior(engine, ref_output, TODO)
+        self._assert_behavior(engine, TODO)
         engine.shutdown()
         del engine
 
     def _assert_behavior(
-            self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
+            self, engine: sgl.Engine,  expect_physical_to_local_map
     ):
         actual_output = self._engine_generate(engine)
-        self.assertEqual(actual_output, ref_output)
+        self.assertEqual(actual_output, _REF_OUTPUT)
 
         physical_to_logical_map = (
             engine.tokenizer_manager.expert_location_metadata.physical_to_logical_map
