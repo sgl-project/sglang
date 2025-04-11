@@ -1433,7 +1433,7 @@ class Scheduler(
             pt += new_batch.extend_lens[i]
         '''
         pt = 0
-        pt_map = {}
+        req_info_map = {}
         try_to_fetch_kv_cache_req_list = []
         for i in range(new_batch.batch_size()):
             req = new_batch.reqs[i]
@@ -1441,7 +1441,7 @@ class Scheduler(
                 pt += new_batch.extend_lens[i]
                 continue
             try_to_fetch_kv_cache_req_list.append(req)
-            pt_map[req.rid] = (pt, pt + new_batch.extend_lens[i])
+            req_info_map[req.rid] = (pt, pt + new_batch.extend_lens[i], len(req.prefix_indices))
             pt += new_batch.extend_lens[i]
         
         kv_bytes_map = self.kv_transfer_agent.get_batch_kv_buffer(try_to_fetch_kv_cache_req_list)
@@ -1452,8 +1452,8 @@ class Scheduler(
             for layer_id, layer_kv_buffer in enumerate(layer_kv_buffers):
                 kv_cache_pool.set_kv_buffer_by_layer(
                     layer_id,
-                    new_batch.out_cache_loc[pt_map[rid][0] : pt_map[rid][1]],
-                    layer_kv_buffer[len(req.prefix_indices):],
+                    new_batch.out_cache_loc[req_info_map[rid][0] : req_info_map[rid][1]],
+                    layer_kv_buffer[req_info_map[rid][2]:],
                     None
                 )
             req.kv_cache_restored = True
