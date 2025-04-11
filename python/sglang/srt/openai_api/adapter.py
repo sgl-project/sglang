@@ -1661,11 +1661,6 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     if len(all_requests) == 1:
         prompt = prompts[0]
         if isinstance(prompt, str) or isinstance(prompt[0], str):
-            # Handle empty string inputs
-            if isinstance(prompt, str) and prompt == "":
-                prompt = " "  # Replace empty string with a space character
-            elif isinstance(prompt, list):
-                prompt = [p if p != "" else " " for p in prompt]
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list) and isinstance(
             prompt[0], MultimodalEmbeddingInput
@@ -1691,14 +1686,6 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             prompt_kwargs = {"input_ids": prompt}
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
-            # Handle empty strings in multiple requests
-            if isinstance(prompts[0], str):
-                prompts = [p if p != "" else " " for p in prompts]
-            else:
-                prompts = [
-                    [p if p != "" else " " for p in prompt_list]
-                    for prompt_list in prompts
-                ]
             prompt_kwargs = {"text": prompts}
         elif isinstance(prompts[0], list) and isinstance(
             prompts[0][0], MultimodalEmbeddingInput
@@ -1745,6 +1732,23 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
     try:
         request_json = await raw_request.json()
         original_input = request_json.get("input", "")
+
+        if original_input == "":
+            return create_error_response(
+                message="Empty string is not allowed as input.",
+                err_type="InvalidInputError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
+        if isinstance(original_input, list) and all(
+            isinstance(item, str) for item in original_input
+        ):
+            if any(item == "" for item in original_input):
+                return create_error_response(
+                    message="Empty strings are not allowed in input list.",
+                    err_type="InvalidInputError",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
         # Check if input type matches any of the allowed types
         valid_input = isinstance(original_input, str) or (
