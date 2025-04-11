@@ -321,24 +321,27 @@ class MultimodalInputs:
         """
         merge image inputs when requests are being merged
         """
+        # Merge mm_items
+        if not self.mm_items:
+            self.mm_items = other.mm_items
+        else:
+            self.mm_items.extend(other.mm_items)
 
-        # Use image hash as fake token_ids. We use this as the key for prefix matching in the radix cache.
-        # Please note that if the `input_ids` is later used in the model forward,
-        # you also need to clamp the values within the range of [0, vocab_size) to avoid out-of-bound
-        # errors in cuda kernels. See also llava.py for example.
+        # Merge image_pad_len if exists
+        if self.image_pad_len is not None and other.image_pad_len is not None:
+            self.image_pad_len.extend(other.image_pad_len)
+        elif other.image_pad_len is not None:
+            self.image_pad_len = other.image_pad_len
 
-        # args needed to be merged
-        optional_args = [
-            "items",
-            "image_offsets",
-            "image_pad_len",
-            # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
-        ]
-        for arg in optional_args:
-            self_arg = getattr(self, arg, None)
-            if self_arg is not None:
-                setattr(self, arg, self_arg + getattr(other, arg))
-        # other args would be kept intact
+        # Merge num_image_tokens if exists
+        if self.num_image_tokens is not None and other.num_image_tokens is not None:
+            self.num_image_tokens += other.num_image_tokens
+        elif other.num_image_tokens is not None:
+            self.num_image_tokens = other.num_image_tokens
+
+        # Merge mrope_position_delta if exists
+        if other.mrope_position_delta is not None:
+            self.mrope_position_delta = other.mrope_position_delta
 
 
 class Req:
