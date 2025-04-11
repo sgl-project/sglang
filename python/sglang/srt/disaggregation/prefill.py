@@ -26,6 +26,7 @@ import torch
 
 from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVSender
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
 )
@@ -95,7 +96,7 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args)
+        kv_manager = KVManager(kv_args, DisaggregationMode("prefill"))
         return kv_manager
 
     def add(self, req: Req) -> None:

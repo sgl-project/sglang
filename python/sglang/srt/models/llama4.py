@@ -414,7 +414,7 @@ class Llama4Model(nn.Module):
             lambda idx, prefix: Llama4DecoderLayer(
                 config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
-            prefix="model.layers",
+            prefix=add_prefix("layers", prefix),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -465,6 +465,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
 
     def _init_model(
         self,
