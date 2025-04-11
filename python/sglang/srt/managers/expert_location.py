@@ -198,7 +198,7 @@ def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor, 
 
 def _pad_nested_array(arr, pad_value):
     max_len = max(len(inner) for outer in arr for inner in outer)
-    padded = [[[inner + [pad_value] * (max_len - len(inner))] for inner in outer] for outer in arr]
+    padded = [[inner + [pad_value] * (max_len - len(inner)) for inner in outer] for outer in arr]
     return padded
 
 
