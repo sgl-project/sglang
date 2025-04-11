@@ -4,7 +4,6 @@ set -ex
 PYTHON_VERSION=$1
 CUDA_VERSION=$2
 PYTHON_ROOT_PATH=/opt/python/cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}
-ENABLE_SM90A=$(( ${CUDA_VERSION%.*} >= 12 ? ON : OFF ))
 
 if [ ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="pytorch/manylinux2_28-builder:cuda${CUDA_VERSION}"

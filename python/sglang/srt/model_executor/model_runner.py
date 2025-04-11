@@ -281,7 +281,6 @@ class ModelRunner:
                 f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"because this is a multimodal model."
             )
-
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
@@ -1071,7 +1070,8 @@ class ModelRunner:
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
-        return rope_scaling.get("type", None) == "mrope"
+        is_mrope_enabled = "mrope_section" in rope_scaling
+        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader

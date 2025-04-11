@@ -268,6 +268,9 @@ class MultimodalDataItem:
             self.modality == Modality.VIDEO
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
     def validate(self):
         ...
         # TODO
@@ -306,11 +309,7 @@ class MultimodalInputs:
         )
 
         assert isinstance(ret.mm_items, list)
-        ret.mm_items = [
-            item
-            for item in ret.mm_items
-            if item.is_audio() or item.is_image() or item.is_video()
-        ]
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         assert len(ret.mm_items) != 0
 
@@ -345,8 +344,8 @@ class MultimodalInputs:
         """ """
         return any(item.is_audio() for item in self.mm_items)
 
-    def collect_image_inputs(self) -> List[torch.Tensor]:
-        return [item.pixel_values for item in self.mm_items if item.is_image()]
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
 
     def merge(self, other: MultimodalInputs):
         """
