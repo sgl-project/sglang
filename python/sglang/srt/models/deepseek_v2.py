@@ -1626,7 +1626,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.n_routed_experts,
-            num_groups=config.n_groups,
+            num_groups=config.n_group,
         )
 
 
