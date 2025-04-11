@@ -30,6 +30,7 @@ Benchmark Results:
 | Qwen2.5-VL-7B-Instruct | 0.477  | 0.504        |
 | MiniCPM-V-2.6          | 0.435  | —            |
 | Deepseek-Janus-Pro-7B  | 0.373  | -            |
+| Deepseek-VL2           | 0.405 | - |
 | Gemma-3-it-4B          | 0.41   | 0.403        |
 | llama3-llava-next-8b | 0.245 | - |
 | llava-v1.6-mistral-7b-sglang | 0.338 | - |
