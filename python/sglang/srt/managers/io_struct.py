@@ -816,7 +816,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    dump_output: Optional[Any] = None
 
 
 @dataclass
