@@ -38,8 +38,6 @@ class HPUAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
-        self.k_cache = VLLMKVCache()
-        self.v_cache = VLLMKVCache()
         from habana_frameworks.torch.hpex.kernels import FusedSDPA
 
         self.fused_scaled_dot_product_attention = ModuleFusedSDPA(FusedSDPA)
