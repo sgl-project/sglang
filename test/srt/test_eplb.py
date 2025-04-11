@@ -119,7 +119,7 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def _assert_behavior(
-            self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
+        self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
     ):
         ret = engine.flush_cache()
         assert ret.success
