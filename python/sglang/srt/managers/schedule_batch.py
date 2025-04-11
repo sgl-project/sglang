@@ -1535,9 +1535,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             num_decode_reqs=(
-                len(self.reqs) - len(self.decoding_reqs)
-                if self.forward_mode.is_mixed()
-                else 0
+                len(self.decoding_reqs) if self.forward_mode.is_mixed() else 0
             ),
         )
 

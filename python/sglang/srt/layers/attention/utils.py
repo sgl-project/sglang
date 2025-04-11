@@ -98,22 +98,32 @@ def create_flashmla_kv_indices_triton(
 
 
 @triton.jit
-def create_casual_mask_paged_triton(
+def create_casual_mask_from_page_triton(
     mask_ptr,  # [qo_len, kv_len]
     qo_indptr,  # [bs + 1], cumulative ranges for each req
     kv_indptr,  # [bs + 1]
     prefix_lens_ptr,  # [bs + 1]
     stride_mask_qo: tl.constexpr,
+    bs: tl.constexpr,
 ):
-    pid_bs = tl.program_id(axis=0)
-    qo_start = tl.load(qo_indptr + pid_bs).to(tl.int32)
-    qo_end = tl.load(qo_indptr + pid_bs + 1).to(tl.int32)
-    kv_start = tl.load(kv_indptr + pid_bs).to(tl.int32)
-    kv_end = tl.load(kv_indptr + pid_bs + 1).to(tl.int32)
-    kv_len = kv_end - kv_start
+    """Each program handles a row of qo"""
+    pid_qo = tl.program_id(axis=0)
+    # qo_indices = tl.load(qo_indptr + tl.arange(0, bs + 1)).to(tl.int32)
 
-    for i in range(qo_start, qo_end):
-        mask_offset = i * stride_mask_qo + kv_start + tl.arange(kv_len, dtype=tl.int32)
-        qo_index = i + tl.load(prefix_lens_ptr + pid_bs)
-        mask = tl.arange(kv_start, kv_end) < qo_index
-        tl.store(mask_ptr + mask_offset, mask)
+    # Find which req this row belongs to
+    req_id = 0
+    for i in range(bs + 1):
+        # qo_start = qo_indices[req_id]
+        # qo_end = qo_indices[req_id + 1]
+        qo_start = tl.load(qo_indptr + i).to(tl.int32)
+        qo_end = tl.load(qo_indptr + i + 1).to(tl.int32)
+        if qo_start <= pid_qo and pid_qo < qo_end:
+            req_id = i
+
+    kv_start = tl.load(kv_indptr + req_id).to(tl.int32)
+    kv_end = tl.load(kv_indptr + req_id + 1).to(tl.int32)
+    kv_len = kv_end - kv_start
+    mask_offset = pid_qo * stride_mask_qo + kv_start + tl.arange(0, kv_len)
+    qo_index = pid_qo + tl.load(prefix_lens_ptr + pid_qo)
+    mask = tl.arange(kv_start, kv_end) < qo_index
+    tl.store(mask_ptr + mask_offset, mask)
