@@ -158,6 +158,7 @@ def biased_grouped_topk_impl(
     num_expert_group: int = 0,
     topk_group: int = 0,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: float = 2.5,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -194,9 +195,7 @@ def biased_grouped_topk_impl(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        topk_weights[:, -1] = (
-            topk_weights[:, :-1].sum(dim=-1) / 2.5
-        )  # 2.5 is the routed_scaling_factor.
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
 
     if renormalize:
         topk_weights_sum = (
@@ -219,6 +218,7 @@ def biased_grouped_topk(
     topk_group: int = 0,
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
+    routed_scaling_factor: float = 2.5,
 ):
     biased_grouped_topk_fn = (
         torch.compile(
@@ -236,6 +236,7 @@ def biased_grouped_topk(
         num_expert_group,
         topk_group,
         n_share_experts_fusion=n_share_experts_fusion,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -250,10 +251,12 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    routed_scaling_factor: float = 2.5,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
         n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        routed_scaling_factor = global_server_args_dict["routed_scaling_factor"]
     # DeekSeek V2/V3/R1 serices models uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
@@ -278,6 +281,7 @@ def select_experts(
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 n_share_experts_fusion=n_share_experts_fusion,
+                routed_scaling_factor=routed_scaling_factor,
             )
     elif torch_native and custom_routing_function is None:
         topk_weights, topk_ids = fused_topk_native(

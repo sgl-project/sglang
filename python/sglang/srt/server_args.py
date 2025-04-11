@@ -184,7 +184,8 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
-    n_share_experts_fusion: int = 0
+    n_share_experts_fusion: Optional[int] = None
+    routed_scaling_factor: Optional[float] = None
     disable_shared_experts_fusion: bool = False
 
     # Debug tensor dumps
@@ -1116,9 +1117,15 @@ class ServerArgs:
         parser.add_argument(
             "--n-share-experts-fusion",
             type=int,
-            default=0,
+            default=None,
             help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1 "
             "we use tp_size by default.",
+        )
+        parser.add_argument(
+            "--routed-scaling-factor",
+            type=float,
+            default=None,
+            help="The scaling factor for routed experts in deepseek v3/r1.",
         )
         parser.add_argument(
             "--disable-shared-experts-fusion",
