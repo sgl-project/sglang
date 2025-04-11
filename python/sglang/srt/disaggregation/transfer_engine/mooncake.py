@@ -49,7 +49,16 @@ class MooncakeTransferEngine:
                 "to run SGLang with MooncakeTransferEngine."
             ) from e
 
-        self.engine = TransferEngine()
+        try:
+            self.engine = TransferEngine()
+        except RuntimeError as e:
+            raise RuntimeError(f"Runtime: {e}") from e
+        except ValueError as e:
+            logger.error("Value error occurred for mooncake: %s", e)
+            raise
+        except Exception as e:
+            logger.error("An unknow error occurred for mooncake: %s", e)
+            raise
 
         try:
             self.config = MooncakeTransferEngineConfig.load_from_env()
@@ -73,10 +82,16 @@ class MooncakeTransferEngine:
         )
 
     def register(self, ptr, length):
-        self.engine.register_memory(ptr, length)
+        ret_value = self.engine.register_memory(ptr, length)
+        if ret_value != 0:
+            logger.error("Mooncake memory registration failed.")
+            raise RuntimeError("Mooncake memory registration failed.")
 
     def deregister(self, ptr):
-        self.engine.unregister_memory(ptr)
+        ret_value = self.engine.unregister_memory(ptr)
+        if ret_value != 0:
+            logger.error("Mooncake memory deregistration failed.")
+            raise RuntimeError("Mooncake memory deregistration failed.")
 
     def initialize(
         self,
@@ -86,7 +101,10 @@ class MooncakeTransferEngine:
         device_name: str,
     ) -> None:
         """Initialize the mooncake instance."""
-        self.engine.initialize(local_hostname, metadata_server, protocol, device_name)
+        ret_value = self.engine.initialize(local_hostname, metadata_server, protocol, device_name)
+        if ret_value != 0:
+            logger.error("Mooncake initialization failed.")
+            raise RuntimeError("Mooncake initialization failed.")
 
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
