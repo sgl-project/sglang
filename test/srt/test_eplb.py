@@ -18,11 +18,7 @@ from sglang.test.test_utils import (
 # DeepSeek-Coder-V2-Lite-Instruct
 _NUM_ROUTED_EXPERTS = 64
 _NUM_HIDDEN_LAYERS = 27
-# TODO
-# TODO temp
-# TODO
-# _REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
-_REF_OUTPUT = [', 4+4=8,']
+_REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
 
 
 class TestEPLB(CustomTestCase):
@@ -200,11 +196,7 @@ class TestEPLB(CustomTestCase):
 
     def _engine_generate(self, engine: sgl.Engine):
         output = engine.generate(
-            # TODO
-            # TODO temp
-            # TODO
-            prompt=["1+1=2, 2+2=4"],
-            # prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
+            prompt=["1+1=2, 2+2=4", "One plus one is two, two plus two is four"],
             sampling_params=dict(max_new_tokens=8, temperature=0.0),
         )
         print(f"engine_generate {output=}")
