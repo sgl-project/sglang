@@ -18,6 +18,8 @@
 
 import logging
 import os
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -27,6 +29,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_reduce, get_tensor_model_parallel_rank,
@@ -135,7 +138,7 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, forward_mode: Optional[ForwardMode] = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -1031,6 +1034,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
+class _DecoderLayerExecutionMode(Enum):
+    # The MLP sublayer requires 1/tp_size tokens as input
+    MLP_INPUT_ONE = auto()
+    # The MLP sublayer requires all tokens as input
+    MLP_INPUT_ALL = auto()
+
+
+@dataclass
+class _DecoderLayerInfo:
+    is_sparse: bool
+    execution_mode: _DecoderLayerExecutionMode
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1041,14 +1057,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
     ) -> None:
-
-        def is_sparse_layer(l: int):
-            return (
-                config.n_routed_experts is not None
-                and l >= config.first_k_dense_replace
-                and l % config.moe_layer_freq == 0
-            )
-
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -1101,27 +1109,36 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        if is_nextn or is_sparse_layer(layer_id):
+        self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
+        previous_layer_info = self._compute_info(
+            config, layer_id=layer_id - 1, is_nextn=False
+        )
+
+        if self.info.is_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
             )
-            self.is_sparse = True
         else:
+            if self._enable_moe_dense_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
-            self.is_sparse = False
 
         self.input_is_scattered = (
-            is_sparse_layer(layer_id - 1)
-            and global_server_args_dict["enable_deepep_moe"]
+            previous_layer_info.execution_mode
+            == _DecoderLayerExecutionMode.MLP_INPUT_ONE
         )
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
@@ -1130,6 +1147,25 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    @staticmethod
+    def _enable_moe_dense_fully_dp():
+        return global_server_args_dict["moe_dense_tp_size"] == 1
+
+    @staticmethod
+    def _compute_info(config: PretrainedConfig, layer_id: int, is_nextn: bool):
+        is_sparse = is_nextn or (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
+        )
+        execution_mode = (
+            _DecoderLayerExecutionMode.MLP_INPUT_ONE
+            if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
+            or (DeepseekV2DecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
+            else _DecoderLayerExecutionMode.MLP_INPUT_ALL
+        )
+        return _DecoderLayerInfo(is_sparse=is_sparse, execution_mode=execution_mode)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1137,16 +1173,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if global_server_args_dict["enable_deepep_moe"] and self.is_sparse:
-            return self.forward_deepep(
+        if self.info.execution_mode == _DecoderLayerExecutionMode.MLP_INPUT_ONE:
+            return self.forward_mode_mlp_input_one(
+                positions, hidden_states, forward_batch, residual
+            )
+        elif self.info.execution_mode == _DecoderLayerExecutionMode.MLP_INPUT_ALL:
+            return self.forward_mode_mlp_input_all(
                 positions, hidden_states, forward_batch, residual
             )
         else:
-            return self.forward_normal(
-                positions, hidden_states, forward_batch, residual
-            )
+            raise NotImplementedError
 
-    def forward_normal(
+    def forward_mode_mlp_input_all(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1213,7 +1251,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def forward_deepep(
+    def forward_mode_mlp_input_one(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1271,7 +1309,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual
                 )
-        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+
+        if not (
+            self._enable_moe_dense_fully_dp()
+            and (not self.info.is_sparse)
+            and hidden_states.shape[0] == 0
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
 
         if self.is_last_layer and self.attn_tp_size != 1:
             hidden_states += residual

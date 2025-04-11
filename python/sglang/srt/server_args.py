@@ -188,6 +188,7 @@ class ServerArgs:
     enable_flashmla: bool = False
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
     enable_scheduler_input_blocker: bool = False
@@ -256,6 +257,11 @@ class ServerArgs:
                 self.chunked_prefill_size = 8192
 
         assert self.chunked_prefill_size % self.page_size == 0
+
+        assert self.moe_dense_tp_size in {
+            1,
+            None,
+        }, f"moe_dense_tp_size only support 1 and None currently"
 
         if self.enable_flashmla is True:
             logger.warning(
@@ -1136,6 +1142,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_period,
             help="Time (inm seconds) to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
         )
         parser.add_argument(
             "--deepep-mode",
