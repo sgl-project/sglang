@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import flatten_nested_list
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -63,8 +64,12 @@ class GenerateReqInput:
     image_data: Optional[
         Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[Union[List[List[str]], List[str], str]] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[Union[List[List[str]], List[str], str]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -110,7 +115,11 @@ class GenerateReqInput:
     data_parallel_rank: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
 
     def normalize_batch_and_arguments(self):
         """
@@ -232,6 +241,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
+        self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
@@ -299,6 +309,15 @@ class GenerateReqInput:
                 # Expand for parallel sampling
                 self.image_data = wrapped_images * self.parallel_sample_num
                 self.modalities = ["image"] * num
+
+    def _normalize_video_data(self, num):
+        """Normalize audio data for batch processing."""
+        if self.video_data is None:
+            self.video_data = [None] * num
+        elif not isinstance(self.video_data, list):
+            self.video_data = [self.video_data] * num
+        elif isinstance(self.video_data, list):
+            self.video_data = self.video_data * self.parallel_sample_num
 
     def _normalize_audio_data(self, num):
         """Normalize audio data for batch processing."""
@@ -408,6 +427,7 @@ class GenerateReqInput:
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
             image_data=self.image_data[i],
+            video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
@@ -578,7 +598,11 @@ class EmbeddingReqInput:
         return self.rid
 
     def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.audio_data)
+            or has_valid_data(self.video_data)
+        )
 
     def __getitem__(self, i):
         if self.is_cross_encoder_request:
