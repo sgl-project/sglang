@@ -135,7 +135,7 @@ class TestEPLB(CustomTestCase):
         init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
 
         engine = sgl.Engine(**engine_kwargs, init_expert_location=json.dumps(init_expert_location))
-        self._assert_behavior(engine, TODO)
+        self._assert_behavior(engine, physical_to_logical_map[0])
         engine.shutdown()
         del engine
 
