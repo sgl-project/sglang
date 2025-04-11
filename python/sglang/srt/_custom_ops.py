@@ -28,7 +28,7 @@ if not is_hpu():
 
 
 if not is_hip():
-    if use_vllm_custom_allreduce:
+    if use_vllm_custom_allreduce or is_hpu():
         custom_op = torch.ops._C_custom_ar
     else:
         custom_op = sgl_kernel.allreduce

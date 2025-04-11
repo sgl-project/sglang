@@ -83,7 +83,9 @@ srt_xpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
+srt_hpu = ["sglang[runtime_common]",
+           "outlines>=0.0.44,<=0.1.11",
+           "vllm @ git+https://github.com/HabanaAI/vllm-fork.git@873b5017da95113a7a8ec55749ce15b63935dc45"]
 
 # CPU: currently, there are no pre-built vllm wheels for CPU.
 # To install vllm for CPU, please follow the instruction here:

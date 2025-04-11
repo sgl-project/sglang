@@ -29,6 +29,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -38,7 +40,16 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import (
+    dataclass_to_device,
+    get_compiler_backend,
+    get_scheduler_device,
+    is_hpu,
+)
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -96,7 +107,10 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
-    def is_cuda_graph(self):
+    def is_cuda_graph(self, device: str = "cuda"):
+        if device == "hpu":
+            # hpu will always use graph runner
+            return True
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -225,6 +239,8 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    hpu_metadata: Optional[HPUBlockMetadata] = None
+
     @classmethod
     def init_new(
         cls,
@@ -232,6 +248,10 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         device = model_runner.device
+        scheduler_device = get_scheduler_device(device)
+        if scheduler_device != device:
+            pt_device = torch.device(device, model_runner.gpu_id)
+            batch = dataclass_to_device(batch, pt_device)
         extend_input_logprob_token_ids_gpu = None
         if batch.extend_input_logprob_token_ids is not None:
             extend_input_logprob_token_ids_gpu = (
@@ -310,7 +330,10 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
+            if model_runner.server_args.attention_backend not in [
+                "torch_native",
+                "hpu",
+            ]:
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -334,6 +357,8 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        if model_runner.server_args.attention_backend == "hpu":
+            ret.hpu_metadata = batch.hpu_metadata
         return ret
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
@@ -554,6 +579,6 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=is_hpu())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)

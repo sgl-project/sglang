@@ -37,6 +37,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from dataclasses import fields
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -82,6 +83,11 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name, default)
+    return int(value)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -1828,3 +1834,29 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def get_scheduler_device(worker_device: str):
+    # HPU has higher overhead when running many small ops
+    # so we run all scheduler ops on CPU when using HPU
+    return "cpu" if is_hpu() else worker_device
+
+
+def dataclass_to_device(dataclass_obj: Any, device: torch.device):
+    if isinstance(dataclass_obj, torch.Tensor):
+        return dataclass_obj.to(device)
+    elif isinstance(dataclass_obj, list):
+        return [dataclass_to_device(item, device) for item in dataclass_obj]
+    elif isinstance(dataclass_obj, dict):
+        return {
+            key: dataclass_to_device(value, device)
+            for key, value in dataclass_obj.items()
+        }
+    elif isinstance(dataclass_obj, tuple):
+        return tuple(dataclass_to_device(item, device) for item in dataclass_obj)
+    elif dataclasses.is_dataclass(dataclass_obj):
+        for field in fields(dataclass_obj):
+            value = getattr(dataclass_obj, field.name)
+            setattr(dataclass_obj, field.name, dataclass_to_device(value, device))
+
+    return dataclass_obj
