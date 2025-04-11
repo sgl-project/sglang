@@ -26,7 +26,7 @@ _REF_OUTPUT = [', 4+4=8,']
 
 
 class TestEPLB(CustomTestCase):
-    def _tempdisable_test_eplb_e2e(self):
+    def test_eplb_e2e(self):
         print("Action: test_eplb_e2e")
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
@@ -72,7 +72,7 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
-    def _tempdisable_test_eplb_init_expert_location_and_save_expert_distribution(self):
+    def test_eplb_init_expert_location_and_save_expert_distribution(self):
         print("Action: test_eplb_init_expert_location_and_save_expert_distribution")
         with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
             engine_kwargs = dict(
