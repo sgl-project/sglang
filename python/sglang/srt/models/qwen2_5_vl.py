@@ -553,14 +553,18 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+        if "mrope_section" in self.config.rope_scaling:
             positions = forward_batch.mrope_positions
+            assert positions.ndim == 2 and positions.size(0) == 3, (
+                "multimodal section rotary embedding requires "
+                f"(3, seq_len) positions, but got {positions.size()}"
+            )
 
         if not (
             forward_batch.forward_mode.is_decode()
             or not forward_batch.contains_image_inputs()
         ):
-            if getattr(self.config, "rope_scaling", {}).get("type", None) == "mrope":
+            if "mrope_section" in self.config.rope_scaling:
                 assert positions.ndim == 2 and positions.size(0) == 3, (
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
