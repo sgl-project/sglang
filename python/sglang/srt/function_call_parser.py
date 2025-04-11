@@ -487,15 +487,14 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.bot_token_full = "<｜tool▁calls▁begin｜>"
-        self.bot_token_single = "<｜tool▁call▁begin｜>"
-        self.eot_token_single = "<｜tool▁calls▁end｜>"
-        self.bop_token = "```json"
-        self.eop_token = "```"
+        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.eot_token = "<｜tool▁calls▁end｜>"
+        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
-        return self.bot_token_full in text
+        return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -505,24 +504,18 @@ class DeepSeekV3Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token_full)
+        idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        pattern = rf"{self.bot_token_single}(.*?){self.eot_token_single}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_name = (
-                    match_result.split("<｜tool▁sep｜>")[1]
-                    .split(self.bop_token)[0]
-                    .strip()
-                )
-                func_args = re.search(
-                    f"{self.bop_token}\n(.*?)\n{self.eop_token}", match_result
-                ).group(1)
+                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                func_name = func_detail.group(2)
+                func_args = func_detail.group(3)
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
