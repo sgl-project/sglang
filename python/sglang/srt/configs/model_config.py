@@ -71,7 +71,7 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        
+
         if enable_multimodal is None:
             if self.hf_config.architectures == "Llama4ForConditionalGeneration":
                 enable_multimodal = False
