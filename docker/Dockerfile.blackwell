@@ -1,8 +1,5 @@
-ARG CUDA_VERSION=12.8.1
-
 FROM pytorch/manylinux2_28-builder:cuda12.8
 
-ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /sgl-workspace
