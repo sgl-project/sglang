@@ -38,6 +38,7 @@ class TestEPLB(CustomTestCase):
                 enable_scheduler_input_blocker=True,
                 disable_overlap_schedule=True,  # TODO
                 tp_size=2,
+                dp_size=2,
                 log_level="info",
             )
 
@@ -80,6 +81,7 @@ class TestEPLB(CustomTestCase):
                 deepep_mode="normal",
                 disable_cuda_graph=True,
                 tp_size=2,
+                dp_size=2,
                 log_level="info",
             )
 
@@ -131,6 +133,7 @@ class TestEPLB(CustomTestCase):
             deepep_mode="normal",
             disable_cuda_graph=True,
             tp_size=2,
+            dp_size=2,
             log_level="info",
         )
 
@@ -157,6 +160,7 @@ class TestEPLB(CustomTestCase):
             deepep_mode="normal",
             disable_cuda_graph=True,
             tp_size=2,
+            dp_size=2,
             log_level="info",
         )
 
