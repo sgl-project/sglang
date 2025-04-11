@@ -29,12 +29,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          git clone https://github.com/HabanaAI/vllm-fork.git
-          cd vllm-fork
-          git checkout v0.6.6.post1+Gaudi-1.20.0
-          pip install --user -r requirements-hpu.txt
-          pip install --user -e .  --no-build-isolation
-          cd ..
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install --user -e .
