@@ -274,6 +274,11 @@ class MultimodalDataItem:
     def is_video(self):
         return self.modality == Modality.VIDEO
 
+    def is_audio(self):
+        return (
+            self.is_modality(Modality.AUDIO)
+        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
 
