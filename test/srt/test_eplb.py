@@ -23,6 +23,7 @@ _REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
 
 class TestEPLB(CustomTestCase):
     def _tempdisable_test_eplb_e2e(self):
+        print("Action: test_eplb_e2e")
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -30,6 +31,7 @@ class TestEPLB(CustomTestCase):
                 enable_eplb=True,
                 eplb_storage_dir=tmpdir,
                 ep_num_redundant_experts=4,
+                enable_dp_attention=True,
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
@@ -66,12 +68,14 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def _tempdisable_test_eplb_init_expert_location_and_save_expert_distribution(self):
+        print("Action: test_eplb_init_expert_location_and_save_expert_distribution")
         with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 trust_remote_code=True,
                 enable_eplb=True,
                 ep_num_redundant_experts=4,
+                enable_dp_attention=True,
                 enable_deepep_moe=True,
                 deepep_mode="normal",
                 disable_cuda_graph=True,
@@ -116,11 +120,13 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def test_nontrivial_location(self):
+        print("Action: test_nontrivial_location")
         ep_num_redundant_experts = 4
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             trust_remote_code=True,
             ep_num_redundant_experts=ep_num_redundant_experts,
+            enable_dp_attention=True,
             enable_deepep_moe=True,
             deepep_mode="normal",
             disable_cuda_graph=True,
@@ -140,11 +146,13 @@ class TestEPLB(CustomTestCase):
         engine.shutdown()
         del engine
 
-    def _tempdisable_test_trivial_with_redundant_experts(self):
+    def test_trivial_with_redundant_experts(self):
+        print("Action: test_trivial_with_redundant_experts")
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             trust_remote_code=True,
             ep_num_redundant_experts=4,
+            enable_dp_attention=True,
             enable_deepep_moe=True,
             deepep_mode="normal",
             disable_cuda_graph=True,
