@@ -457,6 +457,7 @@ class SRTRunner:
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
         speculative_draft_model_path: Optional[str] = None,
+        speculative_draft_model_revision: Optional[str] = None,
         speculative_algorithm: Optional[str] = None,
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
@@ -471,6 +472,9 @@ class SRTRunner:
         spec_kwargs = {}
         if speculative_draft_model_path:
             spec_kwargs["speculative_draft_model_path"] = speculative_draft_model_path
+            spec_kwargs["speculative_draft_model_revision"] = (
+                speculative_draft_model_revision
+            )
             spec_kwargs["speculative_algorithm"] = speculative_algorithm
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
