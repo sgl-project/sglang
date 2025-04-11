@@ -15,7 +15,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-_NUM_ROUTED_EXPERTS = 64  # DeepSeek-Coder-V2-Lite-Instruct
+# DeepSeek-Coder-V2-Lite-Instruct
+_NUM_ROUTED_EXPERTS = 64
+_NUM_HIDDEN_LAYERS = 27
 _REF_OUTPUT = [', 4+4=8,', ', four plus four is eight, eight']
 
 
@@ -114,10 +116,11 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def test_nontrivial_location(self):
+        ep_num_redundant_experts = 4
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             trust_remote_code=True,
-            ep_num_redundant_experts=4,
+            ep_num_redundant_experts=ep_num_redundant_experts,
             enable_deepep_moe=True,
             deepep_mode="normal",
             disable_cuda_graph=True,
@@ -126,8 +129,8 @@ class TestEPLB(CustomTestCase):
         )
 
         physical_to_logical_map = (
-                torch.arange(0, num_physical_experts).repeat(num_layers, 1)
-                % num_logical_experts
+                torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(_NUM_HIDDEN_LAYERS, 1)
+                % _NUM_ROUTED_EXPERTS
         )
         init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
 
