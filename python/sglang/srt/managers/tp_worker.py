@@ -57,19 +57,13 @@ class TpModelWorker:
         self.tp_rank = tp_rank
 
         # Init model and tokenizer
-        self.model_config = ModelConfig(
-            (
+        self.model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=(
                 server_args.model_path
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
         )
         self.model_runner = ModelRunner(
             model_config=self.model_config,
