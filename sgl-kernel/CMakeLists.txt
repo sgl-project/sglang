@@ -164,7 +164,6 @@ set(SOURCES
     "csrc/elementwise/rope.cu"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
-    "csrc/gemm/cublas_grouped_gemm.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"

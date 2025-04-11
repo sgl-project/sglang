@@ -113,11 +113,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
   m.def(
-      "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
-      " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
-  m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
-
-  m.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
       "                      Tensor block_scale_a, Tensor block_scale_b,"
       "                      Tensor alpha) -> ()");

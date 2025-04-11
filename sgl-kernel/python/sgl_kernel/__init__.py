@@ -25,7 +25,6 @@ from sgl_kernel.elementwise import (
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
-    cublas_grouped_gemm,
     cutlass_scaled_fp4_mm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
