@@ -56,6 +56,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
+        scheduler: Scheduler,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.aux_dtype = aux_dtype
@@ -68,6 +69,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.bootstrap_port = bootstrap_port
+        self.scheduler = scheduler
 
     def allocate_token_id(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
@@ -84,6 +86,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.gpu_id = self.scheduler.gpu_id
 
         # Define req -> input ids buffer
         kv_args.aux_data_ptrs = [

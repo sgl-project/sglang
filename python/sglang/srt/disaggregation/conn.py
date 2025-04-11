@@ -74,7 +74,7 @@ KVRECEIVER_POLLING_PORT = 27788
 class KVManager:
     # TODO: make it general and support multiple transfer backend before merging
     def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
-        self.engine = MooncakeTransferEngine()
+        self.engine = MooncakeTransferEngine(args.gpu_id)
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
         self.request_pool: RequestPoolType = {}

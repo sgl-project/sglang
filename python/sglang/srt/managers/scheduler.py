@@ -590,6 +590,7 @@ class Scheduler(
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
+                scheduler=self,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_infight_queue: List[Req] = []

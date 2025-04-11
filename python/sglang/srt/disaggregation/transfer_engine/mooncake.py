@@ -4,6 +4,9 @@ import os
 import uuid
 from dataclasses import dataclass
 
+from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.disaggregation.rdma_device_utils import find_best_roce_for_gpu
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,19 +30,36 @@ class MooncakeTransferEngineConfig:
         )
 
     @staticmethod
-    def load_from_env() -> "MooncakeTransferEngineConfig":
+    def load_config(gpu_id=None) -> "MooncakeTransferEngineConfig":
         """Load config from a file specified in the environment variable."""
         config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
-            raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
-            )
+           logger.info("No config set for 'MOONCAKE_CONFIG_PATH', specified env is preferred")
+           return MooncakeTransferEngineConfig.auto_config(gpu_id)
         return MooncakeTransferEngineConfig.from_file(config_file_path)
 
+    @staticmethod
+    def load_auto_config(gpu_id) -> "MooncakeTransferEngineConfig":
+        """Load config from a file specified in the environment variable."""
+        metadata_server = os.getenv("MOONCAKE_METADATA_SERVER", None)
+        if metadata_server is None:
+            raise ValueError(
+                "The environment variable 'MOONCAKE_METADATA_SERVER' is not set."
+            )
+        local_hostname = os.getenv("MOONCAKE_LOCAL_HOSTNAME", default=get_local_ip_by_remote())
+        protocol = os.getenv("MOONCAKE_PROTOCOL", default="rdma")
+        default_ib_device, _ = find_best_roce_for_gpu(gpu_id)
+        device_name = os.getenv("MOONCAKE_RDMA_DEVICE_NAME", default=default_ib_device)
+        return MooncakeTransferEngineConfig(
+            local_hostname=local_hostname,
+            metadata_server=metadata_server,
+            protocol=protocol,
+            device_name=device_name,
+        )
 
 class MooncakeTransferEngine:
 
-    def __init__(self):
+    def __init__(self, gpu_id=0):
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -52,7 +72,7 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
 
         try:
-            self.config = MooncakeTransferEngineConfig.load_from_env()
+            self.config = MooncakeTransferEngineConfig.load_auto_config(gpu_id)
             logger.info("Mooncake Configuration loaded successfully.")
         except ValueError as e:
             logger.error(e)
@@ -60,8 +80,6 @@ class MooncakeTransferEngine:
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
-
-        self.config = MooncakeTransferEngineConfig.load_from_env()
 
         session_suffix = "_" + str(uuid.uuid4())
         self.session_id = self.config.local_hostname + session_suffix

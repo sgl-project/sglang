@@ -99,6 +99,7 @@ class DecodePreallocQueue:
     def _init_kv_manager(self) -> KVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
+        kv_args.gpu_id = self.scheduler.gpu_id
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
