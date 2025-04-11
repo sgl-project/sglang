@@ -1790,9 +1790,13 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
+                logger.warning(f"retry() observe error: {e}")
+                traceback.print_exc()
                 raise Exception(f"retry() exceed maximum number of retries.")
 
             if not should_retry(e):
+                logger.warning(f"retry() observe error: {e}")
+                traceback.print_exc()
                 raise Exception(f"retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
