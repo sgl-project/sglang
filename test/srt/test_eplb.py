@@ -58,7 +58,7 @@ class TestEPLB(CustomTestCase):
             del engine
 
             print(f"Action: start engine")
-            engine = sgl.Engine(**engine_kwargs)
+            engine = sgl.Engine(**engine_kwargs, port=21000)
             self._assert_behavior(
                 engine,
                 physical_to_logical_map_layer_0_after_first_rebalance,
@@ -106,6 +106,7 @@ class TestEPLB(CustomTestCase):
                 **engine_kwargs,
                 eplb_storage_dir=eplb_storage_dir_b,
                 init_expert_location=str(snapshot_path),
+                port=21000,
             )
             self._assert_behavior(engine, "not_equal_trivial")
             print(f"Action: shutdown engine")
@@ -115,7 +116,7 @@ class TestEPLB(CustomTestCase):
             print(
                 f"Action: start engine to check automatically loading from storage dir"
             )
-            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a)
+            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a, port=22000)
             self._assert_behavior(engine, "not_equal_trivial")
             print(f"Action: shutdown engine")
             engine.shutdown()
