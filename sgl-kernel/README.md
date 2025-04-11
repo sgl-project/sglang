@@ -144,11 +144,40 @@ Note:
 
 The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
 
+#### Build with [ccache](https://github.com/ccache/ccache)
+```bash
+# or `yum install -y ccache`.
+apt-get install -y ccache
+# Building with ccache is enabled when ccache is installed and CCACHE_DIR is set.
+export CCACHE_DIR=/path/to/your/ccache/dir
+export CCACHE_BACKEND=""
+export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+unset CCACHE_READONLY
+python -m uv build --wheel -Cbuild-dir=build --color=always .
+```
+
+##### Configuring CMake Build Options
+Cmake options can be configuring by adding `-Ccmake.define.<option>=<value>` to the `uv build` flags.
+For example, to enable building FP4 kernels, use:
+```bash
+python -m uv build --wheel -Cbuild-dir=build -Ccmake.define.SGL_KERNEL_ENABLE_FP4=1 --color=always .
+```
+See CMakeLists.txt for more options.
+
 ### Testing & Benchmarking
 
-1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests)
+1. Add pytest tests in [tests/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/tests), if you need to skip some test, please use `@pytest.mark.skipif`
+
+```python
+@pytest.mark.skipif(
+    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
+)
+```
+
 2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
 3. Run test suite
+
+
 
 ### Release new version
 
