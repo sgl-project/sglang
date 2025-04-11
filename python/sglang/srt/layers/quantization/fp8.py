@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
+    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -330,6 +331,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 layer.input_scale = None
+            elif layer.weight.device.type == "cpu":
+                assert (
+                    cpu_has_amx_support()
+                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                _process_weight_after_loading(layer, ["weight"])
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -426,6 +432,17 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if layer.use_intel_amx_backend:
+                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                    x,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                    bias,
+                    x.dtype,
+                    True,  # is_vnni
+                )            
+            
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
