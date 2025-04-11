@@ -42,6 +42,10 @@ import triton.language as tl
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import get_compiler_backend, is_hpu
 
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
@@ -231,12 +235,7 @@ class ForwardBatch:
     mrope_positions: torch.Tensor = None
 
     # For HPU paged attention
-    block_list: Optional[torch.Tensor] = None
-    block_mapping: Optional[torch.Tensor] = None
-    block_usage: Optional[torch.Tensor] = None
-    block_scales: Optional[torch.Tensor] = None
-    block_groups: Optional[torch.Tensor] = None
-    use_contiguous_pa: Optional[bool] = None
+    hpu_metadata: Optional[HPUBlockMetadata] = None
 
     @classmethod
     def init_new(
@@ -351,12 +350,7 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if model_runner.server_args.attention_backend == "hpu":
-            ret.block_list = batch.block_list
-            ret.block_mapping = batch.block_mapping
-            ret.block_groups = batch.block_groups
-            ret.block_usage = batch.block_usage
-            ret.block_scales = batch.block_scales
-            ret.use_contiguous_pa = batch.use_contiguous_pa
+            ret.hpu_metadata = batch.hpu_metadata
         return ret
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:

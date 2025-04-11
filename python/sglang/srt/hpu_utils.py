@@ -12,13 +12,30 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import itertools
 import math
 import os
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hpu
+
+
+@dataclass
+class HPUBlockMetadata:
+    """HPU-specific metadata for paged attention."""
+
+    use_contiguous_pa: Optional[bool] = None
+    block_list: Optional[torch.Tensor] = None
+    block_mapping: Optional[torch.Tensor] = None
+    block_groups: Optional[torch.Tensor] = None
+    block_usage: Optional[torch.Tensor] = None
+    block_scales: Optional[torch.Tensor] = None
+
 
 _is_hpu = is_hpu()
 
@@ -112,7 +129,7 @@ if _is_hpu:
         padding = target_len - input_len
         return input + [v] * padding
 
-    def _set_block_mapping(metadata, batch_size, device):
+    def _set_block_mapping(metadata: HPUBlockMetadata, batch_size, device):
         """Set block mapping using one-hot encoding of block groups."""
         # Handle out of bounds classes on CPU
         block_groups = metadata.block_groups.to(torch.long)
@@ -125,7 +142,7 @@ if _is_hpu:
         block_groups.masked_fill_(oob_values, batch_size)
         return block_mapping.to(torch.bfloat16), block_groups
 
-    def _set_block_scales(metadata, device):
+    def _set_block_scales(metadata: HPUBlockMetadata, device):
         """Set block scales using batch2block and block2batch operations."""
         block_mapping = metadata.block_mapping
         ones = torch.ones(
@@ -135,7 +152,9 @@ if _is_hpu:
         block_scales = torch.reciprocal(torch.maximum(ones, sums))
         return block_scales
 
-    def _init_block_metadata(ret, block_tables, slot_mapping, block_size, batch_size):
+    def _init_block_metadata(
+        metadata: HPUBlockMetadata, block_tables, slot_mapping, block_size, batch_size
+    ):
         """Initialize block metadata for HPU paged attention."""
         device = "cpu"
 
@@ -153,7 +172,7 @@ if _is_hpu:
         assert len(block_list) == len(block_groups)
         assert len(block_list) == len(block_usage)
 
-        if USE_CONTIGUOUS_PA:
+        if metadata.use_contiguous_pa:
             # Pad block metadata if needed
             block_bucket_size = max(max(block_list) + 1, len(block_list))
             block_bucket_size = find_bucket(
@@ -188,15 +207,19 @@ if _is_hpu:
         block_usage = padding_fn(block_usage, 1)
 
         # Convert to tensors
-        ret.block_list = torch.tensor(block_list, dtype=torch.long, device=device)
-        ret.block_groups = torch.tensor(block_groups, dtype=torch.long, device=device)
-        ret.block_usage = torch.tensor(block_usage, dtype=torch.bfloat16, device=device)
+        metadata.block_list = torch.tensor(block_list, dtype=torch.long, device=device)
+        metadata.block_groups = torch.tensor(
+            block_groups, dtype=torch.long, device=device
+        )
+        metadata.block_usage = torch.tensor(
+            block_usage, dtype=torch.bfloat16, device=device
+        )
 
         # Set block mapping and scales
-        ret.block_mapping, ret.block_groups = _set_block_mapping(
-            ret, batch_size, device
+        metadata.block_mapping, metadata.block_groups = _set_block_mapping(
+            metadata, batch_size, device
         )
-        ret.block_scales = _set_block_scales(ret, device)
+        metadata.block_scales = _set_block_scales(metadata, device)
 
     def get_prefill_seq_len_bucket(sum_seq_len):
         return find_bucket(
@@ -214,10 +237,8 @@ if _is_hpu:
         )
 
     def create_hpu_specific_fields(ret, page_size, req_token_pool):
-
         ret.page_size = page_size
         if ret.forward_mode.is_decode():
-            ret.use_contiguous_pa = USE_CONTIGUOUS_PA
             batch_size = len(ret.seq_lens)
             padded_batch_size = get_decode_batch_bucket(batch_size)
             block_tables = []
@@ -238,7 +259,11 @@ if _is_hpu:
             slot_mapping = torch.nn.functional.pad(
                 ret.out_cache_loc, (0, padding_len), value=0
             )
+
+            # Create HPUBlockMetadata instance
+            hpu_metadata = HPUBlockMetadata(use_contiguous_pa=USE_CONTIGUOUS_PA)
             _init_block_metadata(
-                ret, block_tables, slot_mapping, page_size, padded_batch_size
+                hpu_metadata, block_tables, slot_mapping, page_size, padded_batch_size
             )
+            ret.hpu_metadata = hpu_metadata
         return ret

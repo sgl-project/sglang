@@ -17,6 +17,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 else:
+
     def awq_dequantize(*args, **kwargs):
         raise NotImplementedError("AWQ is only supported on CUDA")
 

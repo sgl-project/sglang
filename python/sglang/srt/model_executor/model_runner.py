@@ -95,6 +95,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 monkey_patch_torch_compile()
 
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 

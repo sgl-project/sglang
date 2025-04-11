@@ -44,6 +44,7 @@ if _is_hpu:
     from sglang.srt.hpu_utils import (
         SKIP_WARMUP,
         USE_CONTIGUOUS_PA,
+        HPUBlockMetadata,
         get_decode_all_buckets,
         get_decode_batch_bucket,
         get_prefill_all_seq_len_buckets,
@@ -150,6 +151,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_groups = None
         block_usage = None
         block_scales = None
+        use_contiguous_pa = None
     else:
         padded_batch_size = get_decode_batch_bucket(batch_size)
         padding_len = padded_batch_size - batch_size
@@ -169,7 +171,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         )
         batch_size = padded_batch_size
         mask = torch.arange(0, page_size, device="hpu", dtype=torch.int32).unsqueeze(0)
-        mask = mask >= forward_batch.block_usage.to("hpu").unsqueeze(-1)
+        mask = mask >= forward_batch.hpu_metadata.block_usage.to("hpu").unsqueeze(-1)
         attn_bias = (
             torch.zeros_like(mask, dtype=model_runner.dtype)
             .masked_fill_(mask, -math.inf)
@@ -179,11 +181,12 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         seq_pos = None
         seq_idx = None
         extend_seq_lens_padded = None
-        block_list = forward_batch.block_list.to("hpu")
-        block_mapping = forward_batch.block_mapping.to("hpu")
-        block_groups = forward_batch.block_groups.to("hpu")
-        block_usage = forward_batch.block_usage.to("hpu")
-        block_scales = forward_batch.block_scales.to("hpu")
+        block_list = forward_batch.hpu_metadata.block_list.to("hpu")
+        block_mapping = forward_batch.hpu_metadata.block_mapping.to("hpu")
+        block_groups = forward_batch.hpu_metadata.block_groups.to("hpu")
+        block_usage = forward_batch.hpu_metadata.block_usage.to("hpu")
+        block_scales = forward_batch.hpu_metadata.block_scales.to("hpu")
+        use_contiguous_pa = forward_batch.hpu_metadata.use_contiguous_pa
 
     return HPUForwardBatch(
         forward_mode=forward_batch.forward_mode,
@@ -204,7 +207,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_scales=block_scales,
         attn_backend=forward_batch.attn_backend,
         token_to_kv_pool=forward_batch.token_to_kv_pool,
-        use_contiguous_pa=forward_batch.use_contiguous_pa,
+        use_contiguous_pa=use_contiguous_pa,
     )
 
 
@@ -334,7 +337,6 @@ class HPUGraphRunner:
             block_scales=None,
             attn_backend=self.model_runner.attn_backend,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            use_contiguous_pa=None,
         )
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         for i in range(3):
@@ -370,7 +372,6 @@ class HPUGraphRunner:
             block_scales=torch.zeros(block_num, dtype=torch.bfloat16, device="hpu"),
             attn_backend=self.model_runner.attn_backend,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            use_contiguous_pa=USE_CONTIGUOUS_PA,
         )
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         for i in range(3):

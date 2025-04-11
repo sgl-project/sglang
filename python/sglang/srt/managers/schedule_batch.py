@@ -47,6 +47,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.conn import KVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.hpu_utils import HPUBlockMetadata
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -1633,12 +1634,7 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     # HPU-specific fields
-    use_contiguous_pa: Optional[bool] = None
-    block_list: Optional[torch.Tensor] = None
-    block_mapping: Optional[torch.Tensor] = None
-    block_groups: Optional[torch.Tensor] = None
-    block_usage: Optional[torch.Tensor] = None
-    block_scales: Optional[torch.Tensor] = None
+    hpu_metadata: Optional[HPUBlockMetadata] = None
 
 
 @triton.jit
