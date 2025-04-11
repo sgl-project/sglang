@@ -12,21 +12,21 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
 from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
+    global_expert_location_metadata,
+    global_server_args_dict,
+)
 from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 
 def fused_topk_native(
@@ -250,6 +250,7 @@ def select_experts(
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
+    expert_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
 ):
     n_share_experts_fusion = 0
     if global_server_args_dict["n_share_experts_fusion"] is not None:
@@ -301,6 +302,10 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    expert_distribution_recorder.record_new_token(topk_ids)
+    if expert_logical_to_rank_dispatch_physical_map is not None:
+        # TODO this is inefficient, and I will fuse into existing kernels
+        topk_ids = expert_logical_to_rank_dispatch_physical_map[topk_ids]
+
+    expert_distribution_recorder.on_select_experts(topk_ids=topk_ids)
 
     return topk_weights, topk_ids
