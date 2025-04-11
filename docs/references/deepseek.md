@@ -136,7 +136,9 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 
 - **Weight**: Per-128x128-block quantization for better numerical stability.
 
-**Usage**: Turn on by default for DeepSeek V3 models.
+- **DeepGEMM**: The [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) kernel library deisgned for FP8 matrix multiplications. Note that enabling DeepGEMM will cause large compilation overhead during the first few run.
+
+**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is turned off by default, and can be enabled with environment variable `SGL_ENABLE_JIT_DEEPGEMM=1`.
 
 ### Multi-token Prediction
 **Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/backend/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
