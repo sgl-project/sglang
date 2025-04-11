@@ -301,7 +301,7 @@ class ModelRunner:
 
         server_args.disable_chunked_prefix_cache = True
         logger.info(
-            "Currently chunked prefix cache is automaticallyturned off. This should be changed after flash_attn_varlen kernel is merged into sgl-kernel."
+            "Currently chunked prefix cache is automatically turned off. This should be changed after flash_attn_varlen kernel is merged into sgl-kernel."
         )
         # TODO: Uncomment following lines after flash_attn_varlen kernel is merged into sgl-kernel
         # if not self.use_mla_backend:
