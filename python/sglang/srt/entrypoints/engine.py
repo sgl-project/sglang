@@ -31,7 +31,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -649,8 +648,14 @@ def _compute_initial_expert_location_metadata(
     server_args: ServerArgs, eplb_manager: EPLBManager
 ) -> ExpertLocationMetadata:
     if (data := server_args.init_expert_location) is not None:
-        # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
-        return ExpertLocationMetadata.init_by_mapping(server_args, **json.loads(data))
+        data_dict = json.loads(data)
+        if "physical_to_logical_map" in data_dict:
+            # TODO We may want to allow users to not provide `logical_to_all_physical_map` if this API is frequently used
+            return ExpertLocationMetadata.init_by_mapping(server_args, **data_dict)
+        elif "logical_count" in data_dict:
+            return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
+        else:
+            raise NotImplementedError(f"Unknown init_expert_location format ({list(data_dict.keys())=})")
     if server_args.enable_eplb:
         return eplb_manager.compute_expert_location_metadata()
     return ExpertLocationMetadata.init_trivial(server_args)
