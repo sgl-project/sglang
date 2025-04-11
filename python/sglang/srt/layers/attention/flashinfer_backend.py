@@ -18,7 +18,7 @@ import torch
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
-    create_casual_mask_paged_triton,
+    create_casual_mask_from_page_triton,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -487,13 +487,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 mask_p = torch.zeros(
                     qo_indptr_p[-1], kv_indptr_p[-1], device=q.device, dtype=torch.bool
                 )
+
                 # TODO(Wenxuan) debug this
-                # create_casual_mask_paged_triton[(num_prefill_reqs)](
+                # create_casual_mask_from_page_triton[(qo_indptr_p[-1])](
                 #     mask_p,
                 #     qo_indptr_p,
                 #     kv_indptr_p,
                 #     forward_batch.extend_prefix_lens,
                 #     stride_mask_qo=mask_p.stride(0),
+                #     bs=num_prefill_reqs,
                 # )
                 for i in range(num_prefill_reqs):
                     q_start = qo_indptr_p[i]
@@ -1020,7 +1022,13 @@ class FlashInferIndicesUpdaterPrefill:
             )
         if forward_metadata.use_pod:
             num_prefill_reqs = bs - forward_metadata.num_decode_reqs
-            decode_kv_indptr = kv_indptr[num_prefill_reqs : bs + 1]
+            # TODO(Wenxuan) avoid cat and allocate one more slot at the beginning?
+            decode_kv_indptr = torch.cat(
+                [
+                    torch.tensor([0], device=kv_indptr.device, dtype=kv_indptr.dtype),
+                    kv_indptr[num_prefill_reqs + 1 : bs + 1],
+                ]
+            )
             forward_metadata.prefill_kv_indptr = kv_indptr[: num_prefill_reqs + 1]
             forward_metadata.prefill_qo_indptr = qo_indptr[: num_prefill_reqs + 1]
             forward_metadata.prefill_kv_indices = kv_indices
@@ -1038,6 +1046,7 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_data_type=self.data_type,
                 non_blocking=True,
             )
+
         elif use_ragged:
             # extend part
             wrapper_ragged.begin_forward(
