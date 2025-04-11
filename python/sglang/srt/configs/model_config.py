@@ -15,6 +15,7 @@
 import json
 import logging
 import math
+import os
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
 
@@ -65,6 +66,9 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.attention_chunk_size = getattr(
+            self.hf_text_config, "attention_chunk_size", None
+        )
 
         # Check model type
         self.is_generation = is_generation_model(
@@ -231,6 +235,20 @@ class ModelConfig:
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
+        if quant_cfg is None:
+            # check if is modelopt model -- modelopt doesn't have corresponding field
+            # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
+            # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+            is_local = os.path.exists(self.model_path)
+            modelopt_quant_config = {"quant_method": "modelopt"}
+            if not is_local:
+                from huggingface_hub import HfApi
+
+                hf_api = HfApi()
+                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                    quant_cfg = modelopt_quant_config
+            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+                quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -258,8 +276,10 @@ class ModelConfig:
             "experts_int8",
             "w8a8_int8",
             "w8a8_fp8",
+            "moe_wna16",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -467,6 +487,7 @@ multimodal_model_archs = [
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
+    "Llama4ForConditionalGeneration",
     "LlavaMistralForCausalLM",
     "LlavaQwenForCausalLM",
     "LlavaVidForCausalLM",
