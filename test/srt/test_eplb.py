@@ -128,8 +128,9 @@ class TestEPLB(CustomTestCase):
             log_level="info",
         )
 
+        offset = 3
         physical_to_logical_map = (
-                torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(_NUM_HIDDEN_LAYERS, 1)
+                (offset + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(_NUM_HIDDEN_LAYERS, 1))
                 % _NUM_ROUTED_EXPERTS
         )
         init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
