@@ -35,6 +35,16 @@ The core features include:
 
 .. toctree::
    :maxdepth: 1
+   :caption: Supported Models
+
+   supported_models/generative_models.md
+   supported_models/vision_language_models.md
+   supported_models/embedding_models.md
+   supported_models/reward_models.md
+   supported_models/support_new_models.md
+
+.. toctree::
+   :maxdepth: 1
    :caption: Advanced Features
 
    backend/speculative_decoding.ipynb
