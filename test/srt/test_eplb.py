@@ -145,11 +145,11 @@ class TestEPLB(CustomTestCase):
         physical_to_logical_map = (
                 (offset + torch.arange(0, _NUM_ROUTED_EXPERTS + ep_num_redundant_experts).repeat(_NUM_HIDDEN_LAYERS, 1))
                 % _NUM_ROUTED_EXPERTS
-        ).tolist()
+        )
         init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
 
         engine = sgl.Engine(**engine_kwargs, init_expert_location=json.dumps(init_expert_location))
-        self._assert_behavior(engine, physical_to_logical_map[0])
+        self._assert_behavior(engine, physical_to_logical_map[0].tolist())
         engine.shutdown()
         del engine
 
