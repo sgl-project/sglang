@@ -276,9 +276,8 @@ class ModelRunner:
                 f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"because this is a multimodal model."
             )
-
             logger.info(
-                "Automatically turn off --chunked-prefill-size for multimodal model."
+                "Automatically disabling --chunked-prefill-size for multimodal models. Use --disable-multimodal if only language model functionality is required."
             )
             server_args.chunked_prefill_size = -1
 

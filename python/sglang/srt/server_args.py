@@ -978,7 +978,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-multimodal",
             action="store_true",
-            help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
+            help="Disable the multimodal functionality, restricting the model to support only language-based operations for multimodal models.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
