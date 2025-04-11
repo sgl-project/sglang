@@ -47,6 +47,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.conn import KVSender
 from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.epmoe_permute_tensor import EP_BACK_MAPPING_TENSOR, EP_PERMUTE_TENSOR
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -55,7 +56,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, get_compiler_backend
-from sglang.srt.epmoe_permute_tensor import EP_PERMUTE_TENSOR, EP_BACK_MAPPING_TENSOR
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput

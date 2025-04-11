@@ -203,7 +203,11 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
-        self.ep_back_mapping_tensor = ep_back_mapping_tensor.to(torch.cuda.current_device()) if ep_back_mapping_tensor is not None else None
+        self.ep_back_mapping_tensor = (
+            ep_back_mapping_tensor.to(torch.cuda.current_device())
+            if ep_back_mapping_tensor is not None
+            else None
+        )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
@@ -225,7 +229,7 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
         )
-        
+
         if self.ep_back_mapping_tensor is not None:
             topk_ids = self.ep_back_mapping_tensor[topk_ids]
 
@@ -416,7 +420,11 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        expert_id = self.ep_back_mapping_tensor[expert_id] if self.ep_back_mapping_tensor is not None else expert_id
+        expert_id = (
+            self.ep_back_mapping_tensor[expert_id]
+            if self.ep_back_mapping_tensor is not None
+            else expert_id
+        )
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
         expert_id = expert_id - self.start_expert_id

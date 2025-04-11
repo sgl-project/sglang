@@ -199,7 +199,12 @@ class DeepseekV2MoE(nn.Module):
         MoEImpl = (
             DeepEPMoE
             if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_eplb_moe"] else FusedMoE)
+            else (
+                EPMoE
+                if global_server_args_dict["enable_ep_moe"]
+                or global_server_args_dict["enable_eplb_moe"]
+                else FusedMoE
+            )
         )
 
         self.experts = MoEImpl(
@@ -214,7 +219,11 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
-            ep_back_mapping_tensor=ep_back_mapping_tensor if global_server_args_dict["enable_eplb_moe"] else None,
+            ep_back_mapping_tensor=(
+                ep_back_mapping_tensor
+                if global_server_args_dict["enable_eplb_moe"]
+                else None
+            ),
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
@@ -293,7 +302,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        print(f"final_hidden_states: {final_hidden_states}")
         return final_hidden_states
 
     def forward_deepep(
@@ -1085,7 +1093,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if is_nextn or is_sparse_layer(layer_id):
             if global_server_args_dict["enable_eplb_moe"]:
-                ep_back_mapping_tensor = global_server_args_dict["ep_back_mapping_tensor"][layer_id]
+                ep_back_mapping_tensor = global_server_args_dict[
+                    "ep_back_mapping_tensor"
+                ][layer_id]
                 self.mlp = DeepseekV2MoE(
                     config=config,
                     quant_config=quant_config,
