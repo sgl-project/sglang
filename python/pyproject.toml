@@ -57,6 +57,17 @@ srt = [
     "einops",
 ]
 
+blackwell = [
+    "sglang[runtime_common]",
+    "sgl-kernel",
+    "torch",
+    "torchvision",
+    "cuda-python",
+    "outlines>=0.0.44,<=0.1.11",
+    "partial_json_parser",
+    "einops",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
