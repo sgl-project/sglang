@@ -28,9 +28,15 @@ class ExpertDistributionStorage:
         path.write_text(json.dumps(data))
 
     def get_last_snapshot(self) -> Optional[Dict[str, Any]]:
-        paths = sorted(list(self._dir_data.glob("*.json")), key=lambda p: int(p.stem))
-        if len(paths) == 0:
+        path = self.get_last_snapshot_path(self._dir_data)
+        if path is None:
             return None
-        path = paths[-1]
         logger.info(f"get_last_snapshot choose path {path}")
         return json.loads(path.read_text())
+
+    @staticmethod
+    def get_last_snapshot_path(dir_data: Path) -> Optional[Path]:
+        paths = sorted(list(dir_data.glob("*.json")), key=lambda p: int(p.stem))
+        if len(paths) == 0:
+            return None
+        return paths[-1]
