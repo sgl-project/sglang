@@ -1088,7 +1088,6 @@ void decode_attention_cpu(
   CHECK_DIM(3, query);
   CHECK_DIM(3, k_buffer);
   CHECK_DIM(3, v_buffer);
-  CHECK_INPUT(key);
   CHECK_DIM(3, key);
   CHECK_DIM(3, value);
   CHECK_DIM(1, loc);
