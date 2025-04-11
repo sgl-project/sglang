@@ -72,6 +72,8 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_by_eplb(server_args: ServerArgs, logical_count: torch.Tensor):
+        if not isinstance(logical_count, torch.Tensor):
+            logical_count = torch.tensor(logical_count)
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
 
