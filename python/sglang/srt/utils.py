@@ -120,6 +120,20 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def infer_device():
+    """
+    Infer the device type based on the current environment.
+    """
+    if is_cuda_alike():
+        return "cuda"
+    elif is_xpu():
+        return "xpu"
+    elif is_hpu():
+        return "hpu"
+    else:
+        return "cpu"
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
