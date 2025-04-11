@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     add_prefix,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -1904,6 +1905,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = self_attn.kv_b_proj.weight_scale
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                if (
+                    w_kc.device == torch.device("cpu")
+                    and cpu_has_amx_support()
+                    and w.dtype == torch.float8_e4m3fn
+                ):
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
