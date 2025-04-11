@@ -178,7 +178,7 @@ async def handle_generate_request(request_data: dict):
         }
     )
 
-    print("[wytdebug] modified_request:", modified_request)
+    print("[NIXL PD disagg] modified_request:", modified_request)
 
     # Check if streaming is requested
     if request_data.get("stream", False):

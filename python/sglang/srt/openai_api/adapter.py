@@ -1110,13 +1110,12 @@ def v1_chat_generate_request(
     )
 
 
-    logging.info("[wytdebug] reach 2")
     if hasattr(all_requests[0], "bootstrap_room"):
         adapted_request.bootstrap_room = all_requests[0].bootstrap_room
-    logging.info("[wytdebug] reach 3")
+
     if hasattr(all_requests[0], "bootstrap_host"):
         adapted_request.bootstrap_host = all_requests[0].bootstrap_host
-    logging.info("[wytdebug] reach 4")
+
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
@@ -1319,12 +1318,7 @@ async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
     request_json = await raw_request.json()
-    logging.info("[wytdebug] reach 0")
     all_requests = [ChatCompletionRequest(**request_json)]
-    logging.info("[wytdebug] reach 1")
-    # for req in all_requests:
-    #     assert req.bootstrap_room is not None
-        # logging.info(f"[wytdebug] request bootstrap_room {req.bootstrap_room}")
 
     created = int(time.time())
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)

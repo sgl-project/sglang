@@ -108,7 +108,7 @@ class MemDescCollector:
             try:
                 msg= self.socket.recv(flags=zmq.NOBLOCK)
                 msg = DecodeMemDescMsg.deserialize(msg)
-                logging.info(f'[wytdebug] memdesc collector recv {msg.room_number}, len(kv_descs): {len(msg.kv_descs_serialized)}, len(aux_descs): {len(msg.aux_descs_serialized)}')
+                logging.debug(f'[NIXL PD disagg] memdesc collector recv {msg.room_number}, len(kv_descs): {len(msg.kv_descs_serialized)}, len(aux_descs): {len(msg.aux_descs_serialized)}')
                 assert self.buffer.get(msg.room_number) is None, f"Duplicate message for {msg.room_number}"
                 self.buffer[msg.room_number] = (
                     self.deserializer(msg.kv_descs_serialized), 
@@ -120,7 +120,7 @@ class MemDescCollector:
     def try_fetch(self, room_number: int) -> tuple[Any, Any]:
         if self.buffer.get(room_number) is None:
             return (None, None)
-        logging.info(f'[wytdebug] memdesc collector pop out {room_number}')
+        logging.debug(f'[NIXL PD disagg] memdesc collector pop out {room_number}')
         return self.buffer[room_number]
 
 class KVManager:
@@ -218,7 +218,7 @@ class KVSender:
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        logging.info(f"[wytdebug] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
+        logging.debug(f"[NIXL PD disagg] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
 
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
@@ -246,7 +246,7 @@ class KVSender:
 
         if self.remote_kv_descs is None:
             assert self.remote_aux_descs is None
-            # logging.info(f'[wytdebug] try fetch {self.mgr.peer_name} {self.bootstrap_room}')
+            # logging.debug(f'[NIXL PD disagg] try fetch {self.mgr.peer_name} {self.bootstrap_room}')
             self.remote_kv_descs, self.remote_aux_descs = \
                 self.mgr.memdesc_collector.try_fetch( self.bootstrap_room)
         else:
@@ -264,7 +264,7 @@ class KVSender:
         elif state == "DONE" and state2 == "DONE":
             return KVPoll.Success
         else:
-            # logging.info(f"[wytdebug] KVSender {self.bootstrap_room} poll result: {state}, {state2}")
+            # logging.debug(f"[NIXL PD disagg] KVSender {self.bootstrap_room} poll result: {state}, {state2}")
             return KVPoll.Transferring
 
     def failure_exception(self):
@@ -291,7 +291,7 @@ class KVReceiver:
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        logging.info(f'[wytdebug] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
+        logging.debug(f'[NIXL PD disagg] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
 
         # Once D recv a req, it will:
         # 1. do preallocate 
@@ -303,7 +303,7 @@ class KVReceiver:
             kv_descs_serialized=self.mgr.agent.get_serialized_descs(kv_descs),
             aux_descs_serialized=self.mgr.agent.get_serialized_descs(aux_descs)
         )
-        logging.info(f'[wytdebug] KVReceiver: sending to Prefill memdesc collector ({self.memdesc_collector_addr}): {msg.room_number}')
+        logging.debug(f'[NIXL PD disagg] KVReceiver: sending to Prefill memdesc collector ({self.memdesc_collector_addr}): {msg.room_number}')
         msg.send_to_memdesc_collector(self.memdesc_collector_addr)
 
         self.has_init = True

@@ -99,7 +99,7 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        logging.info("[wytdebug] Bqueue enqueue. bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
+        logging.info("[NIXL PD disagg] Bqueue enqueue. bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -134,12 +134,12 @@ class PrefillBootstrapQueue:
                 continue
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
-            logging.info(f"[wytdebug] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
+            logging.debug(f"[NIXL PD disagg] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
 
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
-                logging.info(f"[wytdebug] pop_bootstrapped: no available metadata buffer index")
+                logging.debug(f"[NIXL PD disagg] pop_bootstrapped: no available metadata buffer index")
                 break
             req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert req.metadata_buffer_index is not None
@@ -152,7 +152,7 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
         if len(bootstrapped_reqs) > 0:
-            logging.info(f"[wytdebug] Bbqueue pop out: {len(bootstrapped_reqs)}")
+            logging.debug(f"[NIXL PD disagg] Bbqueue pop out: {len(bootstrapped_reqs)}")
         return bootstrapped_reqs
 
 
@@ -257,5 +257,5 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.allocate_token_id(
                 req.metadata_buffer_index, token_id
             )
-        logging.info(f"[wytdebug] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
+        logging.debug(f"[NIXL PD disagg] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
         req.disagg_kv_sender.send(kv_indices)
