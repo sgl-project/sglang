@@ -337,6 +337,7 @@ class HPUGraphRunner:
             block_scales=None,
             attn_backend=self.model_runner.attn_backend,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            use_contiguous_pa=None,
         )
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         for i in range(3):
