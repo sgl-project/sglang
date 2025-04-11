@@ -293,5 +293,5 @@ if _is_hpu:
     def compute_hpu_attn_bias_decode(page_size, block_usage, dtype):
         mask = torch.arange(0, page_size, device="hpu", dtype=torch.int32).unsqueeze(0)
         mask = mask >= block_usage.to("hpu").unsqueeze(-1)
-        attn_bias = torch.zeros_like(mask, dtype).masked_fill_(mask, -math.inf).clone()
+        attn_bias = torch.zeros_like(mask).masked_fill_(mask, -math.inf).clone()
         return attn_bias
