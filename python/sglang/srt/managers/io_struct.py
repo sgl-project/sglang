@@ -702,12 +702,11 @@ class UpdateWeightsFromDistributedReqOutput:
 class UpdateWeightsFromTensorReqInput:
     """Update model weights from tensor input.
 
-    - Binary data like tensors are base64 encoded
+    - Tensors are serialized for transmission
     - Data is structured in JSON for easy transmission over HTTP
-    - No pickle serialization is used for security reasons
     """
 
-    serialized_named_tensors: List[str]
+    serialized_named_tensors: List[Union[str, bytes]]
     # Optional format specification for loading
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
