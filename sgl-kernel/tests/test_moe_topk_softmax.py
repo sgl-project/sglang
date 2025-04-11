@@ -42,11 +42,9 @@ def test_topk_softmax(num_tokens, num_experts, topk):
         topk_weights_ref, topk_weights, atol=1e-3, rtol=1e-3
     ), f"Weights mismatch: torch={topk_indices_ref} vs SGLang={topk_weights}"
 
-    assert torch.equal(
-        topk_indices_ref, topk_indices
+    assert torch.allclose(
+        topk_indices_ref.int(), topk_indices, atol=0, rtol=0
     ), f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
-
-    print("✅ Native torch and custom kernel implementations match.")
 
 
 if __name__ == "__main__":

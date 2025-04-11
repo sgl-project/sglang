@@ -187,9 +187,6 @@ def test_correctness(
         pos_ids, query_flashinfer, key_flashinfer
     )
 
-    print(query_ref_out)
-    print(query_flashinfer_out)
-
     torch.testing.assert_close(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )

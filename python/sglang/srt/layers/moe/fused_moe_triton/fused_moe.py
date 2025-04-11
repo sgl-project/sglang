@@ -707,7 +707,7 @@ def moe_align_block_size(
             dtype=torch.int32,
             device=topk_ids.device,
         )
-        cumsum_buffer = torch.zeros(
+        cumsum_buffer = torch.empty(
             num_experts + 1, dtype=torch.int32, device=topk_ids.device
         )
 

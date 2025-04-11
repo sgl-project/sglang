@@ -79,7 +79,6 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     rtol = 0.02
     atol = 1
     torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
-    print(f"M={M}, N={N}, K={K}, out_dtype={out_dtype}: OK")
 
 
 @pytest.mark.parametrize("M", [1, 3, 5, 127, 128, 512, 1024, 4096])

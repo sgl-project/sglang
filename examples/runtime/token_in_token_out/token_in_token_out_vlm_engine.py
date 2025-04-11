@@ -1,10 +1,7 @@
 import argparse
 import dataclasses
-from io import BytesIO
 from typing import Tuple
 
-import requests
-from PIL import Image
 from transformers import AutoProcessor
 
 from sglang import Engine
@@ -19,20 +16,22 @@ def get_input_ids(
 ) -> Tuple[list[int], list]:
     chat_template = get_chat_template_by_model_path(model_config.model_path)
     text = f"{chat_template.image_token}What is in this picture?"
-    images = [Image.open(BytesIO(requests.get(DEFAULT_IMAGE_URL).content))]
     image_data = [DEFAULT_IMAGE_URL]
 
     processor = AutoProcessor.from_pretrained(
         model_config.model_path, trust_remote_code=server_args.trust_remote_code
     )
 
-    inputs = processor(
-        text=[text],
-        images=images,
-        return_tensors="pt",
+    input_ids = (
+        processor.tokenizer(
+            text=[text],
+            return_tensors="pt",
+        )
+        .input_ids[0]
+        .tolist()
     )
 
-    return inputs.input_ids[0].tolist(), image_data
+    return input_ids, image_data
 
 
 def token_in_out_example(
