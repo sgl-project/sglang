@@ -1608,6 +1608,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def get_param_category(self, name):
+        if ".experts." in name:
+            return "moe"
+        return "others"
+
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
