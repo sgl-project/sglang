@@ -75,8 +75,6 @@ class TestEPLB(CustomTestCase):
     #             enable_deepep_moe=True,
     #             deepep_mode="normal",
     #             disable_cuda_graph=True,
-    #             enable_scheduler_input_blocker=True,
-    #             disable_overlap_schedule=True, # TODO
     #             tp_size=2,
     #         )
     #
