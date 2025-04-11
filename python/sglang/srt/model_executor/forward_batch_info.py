@@ -417,13 +417,53 @@ class ForwardBatch:
                     ] * 3
                 else:
                     # TODO: current qwen2-vl do not support radix cache since mrope position calculation
+                    image_items = [
+                        item
+                        for item in multimodal_inputs.mm_items
+                        if item.image_grid_thws is not None
+                    ]
+                    image_grid_thw = (
+                        torch.concat(
+                            [item.image_grid_thws for item in image_items],
+                            dim=0,
+                        )
+                        if image_items
+                        else None
+                    )
+
+                    video_items = [
+                        item
+                        for item in multimodal_inputs.mm_items
+                        if item.video_grid_thws is not None
+                    ]
+                    video_grid_thw = (
+                        torch.concat(
+                            [item.video_grid_thws for item in video_items],
+                            dim=0,
+                        )
+                        if video_items
+                        else None
+                    )
+
+                    second_per_grid_ts = (
+                        torch.concat(
+                            [
+                                item.second_per_grid_ts
+                                for item in multimodal_inputs.mm_items
+                            ],
+                            dim=0,
+                        )
+                        if video_items
+                        else None
+                    )
+
                     mrope_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=self.input_ids[
                                 extend_start_loc : extend_start_loc + extend_seq_len
                             ],
-                            image_grid_thw=multimodal_inputs.image_grid_thws,
-                            video_grid_thw=multimodal_inputs.video_grid_thws,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
                             image_token_id=multimodal_inputs.im_token_id,
                             video_token_id=multimodal_inputs.video_token_id,
                             vision_start_token_id=hf_config.vision_start_token_id,
@@ -431,7 +471,7 @@ class ForwardBatch:
                             spatial_merge_size=hf_config.vision_config.spatial_merge_size,
                             context_len=0,
                             seq_len=len(self.input_ids),
-                            second_per_grid_ts=multimodal_inputs.second_per_grid_ts,
+                            second_per_grid_ts=second_per_grid_ts,
                             tokens_per_second=hf_config.vision_config.tokens_per_second,
                         )
                     )
