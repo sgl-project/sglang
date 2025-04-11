@@ -123,6 +123,7 @@ from sglang.srt.utils import (
     configure_logger,
     crash_on_warnings,
     get_bool_env_var,
+    get_scheduler_device,
     get_zmq_socket,
     is_hpu,
     kill_itself_when_parent_died,
@@ -130,7 +131,6 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
-    get_scheduler_device,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 

@@ -33,7 +33,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend, is_hpu, get_scheduler_device
+from sglang.srt.utils import (
+    DynamicGradMode,
+    get_compiler_backend,
+    get_scheduler_device,
+    is_hpu,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -70,7 +75,9 @@ class TpModelWorkerClient:
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
         self.future_token_ids_map = torch.empty(
-            (self.max_running_requests * 5,), dtype=torch.int64, device=self.scheduler_device
+            (self.max_running_requests * 5,),
+            dtype=torch.int64,
+            device=self.scheduler_device,
         )
 
         # Launch threads
@@ -82,7 +89,9 @@ class TpModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
-        self.scheduler_stream = torch.get_device_module(self.scheduler_device).current_stream()
+        self.scheduler_stream = torch.get_device_module(
+            self.scheduler_device
+        ).current_stream()
         if self.scheduler_device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 

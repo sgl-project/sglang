@@ -1834,6 +1834,7 @@ def fast_topk(values, topk, dim):
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
 
+
 def get_scheduler_device(worker_device: str):
     # HPU has higher overhead when running many small ops
     # so we run all scheduler ops on CPU when using HPU

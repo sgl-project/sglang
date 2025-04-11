@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_scheduler_device,
     init_custom_process_group,
     is_cuda,
     is_flashinfer_available,
@@ -767,7 +768,7 @@ class ModelRunner:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
-                device=self.device if self.device != "hpu" else "cpu",
+                device=get_scheduler_device(self.device),
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
         else:
@@ -822,7 +823,7 @@ class ModelRunner:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    device=self.device if self.device != "hpu" else "cpu",
+                    device=get_scheduler_device(self.device),
                     kvcache=self.token_to_kv_pool,
                 )
         else:
