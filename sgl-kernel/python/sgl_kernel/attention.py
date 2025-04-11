@@ -59,5 +59,10 @@ def cutlass_mla_decode(
     )
     return out
 
-def cutlass_mla_get_workspace_size(max_seq_len: int, num_batches: int, sm_count: int = 0) -> int:
-    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size(max_seq_len, num_batches, sm_count)
+
+def cutlass_mla_get_workspace_size(
+    max_seq_len: int, num_batches: int, sm_count: int = 0
+) -> int:
+    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size(
+        max_seq_len, num_batches, sm_count
+    )

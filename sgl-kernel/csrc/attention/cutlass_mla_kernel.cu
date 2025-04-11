@@ -196,9 +196,11 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   typename MlaSm100Type::Fmha::Arguments arguments;
   using TileShapeH = typename MlaSm100Type::TileShapeH;
   using TileShapeD = typename MlaSm100Type::TileShapeD;
-  arguments.problem_shape = cute::make_tuple(TileShapeH{}, static_cast<int>(max_seq_len), TileShapeD{}, static_cast<int>(num_batches));
+  arguments.problem_shape =
+      cute::make_tuple(TileShapeH{}, static_cast<int>(max_seq_len), TileShapeD{}, static_cast<int>(num_batches));
   // Assumes device 0 when getting sm_count.
-  arguments.hw_info.sm_count  = sm_count <= 0 ? cutlass::KernelHardwareInfo::query_device_multiprocessor_count(/*device_id=*/0) : sm_count;
+  arguments.hw_info.sm_count =
+      sm_count <= 0 ? cutlass::KernelHardwareInfo::query_device_multiprocessor_count(/*device_id=*/0) : sm_count;
   MlaSm100Type::Fmha::set_split_kv(arguments);
 
   return MlaSm100Type::Fmha::get_workspace_size(arguments);
