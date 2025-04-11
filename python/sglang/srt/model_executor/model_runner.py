@@ -87,7 +87,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
+    set_cuda_arch, get_bool_env_var,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,6 +179,8 @@ class ModelRunner:
             }
         )
         set_global_expert_location_metadata(expert_location_metadata)
+        if self.tp_rank == 0 and get_bool_env_var("SGLANG_LOG_EXPERT_LOCATION_METADATA"):
+            logger.info(f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}")
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -481,6 +483,8 @@ class ModelRunner:
         torch.distributed.barrier()
 
         get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
+        if self.tp_rank == 0 and get_bool_env_var("SGLANG_LOG_EXPERT_LOCATION_METADATA"):
+            logger.info(f"Updated expert_location_metadata: {get_global_expert_location_metadata().debug_str()}")
 
         # We may be able to further reduce lock time by faster copying, pre-transfering, etc
         self.update_weights_from_disk(
