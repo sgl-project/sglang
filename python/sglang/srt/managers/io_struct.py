@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.expert_location import ExpertLocationMetadata
+
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -665,7 +668,21 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class FlushCacheReq:
+class FlushCacheReqInput:
+    pass
+
+
+@dataclass
+class FlushCacheReqOutput:
+    success: bool
+
+
+class UpdateExpertLocationReqInput:
+    expert_location_metadata: "ExpertLocationMetadata"
+
+
+@dataclass
+class UpdateExpertLocationReqOutput:
     pass
 
 
@@ -675,6 +692,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # The parameter categories to filter
+    param_categories: Optional[List[str]] = None
 
 
 @dataclass
@@ -816,7 +835,7 @@ class ExpertDistributionReq(Enum):
 
 @dataclass
 class ExpertDistributionReqOutput:
-    pass
+    dump_output: Optional[Any] = None
 
 
 @dataclass
@@ -911,3 +930,13 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+
+@dataclass
+class BlockReqInput:
+    type: BlockReqType
