@@ -23,6 +23,7 @@ class TestEPLB(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                trust_remote_code=True,
                 enable_eplb=True,
                 eplb_storage_dir=tmpdir,
                 ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
@@ -63,6 +64,7 @@ class TestEPLB(CustomTestCase):
         with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
             engine_kwargs = dict(
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                trust_remote_code=True,
                 enable_eplb=True,
                 ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
                 enable_deepep_moe=True,
