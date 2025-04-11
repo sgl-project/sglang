@@ -51,7 +51,9 @@ class ExpertLocationMetadata:
 
         common = ExpertLocationMetadata._init_common(server_args)
         model_config_for_expert_location = common["model_config_for_expert_location"]
-        logical_to_all_physical_map = _compute_logical_to_all_physical_map(physical_to_logical_map)
+        logical_to_all_physical_map = _compute_logical_to_all_physical_map(physical_to_logical_map,
+                                                                           num_logical_experts=model_config_for_expert_location.num_logical_experts
+                                                                           )
 
         return ExpertLocationMetadata(
             num_layers=model_config_for_expert_location.num_layers,
@@ -178,7 +180,21 @@ class ExpertLocationMetadata:
         )
 
 
-def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor):
+def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor, num_logical_experts: int):
+    num_layers, num_physical_experts = physical_to_logical_map.shape
+
+    logical_to_all_physical_map = [
+        [
+            []
+            for physical_expert_id in range(num_logical_experts)
+        ]
+        for layer_id in range(num_layers)
+    ]
+
+    for layer_id in range(num_layers):
+        for physical_expert_id in range(num_physical_experts):
+            TODO
+
     return TODO
 
 
