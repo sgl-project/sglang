@@ -697,6 +697,10 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.eplb_manager.rebalance()
 
+    async def eplb_save_expert_distribution(self):
+        self.auto_create_handle_loop()
+        self.eplb_manager.save_expert_distribution()
+
     async def update_expert_location(self, obj: UpdateExpertLocationReqInput):
         self.auto_create_handle_loop()
         assert (
