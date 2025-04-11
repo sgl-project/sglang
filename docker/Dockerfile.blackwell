@@ -14,6 +14,6 @@ RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 \
     && pip3 install setuptools==75.0.0 wheel==0.41.0 scikit-build-core
 
 RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
-    && pip3 install -e "python[blackwell]"
+    && cd sglang && pip3 install -e "python[blackwell]"
 
 ENV DEBIAN_FRONTEND=interactive
