@@ -74,7 +74,6 @@ HPUForwardBatch = namedtuple(
         "block_mapping",
         "block_groups",
         "block_usage",
-        "block_scales",
         "attn_backend",
         "token_to_kv_pool",
         "use_contiguous_pa",
@@ -150,7 +149,6 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_mapping = None
         block_groups = None
         block_usage = None
-        block_scales = None
         use_contiguous_pa = None
     else:
         padded_batch_size = get_decode_batch_bucket(batch_size)
@@ -185,7 +183,6 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_mapping = forward_batch.hpu_metadata.block_mapping.to("hpu")
         block_groups = forward_batch.hpu_metadata.block_groups.to("hpu")
         block_usage = forward_batch.hpu_metadata.block_usage.to("hpu")
-        block_scales = forward_batch.hpu_metadata.block_scales.to("hpu")
         use_contiguous_pa = forward_batch.hpu_metadata.use_contiguous_pa
 
     return HPUForwardBatch(
@@ -204,7 +201,6 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_mapping=block_mapping,
         block_groups=block_groups,
         block_usage=block_usage,
-        block_scales=block_scales,
         attn_backend=forward_batch.attn_backend,
         token_to_kv_pool=forward_batch.token_to_kv_pool,
         use_contiguous_pa=use_contiguous_pa,
@@ -334,7 +330,6 @@ class HPUGraphRunner:
             block_mapping=None,
             block_groups=None,
             block_usage=None,
-            block_scales=None,
             attn_backend=self.model_runner.attn_backend,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             use_contiguous_pa=None,
@@ -370,7 +365,6 @@ class HPUGraphRunner:
             ),
             block_groups=torch.zeros(block_num, dtype=torch.int64, device="hpu"),
             block_usage=torch.zeros(block_num, dtype=torch.bfloat16, device="hpu"),
-            block_scales=torch.zeros(block_num, dtype=torch.bfloat16, device="hpu"),
             attn_backend=self.model_runner.attn_backend,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             use_contiguous_pa=USE_CONTIGUOUS_PA,

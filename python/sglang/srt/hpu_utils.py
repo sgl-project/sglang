@@ -34,7 +34,6 @@ class HPUBlockMetadata:
     block_mapping: Optional[torch.Tensor] = None
     block_groups: Optional[torch.Tensor] = None
     block_usage: Optional[torch.Tensor] = None
-    block_scales: Optional[torch.Tensor] = None
 
 
 _is_hpu = is_hpu()
@@ -142,16 +141,6 @@ if _is_hpu:
         block_groups.masked_fill_(oob_values, batch_size)
         return block_mapping.to(torch.bfloat16), block_groups
 
-    def _set_block_scales(metadata: HPUBlockMetadata, device):
-        """Set block scales using batch2block and block2batch operations."""
-        block_mapping = metadata.block_mapping
-        ones = torch.ones(
-            (block_mapping.size(0),), device=device, dtype=block_mapping.dtype
-        )
-        sums = batch2block(block2batch(ones, block_mapping), block_mapping)
-        block_scales = torch.reciprocal(torch.maximum(ones, sums))
-        return block_scales
-
     def _init_block_metadata(
         metadata: HPUBlockMetadata, block_tables, slot_mapping, block_size, batch_size
     ):
@@ -219,7 +208,6 @@ if _is_hpu:
         metadata.block_mapping, metadata.block_groups = _set_block_mapping(
             metadata, batch_size, device
         )
-        metadata.block_scales = _set_block_scales(metadata, device)
 
     def get_prefill_seq_len_bucket(sum_seq_len):
         return find_bucket(

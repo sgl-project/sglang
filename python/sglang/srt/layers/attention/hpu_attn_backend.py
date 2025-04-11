@@ -28,9 +28,8 @@ if TYPE_CHECKING:
 
 _is_hpu = is_hpu()
 if _is_hpu:
-    import vllm_hpu_extension.kernels as kernels
     import vllm_hpu_extension.ops as ops
-    from vllm_hpu_extension.utils import Matmul, ModuleFusedSDPA, Softmax, VLLMKVCache
+    from vllm_hpu_extension.utils import Matmul, ModuleFusedSDPA, Softmax
 
 
 class HPUAttnBackend(AttentionBackend):
@@ -140,7 +139,6 @@ class HPUAttnBackend(AttentionBackend):
             block_list=forward_batch.block_list,
             block_mapping=forward_batch.block_mapping,
             block_bias=forward_batch.attn_bias,
-            block_scales=forward_batch.block_scales,
             block_groups=forward_batch.block_groups,
             scale=layer.scaling,
             matmul_qk_op=self.matmul_qk,
