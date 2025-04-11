@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+from sglang.srt.utils import is_flashinfer_available
+
+if is_flashinfer_available():
+    from flashinfer.cascade import merge_state
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -30,7 +35,7 @@ class FlashAttentionMetadata:
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
-    max_seq_len_q: int = 0
+    max_seq_len_q: int = 1
     # Maximum sequence length for key
     max_seq_len_k: int = 0
     # Cumulative sequence lengths for query
@@ -291,6 +296,8 @@ class FlashAttentionBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         self.forward_metadata: FlashAttentionMetadata = None
+        # extra metdata for handling speculative decoding topk > 1, extended draft decode and verify
+        self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
@@ -303,8 +310,8 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.model_config.attention_arch == AttentionArch.MLA
         ) and (not global_server_args_dict["disable_mla"])
         self.skip_prefill = skip_prefill
-
-        self.topk = topk
+        self.topk = topk or (model_runner.server_args.speculative_eagle_topk if model_runner.server_args.speculative_eagle_topk is not None else 0)
+        # torch.distributed.breakpoint()
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -328,24 +335,80 @@ class FlashAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                metadata.cache_seqlens_int32 = (
-                    seqlens_in_batch + (self.speculative_step_id + 1)
-                ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
-                )
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
-                )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                if self.topk <= 1:
+                    metadata.cache_seqlens_int32 = (
+                        seqlens_in_batch + (self.speculative_step_id + 1)
+                    ).to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                        self.speculative_step_id + 1
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+                else:
+                    metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
+                    metadata.max_seq_len_q = self.topk
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.topk + 1,
+                        step=self.topk,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
+
+                    metadata_expand = FlashAttentionMetadata()
+                    decode_length = self.speculative_step_id + 1
+                    metadata_expand.cache_seqlens_int32 = torch.full(
+                        (seqlens_in_batch.numel() * self.topk,),
+                        decode_length,
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    metadata_expand.max_seq_len_q = 1
+                    metadata_expand.max_seq_len_k = self.speculative_step_id + 1
+                    metadata_expand.cu_seqlens_q = torch.arange(
+                        0,
+                        metadata_expand.cache_seqlens_int32.numel() + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata_expand.cu_seqlens_k = torch.arange(
+                        0,
+                        metadata_expand.cache_seqlens_int32.numel() * decode_length + 1,
+                        step=decode_length,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    cache_loc = forward_batch.out_cache_loc.view(
+                        self.speculative_num_steps, -1
+                    ).T.contiguous()
+                    metadata_expand.page_table = (
+                        cache_loc[:, :decode_length].contiguous().to(torch.int32)
+                    )
+                    self.forward_metadata_spec_decode_expand = metadata_expand
+                    # print("decode draft step id", self.speculative_step_id)
+                    # print("metadata", metadata)
+                    # print("metadata_expand", metadata_expand)
+                    # torch.distributed.breakpoint()
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -360,29 +423,121 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
         elif forward_batch.forward_mode.is_target_verify():
-            metadata.cache_seqlens_int32 = (
-                forward_batch.seq_lens + self.speculative_num_draft_tokens
-            ).to(torch.int32)
-            metadata.max_seq_len_q = self.speculative_num_draft_tokens
-            metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item()
-                + self.speculative_num_draft_tokens
-            )
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+            if self.topk <= 1:
+                metadata.cache_seqlens_int32 = (
+                    forward_batch.seq_lens + self.speculative_num_draft_tokens
+                ).to(torch.int32)
+                metadata.max_seq_len_q = 1
+                metadata.max_seq_len_k = (
+                    forward_batch.seq_lens_cpu.max().item()
+                    + self.speculative_num_draft_tokens
+                )
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
+            else:
+                metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
+                metadata_expand = FlashAttentionMetadata()
+                metadata_expand.cache_seqlens_int32 = torch.full(
+                    (
+                        forward_batch.seq_lens.numel()
+                        * self.speculative_num_draft_tokens,
+                    ),
+                    self.speculative_num_draft_tokens,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                metadata_expand.max_seq_len_q = 1
+                metadata_expand.max_seq_len_k = self.speculative_num_draft_tokens
+                metadata_expand.cu_seqlens_q = torch.arange(
+                    0,
+                    metadata_expand.cache_seqlens_int32.numel() + 1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                metadata_expand.cu_seqlens_k = torch.arange(
+                    0,
+                    metadata_expand.cache_seqlens_int32.numel()
+                    * self.speculative_num_draft_tokens
+                    + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                offsets = torch.arange(
+                    self.speculative_num_draft_tokens, device=device
+                ).unsqueeze(
+                    0
+                )  # shape: (1, self.speculative_num_draft_tokens)
+                cols = offsets.expand(
+                    forward_batch.seq_lens.numel(), -1
+                ) + forward_batch.seq_lens.unsqueeze(1)
+                non_masked_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, :
+                    ]
+                    .gather(1, cols)
+                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                )  # (bsz, draft_num)
+
+                cum_len = torch.nn.functional.pad(
+                    torch.cumsum(
+                        (
+                            forward_batch.seq_lens + self.speculative_num_draft_tokens
+                        ).repeat_interleave(self.speculative_num_draft_tokens),
+                        dim=0,
+                    ),
+                    (1, 0),
+                )[:-1]
+                mask_extraction_indices = (
+                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                    + cum_len[:, None]
+                ).view(1, -1)
+                mask = forward_batch.spec_info.custom_mask[
+                    mask_extraction_indices
+                ].view(
+                    -1, self.speculative_num_draft_tokens
+                )  # (bsz * draft_num, draft_num)
+                metadata_expand.page_table = (non_masked_page_table * mask).to(
+                    torch.int32
+                )
+                self.forward_metadata_spec_decode_expand = metadata_expand
+                # print("verify step id")
+                # print("metadata", metadata)
+                # print("metadata_expand", metadata_expand)
+                # torch.distributed.breakpoint()
         elif forward_batch.forward_mode.is_extend_or_draft_extend():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -523,7 +678,7 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
         k_descale, v_descale = None, None
@@ -575,7 +730,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            o = flash_attn_with_kvcache(
+            o, softmax_lse, *rest = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -585,12 +740,42 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=causal,
+                causal=(
+                    False
+                    if forward_batch.forward_mode.is_target_verify() and self.topk > 1
+                    else causal
+                ),
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                return_softmax_lse=True,
             )
+            if forward_batch.forward_mode.is_target_verify() and self.topk > 1:
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                )
+                o, _ = merge_state(
+                    o,
+                    softmax_lse.T.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.T.contiguous(),
+                )
+                # torch.distributed.breakpoint()
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -664,7 +849,7 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
         causal = not layer.is_cross_attention
@@ -699,8 +884,9 @@ class FlashAttentionBackend(AttentionBackend):
                 page_table = metadata.page_table
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_q = metadata.max_seq_len_q
 
-            o = flash_attn_with_kvcache(
+            o, softmax_lse, *rest = flash_attn_with_kvcache(
                 q=q_reshaped,
                 k_cache=key_cache,
                 v_cache=value_cache,
@@ -708,14 +894,42 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k,
-                max_seqlen_q=1,
+                max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
-                causal=causal,
+                causal=False if self.topk > 1 else causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                return_softmax_lse=True,
             )
+            if self.topk > 1:
+                # torch.distributed.breakpoint()
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q_reshaped,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                )
+                o, _ = merge_state(
+                    o,
+                    softmax_lse.T.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.T.contiguous(),
+                )
+                # print("draft decode merge finish! id:", self.speculative_step_id)
+                # torch.distributed.breakpoint()
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1043,12 +1257,10 @@ class FlashAttentionMultiStepBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-
-        # TODO: Support Topk > 1 for FlashAttentionBackend Spec Decoding
-        assert (
-            self.topk == 1
-        ), "speculative_eagle_topk must be 1 for FlashAttentionMultiStepBackend"
-
+        # # TODO: Support Topk > 1 for FlashAttentionBackend Spec Decoding
+        # assert (
+        #     self.topk == 1
+        # ), "speculative_eagle_topk must be 1 for FlashAttentionMultiStepBackend"
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(
