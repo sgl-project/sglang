@@ -677,6 +677,7 @@ class FlushCacheReqOutput:
     success: bool
 
 
+@dataclass
 class UpdateExpertLocationReqInput:
     expert_location_metadata: "ExpertLocationMetadata"
 
