@@ -3,7 +3,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
-from sgl_kernel import awq_dequantize
 
 from sglang.srt.layers.linear import (
     LinearBase,
@@ -12,6 +11,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import is_npu
+
+if not is_npu():
+    from sgl_kernel import awq_dequantize
 
 logger = logging.getLogger(__name__)
 

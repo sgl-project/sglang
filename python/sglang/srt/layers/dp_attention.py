@@ -70,6 +70,7 @@ def initialize_dp_attention(
         False,
         False,
         False,
+        False,
         group_name="attention_tp",
     )
 
