@@ -71,7 +71,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    compute_shared_experts_fusion_weights,
+    default_weight_loader,
+)
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_hip
 
 _is_hip = is_hip()
@@ -1477,43 +1480,27 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            suffix_list = [
+
+        weights = compute_shared_experts_fusion_weights(
+            weights,
+            n_share_experts_fusion=self.n_share_experts_fusion,
+            n_routed_experts=self.config.n_routed_experts,
+            moe_layer_ids=range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers,
+                self.config.moe_layer_freq,
+            ),
+            suffix_list=[
                 "down_proj.weight",
                 "down_proj.weight_scale_inv",
                 "gate_proj.weight",
                 "gate_proj.weight_scale_inv",
                 "up_proj.weight",
                 "up_proj.weight_scale_inv",
-            ]
-            names_to_remove = []
-            for moe_layer in tqdm(
-                range(
-                    self.config.first_k_dense_replace,
-                    self.config.num_hidden_layers,
-                    self.config.moe_layer_freq,
-                ),
-                desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
-            ):
-                for num_repeat in range(self.n_share_experts_fusion):
-                    for suffix in suffix_list:
-                        shared_expert_weight_name = (
-                            f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                        )
-                        weights_list.append(
-                            (
-                                f"model.layers.{moe_layer}."
-                                f"mlp.experts."
-                                f"{self.config.n_routed_experts + num_repeat}"
-                                f".{suffix}",
-                                weights_dict[shared_expert_weight_name].clone(),
-                            )
-                        )
-                        names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
+            ],
+            shared_expert_name_template="model.layers.{moe_layer_id}.mlp.shared_experts.{suffix}",
+            routed_expert_name_template="model.layers.{moe_layer_id}.mlp.experts.{expert_index}.{suffix}",
+        )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

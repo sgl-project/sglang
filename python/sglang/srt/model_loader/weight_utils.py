@@ -849,3 +849,42 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def compute_shared_experts_fusion_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    n_share_experts_fusion: Optional[int],
+    n_routed_experts: int,
+    moe_layer_ids: Iterable[int],
+    suffix_list: List[str],
+    shared_expert_name_template: str,
+    routed_expert_name_template: str,
+):
+    if n_share_experts_fusion is None or n_share_experts_fusion == 0:
+        return weights
+
+    weights_list = list(weights)
+    weights_dict = dict(weights_list)
+    names_to_remove = []
+    for moe_layer_id in tqdm(
+        moe_layer_ids,
+        desc=f"Cloning {n_share_experts_fusion} "
+        "replicas of the shared expert into MoE",
+    ):
+        for repeat_index in range(n_share_experts_fusion):
+            for suffix in suffix_list:
+                shared_expert_weight_name = shared_expert_name_template.format(
+                    moe_layer_id=moe_layer_id, suffix=suffix
+                )
+                weights_list.append(
+                    (
+                        routed_expert_name_template.format(
+                            moe_layer_id=moe_layer_id,
+                            expert_index=n_routed_experts + repeat_index,
+                            suffix=suffix,
+                        ),
+                        weights_dict[shared_expert_weight_name],
+                    )
+                )
+                names_to_remove += [shared_expert_weight_name]
+    return [w for w in weights_list if w[0] not in names_to_remove]
