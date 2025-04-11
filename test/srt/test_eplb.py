@@ -23,50 +23,50 @@ _TRIVIAL_EXPERT_LOCATIONS = list(
 
 
 class TestEPLB(CustomTestCase):
-    # def test_eplb_e2e(self):
-    #     with tempfile.TemporaryDirectory() as tmpdir:
-    #         engine_kwargs = dict(
-    #             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
-    #             trust_remote_code=True,
-    #             enable_eplb=True,
-    #             eplb_storage_dir=tmpdir,
-    #             ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
-    #             enable_deepep_moe=True,
-    #             deepep_mode="normal",
-    #             disable_cuda_graph=True,
-    #             enable_scheduler_input_blocker=True,
-    #             disable_overlap_schedule=True,  # TODO
-    #             tp_size=2,
-    #             log_level="info",
-    #         )
-    #
-    #         print(f"Action: start engine")
-    #         engine = sgl.Engine(**engine_kwargs)
-    #         ref_output = self._engine_generate(engine)
-    #         self._assert_behavior(engine, ref_output, "equal_trivial")
-    #
-    #         print(f"Action: eplb_rebalance")
-    #         engine.eplb_rebalance()
-    #         self._engine_flush_cache(engine)
-    #         physical_to_logical_map_layer_0_after_first_rebalance = (
-    #             self._assert_behavior(engine, ref_output, "not_equal_trivial")
-    #         )
-    #
-    #         print(f"Action: shutdown engine")
-    #         engine.shutdown()
-    #         del engine
-    #
-    #         print(f"Action: start engine")
-    #         engine = sgl.Engine(**engine_kwargs)
-    #         self._assert_behavior(
-    #             engine,
-    #             ref_output,
-    #             physical_to_logical_map_layer_0_after_first_rebalance,
-    #         )
-    #
-    #         print(f"Action: shutdown engine")
-    #         engine.shutdown()
-    #         del engine
+    def test_eplb_e2e(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine_kwargs = dict(
+                model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                trust_remote_code=True,
+                enable_eplb=True,
+                eplb_storage_dir=tmpdir,
+                ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                enable_deepep_moe=True,
+                deepep_mode="normal",
+                disable_cuda_graph=True,
+                enable_scheduler_input_blocker=True,
+                disable_overlap_schedule=True,  # TODO
+                tp_size=2,
+                log_level="info",
+            )
+
+            print(f"Action: start engine")
+            engine = sgl.Engine(**engine_kwargs)
+            ref_output = self._engine_generate(engine)
+            self._assert_behavior(engine, ref_output, "equal_trivial")
+
+            print(f"Action: eplb_rebalance")
+            engine.eplb_rebalance()
+            self._engine_flush_cache(engine)
+            physical_to_logical_map_layer_0_after_first_rebalance = (
+                self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            )
+
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
+            print(f"Action: start engine")
+            engine = sgl.Engine(**engine_kwargs)
+            self._assert_behavior(
+                engine,
+                ref_output,
+                physical_to_logical_map_layer_0_after_first_rebalance,
+            )
+
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
 
     def test_eplb_init_expert_location_and_save_expert_distribution(self):
         with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
