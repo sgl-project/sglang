@@ -37,10 +37,9 @@ class TestEPLB(CustomTestCase):
             self._assert_behavior(engine, ref_output, "equal_trivial")
 
             print(f"Action: eplb_rebalance")
-            physical_to_logical_map_layer_0_after_first_rebalance = (
-                engine.eplb_rebalance()
-            )
-            self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            engine.eplb_rebalance()
+            physical_to_logical_map_layer_0_after_first_rebalance = self._assert_behavior(engine, ref_output,
+                                                                                          "not_equal_trivial")
 
             print(f"Action: shutdown engine")
             engine.shutdown()
@@ -104,7 +103,7 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def _assert_behavior(
-        self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
+            self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
     ):
         ret = engine.flush_cache()
         assert ret.success
