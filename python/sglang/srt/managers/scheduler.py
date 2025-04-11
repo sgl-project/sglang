@@ -130,6 +130,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    get_scheduler_device,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -290,15 +291,13 @@ class Scheduler(
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
-            self.device,
+            worker_device,
             worker_global_server_args_dict,
             _,
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if self.device == "hpu":
-            # scheduler will run on cpu if hpu is used
-            self.device = "cpu"
+        self.device = get_scheduler_device(worker_device)
         self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
