@@ -268,6 +268,9 @@ class MultimodalDataItem:
             self.modality == Modality.VIDEO
         ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
 
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
     def validate(self):
         ...
         # TODO
@@ -306,11 +309,7 @@ class MultimodalInputs:
         )
 
         assert isinstance(ret.mm_items, list)
-        ret.mm_items = [
-            item
-            for item in ret.mm_items
-            if item.is_audio() or item.is_image() or item.is_video()
-        ]
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
         assert len(ret.mm_items) != 0
 
@@ -345,8 +344,8 @@ class MultimodalInputs:
         """ """
         return any(item.is_audio() for item in self.mm_items)
 
-    def collect_image_inputs(self) -> List[torch.Tensor]:
-        return [item.pixel_values for item in self.mm_items if item.is_image()]
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
 
     def merge(self, other: MultimodalInputs):
         """
@@ -390,6 +389,8 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_room: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -523,8 +524,8 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init
