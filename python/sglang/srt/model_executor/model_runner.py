@@ -179,6 +179,13 @@ class ModelRunner:
                 "use_mla_backend": self.use_mla_backend,
             }
         )
+
+        # CPU offload
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+
+        # Get memory before model loading
+        min_per_gpu_memory = self.init_torch_distributed()
+
         set_global_expert_location_metadata(expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(
             "SGLANG_LOG_EXPERT_LOCATION_METADATA"
@@ -186,12 +193,6 @@ class ModelRunner:
             logger.info(
                 f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
             )
-
-        # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
-
-        # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
 
         # If it is a draft model tp_group can be different.
         self.initialize(min_per_gpu_memory)
