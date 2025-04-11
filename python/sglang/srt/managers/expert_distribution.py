@@ -1,4 +1,5 @@
 import logging
+import threading
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
@@ -6,6 +7,7 @@ from typing import Any, List, Optional, Type
 
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -37,8 +39,12 @@ class _ExpertDistributionRecorder:
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
+    @contextmanager
     def with_current_layer(self, layer_idx):
-        return self._current_layer_idx.with_value(layer_idx)
+        print(f"hi [{get_tensor_model_parallel_rank()}, {threading.get_native_id()}, {self.__class__.__name__}] with_current_layer start {layer_idx=}")
+        with self._current_layer_idx.with_value(layer_idx):
+            yield
+        print(f"hi [{get_tensor_model_parallel_rank()}, {threading.get_native_id()}, {self.__class__.__name__}] with_current_layer end {layer_idx=}")
 
     def with_debug_name(self, debug_name):
         return self._current_debug_name.with_value(debug_name)
@@ -106,6 +112,7 @@ class _ExpertDistributionRecorder:
 
     def dump_record(self):
         """Dump the expert distribution record and reset the recorder after dumping."""
+        print(f"hi [{get_tensor_model_parallel_rank()}, {threading.get_native_id()}, {self.__class__.__name__}] dump_record start")
         output = self._accumulator.dump()
         self._reset()
         return output
