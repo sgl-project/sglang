@@ -185,9 +185,7 @@ def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor, 
 
     num_layers, num_physical_experts = physical_to_logical_map.shape
 
-    logical_to_all_physical_map = [[[] for _logical_expert_id in range(num_logical_experts)] for _layer_id in
-                                   range(num_layers)]
-
+    logical_to_all_physical_map = [[[] for _ in range(num_logical_experts)] for _ in range(num_layers)]
     for layer_id in range(num_layers):
         for physical_expert_id in range(num_physical_experts):
             logical_expert_id = physical_to_logical_map[layer_id, physical_expert_id].item()
