@@ -158,6 +158,22 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+def auto_detect_device():
+    """
+    Auto-detect the available device based on the current platform.
+    """
+    if is_cuda_alike():  # same for rocm
+        return "cuda"
+    elif is_hpu():
+        return "hpu"
+    elif is_xpu():
+        return "xpu"
+    elif is_npu():
+        return "npu"
+    else:
+        return "cpu"
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
