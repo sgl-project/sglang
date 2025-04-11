@@ -58,6 +58,7 @@ sources = [
     "csrc/cpu/decode.cpp",
     "csrc/cpu/extend.cpp",
     "csrc/cpu/gemm.cpp",
+    "csrc/cpu/gemm_fp8.cpp",
     "csrc/cpu/gemm_int8.cpp",
     "csrc/cpu/moe.cpp",
     "csrc/cpu/moe_int8.cpp",
