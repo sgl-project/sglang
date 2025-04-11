@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 from sglang.srt.utils import get_local_ip_by_remote
-from sglang.srt.disaggregation.rdma_device_utils import find_best_roce_for_gpu
+from sglang.srt.disaggregation.rdma_device_utils import find_best_rdma_device_for_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class MooncakeTransferEngineConfig:
             )
         local_hostname = os.getenv("MOONCAKE_LOCAL_HOSTNAME", default=get_local_ip_by_remote())
         protocol = os.getenv("MOONCAKE_PROTOCOL", default="rdma")
-        default_ib_device, _ = find_best_roce_for_gpu(gpu_id)
+        default_ib_device, _ = find_best_rdma_device_for_gpu(gpu_id)
         device_name = os.getenv("MOONCAKE_RDMA_DEVICE_NAME", default=default_ib_device)
         return MooncakeTransferEngineConfig(
             local_hostname=local_hostname,
