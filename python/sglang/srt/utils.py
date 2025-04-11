@@ -76,6 +76,7 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from decord import VideoReader, cpu, gpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
