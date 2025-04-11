@@ -31,6 +31,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -655,7 +656,9 @@ def _compute_initial_expert_location_metadata(
         elif "logical_count" in data_dict:
             return ExpertLocationMetadata.init_by_eplb(server_args, **data_dict)
         else:
-            raise NotImplementedError(f"Unknown init_expert_location format ({list(data_dict.keys())=})")
+            raise NotImplementedError(
+                f"Unknown init_expert_location format ({list(data_dict.keys())=})"
+            )
     if server_args.enable_eplb:
         return eplb_manager.compute_expert_location_metadata()
     return ExpertLocationMetadata.init_trivial(server_args)
