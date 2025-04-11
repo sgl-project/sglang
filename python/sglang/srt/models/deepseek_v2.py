@@ -214,15 +214,12 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
-<<<<<<< HEAD
             ep_back_mapping_tensor=ep_back_mapping_tensor if global_server_args_dict["enable_eplb_moe"] else None,
-=======
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
->>>>>>> upstream/main
         )
 
         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:

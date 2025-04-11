@@ -82,14 +82,11 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-<<<<<<< HEAD
     "enable_eplb_moe": ServerArgs.enable_eplb_moe,
     "ep_load_tensor": EP_PERMUTE_TENSOR,
     "ep_back_mapping_tensor": EP_BACK_MAPPING_TENSOR,
-=======
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
->>>>>>> upstream/main
 }
 
 logger = logging.getLogger(__name__)

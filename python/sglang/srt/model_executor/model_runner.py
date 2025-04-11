@@ -158,11 +158,8 @@ class ModelRunner:
                 "enable_dp_attention": server_args.enable_dp_attention,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
-<<<<<<< HEAD
                 "enable_eplb_moe": server_args.enable_eplb_moe,
-=======
                 "deepep_mode": server_args.deepep_mode,
->>>>>>> upstream/main
                 "device": server_args.device,
                 "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
                 "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,

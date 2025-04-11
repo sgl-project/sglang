@@ -1106,11 +1106,11 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
-<<<<<<< HEAD
             "--enable-eplb-moe",
             action="store_true",
             help="Enabling Load Balance MoE implementation for EP MoE.",
-=======
+        )
+        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
@@ -1129,7 +1129,6 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
->>>>>>> upstream/main
         )
 
         # Server warmups
