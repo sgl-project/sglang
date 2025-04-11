@@ -40,10 +40,10 @@ class EPLBManager:
                 f"Sleep {sleep_time} seconds before automatically trigger rebalancing"
             )
             await asyncio.sleep(sleep_time)
-            self.save_expert_distribution()
             await self.rebalance()
 
     async def rebalance(self):
+        self.save_expert_distribution()
         expert_location_metadata = self.compute_expert_location_metadata()
         await self._tokenizer_manager.update_expert_location(
             UpdateExpertLocationReqInput(
