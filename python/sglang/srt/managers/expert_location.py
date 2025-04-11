@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers import deepseek_eplb
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
 

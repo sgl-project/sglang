@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+if TYPE_CHECKING:
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ class ExpertDistributionStorage:
         if not self._dir_data.exists():
             self._dir_data.mkdir(parents=True, exist_ok=True)
 
-    def bind(self, tokenizer_manager: TokenizerManager):
+    def bind(self, tokenizer_manager: "TokenizerManager"):
         self._tokenizer_manager = tokenizer_manager
 
     async def start(self):
