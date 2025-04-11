@@ -199,6 +199,20 @@ void topk_softmax(
 std::vector<at::Tensor>
 moe_fused_gate(at::Tensor& input, at::Tensor& bias, int64_t num_expert_group, int64_t topk_group, int64_t topk);
 
+void fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor &output,
+    const torch::Tensor &a,
+    const torch::Tensor &b,
+    const torch::Tensor &scales_a,
+    const torch::Tensor &scales_b,
+    const torch::Tensor &stride_a,
+    const torch::Tensor &stride_b,
+    const torch::Tensor &stride_c,
+    const torch::Tensor &layout_sfa,
+    const torch::Tensor &layout_sfb,
+    const torch::Tensor &problem_sizes,
+    const torch::Tensor &expert_offsets);
+
 /*
  * From csrc/speculative
  */
