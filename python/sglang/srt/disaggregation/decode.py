@@ -182,7 +182,7 @@ class DecodePreallocQueue:
 
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
+                    : len(decode_req.req.origin_input_ids) #BUG(wyt) need to support chunk prefill.
                 ]
                 .cpu()
                 .numpy()
@@ -192,7 +192,7 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            logging.debug(f"[NIXL PD disagg] pop_reallocated kv_indices shape {kv_indices.shape}")
+            logger.info(f"[NIXL PD disagg] pop_preallocated {decode_req.req.bootstrap_room} kv_indices shape {kv_indices.shape}")
             decode_req.kv_receiver.init(kv_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -202,7 +202,7 @@ class DecodePreallocQueue:
         ]
 
         if len(preallocated_reqs) > 0:
-            logging.debug(f"[NIXL PD disagg] pop preallocated_reqs {len(preallocated_reqs)}")
+            logger.info(f"[NIXL PD disagg] pop preallocated_reqs {len(preallocated_reqs)}. {[r.req.bootstrap_room for r in preallocated_reqs]}")
         return preallocated_reqs
 
     def _allocatable_tokens(self) -> int:
@@ -314,6 +314,9 @@ class DecodeTransferQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        for req in transferred_reqs:
+            logger.info(f'[NIXL PD disagg] pop_transferred: {req.bootstrap_room}')
 
         return transferred_reqs
 
@@ -463,6 +466,7 @@ class SchedulerDisaggregationDecodeMixin:
                 can_run_list.append(req)
                 req.init_next_round_input(self.tree_cache)
             else:
+                logger.info(f'[NIXL PD disagg] get_new_prebuilt_batch: i > num_not_used_batch {i} {num_not_used_batch}')
                 waiting_queue.append(req)
 
         self.waiting_queue = waiting_queue

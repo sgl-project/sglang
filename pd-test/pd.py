@@ -32,7 +32,8 @@ LB_SERVE_PORT = "8100"
 
 EXTRA_SSH_ARGS = "" # "-i ~/ytwu/.ssh/id_ed25519"
 
-NETDEVICE = "eth0"
+# NETDEVICE = "eth0"
+NETDEVICE = "lo"
 
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # MODEL="/home/qspace/upload/luban_cache/model/luban-llm_deepseek_v3-model_path/DeepSeek-V3/"
@@ -149,7 +150,7 @@ def do_exp():
 
     # setup sglang servers.
     sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + PREFILL_ARGS.copy() + [
-      "--max-running-requests 1024"
+      "--max-running-requests 1"
     ]
     sglang_decode_args = SGLANG_COMMON_ARGS.copy() + DECODE_ARGS.copy() + [
       "--max-running-requests", f"{bsz}",
@@ -159,14 +160,14 @@ def do_exp():
       "CUDA_VISIBLE_DEVICES=0",
       "UCX_TLS=tcp,cuda",
       f"UCX_NET_DEVICES={NETDEVICE}",
-      "UCX_LOG_LEVEL=info"
+      "UCX_LOG_LEVEL=info",
     ]
 
     decode_env = [
       "CUDA_VISIBLE_DEVICES=1",
       "UCX_TLS=tcp,cuda",
       f"UCX_NET_DEVICES={NETDEVICE}",
-      "UCX_LOG_LEVEL=info"
+      "UCX_LOG_LEVEL=info",
     ]
 
     prefillServer = runCommand([f"{' '.join(prefill_env)} python3 -m sglang.launch_server"] + sglang_prefill_args, (PREFILL_ADDR, PREFILL_SSH_PORT), prefill_output_log)
@@ -183,7 +184,7 @@ def do_exp():
       "--prefill", f"http://{PREFILL_ADDR}:{PREFILL_SERVE_PORT}",
       "--decode", f"http://{DECODE_ADDR}:{DECODE_SERVE_PORT}",
       "--host 0.0.0.0", 
-      "--port", f"{LB_SERVE_PORT}",
+      "--port", f"{LB_SERVE_PORT}", 
     ], outputStream=lb_output_log)
 
     time.sleep(1)
@@ -195,9 +196,10 @@ def do_exp():
       "--port", f"{LB_SERVE_PORT}",
       "--endpoint", "/v1/chat/completions",
       "--dataset-name", "jsonl",
-      "--num-prompts", f"{ bsz * 10 }", 
+      "--num-prompts", f"{ bsz * 2 }", 
       # "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
-      "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
+      # "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
+      "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",

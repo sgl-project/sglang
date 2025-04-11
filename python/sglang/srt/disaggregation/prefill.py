@@ -99,7 +99,7 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        logging.info("[NIXL PD disagg] Bqueue enqueue. bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
+        logger.info(f"[NIXL PD disagg] Bqueue enqueue. bootstrap_host: {req.bootstrap_host}, bootstrap_room: {req.bootstrap_room}")
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -134,12 +134,12 @@ class PrefillBootstrapQueue:
                 continue
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
-            logging.debug(f"[NIXL PD disagg] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
+            logger.info(f"[NIXL PD disagg] bqueue poll result: {KVPoll.str(poll)} bootstrap room: {req.bootstrap_room}, ")
 
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
-                logging.debug(f"[NIXL PD disagg] pop_bootstrapped: no available metadata buffer index")
+                logger.info(f"[NIXL PD disagg] pop_bootstrapped: no available metadata buffer index")
                 break
             req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert req.metadata_buffer_index is not None
@@ -152,7 +152,7 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
         if len(bootstrapped_reqs) > 0:
-            logging.debug(f"[NIXL PD disagg] Bbqueue pop out: {len(bootstrapped_reqs)}")
+            logger.info(f"[NIXL PD disagg] Bbqueue pop out: {len(bootstrapped_reqs)}")
         return bootstrapped_reqs
 
 
@@ -222,6 +222,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
                 req.metadata_buffer_index
             )
+            logger.info(f'[NIXL PD disagg] pop_infight_queue broom={req.bootstrap_room}')
 
         self.disagg_prefill_infight_queue = undone_reqs
 
@@ -257,5 +258,5 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.allocate_token_id(
                 req.metadata_buffer_index, token_id
             )
-        logging.debug(f"[NIXL PD disagg] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
+        logger.info(f"[NIXL PD disagg] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
         req.disagg_kv_sender.send(kv_indices)

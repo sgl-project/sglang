@@ -108,7 +108,7 @@ class MemDescCollector:
             try:
                 msg= self.socket.recv(flags=zmq.NOBLOCK)
                 msg = DecodeMemDescMsg.deserialize(msg)
-                logging.debug(f'[NIXL PD disagg] memdesc collector recv {msg.room_number}, len(kv_descs): {len(msg.kv_descs_serialized)}, len(aux_descs): {len(msg.aux_descs_serialized)}')
+                logger.debug(f'[NIXL PD disagg] memdesc collector recv {msg.room_number}, len(kv_descs): {len(msg.kv_descs_serialized)}, len(aux_descs): {len(msg.aux_descs_serialized)}')
                 assert self.buffer.get(msg.room_number) is None, f"Duplicate message for {msg.room_number}"
                 self.buffer[msg.room_number] = (
                     self.deserializer(msg.kv_descs_serialized), 
@@ -120,7 +120,7 @@ class MemDescCollector:
     def try_fetch(self, room_number: int) -> tuple[Any, Any]:
         if self.buffer.get(room_number) is None:
             return (None, None)
-        logging.debug(f'[NIXL PD disagg] memdesc collector pop out {room_number}')
+        logger.debug(f'[NIXL PD disagg] memdesc collector pop out {room_number}')
         return self.buffer[room_number]
 
 class KVManager:
@@ -169,6 +169,9 @@ class KVManager:
             remote_metadata = self.socket.recv()
             self.socket.send_string(self.agent.name)
             self.peer_name = self.agent.add_remote_agent(remote_metadata)
+            if type(self.peer_name) is bytes:
+                self.peer_name = self.peer_name.decode("utf-8")
+
             if not self.peer_name:
                 raise Exception("KVSender failed to add KVReceiver's remote agent metadata")
         elif mode == "decode":
@@ -177,6 +180,10 @@ class KVManager:
                 raise Exception("KVSender failed to get metadata")
             self.socket.send(metadata)
             self.peer_name = self.socket.recv_string()
+            if type(self.peer_name) is bytes:
+                self.peer_name = self.peer_name.decode("utf-8")
+        
+        self.peer_name_bytes = self.peer_name.encode("utf-8")
 
 class KVPoll:
     Failed = 0
@@ -185,10 +192,33 @@ class KVPoll:
     Transferring = 3
     Success = 4
 
+    @staticmethod
+    def str(x) -> str:
+        if x == KVPoll.Failed:
+            return "Failed"
+        elif x == KVPoll.Bootstrapping:
+            return "Bootstrapping"
+        elif x == KVPoll.WaitingForInput:
+            return "WaitingForInput"
+        elif x == KVPoll.Transferring:
+            return "Transferring"
+        elif x == KVPoll.Success:
+            return "Success"
+        else:
+            raise Exception("Unknown KVPoll state")
 
 import torch
 tmp=torch.zeros(64 * 1024 * 1024, dtype=torch.int32, device="cpu").contiguous()
 
+
+def init_xfer_names(prefill_agent_name: str, decode_agent_name: str, bootstrap_room: int) -> tuple[bytes, bytes]:
+    assert isinstance(prefill_agent_name, str)
+    assert isinstance(decode_agent_name, str)
+    assert isinstance(bootstrap_room, int)
+    return (
+        (f"{prefill_agent_name}_{decode_agent_name}_[{bootstrap_room}]_kv").encode("utf-8"),
+        (f"{prefill_agent_name}_{decode_agent_name}_[{bootstrap_room}]_aux").encode("utf-8")
+    )
 
 class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
@@ -196,12 +226,18 @@ class KVSender:
         bootstrap_addr: prefill: host address, decode: corresponding prefill address
         bootstrap_room: unique id per request
         """
+
+        assert isinstance(bootstrap_room, int)
+        
         self.has_sent = False
         self.mgr = mgr
         self.bootstrap_room = bootstrap_room
 
         self.remote_kv_descs = None
         self.remote_aux_descs = None
+
+        # To adapt the strange design of NIXL xfer lookup mechanism. Check https://github.com/ai-dynamo/nixl/pull/138
+        self.kv_xfer_name, self.aux_xfer_name = init_xfer_names(mgr.agent.name, mgr.peer_name, bootstrap_room)
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
@@ -218,11 +254,11 @@ class KVSender:
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        logging.debug(f"[NIXL PD disagg] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
+        logger.info(f"[NIXL PD disagg] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
 
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
-            "WRITE", kv_descs, self.remote_kv_descs, self.mgr.peer_name, str(self.bootstrap_room)
+            "WRITE", kv_descs, self.remote_kv_descs, self.mgr.peer_name, self.kv_xfer_name
         )
         if not self.xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -231,7 +267,7 @@ class KVSender:
             raise Exception("KVSender failed to post transfer")
         # Send aux
         self.xfer_handle_aux = self.mgr.agent.initialize_xfer(
-            "WRITE", aux_descs, self.remote_aux_descs, self.mgr.peer_name, str(self.bootstrap_room) + "_aux"
+            "WRITE", aux_descs, self.remote_aux_descs, self.mgr.peer_name, self.aux_xfer_name
         )
         if not self.xfer_handle_aux:
             raise Exception("KVSender failed to create transfer")
@@ -246,7 +282,7 @@ class KVSender:
 
         if self.remote_kv_descs is None:
             assert self.remote_aux_descs is None
-            # logging.debug(f'[NIXL PD disagg] try fetch {self.mgr.peer_name} {self.bootstrap_room}')
+            # logger.debug(f'[NIXL PD disagg] try fetch {self.mgr.peer_name} {self.bootstrap_room}')
             self.remote_kv_descs, self.remote_aux_descs = \
                 self.mgr.memdesc_collector.try_fetch( self.bootstrap_room)
         else:
@@ -264,7 +300,7 @@ class KVSender:
         elif state == "DONE" and state2 == "DONE":
             return KVPoll.Success
         else:
-            # logging.debug(f"[NIXL PD disagg] KVSender {self.bootstrap_room} poll result: {state}, {state2}")
+            # logger.info(f"[NIXL PD disagg] KVSender {self.bootstrap_room} poll result: {state}, {state2}")
             return KVPoll.Transferring
 
     def failure_exception(self):
@@ -278,9 +314,17 @@ class KVReceiver:
         self.has_init = False
         self.mgr = mgr
         self.memdesc_collector_addr = memdesc_collector_addr
+
+        if bootstrap_room is None:
+            logger.warning("KVReceiver bootstrap room is None, using 0")
         self.bootstrap_room = bootstrap_room if bootstrap_room else 0
+
         self.kv_transfer_done = False
         self.aux_transfer_done = False
+    
+
+        # to adapt the strange design of NIXL xfer look up mechanism.
+        self.kv_xfer_name, self.aux_xfer_name = init_xfer_names(mgr.peer_name, mgr.agent.name, self.bootstrap_room)
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         kv_addrs = []
@@ -291,7 +335,7 @@ class KVReceiver:
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        logging.debug(f'[NIXL PD disagg] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
+        logger.debug(f'[NIXL PD disagg] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
 
         # Once D recv a req, it will:
         # 1. do preallocate 
@@ -303,7 +347,7 @@ class KVReceiver:
             kv_descs_serialized=self.mgr.agent.get_serialized_descs(kv_descs),
             aux_descs_serialized=self.mgr.agent.get_serialized_descs(aux_descs)
         )
-        logging.debug(f'[NIXL PD disagg] KVReceiver: sending to Prefill memdesc collector ({self.memdesc_collector_addr}): {msg.room_number}')
+        logger.debug(f'[NIXL PD disagg] KVReceiver: sending to Prefill memdesc collector ({self.memdesc_collector_addr}): {msg.room_number}')
         msg.send_to_memdesc_collector(self.memdesc_collector_addr)
 
         self.has_init = True
@@ -312,11 +356,13 @@ class KVReceiver:
         if self.has_init is False:
             return KVPoll.WaitingForInput
         if not self.kv_transfer_done:
-            self.kv_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, str(self.bootstrap_room))
+            self.kv_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, self.kv_xfer_name )
         if not self.aux_transfer_done:
-            self.aux_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, str(self.bootstrap_room) + "_aux")
+            self.aux_transfer_done = self.mgr.agent.check_remote_xfer_done(self.mgr.peer_name, self.aux_xfer_name )
         if self.kv_transfer_done and self.aux_transfer_done:
             return KVPoll.Success
+        
+        # logging.info(f"[NIXL PD disagg] KVReceiver {self.bootstrap_room} poll result: {self.kv_transfer_done}, {self.aux_transfer_done}")
         return KVPoll.WaitingForInput
 
     def failure_exception(self):

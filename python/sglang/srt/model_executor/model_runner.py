@@ -755,8 +755,13 @@ class ModelRunner:
             )
 
         if self.req_to_token_pool is None:
+
+            pool_size = max_num_reqs + 1
+            if self.server_args.disaggregation_mode == 'prefill':
+                pool_size = 1024 # TODO(wyt) to store transferring requests
+
             self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
+                size=pool_size,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,

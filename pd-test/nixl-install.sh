@@ -43,16 +43,8 @@ cd ~
 rm -rf nixl
 git clone https://github.com/jokerwyt/nixl
 cd nixl
-git checkout 250409/fix-check_remote_xfer_done
-rm -rf build
-mkdir build
-meson setup build
-cd build
-meson configure -Ducx_path=/opt/ucx-1.18.0
-ninja
-ninja install
-cd ..
-pip install .
+git checkout 250409/wyt-debug
+./build.sh # NOTE check ucx path inside!
 
 popd
 
