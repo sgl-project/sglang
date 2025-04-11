@@ -716,6 +716,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
+        self.enable_chunked_prefix_cache = global_server_args_dict[
+            "enable_chunked_prefix_cache"
+        ]
         self.attention_backend = global_server_args_dict["attention_backend"]
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
@@ -738,6 +741,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if (
                 forward_batch.forward_mode.is_extend()
+                and self.enable_chunked_prefix_cache
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):

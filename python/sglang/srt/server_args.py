@@ -185,6 +185,7 @@ class ServerArgs:
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
+    enable_chunked_prefix_cache: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1116,6 +1117,11 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+        )
+        parser.add_argument(
+            "--enable-chunked-prefix-cache",
+            action="store_true",
+            help="Using MHA with chunked prefix cache that improves performance when prefilling long sequences. Currently only supported for DeepSeek models.",
         )
 
         # Server warmups

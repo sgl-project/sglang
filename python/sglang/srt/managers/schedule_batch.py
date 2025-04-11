@@ -83,6 +83,7 @@ global_server_args_dict = {
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
     "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
+    "enable_chunked_prefix_cache": ServerArgs.enable_chunked_prefix_cache,
 }
 
 logger = logging.getLogger(__name__)
