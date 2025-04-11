@@ -593,7 +593,11 @@ class FlashAttentionBackend(AttentionBackend):
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            if global_server_args_dict["enable_chunked_prefix_cache"]:
+            if (
+                not global_server_args_dict["disable_chunked_prefix_cache"]
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
                 # Do multi-head attention with chunked prefix cache
                 from flash_attn_interface import flash_attn_varlen_func
 

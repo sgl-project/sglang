@@ -169,7 +169,7 @@ class ModelRunner:
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
-                "enable_chunked_prefix_cache": server_args.enable_chunked_prefix_cache,
+                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
@@ -298,6 +298,18 @@ class ModelRunner:
 
         if server_args.enable_deepep_moe:
             logger.info(f"DeepEP is turned on. DeepEP mode: {server_args.deepep_mode}")
+
+        server_args.disable_chunked_prefix_cache = True
+        logger.info(
+            "Currently chunked prefix cache is automaticallyturned off. This should be changed after flash_attn_varlen kernel is merged into sgl-kernel."
+        )
+        # TODO: Uncomment following lines after flash_attn_varlen kernel is merged into sgl-kernel
+        # if not self.use_mla_backend:
+        #     logger.info("Disable chunked prefix cache for non-MLA backend.")
+        #     server_args.disable_chunked_prefix_cache = True
+        # elif self.page_size > 1:
+        #     logger.info("Disable chunked prefix cache when page size > 1.")
+        #     server_args.disable_chunked_prefix_cache = True
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
