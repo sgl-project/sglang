@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from typing import List
 
 import sglang as sgl
@@ -88,7 +89,7 @@ class TestEPLB(CustomTestCase):
             print(f"Action: eplb_save_expert_distribution")
             engine.eplb_save_expert_distribution()
             snapshot_path = ExpertDistributionStorage.get_last_snapshot_path(
-                eplb_storage_dir_a
+                Path(eplb_storage_dir_a) / "expert_distribution_storage"
             )
             assert snapshot_path is not None
 
