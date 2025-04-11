@@ -44,7 +44,19 @@ from importlib.util import find_spec
 from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -1828,3 +1840,25 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None

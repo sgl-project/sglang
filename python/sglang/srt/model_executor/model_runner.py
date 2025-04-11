@@ -45,7 +45,13 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
+    global_server_args_dict,
+    set_global_expert_location_metadata,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -100,6 +106,7 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
+        expert_location_metadata: ExpertLocationMetadata,
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -134,6 +141,8 @@ class ModelRunner:
             and not server_args.disable_mla
         )
         self.attention_chunk_size = model_config.attention_chunk_size
+
+        self.forward_pass_id = 0
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -172,6 +181,7 @@ class ModelRunner:
                 "use_mla_backend": self.use_mla_backend,
             }
         )
+        set_global_expert_location_metadata(expert_location_metadata)
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -191,6 +201,13 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        expert_distribution_recorder.initialize(
+            server_args,
+            get_global_expert_location_metadata(),
+            # TODO handle DP!=TP case
+            rank=self.tp_rank,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -996,6 +1013,13 @@ class ModelRunner:
 
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ) -> LogitsProcessorOutput:
+        self.forward_pass_id += 1
+        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
+            return self._forward_raw(forward_batch, skip_attn_backend_init)
+
+    def _forward_raw(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()

@@ -68,7 +68,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -88,8 +89,6 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
-
-expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
 
@@ -1311,11 +1310,11 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
         for i in range(len(self.layers)):
-            expert_distribution_recorder.set_current_layer(i)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            with expert_distribution_recorder.with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1607,6 +1606,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    @classmethod
+    def get_expert_location_metadata(cls, config):
+        return ExpertLocationMetadata.init_new(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+        )
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
