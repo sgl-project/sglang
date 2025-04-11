@@ -182,6 +182,8 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
+    separate_reasoning: bool = True
+    stream_reasoning: bool = True
 
 
 class CompletionResponseChoice(BaseModel):

@@ -538,6 +538,7 @@ def v1_generate_request(
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
                 "skip_special_tokens": request.skip_special_tokens,
+                "separate_reasoning": request.separate_reasoning,
             }
         )
         return_logprobs.append(request.logprobs is not None)
