@@ -17,18 +17,12 @@ RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps
 ENV DEBIAN_FRONTEND=interactive
 
 RUN yum install -y libibverbs rdma-core infiniband-diags \
-    libibumad libnl3 librdmacm perftest zsh ccache tmux \
+    libibumad libnl3 librdmacm lsof perftest zsh ccache tmux \
     htop git-lfs tree \
     && yum clean all
 
-# Set up locale
-RUN locale-gen en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
-
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir \
+RUN pip3 install --no-cache-dir \
     pytest \
     black \
     isort \
