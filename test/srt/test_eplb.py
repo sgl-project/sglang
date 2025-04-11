@@ -1,7 +1,7 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import List
 
 import sglang as sgl
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
@@ -124,13 +124,17 @@ class TestEPLB(CustomTestCase):
             log_level="info",
         )
 
-        engine = sgl.Engine(**engine_kwargs)
+        init_expert_location = dict(
+            physical_to_logical_map=TODO,
+        )
+
+        engine = sgl.Engine(**engine_kwargs, init_expert_location=json.dumps(init_expert_location))
         self._assert_behavior(engine, TODO)
         engine.shutdown()
         del engine
 
     def _assert_behavior(
-            self, engine: sgl.Engine,  expect_physical_to_local_map
+            self, engine: sgl.Engine, expect_physical_to_local_map
     ):
         actual_output = self._engine_generate(engine)
         self.assertEqual(actual_output, _REF_OUTPUT)
@@ -166,9 +170,10 @@ class TestEPLB(CustomTestCase):
         ret = engine.flush_cache()
         assert ret.success
 
+
 def _compute_trivial_expert_locations(ep_num_redundant_experts: int):
     return list(x % _NUM_ROUTED_EXPERTS for x in range(_NUM_ROUTED_EXPERTS + ep_num_redundant_experts))
 
+
 if __name__ == "__main__":
     unittest.main()
-
