@@ -55,8 +55,43 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
+    def test_eplb_init_expert_location_and_save_expert_distribution(self):
+        with tempfile.TemporaryDirectory() as eplb_storage_dir_a, tempfile.TemporaryDirectory() as eplb_storage_dir_b:
+            engine_kwargs = dict(
+                model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+                enable_eplb=True,
+                ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                tp_size=2,
+            )
+
+            print(f"Action: start engine")
+            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a)
+            ref_output = self._engine_generate(engine)
+            self._assert_behavior(engine, ref_output, "equal_trivial")
+
+            print(f"Action: eplb_save_expert_distribution")
+            engine.eplb_save_expert_distribution()
+
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
+            print(f"Action: start engine with init_expert_location")
+            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_b, init_expert_location=TODO)
+            self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
+            print(f"Action: start engine to check automatically loading from storage dir")
+            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_a)
+            self._assert_behavior(engine, ref_output, "not_equal_trivial")
+            print(f"Action: shutdown engine")
+            engine.shutdown()
+            del engine
+
     def _assert_behavior(
-        self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
+            self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
     ):
         ret = engine.flush_cache()
         assert ret.success
