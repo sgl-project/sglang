@@ -184,6 +184,10 @@ class Modality(Enum):
                 f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
             )
 
+    @staticmethod
+    def all():
+        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
+
 
 @dataclasses.dataclass
 class MultimodalDataItem:
@@ -199,7 +203,7 @@ class MultimodalDataItem:
     hash: int = None
     pad_value: int = None
     image_sizes: Tuple[int, int] = None
-    image_offsets: Optional[list] = None
+    offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
@@ -246,7 +250,7 @@ class MultimodalDataItem:
 
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
-        elif self.is_audio():
+        elif self.is_modality(Modality.AUDIO):
             if self.audio_features is not None:
                 self.hash = hash_feature(self.audio_features)
             elif self.input_features is not None:
@@ -257,6 +261,9 @@ class MultimodalDataItem:
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
+
     def is_audio(self):
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
@@ -266,7 +273,7 @@ class MultimodalDataItem:
 
     def is_image(self):
         return (
-            self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
+            self.is_modality(Modality.IMAGE) or self.is_modality(Modality.MULTI_IMAGES)
         ) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.pixel_values)
@@ -277,6 +284,11 @@ class MultimodalDataItem:
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.pixel_values)
         )
+
+    def is_audio(self):
+        return (
+            self.is_modality(Modality.AUDIO)
+        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
@@ -342,6 +354,7 @@ class MultimodalInputs:
             "im_token_id",
             "im_start_id",
             "im_end_id",
+            "video_token_id",
             "slice_start_id",
             "slice_end_id",
             "audio_start_id",
@@ -355,11 +368,12 @@ class MultimodalInputs:
         return ret
 
     def contains_image_inputs(self) -> bool:
-        """ """
         return any(item.is_image() for item in self.mm_items)
 
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
     def contains_audio_inputs(self) -> bool:
-        """ """
         return any(item.is_audio() for item in self.mm_items)
 
     def contains_mm_input(self) -> bool:

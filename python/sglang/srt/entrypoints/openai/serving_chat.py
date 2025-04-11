@@ -82,6 +82,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
@@ -143,6 +144,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_ids = []
         openai_compatible_messages = []
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
@@ -158,6 +160,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 msg_dict,
                 template_content_format,
                 image_data,
+                video_data,
                 audio_data,
                 modalities,
             )
@@ -214,11 +217,13 @@ class OpenAIServingChat(OpenAIServingBase):
         stop = request.stop
         image_data = image_data if image_data else None
         audio_data = audio_data if audio_data else None
+        video_data = video_data if video_data else None
         modalities = modalities if modalities else []
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
             image_data=image_data,
+            video_data=video_data,
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
@@ -260,6 +265,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = conv.get_prompt()
 
         image_data = conv.image_data if conv.image_data else None
+        video_data = conv.video_data if conv.video_data else None
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
@@ -277,6 +283,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt=prompt,
             prompt_ids=prompt_ids,
             image_data=image_data,
+            video_data=video_data,
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
