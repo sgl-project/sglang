@@ -93,6 +93,7 @@ srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "torch"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
+runai = ["runai-model-streamer", "runai-model-streamer-s3", "boto3"]
 torch_memory_saver = ["torch_memory_saver>=0.0.4"]
 test = [
     "jsonlines",
@@ -102,11 +103,11 @@ test = [
     "accelerate",
     "peft",
 ]
-all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
-all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]"]
+all = ["sglang[srt]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[runai]"]
+all_hip = ["sglang[srt_hip]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[runai]"]
+all_xpu = ["sglang[srt_xpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[runai]"]
+all_hpu = ["sglang[srt_hpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[runai]"]
+all_cpu = ["sglang[srt_cpu]", "sglang[openai]", "sglang[anthropic]", "sglang[litellm]", "sglang[runai]"]
 
 dev = ["sglang[all]", "sglang[test]"]
 dev_hip = ["sglang[all_hip]", "sglang[test]"]

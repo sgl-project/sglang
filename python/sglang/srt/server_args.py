@@ -440,6 +440,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "layered",
                 "remote",
+                "runai_streamer",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -456,7 +457,9 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"runai_streamer" will load local Safetensors weights using Run:ai '
+            "Model Streamer.",
         )
         parser.add_argument(
             "--trust-remote-code",

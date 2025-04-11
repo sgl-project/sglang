@@ -51,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    runai_safetensors_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
@@ -200,10 +201,13 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
+            if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+                set_runai_streamer_env(load_config)
+            else:
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format}"
+                )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -260,6 +264,9 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
             allow_patterns = ["*.bin"]
+        elif load_format == LoadFormat.RUNAI_STREAMER:
+            use_safetensors = True
+            allow_patterns = ["*.safetensors"]
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
@@ -327,6 +334,8 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_folder,
                 hf_weights_files,
             )
+        elif self.load_config.load_format == LoadFormat.RUNAI_STREAMER:
+            weights_iterator = runai_safetensors_weights_iterator(hf_weights_files)
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(hf_weights_files)
         else:
