@@ -5,7 +5,7 @@ import torch
 
 try:
     import vllm
-    from vllm import _custom_ops as ops
+    from vllm import _custom_ops as vllm_ops
 
     VLLM_AVAILABLE = True
 except ImportError:
