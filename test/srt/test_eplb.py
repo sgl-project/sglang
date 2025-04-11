@@ -3,9 +3,7 @@ import unittest
 from typing import List
 
 import sglang as sgl
-from python.sglang.srt.managers.expert_distribution_storage import (
-    ExpertDistributionStorage,
-)
+from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
