@@ -145,6 +145,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
+  m.def(
+      "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
+      "expert_offsets) -> ()");
+  m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
 
   /*
    * From csrc/speculative
