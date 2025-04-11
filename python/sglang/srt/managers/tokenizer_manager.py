@@ -646,7 +646,9 @@ class TokenizerManager:
                         pass
 
     async def flush_cache(self) -> FlushCacheReqOutput:
-        return await self.flush_cache_communicator(FlushCacheReqInput())
+        outputs = await self.flush_cache_communicator(FlushCacheReqInput())
+        success = all(output.success for output in outputs)
+        return FlushCacheReqOutput(success=success)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
