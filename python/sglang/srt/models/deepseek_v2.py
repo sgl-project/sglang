@@ -169,6 +169,7 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        ep_back_mapping_tensor: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -198,7 +199,12 @@ class DeepseekV2MoE(nn.Module):
         MoEImpl = (
             DeepEPMoE
             if global_server_args_dict["enable_deepep_moe"]
-            else (EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE)
+            else (
+                EPMoE
+                if global_server_args_dict["enable_ep_moe"]
+                or global_server_args_dict["enable_eplb_moe"]
+                else FusedMoE
+            )
         )
 
         self.experts = MoEImpl(
@@ -213,6 +219,11 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
+            ep_back_mapping_tensor=(
+                ep_back_mapping_tensor
+                if global_server_args_dict["enable_eplb_moe"]
+                else None
+            ),
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
@@ -1081,12 +1092,23 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         if is_nextn or is_sparse_layer(layer_id):
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-            self.is_sparse = True
+            if global_server_args_dict["enable_eplb_moe"]:
+                ep_back_mapping_tensor = global_server_args_dict[
+                    "ep_back_mapping_tensor"
+                ][layer_id]
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                    ep_back_mapping_tensor=ep_back_mapping_tensor,
+                )
+            else:
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                )
+                self.is_sparse = True
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
