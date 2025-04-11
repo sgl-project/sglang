@@ -186,6 +186,7 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        expert_location_metadata.to(server_args.device)
         set_global_expert_location_metadata(expert_location_metadata)
         if self.tp_rank == 0 and get_bool_env_var(
             "SGLANG_LOG_EXPERT_LOCATION_METADATA"
