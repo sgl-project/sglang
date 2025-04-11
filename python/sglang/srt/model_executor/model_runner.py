@@ -20,11 +20,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -45,7 +44,14 @@ from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.expert_distribution import expert_distribution_recorder
+from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.managers.io_struct import UpdateExpertLocationReqInput
+from sglang.srt.managers.schedule_batch import (
+    get_global_expert_location_metadata,
+    global_server_args_dict,
+    set_global_expert_location_metadata,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -100,6 +106,7 @@ class ModelRunner:
     def __init__(
         self,
         model_config: ModelConfig,
+        expert_location_metadata: ExpertLocationMetadata,
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -135,6 +142,8 @@ class ModelRunner:
         )
         self.attention_chunk_size = model_config.attention_chunk_size
 
+        self.forward_pass_id = 0
+
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -169,12 +178,14 @@ class ModelRunner:
                 "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
                 "n_share_experts_fusion": server_args.n_share_experts_fusion,
                 "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
+                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
                 "use_mla_backend": self.use_mla_backend,
             }
         )
+        set_global_expert_location_metadata(expert_location_metadata)
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
@@ -191,6 +202,13 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        expert_distribution_recorder.initialize(
+            server_args,
+            get_global_expert_location_metadata(),
+            # TODO handle DP!=TP case
+            rank=self.tp_rank,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -462,8 +480,24 @@ class ModelRunner:
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
 
+    def update_expert_location(self, recv_req: UpdateExpertLocationReqInput):
+        logger.info("update_expert_location start")
+        torch.distributed.barrier()
+
+        get_global_expert_location_metadata().update(recv_req.expert_location_metadata)
+
+        # We may be able to further reduce lock time by faster copying, pre-transfering, etc
+        self.update_weights_from_disk(
+            model_path=self.model_config.model_path,
+            load_format=self.server_args.load_format,
+            param_categories=["moe"],
+        )
+
+        logger.info("update_expert_location end")
+        torch.distributed.barrier()
+
     def update_weights_from_disk(
-        self, model_path: str, load_format: str
+        self, model_path: str, load_format: str, param_categories: Optional[List[str]]
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         logger.info(
@@ -493,18 +527,21 @@ class ModelRunner:
             )
             return iter
 
+        def filter_weight_iter(iter: Iterable[Tuple[str, torch.Tensor]]):
+            if param_categories is None:
+                yield from iter
+            else:
+                for name, weight in iter:
+                    if self.model.get_param_category(name) in param_categories:
+                        yield name, weight
+
         def model_load_weights(model, iter):
-            model.load_weights(iter)
-            for _, module in self.model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            DefaultModelLoader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = filter_weight_iter(get_weight_iter(self.model_config))
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
@@ -914,7 +951,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()
@@ -996,6 +1033,13 @@ class ModelRunner:
 
     def forward(
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ) -> LogitsProcessorOutput:
+        self.forward_pass_id += 1
+        with expert_distribution_recorder.with_forward_pass(self.forward_pass_id):
+            return self._forward_raw(forward_batch, skip_attn_backend_init)
+
+    def _forward_raw(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool
     ) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()

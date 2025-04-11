@@ -162,6 +162,10 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    init_expert_location: Optional[str] = None
+    enable_eplb: bool = False
+    eplb_storage_dir: str = "/tmp/eplb_storage"
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -185,6 +189,7 @@ class ServerArgs:
     warmups: Optional[str] = None
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
+    enable_scheduler_input_blocker: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -320,6 +325,11 @@ class ServerArgs:
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if self.ep_num_redundant_experts > 0:
+            assert (
+                self.enable_deepep_moe
+            ), "ep_num_redundant_experts currently requires DeepEP MoE"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1098,6 +1108,29 @@ class ServerArgs:
             help="Enabling DeepEP MoE implementation for EP MoE.",
         )
         parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-storage-dir",
+            type=str,
+            default=ServerArgs.eplb_storage_dir,
+            help="Storage directory of EPLB subsystem.",
+        )
+        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
@@ -1116,6 +1149,11 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
+        )
+        parser.add_argument(
+            "--enable-scheduler-input-blocker",
+            action="store_true",
+            help="Enable input blocker for Scheduler.",
         )
 
         # Server warmups
