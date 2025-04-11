@@ -115,7 +115,7 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
-    def _tempdisable_test_nontrivial_location(self):
+    def test_nontrivial_location(self):
         ep_num_redundant_experts = 4
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -140,7 +140,7 @@ class TestEPLB(CustomTestCase):
         engine.shutdown()
         del engine
 
-    def test_trivial_with_redundant_experts(self):
+    def _tempdisable_test_trivial_with_redundant_experts(self):
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             trust_remote_code=True,
