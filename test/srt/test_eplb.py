@@ -114,6 +114,23 @@ class TestEPLB(CustomTestCase):
             engine.shutdown()
             del engine
 
+    def test_nontrivial_location(self):
+        engine_kwargs = dict(
+            model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            trust_remote_code=True,
+            ep_num_redundant_experts=4,
+            enable_deepep_moe=True,
+            deepep_mode="normal",
+            disable_cuda_graph=True,
+            tp_size=2,
+            log_level="info",
+        )
+
+        engine = sgl.Engine(**engine_kwargs)
+        self._assert_behavior(engine, ref_output, TODO)
+        engine.shutdown()
+        del engine
+
     def _assert_behavior(
             self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
     ):
