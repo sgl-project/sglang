@@ -20,11 +20,14 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
+MLA_MODEL = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+MLA_TP_SIZE = "4"
+
 
 class TestHiPAttnBackend(unittest.TestCase):
-    def _measure_latency(self, extra_args):
+    def _measure_latency(self, extra_args, model=DEFAULT_MODEL_NAME_FOR_TEST):
         output_throughput = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
+            model,
             [
                 "--input",
                 "32000",
@@ -40,8 +43,7 @@ class TestHiPAttnBackend(unittest.TestCase):
         if is_in_ci():
             self.assertGreater(output_throughput, 90)
 
-    def _measure_mmlu(self, extra_args):
-        model = DEFAULT_MODEL_NAME_FOR_TEST
+    def _measure_mmlu(self, extra_args, model=DEFAULT_MODEL_NAME_FOR_TEST):
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
             model,
@@ -50,7 +52,9 @@ class TestHiPAttnBackend(unittest.TestCase):
             other_args=[
                 "--enable-hip-attention",
                 "--cuda-graph-max-bs",
-                "1",
+                "4",
+                "--max-running-requests",
+                "4",
                 *extra_args,
             ],
         )
@@ -133,11 +137,164 @@ class TestHiPAttnBackend(unittest.TestCase):
     def test_mmlu_offload(self):
         self._measure_mmlu(["--enable-hip-kv-cache-offload"])
 
+    def test_latency_no_extend(self):
+        self._measure_latency(
+            [
+                "--hip-attention-config",
+                '{"using_extend": false}',
+            ]
+        )
+
+    def test_latency_offload_no_extend(self):
+        self._measure_latency(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--hip-attention-config",
+                '{"using_extend": false}',
+            ]
+        )
+
+    def test_mmlu_no_extend(self):
+        self._measure_mmlu(
+            [
+                "--hip-attention-config",
+                '{"using_extend": false}',
+            ]
+        )
+
+    def test_mmlu_offload_no_extend(self):
+        self._measure_mmlu(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--hip-attention-config",
+                '{"using_extend": false}',
+            ]
+        )
+
     def test_passkey(self):
         self._run_passkey([])
 
+    # Test MLA models
     def test_passkey_offload(self):
-        self._run_passkey(["--enable-hip-kv-cache-offload"])
+        self._run_passkey(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ]
+        )
+
+    # MLA Models
+    def test_latency_mla(self):
+        self._measure_latency(
+            [
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_latency_offload_mla(self):
+        self._measure_latency(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_mmlu_mla(self):
+        self._measure_mmlu(
+            [
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_mmlu_offload_mla(self):
+        self._measure_mmlu(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_latency_no_extend_mla(self):
+        self._measure_latency(
+            [
+                "--hip-attention-config",
+                '{"using_extend": false}',
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_latency_offload_no_extend_mla(self):
+        self._measure_latency(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--hip-attention-config",
+                '{"using_extend": false}',
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_mmlu_no_extend_mla(self):
+        self._measure_mmlu(
+            [
+                "--hip-attention-config",
+                '{"using_extend": false}',
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
+
+    def test_mmlu_offload_no_extend_mla(self):
+        self._measure_mmlu(
+            [
+                "--enable-hip-kv-cache-offload",
+                "--hip-attention-config",
+                '{"using_extend": false}',
+                "--trust-remote-code",
+                "--tp-size",
+                MLA_TP_SIZE,
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+            ],
+            MLA_MODEL,
+        )
 
     def test_passkey_mla(self):
         self._run_passkey(
@@ -146,26 +303,24 @@ class TestHiPAttnBackend(unittest.TestCase):
                 '{"block_sparse_block_size_q": 16}',
                 "--trust-remote-code",
                 "--tp-size",
-                "2",
+                MLA_TP_SIZE,
                 "--kv-cache-dtype",
                 "fp8_e5m2",
             ],
-            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+            MLA_MODEL,
         )
 
     def test_passkey_mla_offload(self):
         self._run_passkey(
             [
-                "--hip-attention-config",
-                '{"block_sparse_block_size_q": 16}',
                 "--trust-remote-code",
                 "--tp-size",
-                "2",
+                MLA_TP_SIZE,
                 "--kv-cache-dtype",
                 "fp8_e5m2",
                 "--enable-hip-kv-cache-offload",
             ],
-            "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+            MLA_MODEL,
         )
 
 
