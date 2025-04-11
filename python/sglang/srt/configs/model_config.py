@@ -82,16 +82,16 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = not enable_multimodal and is_multimodal_model(
+        self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
-        self.is_multimodal_gen = not enable_multimodal and is_multimodal_gen_model(
+        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
             self.hf_config.architectures
         )
-        self.is_image_gen = not enable_multimodal and is_image_gen_model(
+        self.is_image_gen = enable_multimodal and is_image_gen_model(
             self.hf_config.architectures
         )
-        self.is_audio_model = not enable_multimodal and is_audio_model(
+        self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
