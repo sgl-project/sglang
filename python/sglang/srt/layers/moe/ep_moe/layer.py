@@ -222,12 +222,8 @@ class EPMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
         
-        if torch.distributed.get_rank() == 0:
-            print(f"topk_ids before: {topk_ids}")
         if self.ep_back_mapping_tensor is not None:
             topk_ids = self.ep_back_mapping_tensor[topk_ids]
-        if torch.distributed.get_rank() == 0:
-            print(f"topk_ids after: {topk_ids}")
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
