@@ -40,7 +40,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend, is_hpu, dataclass_to_device, get_scheduler_device
+from sglang.srt.utils import (
+    dataclass_to_device,
+    get_compiler_backend,
+    get_scheduler_device,
+    is_hpu,
+)
 
 _is_hpu = is_hpu()
 if _is_hpu:
