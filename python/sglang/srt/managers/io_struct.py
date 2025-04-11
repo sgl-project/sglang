@@ -693,6 +693,11 @@ class UpdateWeightsFromDistributedReqInput:
 
 
 @dataclass
+class BatchUpdateWeightsFromDistributedReqInput:
+    parameters: List[UpdateWeightsFromDistributedReqInput]
+
+
+@dataclass
 class UpdateWeightsFromDistributedReqOutput:
     success: bool
     message: str

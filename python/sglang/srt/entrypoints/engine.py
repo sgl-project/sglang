@@ -43,6 +43,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BatchUpdateWeightsFromDistributedReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -323,14 +324,41 @@ class Engine:
 
     def update_weights_from_distributed(self, name: str, dtype, shape):
         """Update weights from distributed source."""
-        obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
+        return self.batch_update_weights_from_distributed(
+            [{"name": name, "dtype": dtype, "shape": shape}]
         )
+
+    def batch_update_weights_from_distributed(self, parameters: List[Dict]):
+        """
+        Update multiple weights from distributed source in a single batch operation.
+
+        Args:
+            parameters: A list of dictionaries, where each dictionary contains:
+                - name: The name of the parameter to update
+                - dtype: The data type of the parameter (can be a string or torch.dtype)
+                - shape: The shape of the parameter
+
+        Returns:
+            A tuple of (success, message)
+        """
+        # Convert torch.dtype objects to strings if needed
+        processed_parameters = []
+        for param in parameters:
+            if not isinstance(param["dtype"], str):
+                dtype_str = str(param["dtype"]).split(".")[-1]
+            else:
+                dtype_str = param["dtype"]
+
+            processed_parameters.append(
+                UpdateWeightsFromDistributedReqInput(
+                    name=param["name"], dtype=dtype_str, shape=param["shape"]
+                )
+            )
+
+        obj = BatchUpdateWeightsFromDistributedReqInput(parameters=processed_parameters)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
+            self.tokenizer_manager.batch_update_weights_from_distributed(obj, None)
         )
 
     def update_weights_from_tensor(
