@@ -3,6 +3,7 @@ import unittest
 from typing import List
 
 import sglang as sgl
+from python.sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -71,13 +72,16 @@ class TestEPLB(CustomTestCase):
 
             print(f"Action: eplb_save_expert_distribution")
             engine.eplb_save_expert_distribution()
+            snapshot_path = ExpertDistributionStorage.get_last_snapshot_path(eplb_storage_dir_a)
+            assert snapshot_path is not None
 
             print(f"Action: shutdown engine")
             engine.shutdown()
             del engine
 
             print(f"Action: start engine with init_expert_location")
-            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_b, init_expert_location=TODO)
+            engine = sgl.Engine(**engine_kwargs, eplb_storage_dir=eplb_storage_dir_b,
+                                init_expert_location=str(snapshot_path))
             self._assert_behavior(engine, ref_output, "not_equal_trivial")
             print(f"Action: shutdown engine")
             engine.shutdown()
