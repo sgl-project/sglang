@@ -82,7 +82,6 @@ class _ExpertDistributionRecorder:
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        self._recording = False
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
