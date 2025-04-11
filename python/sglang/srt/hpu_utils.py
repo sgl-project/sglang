@@ -28,7 +28,7 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hpu
 @dataclass
 class HPUBlockMetadata:
     """HPU-specific metadata for paged attention."""
-
+    page_size: Optional[int] = None
     use_contiguous_pa: Optional[bool] = None
     block_list: Optional[torch.Tensor] = None
     block_mapping: Optional[torch.Tensor] = None
@@ -224,18 +224,18 @@ if _is_hpu:
             ),
         )
 
-    def create_hpu_specific_fields(ret, page_size, req_token_pool):
-        ret.page_size = page_size
-        if ret.forward_mode.is_decode():
-            batch_size = len(ret.seq_lens)
+    def create_hpu_block_metadata(worker_batch, page_size, req_token_pool):
+        hpu_metadata = HPUBlockMetadata(page_size=page_size)
+        if worker_batch.forward_mode.is_decode():
+            batch_size = len(worker_batch.seq_lens)
             padded_batch_size = get_decode_batch_bucket(batch_size)
             block_tables = []
             slots_list = []
             for i in range(batch_size):
-                num_pages = (ret.seq_lens[i] + page_size - 1) // page_size
+                num_pages = (worker_batch.seq_lens[i] + page_size - 1) // page_size
                 num_lots_aligned = num_pages * page_size
                 slots = req_token_pool.req_to_token[
-                    ret.req_pool_indices[i], :num_lots_aligned
+                    worker_batch.req_pool_indices[i], :num_lots_aligned
                 ]
                 pages = (slots // page_size).view(-1, page_size)[:, 0]
                 block_tables.append(pages.flatten().tolist())
@@ -243,9 +243,9 @@ if _is_hpu:
             for i in range(padded_batch_size - batch_size):
                 block_tables.append([_PAD_BLOCK_ID])
 
-            padding_len = padded_batch_size - len(ret.seq_lens)
+            padding_len = padded_batch_size - len(worker_batch.seq_lens)
             slot_mapping = torch.nn.functional.pad(
-                ret.out_cache_loc, (0, padding_len), value=0
+                worker_batch.out_cache_loc, (0, padding_len), value=0
             )
 
             # Create HPUBlockMetadata instance
@@ -253,5 +253,4 @@ if _is_hpu:
             _init_block_metadata(
                 hpu_metadata, block_tables, slot_mapping, page_size, padded_batch_size
             )
-            ret.hpu_metadata = hpu_metadata
-        return ret
+        return hpu_metadata

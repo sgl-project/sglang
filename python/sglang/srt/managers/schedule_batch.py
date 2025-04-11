@@ -59,7 +59,7 @@ from sglang.srt.utils import flatten_nested_list, get_compiler_backend, is_hpu
 
 _is_hpu = is_hpu()
 if _is_hpu:
-    from sglang.srt.hpu_utils import create_hpu_specific_fields
+    from sglang.srt.hpu_utils import create_hpu_block_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1545,7 +1545,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if _is_hpu:
-            create_hpu_specific_fields(
+            worker_batch.hpu_metadata = create_hpu_block_metadata(
                 worker_batch,
                 self.token_to_kv_pool_allocator.page_size,
                 self.req_to_token_pool,
