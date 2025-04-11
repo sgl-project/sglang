@@ -29,7 +29,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
-    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce, get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
@@ -332,6 +332,8 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
             )
+            print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after-select_experts "
+                  f"{self.layer_id=} {topk_weights=} {topk_idx=} ")
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -348,6 +350,8 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights,
                 forward_mode=forward_mode,
             )
+            print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after dispatch "
+                  f"{self.layer_id=} {topk_weights=} {topk_idx=} {hidden_states[:, :5]=} ")
         final_hidden_states = (
             self.experts(
                 hidden_states=hidden_states,
@@ -360,12 +364,16 @@ class DeepseekV2MoE(nn.Module):
             * self.routed_scaling_factor
         )
         if self.ep_size > 1:
+            print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep before combine "
+                  f"{self.layer_id=} {final_hidden_states[:, :5]=} ")
             final_hidden_states = self.deepep_dispatcher.combine(
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
                 forward_mode,
             )
+            print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep after combine "
+                  f"{self.layer_id=} {final_hidden_states[:, :5]=} ")
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
@@ -1210,6 +1218,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep start {self.layer_id=} {self.mlp.__class__.__name__=} "
+              f"{hidden_states.shape=} {hidden_states[:1, :5]=} {residual[:1, :5] if residual is not None else None=}")
 
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -1272,6 +1282,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
             )
 
+        print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward_deepep end {self.layer_id=} {self.mlp.__class__.__name__=} "
+              f"{hidden_states.shape=} {hidden_states[:1, :5]=} {residual[:1, :5] if residual is not None else None=}")
         return hidden_states, residual
 
 
@@ -1391,6 +1403,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        print(f"hi [{get_tensor_model_parallel_rank()}, {self.__class__.__name__}] forward start {input_ids=}")
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
