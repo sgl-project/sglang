@@ -26,6 +26,9 @@ class TestEPLB(CustomTestCase):
                 enable_eplb=True,
                 eplb_storage_dir=tmpdir,
                 ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                enable_deepep_moe=True,
+                deepep_moe_mode="normal",
+                disable_cuda_graph=True,
                 tp_size=2,
             )
 
@@ -62,6 +65,9 @@ class TestEPLB(CustomTestCase):
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 enable_eplb=True,
                 ep_num_redundant_experts=_EP_NUM_REDUNDANT_EXPERTS,
+                enable_deepep_moe=True,
+                deepep_moe_mode="normal",
+                disable_cuda_graph=True,
                 tp_size=2,
             )
 
