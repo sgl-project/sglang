@@ -19,10 +19,13 @@ Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 import dataclasses
 import logging
 from collections import defaultdict
+from typing import Optional
 
 import interegular
 from interegular import InvalidSyntax
-from outlines.caching import cache as disk_cache
+from outlines.caching import cache
+
+from sglang.srt.utils import get_bool_env_var
 
 try:
     # outlines >= 0.1.0
@@ -34,6 +37,9 @@ except ImportError:
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
+# Env var was set in sglang.srt.server_args.ServerArgs.__post__init__
+DISABLE_DISK_CACHE = get_bool_env_var("SGLANG_DISABLE_OUTLINES_DISK_CACHE", "true")
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +49,13 @@ class JumpEdge:
     symbol_next_state: int = None
     byte: int = None
     byte_next_state: int = None
+
+
+def disk_cache(expire: Optional[float] = None, typed=False, ignore=()):
+    if not DISABLE_DISK_CACHE:
+        return cache(expire, typed, ignore)
+    else:
+        return lambda fn: None
 
 
 @disk_cache()
