@@ -6,7 +6,7 @@ These models output a scalar reward score or classification result, often used i
 They are executed with `--is-embedding` and some may require `--trust-remote-code`.
 ```
 
-###### Example launch Command:
+## Example launch Command
 
 ```shell
 python3 -m sglang.launch_server \
@@ -16,7 +16,8 @@ python3 -m sglang.launch_server \
   --tp-size=4 \                          # set for tensor parallelism
   --port 30000 \
 ```
----
+
+## Supporting Matrixs
 
 | Model Family (Reward)                                                     | Example HuggingFace Identifier                              | Description                                                                     |
 |---------------------------------------------------------------------------|-----------------------------------------------------|---------------------------------------------------------------------------------|

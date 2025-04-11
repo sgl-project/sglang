@@ -1,14 +1,10 @@
-# How to Support New Models in SGLang
+# How to Support New Models
 
 This document explains how to add support for new language models and vision‐language models (VLMs) in SGLang. It also covers how to test new models and register external implementations.
-
----
 
 ## How to Support a new Language Model
 
 To support a new model in SGLang, you only need to add a single file under the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sgllang/srt/models). You can learn from existing model implementations and create a new file for your model. For most models, you should be able to find a similar model to start with (e.g., starting from Llama). Also refer how to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
-
----
 
 ## How to Support a new Vision-Language model
 
@@ -30,8 +26,6 @@ You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/pytho
 
 You should test the new vLM locally against Hugging Face models. See the [`mmmu`](https://github.com/sgl-project/sglang/tree/main/benchmark/mmmu) benchmark for an example.
 
----
-
 ## Test the Correctness
 
 ### Interactive Debugging
@@ -49,13 +43,13 @@ For interactive debugging, compare the outputs of Hugging Face/Transformers and 
 
 ### Add the Model to the Test Suite
 
-To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py) file. Then test it using, for example:
+To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models.py) file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU, MMMU-Pro, etc.) in your PR.
+
+This is the command to test a new model on your local machine:
 
 ```bash
 ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
 ```
-
----
 
 ## Port a Model from vLLM to SGLang
 
@@ -75,8 +69,6 @@ To port a model from vLLM to SGLang:
   - **Change the `forward()` functions** and add a `forward_batch()` method.
   - **Add `EntryClass`** at the end.
   - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
-
----
 
 ## Registering an External Model Implementation
 

@@ -6,7 +6,7 @@ SGLang provides robust support for embedding models by integrating efficient ser
 They are executed with `--is-embedding` and some may require `--trust-remote-code` and/or `--chat-template`
 ```
 
-###### Example launch Command:
+## Example launch Command
 
 ```shell
 python3 -m sglang.launch_server \
@@ -16,7 +16,8 @@ python3 -m sglang.launch_server \
   --chat-template gme-qwen2-vl \                     # set chat template
   --port 30000 \
 ```
----
+
+## Supporting Matrixs
 
 | Model Family (Embedding)                        | Example HuggingFace Identifier                | Chat Template | Description                                                                                                                          |
 |-------------------------------------------------|-----------------------------------------------|---------------|--------------------------------------------------------------------------------------------------------------------------------------|
