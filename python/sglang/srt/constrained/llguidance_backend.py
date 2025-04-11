@@ -33,6 +33,7 @@ class GuidanceGrammar(BaseGrammarObject):
     def __init__(
         self, llguidance_tokenizer: llguidance.LLTokenizer, serialized_grammar: str
     ):
+        super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
 

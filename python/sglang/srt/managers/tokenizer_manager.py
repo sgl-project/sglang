@@ -163,6 +163,7 @@ class TokenizerManager:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
         )
@@ -452,6 +453,8 @@ class TokenizerManager:
                 top_logprobs_num,
                 token_ids_logprob,
                 obj.stream,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_room=obj.bootstrap_room,
                 lora_path=obj.lora_path,
                 input_embeds=input_embeds,
                 session_params=session_params,
@@ -736,7 +739,7 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
-        ), "dp_size must be for update weights from distributed"
+        ), "dp_size must be 1 for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
