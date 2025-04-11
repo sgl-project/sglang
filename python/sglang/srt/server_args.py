@@ -156,7 +156,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
-    disable_multimodal: bool = False
+    enable_llama4_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -294,6 +294,8 @@ class ServerArgs:
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
 
         # Data parallelism attention
         if self.enable_dp_attention:
@@ -976,9 +978,9 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1 series models.",
         )
         parser.add_argument(
-            "--disable-multimodal",
+            "--enable-llama4-multimodal",
             action="store_true",
-            help="Disable the multimodal functionality, restricting the model to support only language-based operations for multimodal models.",
+            help="Enable the multimodal functionality for Llama-4.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
