@@ -162,6 +162,8 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    init_expert_location: Optional[str] = None
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -320,6 +322,11 @@ class ServerArgs:
             logger.info(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if self.ep_num_redundant_experts > 0:
+            assert (
+                self.enable_deepep_moe
+            ), "ep_num_redundant_experts currently requires DeepEP MoE"
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1096,6 +1103,18 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
         )
         parser.add_argument(
             "--deepep-mode",
