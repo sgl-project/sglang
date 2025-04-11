@@ -1,0 +1,29 @@
+.output_area {
+    color: #615656;
+}
+
+table.autosummary td {
+    width: 50%
+  }
+
+  img.align-center {
+    display: block;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.output_area.stderr {
+    color: #d3d3d3 !important;
+}
+
+.output_area.stdout {
+    color: #d3d3d3 !important;
+}
+
+div.output_area.stderr {
+    color: #d3d3d3 !important;
+}
+
+div.output_area.stdout {
+    color: #d3d3d3 !important;
+}
