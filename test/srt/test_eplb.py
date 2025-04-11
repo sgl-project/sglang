@@ -92,6 +92,7 @@ class TestEPLB(CustomTestCase):
                 Path(eplb_storage_dir_a) / "expert_distribution_storage"
             )
             assert snapshot_path is not None
+            print(f"{snapshot_path.read_text()=}")
 
             print(f"Action: shutdown engine")
             engine.shutdown()
@@ -118,7 +119,7 @@ class TestEPLB(CustomTestCase):
             del engine
 
     def _assert_behavior(
-        self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
+            self, engine: sgl.Engine, ref_output: List[str], expect_physical_to_local_map
     ):
         ret = engine.flush_cache()
         assert ret.success
