@@ -57,7 +57,9 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
-        print(f"launch_server_from_verl_engine {self.server_args.port}")
+        print(
+            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
+        )
         self.process = launch_server_process(self.server_args)
 
     def _make_request(self, endpoint: str, payload: Optional[dict] = None):
