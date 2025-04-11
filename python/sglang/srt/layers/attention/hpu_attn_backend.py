@@ -74,7 +74,7 @@ class HPUAttnBackend(AttentionBackend):
             query=query,
             key=key,
             value=value,
-            attn_bias=None,
+            attn_bias=forward_batch.attn_bias,
             is_causal=False,
             p=0.0,
             scale=layer.scaling,
