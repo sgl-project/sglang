@@ -67,8 +67,8 @@ class TpModelWorkerClient:
         # Load the model
         self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
         self.max_running_requests = self.worker.max_running_requests
-        self.worker_device = self.worker.device
-        self.scheduler_device = get_scheduler_device(self.worker_device)
+        self.device = self.worker.device
+        self.scheduler_device = get_scheduler_device(self.device)
         self.gpu_id = gpu_id
 
         # Init future mappings
@@ -83,7 +83,7 @@ class TpModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
-        self.forward_stream = torch.get_device_module(self.worker_device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream()
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
         )
@@ -118,9 +118,7 @@ class TpModelWorkerClient:
 
     def forward_thread_func(self):
         try:
-            with torch.get_device_module(self.worker_device).stream(
-                self.forward_stream
-            ):
+            with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
             traceback = get_exception_traceback()
@@ -145,7 +143,7 @@ class TpModelWorkerClient:
 
             # Create event
             self.launch_done = threading.Event()
-            copy_done = torch.get_device_module(self.worker_device).Event()
+            copy_done = torch.get_device_module(self.device).Event()
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
