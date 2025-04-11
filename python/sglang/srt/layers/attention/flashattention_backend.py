@@ -983,8 +983,8 @@ class FlashAttentionBackend(AttentionBackend):
                             :max_seq_pages
                         ][None, :],
                     ]
-                    // self.page_size
                 )
+                page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
