@@ -1070,7 +1070,8 @@ class ModelRunner:
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
-        return rope_scaling.get("type", None) == "mrope"
+        is_mrope_enabled = "mrope_section" in rope_scaling
+        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
