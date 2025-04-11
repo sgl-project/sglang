@@ -118,56 +118,43 @@ class TestFusedMOE(CustomTestCase):
             # Handle HIP case: normalize float8 weights so fused kernel doesn't break
             # on ROCm.
             if _is_hip:
-                (
-                    w1_sgl,
-                    w2_sgl,
-                    w1_scale_sgl,
-                    w2_scale_sgl,
-                    a1_scale_sgl,
-                    a2_scale_sgl,
-                ) = (
-                    x.clone().detach()
-                    for x in (w1, w2, w1_scale, w2_scale, a1_scale, a2_scale)
-                )
-
                 # Normalize to e4m3fnuz on HIP
-                w1_sgl, w1_scale_sgl, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=w1_sgl,
-                    weight_scale=w1_scale_sgl,
-                    input_scale=a1_scale_sgl,
+                w1, w1_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=w1,
+                    weight_scale=w1_scale,
+                    input_scale=a1_scale,
                 )
-                w2_sgl, w2_scale_sgl, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=w2_sgl,
-                    weight_scale=w2_scale_sgl,
-                    input_scale=a2_scale_sgl,
+                w2, w2_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=w2,
+                    weight_scale=w2_scale,
+                    input_scale=a2_scale,
                 )
 
                 sglang_output = fused_moe(
                     a,
-                    w1_sgl,
-                    w2_sgl,
+                    w1,
+                    w2,
                     score,
                     topk,
                     renormalize=False,
                     use_fp8_w8a8=True,
-                    w1_scale=w1_scale_sgl,
-                    w2_scale=w2_scale_sgl,
-                    a1_scale=a1_scale_sgl,
-                    a2_scale=a2_scale_sgl,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
                 )
 
                 torch_output = self.torch_naive_moe(
                     a,
-                    w1_sgl,
-                    w2_sgl,
+                    w1,
+                    w2,
                     score,
                     topk,
-                    w1_scale_sgl,
-                    w2_scale_sgl,
-                    a1_scale_sgl,
-                    a2_scale_sgl,
+                    w1_scale,
+                    w2_scale,
+                    a1_scale,
+                    a2_scale,
                 )
-
             else:
                 sglang_output = fused_moe(
                     a,
