@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_hopper_with_cuda_12_3,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -245,7 +246,16 @@ class ModelRunner:
                     "flashinfer" if is_flashinfer_available() else "triton"
                 )
             else:
-                server_args.attention_backend = "triton"
+                if is_hopper_with_cuda_12_3():
+                    if server_args.speculative_eagle_topk is None or (
+                        server_args.speculative_eagle_topk is not None
+                        and server_args.speculative_eagle_topk == 1
+                    ):
+                        server_args.attention_backend = "fa3"
+                    else:
+                        server_args.attention_backend = "triton"
+                else:
+                    server_args.attention_backend = "triton"
             logger.info(
                 f"Attention backend not set. Use {server_args.attention_backend} backend by default."
             )
@@ -888,9 +898,6 @@ class ModelRunner:
             assert torch.cuda.get_device_capability()[0] >= 9, (
                 "FlashAttention v3 Backend requires SM>=90. "
                 "Please use `--attention-backend flashinfer`."
-            )
-            logger.warning(
-                "FlashAttention v3 Backend is in Beta. FP8 is not supported."
             )
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
