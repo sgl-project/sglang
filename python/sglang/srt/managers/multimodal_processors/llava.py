@@ -9,11 +9,13 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.models.llava import (
+    LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
     LlavaMistralForCausalLM,
     LlavaQwenForCausalLM,
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
+from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
@@ -24,6 +26,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaVidForCausalLM,
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
+        LlavaForConditionalGeneration,
+        Mistral3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor):
@@ -133,13 +137,17 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                             img_data, aspect_ratio, grid_pinpoints
                         )
                     )
+
                 res = await asyncio.gather(*res)
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)
                     image_sizes.append(image_s)
 
-                if isinstance(pixel_values[0], np.ndarray):
+                if (
+                    isinstance(pixel_values[0], np.ndarray)
+                    and len(set(image_sizes)) == 1
+                ):
                     pixel_values = np.stack(pixel_values, axis=0)
             else:
                 # A single image

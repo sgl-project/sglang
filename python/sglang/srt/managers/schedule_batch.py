@@ -199,7 +199,7 @@ class MultimodalDataItem:
         Set the pad value after first hashing the data
         """
 
-        def data_hash(data) -> int:
+        def data_hash(data: bytes) -> int:
             hash_bytes = hashlib.sha256(data).digest()[:8]
             return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
@@ -236,10 +236,12 @@ class MultimodalDataItem:
             if isinstance(f, list):
                 if isinstance(f[0], torch.Tensor):
                     return tensor_hash(f)
-                return data_hash(tuple(flatten_nested_list(f)))
+                elif isinstance(f[0], np.ndarray):
+                    concat_arr = np.concatenate([arr.reshape(-1) for arr in f])
+                    return data_hash(np.ascontiguousarray(concat_arr).data.tobytes())
             elif isinstance(f, np.ndarray):
                 arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
+                arr_bytes = arr.data.tobytes()
                 return data_hash(arr_bytes)
             elif isinstance(f, torch.Tensor):
                 return tensor_hash([f])

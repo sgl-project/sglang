@@ -2,7 +2,7 @@
 
 ## Generative Models
 - Llama / Llama 2 / Llama 3 / Llama 3.1 / Llama 3.2 / Llama 3.3 / Llama 4
-- Mistral / Mixtral / Mistral NeMo / Mistral Small 3
+- Mistral / Mixtral / Pixtral / Mistral NeMo / Mistral Small 3 / Mistral Small 3.1
 - Gemma / Gemma 2 / Gemma3
 - Qwen / Qwen 2 / Qwen 2 MoE / Qwen 2 VL / Qwen 2.5 VL / Olympic Coder
 - DeepSeek / DeepSeek 2 / [DeepSeek 3](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3)
@@ -101,7 +101,7 @@ You can add it to the `ALL_OTHER_MODELS` list in the [test_generation_models.py]
 
 For example, if the model is Qwen/Qwen2-1.5B
 ```
-ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
+ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels
 ```
 
 ### Port a model from vLLM to SGLang
