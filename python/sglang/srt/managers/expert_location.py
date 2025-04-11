@@ -199,18 +199,9 @@ def _compute_logical_to_all_physical_map(physical_to_logical_map: torch.Tensor, 
 
 
 def _pad_nested_array(arr, pad_value):
-    max_logical_per_physical = max(
-        len(logical_to_all_physical_map[layer_id][logical_expert_id])
-        for layer_id in range(num_layers)
-        for logical_expert_id in range(num_logical_experts)
-    )
-
-    for layer_id in range(num_layers):
-        for logical_expert_id in range(num_logical_experts):
-            target = logical_to_all_physical_map[layer_id][logical_expert_id]
-            target += [-1] * (max_logical_per_physical - len(target))
-
-    return TODO
+    max_len = max(len(inner) for outer in arr for inner in outer)
+    padded = [[[inner + [pad_value] * (max_len - len(inner))] for inner in outer] for outer in arr]
+    return torch.tensor(padded)
 
 
 def _compute_logical_to_rank_dispatch_physical_map(
