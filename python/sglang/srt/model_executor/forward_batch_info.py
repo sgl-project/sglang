@@ -234,7 +234,6 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    # For HPU paged attention
     hpu_metadata: Optional[HPUBlockMetadata] = None
 
     @classmethod
