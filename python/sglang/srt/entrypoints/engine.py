@@ -31,6 +31,7 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 from PIL.Image import Image
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
@@ -369,7 +370,9 @@ class Engine:
 
     def eplb_save_expert_distribution(self):
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.eplb_save_expert_distribution())
+        return loop.run_until_complete(
+            self.tokenizer_manager.eplb_save_expert_distribution()
+        )
 
     def update_expert_location(self, expert_location_metadata: ExpertLocationMetadata):
         obj = UpdateExpertLocationReqInput(
