@@ -30,9 +30,9 @@ def cutlass_mla_decode(
         f"but got D_q = {D_q}, D_ckv = {D_ckv}, D_latent = {D_latent}, D_rope = {D_rope}"
     )
     assert H == 128, f"H must be 128, but got {H}"
-    assert (
-        PAGE_SIZE > 0 and (PAGE_SIZE & (PAGE_SIZE - 1)) == 0
-    ), f"PAGE_SIZE must be a power of 2, but got {PAGE_SIZE}"
+    # TODO: There is currently an illegal memory access issue with page size !=
+    # 128. Change this when it is fixed.
+    assert PAGE_SIZE == 128, f"PAGE_SIZE must be 128, but got {PAGE_SIZE}"
 
     # TODO(kaixih@nvidia): support fp8
     assert q_nope_and_q_pe.dtype in (
