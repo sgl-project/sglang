@@ -140,11 +140,11 @@ class TestEPLB(CustomTestCase):
         engine.shutdown()
         del engine
 
-    def test_trivial(self):
+    def test_trivial_with_redundant_experts(self):
         engine_kwargs = dict(
             model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             trust_remote_code=True,
-            ep_num_redundant_experts=0,
+            ep_num_redundant_experts=4,
             enable_deepep_moe=True,
             deepep_mode="normal",
             disable_cuda_graph=True,
