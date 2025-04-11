@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import sglang as sgl
+import torch
 from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -124,9 +125,11 @@ class TestEPLB(CustomTestCase):
             log_level="info",
         )
 
-        init_expert_location = dict(
-            physical_to_logical_map=TODO,
+        physical_to_logical_map = (
+                torch.arange(0, num_physical_experts).repeat(num_layers, 1)
+                % num_logical_experts
         )
+        init_expert_location = dict(physical_to_logical_map=physical_to_logical_map.tolist())
 
         engine = sgl.Engine(**engine_kwargs, init_expert_location=json.dumps(init_expert_location))
         self._assert_behavior(engine, TODO)
