@@ -45,6 +45,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
       "new_kv) -> ()");
   m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
+  m.def(
+      "cutlass_mla_decode(Tensor! out, Tensor q_nope_and_q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
+      "page_table, Tensor workspace) -> ()");
+  m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
+  m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
   /*
    * From csrc/elementwise
@@ -113,11 +118,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
   m.def(
-      "cublas_grouped_gemm(Tensor[] inputs, Tensor[] weights, Tensor[] outputs,"
-      " ScalarType out_dtype, int cublas_handle, int cuda_stream) -> ()");
-  m.impl("cublas_grouped_gemm", torch::kCUDA, &cublas_grouped_gemm);
-
-  m.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
       "                      Tensor block_scale_a, Tensor block_scale_b,"
       "                      Tensor alpha) -> ()");
@@ -177,7 +177,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
-      "cublas_handle, int cuda_stream) -> ()");
+      "cublas_handle, int cuda_stream) -> ()",
+      {at::Tag::needs_fixed_stride_order});
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
   m.def(

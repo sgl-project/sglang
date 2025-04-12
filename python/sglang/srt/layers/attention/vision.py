@@ -94,7 +94,7 @@ class VisionAttention(nn.Module):
             input_size=embed_dim,
             output_size=embed_dim,
             quant_config=quant_config,
-            prefix=add_prefix("out_proj", prefix),
+            prefix=add_prefix("proj", prefix),
         )
 
     def forward(
