@@ -19,7 +19,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
     "compressed-tensors",
     "datasets",
-    "decord",
+    "video-reader-rs",
     "fastapi",
     "hf_transfer",
     "huggingface_hub",

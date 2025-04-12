@@ -47,7 +47,7 @@ PACKAGE_LIST = [
     "tiktoken",
     "anthropic",
     "litellm",
-    "decord",
+    "video-reader-rs",
 ]
 
 

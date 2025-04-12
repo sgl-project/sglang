@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 import PIL
-from decord import VideoReader, cpu
+from video_reader import PyVideoReader
 from PIL import Image
 
 from sglang.srt.utils import encode_video, load_audio, load_image, logger
@@ -24,6 +24,9 @@ class BaseMultiModalProcessorOutput:
 
     # audios
     audios: Optional[list[np.ndarray]] = None
+
+    # image sizes
+    image_sizes: Optional[list[tuple[int, int]]] = None
 
     def normalize(self):
         for field_name in ["image_sizes", "images", "audios"]:
@@ -53,8 +56,9 @@ class BaseMultimodalProcessor(ABC):
         self.hf_config = hf_config
         self._processor = _processor
         self.server_args = server_args
-        # FIXME: not accurate, model and image specific
-        self.NUM_TOKEN_PER_FRAME = 330
+
+        configured_value = getattr(server_args, "num_token_per_frame", None)
+        self.NUM_TOKEN_PER_FRAME = 330 if configured_value is None else configured_value
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
@@ -63,6 +67,7 @@ class BaseMultimodalProcessor(ABC):
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
+
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -102,7 +107,7 @@ class BaseMultimodalProcessor(ABC):
             if isinstance(image, str) and image.startswith("video:"):
                 path = image[len("video:") :]
                 # Estimate frames for the video
-                vr = VideoReader(path, ctx=cpu(0))
+                vr = PyVideoReader(path, threads=0)
                 num_frames = len(vr)
             else:
                 # For images, each contributes one frame
@@ -120,6 +125,7 @@ class BaseMultimodalProcessor(ABC):
         audio_data: Optional[list] = None,
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
+        max_num_frames: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -131,19 +137,14 @@ class BaseMultimodalProcessor(ABC):
 
         """
         if isinstance(multimodal_tokens.image_token, int):
-            multimodal_tokens.image_token = (
-                self._processor.tokenizer.convert_ids_to_tokens(
-                    multimodal_tokens.image_token
-                )
+            multimodal_tokens.image_token = self._processor.tokenizer.convert_ids_to_tokens(
+                multimodal_tokens.image_token
             )
-        else:
-            multimodal_tokens.image_token = multimodal_tokens.image_token
 
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt = self._processor.tokenizer.decode(prompt)
-        else:
-            prompt = prompt
+
         if return_text:
             import re
 
@@ -155,8 +156,8 @@ class BaseMultimodalProcessor(ABC):
             # split text into list of normal text and special tokens
             text_parts = re.split(pattern, prompt)
 
-        # TODO(mick): load from server_args, env, or sampling_params
-        MAX_NUM_FRAMES = 30
+        MAX_NUM_FRAMES = max_num_frames or getattr(self.server_args, "max_num_frames", 30)
+
         estimated_frames_list = self.get_estimated_frames_list(image_data=image_data)
         total_frame_count = sum(estimated_frames_list)
         # a heuristic value, suggesting the maximum fraction of frames to embed from all visual inputs.
@@ -226,7 +227,6 @@ class BaseMultimodalProcessor(ABC):
                     audio_index += 1
                     new_text += multimodal_tokens.audio_token
                 else:
-                    # TODO(mick): handle video
                     # normal text
                     new_text += text_part
 
@@ -238,6 +238,7 @@ class BaseMultimodalProcessor(ABC):
             images=images,
             audios=audios,
             input_text=new_text,
+            image_sizes=image_sizes,
         )
         out.normalize()
         return out

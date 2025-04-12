@@ -54,7 +54,7 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from decord import VideoReader, cpu
+from video_reader import PyVideoReader
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -555,8 +555,7 @@ def encode_video(video_path, frame_count_limit=None):
         gap = len(l) / n
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
-
-    vr = VideoReader(video_path, ctx=cpu(0))
+    vr = PyVideoReader(video_path, threads=0)
     sample_fps = round(vr.get_avg_fps() / 1)  # FPS
     frame_indices = [i for i in range(0, len(vr), sample_fps)]
     if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
