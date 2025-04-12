@@ -1,47 +1,28 @@
-# Extend from the base sglang image
-FROM lmsysorg/sglang:latest
+FROM pytorch/manylinux2_28-builder:cuda12.8
 
-# Install development tools and utilities
-RUN apt-get update && apt-get install -y \
-    gdb \
-    ninja-build \
-    vim \
-    tmux \
-    htop \
-    wget \
-    curl \
-    locales \
-    lsof \
-    git \
-    git-lfs \
-    zsh \
-    tree \
-    silversearcher-ag \
-    cloc \
-    unzip \
-    pkg-config \
-    libssl-dev \
-    bear \
-    ccache \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt update -y \
-    && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
-    && apt update -y \
-    && apt install nsight-systems-cli -y
+WORKDIR /sgl-workspace
 
-# Set up locale
-RUN locale-gen en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+RUN pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.0.8.post2/sgl_kernel-0.0.8.post2+cu128-cp39-abi3-manylinux2014_x86_64.whl \
+    && pip3 install setuptools==75.0.0 wheel==0.41.0 scikit-build-core
+
+RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
+    && cd sglang && pip3 install -e "python[blackwell]"
+
+RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps
+
+ENV DEBIAN_FRONTEND=interactive
+
+RUN yum install -y libibverbs rdma-core infiniband-diags \
+    libibumad libnl3 librdmacm lsof perftest zsh ccache tmux \
+    htop git-lfs tree \
+    && yum clean all
 
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir \
+RUN pip3 install --no-cache-dir \
     pytest \
     black \
     isort \
