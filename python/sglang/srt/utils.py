@@ -37,7 +37,6 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
-from dataclasses import fields
 from enum import Enum
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
