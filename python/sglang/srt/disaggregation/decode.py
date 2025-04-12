@@ -195,7 +195,9 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            decode_req.kv_receiver.notify_pre_alloc(kv_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.notify_pre_alloc(
+                kv_indices, decode_req.metadata_buffer_index
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 

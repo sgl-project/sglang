@@ -77,11 +77,11 @@ class KVManager:
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
         self.disaggregation_mode = disaggregation_mode
-        self.request_pool: RequestPoolType = {}
         self.request_status: Dict[int, KVPoll] = {}
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.to_transfer_pool: RequestPoolType = {}
             self.waiting_pool: WaitingPoolType = {}
             self.transfer_event = threading.Event()
             self.start_prefill_thread()
@@ -244,7 +244,7 @@ class KVManager:
             while True:
                 self.transfer_event.wait()
                 self.transfer_event.clear()
-                bootstrap_room_ready = self.request_pool.keys()
+                bootstrap_room_ready = self.to_transfer_pool.keys()
                 bootstrap_room_request = self.waiting_pool.keys()
                 for room in list(bootstrap_room_request):
                     if room not in list(bootstrap_room_ready):
@@ -263,7 +263,7 @@ class KVManager:
                     (
                         prefill_kv_indices,
                         prefill_aux_index,
-                    ) = self.request_pool.pop(room)
+                    ) = self.to_transfer_pool.pop(room)
                     ret = self.send_kvcache(
                         mooncake_session_id,
                         prefill_kv_indices,
@@ -302,25 +302,19 @@ class KVManager:
 
         threading.Thread(target=decode_thread).start()
 
-    def enqueue_request(
+    def add_transfer_request(
         self,
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int64],
         aux_index: Optional[int],
     ):
-        self.request_pool[bootstrap_room] = (kv_indices, aux_index)
+        self.to_transfer_pool[bootstrap_room] = (kv_indices, aux_index)
         self.request_status[bootstrap_room] = KVPoll.WaitingForInput
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_event.set()
 
     def check_status(self, bootstrap_room: int):
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.request_status[bootstrap_room] == KVPoll.Success
-        ):
-            if bootstrap_room in self.request_pool:
-                self.request_pool.pop(bootstrap_room)
-
+        # TOOD: do we really need the poll()?
         # NOTE: after bootstrapping we can mark the req as waiting for input
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -354,7 +348,9 @@ class KVSender:
         self.num_kv_indices = num_kv_indices
 
     def send(self, kv_indices: npt.NDArray[np.int64]):
-        self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, self.aux_index)
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room, kv_indices, self.aux_index
+        )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
@@ -389,7 +385,6 @@ class KVReceiver:
     def notify_pre_alloc(
         self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
     ):
-        self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, aux_index)
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
