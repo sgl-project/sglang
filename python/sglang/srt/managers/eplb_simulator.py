@@ -83,11 +83,13 @@ def scan_combinations(
         *[
             MyServerArgs(
                 chunked_prefill_size=chunked_prefill_size_per_gpu * 32,
-                ep_num_redundant_experts=32,
-                nnodes=4,
-                tp_size=32,
+                ep_num_redundant_experts=ep_num_redundant_experts,
+                nnodes=nnodes,
+                tp_size=8 * nnodes,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
+            for ep_num_redundant_experts in [32, 64]
+            for nnodes in [2, 4]
             for chunked_prefill_size_per_gpu in [1024, 2048, 4096, 8192, 16384]
             for enable_expert_location_by_eplb in [False, True]
         ]
