@@ -17,7 +17,6 @@ import torch
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -392,10 +391,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        print(
-            f"layer {layer.layer_id}, q_size {q.size()}, ragged {self.forward_metadata.use_ragged}, no prefix {self.forward_metadata.extend_no_prefix}"
-        )
-
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -435,37 +430,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
             )
 
-            qo_indptr = self.prefill_wrapper_ragged._qo_indptr_buf
-            otest = torch.empty_like(o1)
-            max_extend_len = qo_indptr
-            max_extend_len = torch.max(max_extend_len[1:] - max_extend_len[:-1]).item()
-            extend_attention_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
-                otest.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                qo_indptr,
-                torch.zeros_like(qo_indptr),
-                torch.tensor([], dtype=torch.int32, device=q.device),
-                None,
-                None,
-                max_extend_len,
-                layer.scaling,
-                layer.logit_cap,
-            )
-
-            cos_sim = torch.cosine_similarity(otest.view_as(q), o1.view_as(q), dim=-1)
-            print(f"layer {layer.layer_id} min cos_sim = {cos_sim.min().item()}")
-
-            # error occurred in prefill_wrapper_ragged's o, but lse seems correct
-            if not torch.all(cos_sim >= torch.full_like(cos_sim, 0.999)):
-                # dump config and tensors here
-                raise FloatingPointError()
-
-            o1 = otest
-
             if self.forward_metadata.extend_no_prefix:
                 o = o1
             else:
@@ -478,38 +442,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
-
-                kv_indptr = prefill_wrapper_paged._paged_kv_indptr_buf
-                kv_indices = prefill_wrapper_paged._paged_kv_indices_buf
-                otest2 = torch.empty_like(o2)
-                extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
-                    otest2.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    qo_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    None,
-                    None,
-                    max_extend_len,
-                    layer.scaling,
-                    layer.logit_cap,
-                )
-
-                cos_sim2 = torch.cosine_similarity(
-                    otest2.view_as(q), o.view_as(q), dim=-1
-                )
-                print(f"layer {layer.layer_id} min cos_sim2 = {cos_sim2.min().item()}")
-
-                # no error occurred in prefill_wrapper_paged's o and lse
-                if not torch.all(cos_sim2 >= torch.full_like(cos_sim2, 0.999)):
-                    # dump config and tensors here
-                    raise FloatingPointError()
-
-                o = otest2
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(

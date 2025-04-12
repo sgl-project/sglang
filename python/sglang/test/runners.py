@@ -487,7 +487,6 @@ class SRTRunner:
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
             lora_backend=lora_backend,
-            # attention_backend="triton",
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
             chunked_prefill_size=chunked_prefill_size,
