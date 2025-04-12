@@ -523,7 +523,7 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
         k_descale, v_descale = None, None
@@ -664,7 +664,7 @@ class FlashAttentionBackend(AttentionBackend):
         # here is two side inclusive
         window_size = (
             (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
         causal = not layer.is_cross_attention
