@@ -7,7 +7,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import DisposibleTensor, is_cuda, TensorCreator, MaybeTensorCreator
+from sglang.srt.utils import DisposibleTensor, is_cuda, TensorCreator, MaybeTensorCreator, MaybeDisposibleTensor
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -635,7 +635,7 @@ def compute_m_num_tiles_indptr(
 
 
 def grouped_gemm_triton(
-    a: torch.Tensor,
+    a: MaybeDisposibleTensor,
     b: torch.Tensor,
     c: MaybeTensorCreator,
     batch_size: int,
