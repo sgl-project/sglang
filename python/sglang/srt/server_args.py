@@ -196,6 +196,9 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
 
+    # multimodal
+    disable_fast_image_processor: bool = False
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -979,6 +982,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-llama4-multimodal",
+            default=ServerArgs.enable_llama4_multimodal,
             action="store_true",
             help="Enable the multimodal functionality for Llama-4.",
         )
@@ -1168,6 +1172,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
             help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+
+        # Multimodal
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
         )
 
     @classmethod
