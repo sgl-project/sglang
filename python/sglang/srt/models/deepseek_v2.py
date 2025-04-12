@@ -50,12 +50,12 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
+    channel_quant_to_tensor_quant,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -79,6 +79,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8
+
+    from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 else:
     from vllm import _custom_ops as ops
 
@@ -278,10 +280,7 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_mode)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.n_shared_experts is not None and self.n_share_experts_fusion == 0:
-            shared_output = self.shared_experts(hidden_states)
-        else:
-            shared_output = None
+        shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = (
@@ -311,8 +310,7 @@ class DeepseekV2MoE(nn.Module):
         ):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if self.n_shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx = select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -324,6 +322,7 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
             )
         if self.ep_size > 1:
+            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
                 hidden_states,
                 topk_idx,
@@ -336,7 +335,6 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                self.num_experts,
                 forward_mode=forward_mode,
             )
         final_hidden_states = (
@@ -361,6 +359,12 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states
+
+    def _forward_shared_experts(self, hidden_states):
+        if self.n_shared_experts is not None and self.n_share_experts_fusion == 0:
+            return self.shared_experts(hidden_states)
+        else:
+            return None
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -489,6 +493,7 @@ class DeepseekV2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -669,6 +674,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
 
@@ -679,6 +685,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
 
@@ -686,7 +693,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_vc = None
         self.w_scale = None
 
-        self.enable_flashinfer_mla = global_server_args_dict["enable_flashinfer_mla"]
         self.flashinfer_mla_disable_ragged = global_server_args_dict[
             "flashinfer_mla_disable_ragged"
         ]
@@ -694,7 +700,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rocm_fused_decode_mla = os.getenv("SGLANG_ROCM_FUSED_DECODE_MLA") == "1"
 
     def no_absorb(self, forward_batch: ForwardBatch) -> bool:
-        if self.enable_flashinfer_mla:
+        if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             return (
                 not self.flashinfer_mla_disable_ragged
@@ -1380,6 +1386,91 @@ class DeepseekV2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def post_load_weights(self):
+
+        # Perform post-processing after loading weights
+
+        if not global_server_args_dict["disable_mla"]:
+            for layer_id in range(self.config.num_hidden_layers):
+                self_attn = self.model.layers[layer_id].self_attn
+                if hasattr(self_attn.kv_b_proj, "qweight"):
+                    # AWQ compatible
+                    if _is_cuda:
+                        w = awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        w = ops.awq_dequantize(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                            0,
+                            0,
+                            0,
+                        ).T
+                else:
+                    w = self_attn.kv_b_proj.weight
+                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+                # This may affect the accuracy of fp8 model.
+                if w.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fnuz,
+                ):
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            if _is_hip:
+                                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                                    weight=w,
+                                    weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                                    input_scale=None,
+                                )
+                            else:
+                                weight = w
+                                weight_scale = self_attn.kv_b_proj.weight_scale_inv
+
+                            w, scale = block_quant_to_tensor_quant(
+                                weight, weight_scale, weight_block_size
+                            )
+                            self_attn.w_scale = scale
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
+
+                if w.dtype == torch.int8:
+                    if hasattr(self.quant_config, "weight_block_size"):
+                        # block-wise int8 need it
+                        weight_block_size = self.quant_config.weight_block_size
+                        if weight_block_size is not None:
+                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                            w = int8_block_dequant(
+                                weight, weight_scale, weight_block_size
+                            ).to(torch.bfloat16)
+                    else:
+                        # channel-wise int8 need it
+                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                            torch.bfloat16
+                        )
+                w_kc, w_vc = w.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                if (
+                    hasattr(self_attn.kv_b_proj, "weight_scale")
+                    and self_attn.w_scale is None
+                ):
+                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                    if _is_hip:
+                        self_attn.w_scale *= 2.0
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1389,14 +1480,24 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion is not None and self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            suffix_list = [
-                "down_proj.weight",
-                "down_proj.weight_scale_inv",
-                "gate_proj.weight",
-                "gate_proj.weight_scale_inv",
-                "up_proj.weight",
-                "up_proj.weight_scale_inv",
-            ]
+            if self.quant_config.get_name() == "w8a8_int8":
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+            else:
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
             names_to_remove = []
             for moe_layer in tqdm(
                 range(
@@ -1504,79 +1605,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        if not global_server_args_dict["disable_mla"]:
-            for layer_id in range(self.config.num_hidden_layers):
-                self_attn = self.model.layers[layer_id].self_attn
-                if hasattr(self_attn.kv_b_proj, "qweight"):
-                    # AWQ compatible
-                    if _is_cuda:
-                        w = awq_dequantize(
-                            self_attn.kv_b_proj.qweight,
-                            self_attn.kv_b_proj.scales,
-                            self_attn.kv_b_proj.qzeros,
-                        ).T
-                    else:
-                        w = ops.awq_dequantize(
-                            self_attn.kv_b_proj.qweight,
-                            self_attn.kv_b_proj.scales,
-                            self_attn.kv_b_proj.qzeros,
-                            0,
-                            0,
-                            0,
-                        ).T
-                else:
-                    w = self_attn.kv_b_proj.weight
-                # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-                # This may affect the accuracy of fp8 model.
-                if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e4m3fnuz,
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        if _is_hip:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=w,
-                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                                input_scale=None,
-                            )
-                        else:
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                        w, scale = block_quant_to_tensor_quant(
-                            weight, weight_scale, weight_block_size
-                        )
-                        self_attn.w_scale = scale
-                if w.dtype == torch.int8:
-                    if hasattr(self.quant_config, "weight_block_size"):
-                        # block-wise int8 need it
-                        weight_block_size = self.quant_config.weight_block_size
-                        if weight_block_size is not None:
-                            assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                            w = int8_block_dequant(
-                                weight, weight_scale, weight_block_size
-                            ).to(torch.bfloat16)
-                    else:
-                        # channel-wise int8 need it
-                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                            torch.bfloat16
-                        )
-                w_kc, w_vc = w.unflatten(
-                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                if (
-                    hasattr(self_attn.kv_b_proj, "weight_scale")
-                    and self_attn.w_scale is None
-                ):
-                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                    if _is_hip:
-                        self_attn.w_scale *= 2.0
+        self.post_load_weights()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

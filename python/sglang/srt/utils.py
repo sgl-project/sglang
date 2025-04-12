@@ -1819,3 +1819,21 @@ class DeepEPMode(Enum):
             return DeepEPMode.low_latency
         else:
             return DeepEPMode.normal
+
+
+def fast_topk(values, topk, dim):
+    if topk == 1:
+        # Use max along the specified dimension to get both value and index
+        return torch.max(values, dim=dim, keepdim=True)
+    else:
+        # Use topk for efficiency with larger k values
+        return torch.topk(values, topk, dim=dim)
+
+
+def is_hopper_with_cuda_12_3():
+    if not is_cuda():
+        return False
+    is_hopper = torch.cuda.get_device_capability()[0] == 9
+    cuda_version = torch.version.cuda.split(".")
+    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
+    return is_hopper and is_cuda_compatible

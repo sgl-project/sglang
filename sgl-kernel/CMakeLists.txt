@@ -33,7 +33,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        6f4921858b3bb0a82d7cbeb4e499690e9ae60d16
+    GIT_TAG        df8a550d3917b0e97f416b2ed8c2d786f7f686a3
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -76,6 +76,8 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-flash-attention_SOURCE_DIR}/hopper
@@ -145,7 +147,7 @@ if (SGL_KERNEL_ENABLE_FP8)
     )
 endif()
 
-if (SGL_KERNEL_ENABLE_FP4)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -157,15 +159,14 @@ string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE
 string(REPLACE "-D__CUDA_NO_HALF2_OPERATORS__"      "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 
 set(SOURCES
-    "csrc/allreduce/trt_reduce_internal.cu"
-    "csrc/allreduce/trt_reduce_kernel.cu"
+    "csrc/allreduce/custom_all_reduce.cu"
+    "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
-    "csrc/gemm/cublas_grouped_gemm.cu"
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
@@ -254,10 +255,7 @@ if (BUILD_FA3)
         FLASHATTENTION_DISABLE_SM8x
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
-        # FLASHATTENTION_DISABLE_ALIBI
-        # FLASHATTENTION_DISABLE_SOFTCAP
         FLASHATTENTION_DISABLE_UNEVEN_K
-        # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_VARLEN_ONLY
     )
 endif()
