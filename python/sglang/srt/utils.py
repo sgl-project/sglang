@@ -54,10 +54,10 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from PIL import Image
 from decord import VideoReader, cpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
@@ -914,10 +914,10 @@ def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
     mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    total_mem = mem.total / 1024 ** 3
+    available_mem = mem.available / 1024 ** 3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(0.5 * 1024 ** 3)
     else:
         buf_size = -1
 
@@ -1437,10 +1437,10 @@ def dataclass_to_string_truncated(
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
+            f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+            for k, v in data.items()
+            if k not in skip_names
+        )
             + "}"
         )
     elif dataclasses.is_dataclass(data):
@@ -1448,10 +1448,10 @@ def dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
+            f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+            for f in fields
+            if f.name not in skip_names
+        )
             + ")"
         )
     else:
@@ -1641,7 +1641,7 @@ def configure_ipv6(dist_init_addr):
     port_str = None
     if len(addr) > end + 1:
         if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
+            port_str = addr[end + 2:]
         else:
             raise ValueError("received IPv6 address format: expected ':' after ']'")
 
@@ -1779,7 +1779,7 @@ def retry(
             if not should_retry(e):
                 raise Exception(f"retry() observe errors that should not be retried.")
 
-            delay = min(initial_delay * (2**try_index), max_delay) * (
+            delay = min(initial_delay * (2 ** try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
             )
 
@@ -1882,10 +1882,13 @@ class DisposibleTensor:
         return self._value is None
 
     @staticmethod
-    def maybe_unwrap(value: Union[torch.Tensor, "DisposibleTensor"]) -> torch.Tensor:
+    def maybe_unwrap(value: "MaybeDisposibleTensor") -> torch.Tensor:
         if isinstance(value, DisposibleTensor):
             return value.value
         return value
+
+
+MaybeDisposibleTensor = Union[torch.Tensor, DisposibleTensor]
 
 
 class TensorCreator:
@@ -1899,7 +1902,10 @@ class TensorCreator:
         return value
 
     @staticmethod
-    def maybe_create(value: Union[torch.Tensor, "TensorCreator"]) -> torch.Tensor:
+    def maybe_create(value: "MaybeTensorCreator") -> torch.Tensor:
         if isinstance(value, TensorCreator):
             return value.create()
         return value
+
+
+MaybeTensorCreator = Union[torch.Tensor, TensorCreator]
