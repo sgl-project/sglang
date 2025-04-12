@@ -657,7 +657,7 @@ def grouped_gemm_triton(
         if _is_cuda:
             a, scale_a = sglang_per_token_group_quant_fp8(DisposibleTensor.maybe_unwrap(a), block_k)
         else:
-            a, scale_a = per_token_group_quant_fp8(a, block_k)
+            a, scale_a = per_token_group_quant_fp8(DisposibleTensor.maybe_unwrap(a), block_k)
         DisposibleTensor.maybe_dispose(a_ref)
 
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
