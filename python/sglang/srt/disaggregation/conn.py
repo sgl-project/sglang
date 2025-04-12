@@ -319,6 +319,14 @@ class KVManager:
             if bootstrap_room in self.request_pool:
                 self.request_pool.pop(bootstrap_room)
 
+        # NOTE: after bootstrapping we can mark the req as waiting for input
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.request_status[bootstrap_room] == KVPoll.Bootstrapping
+        ):
+            if bootstrap_room in self.waiting_pool:
+                self.request_status[bootstrap_room] = KVPoll.WaitingForInput
+
         return self.request_status[bootstrap_room]
 
     def set_status(self, bootstrap_room: int, status: KVPoll):
@@ -336,7 +344,7 @@ class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
-        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.kv_mgr.set_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
