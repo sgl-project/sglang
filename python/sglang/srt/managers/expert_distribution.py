@@ -1,11 +1,11 @@
 import logging
+import os
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, List, Optional, Type
 
 import torch
-
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_bool_env_var
@@ -189,8 +189,8 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         torch.cuda.synchronize()
 
         num_recv_tokens_per_expert_list = [
-            0
-        ] * self._expert_location_metadata.num_local_physical_experts
+                                              0
+                                          ] * self._expert_location_metadata.num_local_physical_experts
         for token_record in topk_ids_list:
             for global_physical_expert_idx in token_record:
                 local_physical_expert_idx = (
@@ -281,6 +281,7 @@ class _DetailAccumulator(_Accumulator):
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
         super().__init__(expert_location_metadata, rank)
+        self._save_dir = os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_SAVE_DIR")
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
