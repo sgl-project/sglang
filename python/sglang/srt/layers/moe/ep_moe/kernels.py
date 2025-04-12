@@ -4,9 +4,16 @@ from typing import List, Optional
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import DisposibleTensor, is_cuda, TensorCreator, MaybeTensorCreator, MaybeDisposibleTensor
+from sglang.srt.utils import (
+    DisposibleTensor,
+    MaybeDisposibleTensor,
+    MaybeTensorCreator,
+    TensorCreator,
+    is_cuda,
+)
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -437,12 +444,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                    kAlpha
-                    * (
-                        gate_output
-                        + 0.044715 * gate_output * gate_output * gate_output
+                        kAlpha
+                        * (
+                            gate_output
+                            + 0.044715 * gate_output * gate_output * gate_output
+                        )
                     )
-                )
                 )
             )
             gate_output = gate_output.to(InDtype)
@@ -655,9 +662,13 @@ def grouped_gemm_triton(
         block_n, block_k = block_shape[0], block_shape[1]
         a_ref = a
         if _is_cuda:
-            a, scale_a = sglang_per_token_group_quant_fp8(DisposibleTensor.maybe_unwrap(a), block_k)
+            a, scale_a = sglang_per_token_group_quant_fp8(
+                DisposibleTensor.maybe_unwrap(a), block_k
+            )
         else:
-            a, scale_a = per_token_group_quant_fp8(DisposibleTensor.maybe_unwrap(a), block_k)
+            a, scale_a = per_token_group_quant_fp8(
+                DisposibleTensor.maybe_unwrap(a), block_k
+            )
         DisposibleTensor.maybe_dispose(a_ref)
 
         assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
