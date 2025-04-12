@@ -325,7 +325,7 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = len(seqlens_in_batch)
         device = seqlens_in_batch.device
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
                 metadata.cache_seqlens_int32 = (
