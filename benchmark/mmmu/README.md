@@ -27,12 +27,12 @@ Benchmark Results:
 | Model                   | SGLang | HuggingFace |
 |-------------------------|--------|-------------|
 | Qwen2-VL-7B-Instruct   | 0.476  | -            |
-| Qwen2.5-VL-7B-Instruct | 0.477  | 0.504        |
+| Qwen2.5-VL-7B-Instruct | 0.477  | -        |
 | MiniCPM-V-2.6          | 0.435  | —            |
 | MiniCPM-O-2_6          | 0.401 | - |
 | Deepseek-Janus-Pro-7B  | 0.373  | -            |
 | Deepseek-VL2           | 0.405 | - |
-| Gemma-3-it-4B          | 0.41   | 0.403        |
+| Gemma-3-it-4B          | 0.41   | -        |
 | llama3-llava-next-8b | 0.245 | - |
 | llava-v1.6-mistral-7b-sglang | 0.338 | - |
 | llava-onevision-qwen2-7b-ov | 0.423 | - |
