@@ -35,11 +35,77 @@ class HPUBlockMetadata:
     block_groups: Optional[torch.Tensor] = None
     block_usage: Optional[torch.Tensor] = None
 
+    def init_block_metadata(self, block_tables, slot_mapping, block_size, batch_size):
+        """Initialize block metadata for HPU paged attention."""
+        device = "cpu"
+
+        # Calculate block metadata
+        last_block_usage = [slot % block_size + 1 for slot in slot_mapping]
+        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
+        block_usage = [
+            [block_size] * (len(bt) - 1) + [lbu]
+            for bt, lbu in zip(block_tables, last_block_usage)
+            if bt
+        ]
+        block_list = flatten(block_tables)
+        block_groups = flatten(block_groups)
+        block_usage = flatten(block_usage)
+        assert len(block_list) == len(block_groups)
+        assert len(block_list) == len(block_usage)
+
+        if self.use_contiguous_pa:
+            # Pad block metadata if needed
+            block_bucket_size = max(max(block_list) + 1, len(block_list))
+            block_bucket_size = find_bucket(
+                block_bucket_size,
+                (
+                    DECODE_BLOCK_BUCKET_MIN,
+                    DECODE_BLOCK_BUCKET_STEP,
+                    DECODE_BLOCK_BUCKET_MAX,
+                ),
+            )
+            indices = [None] * block_bucket_size
+            for i, bid in enumerate(block_list):
+                indices[bid] = i
+            padding_fn = lambda tensor, pad_value: gather_list(
+                tensor, indices, pad_value
+            )
+        else:
+            block_bucket_size = find_bucket(
+                len(block_list),
+                (
+                    DECODE_BLOCK_BUCKET_MIN,
+                    DECODE_BLOCK_BUCKET_STEP,
+                    DECODE_BLOCK_BUCKET_MAX,
+                ),
+            )
+            padding_fn = lambda tensor, pad_value: pad_list(
+                tensor, block_bucket_size, pad_value
+            )
+
+        block_list = padding_fn(block_list, _PAD_BLOCK_ID)
+        block_groups = padding_fn(block_groups, _PAD_BLOCK_GROUP)
+        block_usage = padding_fn(block_usage, _PAD_BLOCK_USAGE)
+
+        # Convert to tensors
+        self.block_list = torch.tensor(block_list, dtype=torch.long, device=device)
+        self.block_groups = torch.tensor(block_groups, dtype=torch.long, device=device)
+        self.block_usage = torch.tensor(
+            block_usage, dtype=torch.bfloat16, device=device
+        )
+
+        # Set block mapping and scales
+        self.block_mapping, self.block_groups = _set_block_mapping(
+            self, batch_size, device
+        )
+
 
 _is_hpu = is_hpu()
 
 if _is_hpu:
     _PAD_BLOCK_ID = 0
+    _PAD_BLOCK_USAGE = 1
+    _PAD_BLOCK_GROUP = -1
 
     PREFILL_BUCKET_MIN = get_int_env_var("SGLANG_HPU_PREFILL_BUCKET_MIN", 1024)
     PREFILL_BUCKET_STEP = get_int_env_var("SGLANG_HPU_PREFILL_BUCKET_STEP", 1024)
@@ -141,74 +207,6 @@ if _is_hpu:
         block_groups.masked_fill_(oob_values, batch_size)
         return block_mapping.to(torch.bfloat16), block_groups
 
-    def _init_block_metadata(
-        metadata: HPUBlockMetadata, block_tables, slot_mapping, block_size, batch_size
-    ):
-        """Initialize block metadata for HPU paged attention."""
-        device = "cpu"
-
-        # Calculate block metadata
-        last_block_usage = [slot % block_size + 1 for slot in slot_mapping]
-        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
-        block_usage = [
-            [block_size] * (len(bt) - 1) + [lbu]
-            for bt, lbu in zip(block_tables, last_block_usage)
-            if bt
-        ]
-        block_list = flatten(block_tables)
-        block_groups = flatten(block_groups)
-        block_usage = flatten(block_usage)
-        assert len(block_list) == len(block_groups)
-        assert len(block_list) == len(block_usage)
-
-        if metadata.use_contiguous_pa:
-            # Pad block metadata if needed
-            block_bucket_size = max(max(block_list) + 1, len(block_list))
-            block_bucket_size = find_bucket(
-                block_bucket_size,
-                (
-                    DECODE_BLOCK_BUCKET_MIN,
-                    DECODE_BLOCK_BUCKET_STEP,
-                    DECODE_BLOCK_BUCKET_MAX,
-                ),
-            )
-            indices = [None] * block_bucket_size
-            for i, bid in enumerate(block_list):
-                indices[bid] = i
-            padding_fn = lambda tensor, pad_value: gather_list(
-                tensor, indices, pad_value
-            )
-        else:
-            block_bucket_size = find_bucket(
-                len(block_list),
-                (
-                    DECODE_BLOCK_BUCKET_MIN,
-                    DECODE_BLOCK_BUCKET_STEP,
-                    DECODE_BLOCK_BUCKET_MAX,
-                ),
-            )
-            padding_fn = lambda tensor, pad_value: pad_list(
-                tensor, block_bucket_size, pad_value
-            )
-
-        block_list = padding_fn(block_list, _PAD_BLOCK_ID)
-        block_groups = padding_fn(block_groups, -1)
-        block_usage = padding_fn(block_usage, 1)
-
-        # Convert to tensors
-        metadata.block_list = torch.tensor(block_list, dtype=torch.long, device=device)
-        metadata.block_groups = torch.tensor(
-            block_groups, dtype=torch.long, device=device
-        )
-        metadata.block_usage = torch.tensor(
-            block_usage, dtype=torch.bfloat16, device=device
-        )
-
-        # Set block mapping and scales
-        metadata.block_mapping, metadata.block_groups = _set_block_mapping(
-            metadata, batch_size, device
-        )
-
     def get_prefill_seq_len_bucket(sum_seq_len):
         return find_bucket(
             sum_seq_len, (PREFILL_BUCKET_MIN, PREFILL_BUCKET_STEP, PREFILL_BUCKET_MAX)
@@ -250,8 +248,8 @@ if _is_hpu:
 
             # Create HPUBlockMetadata instance
             hpu_metadata = HPUBlockMetadata(use_contiguous_pa=USE_CONTIGUOUS_PA)
-            _init_block_metadata(
-                hpu_metadata, block_tables, slot_mapping, page_size, padded_batch_size
+            hpu_metadata.init_block_metadata(
+                block_tables, slot_mapping, page_size, padded_batch_size
             )
         return hpu_metadata
 

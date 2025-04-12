@@ -29,8 +29,6 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-import math
-import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -40,12 +38,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import (
-    dataclass_to_device,
-    get_compiler_backend,
-    get_scheduler_device,
-    is_hpu,
-)
+from sglang.srt.utils import get_compiler_backend, is_hpu
 
 _is_hpu = is_hpu()
 if _is_hpu:
@@ -248,10 +241,6 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         device = model_runner.device
-        scheduler_device = get_scheduler_device(device)
-        if scheduler_device != device:
-            pt_device = torch.device(device, model_runner.gpu_id)
-            batch = dataclass_to_device(batch, pt_device)
         extend_input_logprob_token_ids_gpu = None
         if batch.extend_input_logprob_token_ids is not None:
             extend_input_logprob_token_ids_gpu = (
