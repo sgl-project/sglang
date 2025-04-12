@@ -1,16 +1,14 @@
-import os
 import hashlib
-import asyncio
 import torch
-from typing import Union, Optional
+from typing import Union
 import zmq
 import logging
 import socket
-from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 from sglang.srt.managers.io_struct import PrefilledReqInput, KVTransferFetch, KVTransferAck, KVTransferFetchBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.pd_disaggregation_controller import PD_DISAGGREGATION_PORT
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.mem_cache.radix_cache import ReqToTokenPool, TokenToKVPoolAllocator
@@ -138,13 +136,7 @@ class KVTransferAgent:
         )
 
         tp_size_per_node = server_args.tp_size // server_args.nnodes
-        if self.role == "prefill":
-            addr = os.getenv('VC_MASTER_HOSTS')
-        else:
-            hostname = os.getenv('HOSTNAME')
-            job_id = os.getenv('JOB_ID')
-            addr = f'{hostname}.{job_id}'
-        self.addr = f"{addr}:{KV_TRANSFER_AGENT_PORT+self.tp_rank % tp_size_per_node}"
+        self.addr = f"{socket.gethostname()}:{KV_TRANSFER_AGENT_PORT+self.tp_rank % tp_size_per_node}"
 
         if server_args.nnodes == 1 and server_args.dist_init_addr is None:
             dist_init_host = "127.0.0.1"
@@ -182,7 +174,7 @@ class KVTransferAgent:
         kv_cache = safetensors_save({"tensor": flatten.to(self.device)})
         self.kv_buffer[req.rid] = kv_cache
         return len(kv_cache)
-            
+
     def get_kv_buffer(self, req: Req) -> torch.Tensor:
         if self.attn_tp_rank == 0:
             dst_ptr = self._allocate_transfer_kv_buffer(req.kv_cache_length)
@@ -213,7 +205,7 @@ class KVTransferAgent:
             loaded_tensor = broadcast_pyobj(
                 loaded_tensor, self.attn_tp_rank, self.attn_tp_cpu_group)
         return loaded_tensor
-    
+
     def get_batch_kv_buffer(self, req_list: List[Req]) -> dict[str, torch.Tensor]:
         same_src_req_list = {}
         res = {}
@@ -221,43 +213,59 @@ class KVTransferAgent:
             if req.kv_transfer_src_addr not in same_src_req_list:
                 same_src_req_list[req.kv_transfer_src_addr] = []
             same_src_req_list[req.kv_transfer_src_addr].append(req)
-        for src_addr, reql in same_src_req_list.items():
+        for _, reql in same_src_req_list.items():
             rid_tensor_map = self.get_batch_kv_buffer_from_same_src(reql)
             for rid, tensor in rid_tensor_map.items():
                 res[rid] = tensor
         return res
-    
+
     def get_batch_kv_buffer_from_same_src(self, req_list: List[Req]) -> dict[str, torch.Tensor]:
         if len(req_list) == 0:
             return {}
         batch_kv_cache_length = 0
         for req in req_list:
             batch_kv_cache_length += req.kv_cache_length
-        # allocate buffer
-        dst_ptr = self._allocate_transfer_kv_buffer(batch_kv_cache_length)
-        # send fetch request
-        self.send_to_pd_disagg_controller.send_pyobj(KVTransferFetchBatch(
-            fetch_batch_req_hash=hashlib.md5(''.join([req.rid for req in req_list]).encode()).hexdigest(),
-            rids=[req.rid for req in req_list],
-            src_addr=req_list[0].kv_transfer_src_addr,
-            src_rank=req_list[0].kv_transfer_src_rank,
-            dst_addr=self.addr,
-            dst_rank=self.tp_rank,
-            dst_ptr=dst_ptr,
-            fetch_ct=self.attn_tp_size,
-        ))
-        # recv ack
-        recv_obj = self.recv_from_pd_disagg_controller.recv_pyobj()
-        if not isinstance(recv_obj, KVTransferAck):
-            raise ValueError(f"Unknown message type: {type(recv_obj)}")
-        elif recv_obj.code != 0:
-            raise Exception(f"KV transfer failed: {recv_obj.code}")
-        # read from buffer
-        batch_kv_cache = self._read_bytes_from_buffer(
-            dst_ptr, batch_kv_cache_length)
-        # free buffer
-        self._free_transfer_kv_buffer(dst_ptr, batch_kv_cache_length)
-        
+
+        try:
+            # allocate buffer
+            dst_ptr = self._allocate_transfer_kv_buffer(batch_kv_cache_length)
+            # send fetch request
+            logger.info(f"Sending kv transfer fetch request")
+            self.send_to_pd_disagg_controller.send_pyobj(KVTransferFetchBatch(
+                fetch_batch_req_hash=hashlib.md5(
+                    ''.join([req.rid for req in req_list]).encode()).hexdigest(),
+                rids=[req.rid for req in req_list],
+                src_addr=req_list[0].kv_transfer_src_addr,
+                src_rank=req_list[0].kv_transfer_src_rank,
+                dst_addr=self.addr,
+                dst_rank=self.tp_rank,
+                dst_ptr=dst_ptr,
+                fetch_ct=self.attn_tp_size,
+            ))
+            # recv ack
+            logger.info(f"Waiting for kv transfer ack")
+            if self.recv_from_pd_disagg_controller.poll(timeout=1000):
+                recv_obj = self.recv_from_pd_disagg_controller.recv_pyobj()
+                if not isinstance(recv_obj, KVTransferAck):
+                    raise ValueError(f"Unknown message type: {type(recv_obj)}")
+                elif recv_obj.code != 0:
+                    raise Exception(f"KV transfer failed: {recv_obj.code}")
+            else:
+                raise Exception("KV transfer timeout")
+            # read from buffer
+            batch_kv_cache = self._read_bytes_from_buffer(
+                dst_ptr, batch_kv_cache_length)
+        except Exception as e:
+            logger.error(f"Get batch kv buffer failed: {e}")
+            for req in req_list:
+                req.finished_reason = FINISH_ABORT(
+                    message=f"Get batch kv buffer failed: {e}")
+            return {}
+        finally:
+            if dst_ptr > 0:
+                # free buffer
+                self._free_transfer_kv_buffer(dst_ptr, batch_kv_cache_length)
+
         # load to device
         pt = 0
         res = {}
@@ -292,56 +300,79 @@ class KVTransferAgent:
     # when prefill node receive kv transfer request
 
     def _handle_kv_transfer_fetch(self, req: KVTransferFetch):
-        kv_cache = self.kv_buffer[req.rid]
-        kv_cache_length = len(kv_cache)
-        src_ptr = self._allocate_transfer_kv_buffer(kv_cache_length)
-        self._write_bytes_to_buffer(src_ptr, kv_cache, kv_cache_length)
-        # send data to remote_addr
-        op_write = 1
-        self.engine.transfer_sync(
-            req.dst_addr, src_ptr, req.dst_ptr, kv_cache_length, op_write)
+        try:
+            kv_cache = self.kv_buffer[req.rid]
+            kv_cache_length = len(kv_cache)
+            src_ptr = self._allocate_transfer_kv_buffer(kv_cache_length)
+            self._write_bytes_to_buffer(src_ptr, kv_cache, kv_cache_length)
+            # send data to remote_addr
+            op_write = 1
+            self.engine.transfer_sync(
+                req.dst_addr, src_ptr, req.dst_ptr, kv_cache_length, op_write)
+            ack_code = 0
+        except Exception as e:
+            logger.error(f"KV transfer failed: {e}")
+            ack_code = 1
+
         # send ack to remote addr
         self.send_to_pd_disagg_controller.send_pyobj(
-            KVTransferAck(req.rid, req.dst_addr, req.dst_rank, 0))
+            KVTransferAck(req.rid, req.dst_addr, req.dst_rank, ack_code))
+
+        if ack_code != 0:
+            return
+
         # free buffer
         self._free_transfer_kv_buffer(src_ptr, kv_cache_length)
         del self.kv_buffer[req.rid]
-        
+
     def _handle_kv_transfer_batch_fetch(self, req: KVTransferFetchBatch):
-        if req.fetch_batch_req_hash not in self.handle_kv_cache_fetch_ct:
-            # calculate the total length of the kv cache
-            batch_kv_cache_length = sum([len(self.kv_buffer[rid]) for rid in req.rids])
-            
-            # allocate buffer
-            src_ptr = self._allocate_transfer_kv_buffer(batch_kv_cache_length)
-            
-            # write to buffer
-            write_to_buffer_ptr = src_ptr
-            for rid in req.rids:
-                kv_buffer_length = len(self.kv_buffer[rid])
-                self._write_bytes_to_buffer(write_to_buffer_ptr, self.kv_buffer[rid], kv_buffer_length)
-                write_to_buffer_ptr += kv_buffer_length
-            self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash] = src_ptr
-            self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash] = 0
-            self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash] = batch_kv_cache_length
-        # send data to remote_addr
-        op_write = 1
-        self.engine.transfer_sync(
-            req.dst_addr, self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash], req.dst_ptr, self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash], op_write)
-        
+        try:
+            if req.fetch_batch_req_hash not in self.handle_kv_cache_fetch_ct:
+                # calculate the total length of the kv cache
+                batch_kv_cache_length = sum(
+                    [len(self.kv_buffer[rid]) for rid in req.rids])
+
+                # allocate buffer
+                src_ptr = self._allocate_transfer_kv_buffer(
+                    batch_kv_cache_length)
+
+                # write to buffer
+                write_to_buffer_ptr = src_ptr
+                for rid in req.rids:
+                    kv_buffer_length = len(self.kv_buffer[rid])
+                    self._write_bytes_to_buffer(
+                        write_to_buffer_ptr, self.kv_buffer[rid], kv_buffer_length)
+                    write_to_buffer_ptr += kv_buffer_length
+                self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash] = src_ptr
+                self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash] = 0
+                self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash] = batch_kv_cache_length
+            # send data to remote_addr
+            op_write = 1
+            self.engine.transfer_sync(
+                req.dst_addr, self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash], req.dst_ptr, self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash], op_write)
+            ack_code = 0
+        except Exception as e:
+            logger.error(f"KV transfer failed: {e}")
+            ack_code = 1
+
         # send ack to remote addr
         self.send_to_pd_disagg_controller.send_pyobj(
-            KVTransferAck(None, req.dst_addr, req.dst_rank, 0))
-        
+            KVTransferAck(None, req.dst_addr, req.dst_rank, ack_code))
+
+        if ack_code != 0:
+            return
+
         # free buffer
         self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash] += 1
         if self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash] == req.fetch_ct:
-            self._free_transfer_kv_buffer(self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash], self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash])
+            self._free_transfer_kv_buffer(
+                self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash], self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash])
             for rid in req.rids:
                 del self.kv_buffer[rid]
             del self.handle_kv_cache_buffer_ptr[req.fetch_batch_req_hash]
             del self.handle_kv_cache_fetch_ct[req.fetch_batch_req_hash]
             del self.handle_kv_cache_buffer_length[req.fetch_batch_req_hash]
+
     def _allocate_transfer_kv_buffer(self, length: int) -> int:
         return self.engine.allocate_managed_buffer(length)
 

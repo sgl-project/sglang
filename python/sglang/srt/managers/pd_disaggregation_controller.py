@@ -1,6 +1,7 @@
 import zmq
 from typing import Union
 import asyncio
+import logging
 
 from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import get_zmq_socket
@@ -11,6 +12,8 @@ from sglang.srt.managers.io_struct import (
 )
 
 from sglang.srt.managers.io_struct import PrefilledReqInput, KVTransferFetch, KVTransferAck, AbortReq, KVTransferFetchBatch
+
+logger = logging.getLogger(__name__)
 
 PD_DISAGGREGATION_PORT = 17000
 
@@ -53,6 +56,7 @@ class PDDisaggregationController:
     async def _handle_request_loop(self):
         while True:
             recv_obj = self.recv_from_transfer_agent.recv_pyobj()
+            logger.info(f"Received request: {recv_obj}")
             self._request_dispatcher(recv_obj)
 
     def _handle_kv_transfer_req(self, req: KVTransferFetch):
