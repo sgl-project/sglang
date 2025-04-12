@@ -1890,15 +1890,15 @@ class DisposibleTensor:
 
     @property
     def shape(self):
-        return TODO
+        return self._get_metadata("shape")
 
     @property
     def device(self):
-        return TODO
+        return self._get_metadata("device")
 
     @property
     def dtype(self):
-        return TODO
+        return self._get_metadata("dtype")
 
     def _get_metadata(self, name: str):
         if not self.is_disposed:
