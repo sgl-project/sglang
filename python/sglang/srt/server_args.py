@@ -195,6 +195,13 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
 
+    # only used by decode instance
+    disaggregation_prefill_bootstrap_addr: str = ''
+
+
+    # only used by prefill instance
+    disaggregation_decode_instance_num: int = 0
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -373,11 +380,37 @@ class ServerArgs:
 
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
+            assert self.disable_cuda_graph == True
+            assert self.disable_overlap_schedule == True
+            assert self.disaggregation_decode_instance_num > 0
+            assert self.disaggregation_prefill_bootstrap_addr == ''
+            # assert self.disagg_decode_peers != []
+
+            # self.disagg_decode_addr_list = self.disagg_decode_peers.split(",")
+            # for peer in self.disagg_decode_addr_list:
+            #     # make sure host:port
+            #     assert ":" in peer, f"Invalid peer {peer} in disagg_decode_peers"
+            #     assert is_valid_ipv6_address(peer.split(":")[0]), f"Invalid peer {peer} in disagg_decode_peers"
+            #     assert is_port_available(peer.split(":")[1]), f"Invalid peer {peer} in disagg_decode_peers"
+
             self.disable_cuda_graph = True
             logger.warning("KV cache is forced as chunk cache for decode server")
             self.disable_overlap_schedule = True
             logger.warning("Overlap scheduler is disabled for prefill server")
+
         elif self.disaggregation_mode == "decode":
+            assert self.disable_radix_cache == True
+            assert self.disable_overlap_schedule == True
+            assert self.disaggregation_prefill_bootstrap_addr != ''
+
+            self.disaggregation_prefill_host_list:list [str] = []
+            self.disaggregation_prefill_tpworker0_bootstrap_port_list: list[str] = []
+            for peer in self.disaggregation_prefill_bootstrap_addr.split(","):
+                # make sure host:port
+                assert ":" in peer, f"Invalid peer {peer} in disagg_prefill_peers"
+                self.disaggregation_prefill_host_list.append(peer.split(":")[0])
+                self.disaggregation_prefill_tpworker0_bootstrap_port_list.append(str(peer.split(":")[1]))
+
             self.disable_radix_cache = True
             logger.warning("Cuda graph is disabled for prefill server")
             self.disable_overlap_schedule = True
@@ -1157,7 +1190,19 @@ class ServerArgs:
             "--disaggregation-bootstrap-port",
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
-            help="Bootstrap server port on the prefill server. Default is 8998.",
+            help="For prefill only. Bootstrap port and memdesc collector port on the prefill server rank 0 TP worker. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-bootstrap-addr",
+            type=str,
+            default=ServerArgs.disaggregation_prefill_bootstrap_addr,
+            help="For decode only. List of peer addresses for disaggregation. This is a comma-separated list of host:tp0_bootstrap_port pairs.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-instance-num",
+            type=int,
+            default=ServerArgs.disaggregation_decode_instance_num,
+            help="For prefill only. The number of decode instances to use for disaggregation.",
         )
 
     @classmethod

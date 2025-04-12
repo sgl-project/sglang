@@ -84,7 +84,8 @@ class GenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregation
-    bootstrap_host: str = "0.0.0.0"
+    prefill_host: Optional[str] = None
+    prefill_tpworker0_bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
@@ -305,7 +306,8 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
 
     # For disaggregation
-    bootstrap_host: str = "0.0.0.0"
+    prefill_host: Optional[str] = None
+    prefill_tpworker0_bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 

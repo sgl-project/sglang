@@ -564,7 +564,7 @@ class Scheduler(
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                server_args=self.server_args
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
 
@@ -583,6 +583,8 @@ class Scheduler(
             )
             metadata_buffers = [output_id_buffer]
 
+            assert self.token_to_kv_pool_allocator
+            
             self.disagg_prefill_pending_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
@@ -590,7 +592,7 @@ class Scheduler(
                 aux_dtype=aux_dtype,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                server_args=self.server_args,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
             )
             # The prefill requests that are in the middle of kv sending
@@ -799,7 +801,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        logger.info(f"[NIXL PD disagg] handle_generate_request recv_req.bootstrap_host: {recv_req.bootstrap_host}, recv_req.bootstrap_room: {recv_req.bootstrap_room}")
+        logger.info(f"[NIXL PD disagg] handle_generate_request recv_req.prefill_host:tp0_port: {recv_req.prefill_host}:{recv_req.prefill_tpworker0_bootstrap_port}, recv_req.bootstrap_room: {recv_req.bootstrap_room}")
         # Create a new request
         if (
             recv_req.session_params is None
@@ -841,7 +843,8 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.tokenizer = self.tokenizer
-            req.bootstrap_host = recv_req.bootstrap_host
+            req.prefill_host = recv_req.prefill_host
+            req.prefill_tpworker0_bootstrap_port = recv_req.prefill_tpworker0_bootstrap_port
             req.bootstrap_room = recv_req.bootstrap_room
 
             if (

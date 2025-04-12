@@ -360,7 +360,9 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
-    bootstrap_host: str = "0.0.0.0"
+
+    prefill_host: Optional[str] = None
+    prefill_tpworker0_bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
 

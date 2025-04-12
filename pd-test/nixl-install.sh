@@ -44,7 +44,7 @@ rm -rf nixl
 git clone https://github.com/jokerwyt/nixl
 cd nixl
 git checkout 250409/wyt-debug
-./build.sh # NOTE check ucx path inside!
+bash ./build.sh # NOTE check ucx path inside!
 
 popd
 

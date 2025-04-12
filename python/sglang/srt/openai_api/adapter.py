@@ -1110,11 +1110,16 @@ def v1_chat_generate_request(
     )
 
 
-    if hasattr(all_requests[0], "bootstrap_room"):
+    # For PD disagg
+    if all_requests[0].prefill_host:
+        adapted_request.prefill_host = all_requests[0].prefill_host
+
+    if all_requests[0].prefill_tpworker0_bootstrap_port:
+        adapted_request.prefill_tpworker0_bootstrap_port = all_requests[0].prefill_tpworker0_bootstrap_port
+
+    if all_requests[0].bootstrap_room:
         adapted_request.bootstrap_room = all_requests[0].bootstrap_room
 
-    if hasattr(all_requests[0], "bootstrap_host"):
-        adapted_request.bootstrap_host = all_requests[0].bootstrap_host
 
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]

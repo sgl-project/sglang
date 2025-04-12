@@ -490,7 +490,8 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
+        self.prefill_host: Optional[str] =  None
+        self.prefill_tpworker0_bootstrap_port: Optional[int] = None
         self.bootstrap_room: Optional[int] = None
         self.disagg_kv_sender: Optional[KVSender] = None
 

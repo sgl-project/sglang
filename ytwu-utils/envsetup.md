@@ -6,7 +6,7 @@ apt update
 apt install -y openssh-server
 echo -e "PermitRootLogin yes\nPasswordAuthentication yes\nPort 2222" | tee -a /etc/ssh/sshd_config > /dev/null
 service ssh restart
-echo "root:914554688wyt" | chpasswd
+echo "root:123456wyt" | chpasswd
 
 ssh-keygen
 ssh-copy-id -p 2222 127.0.0.1

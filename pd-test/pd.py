@@ -17,17 +17,18 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 
-PREFILL_ADDR = "127.0.0.1"
+PREFILL_HOST = "127.0.0.1"
 # PREFILL_INIT_PORT = "20000"
 PREFILL_SSH_PORT = "2222"
 PREFILL_SERVE_PORT = "8080"
+PREFILL_BOOTSTRAP_PORT = "9500"
 
-DECODE_ADDR = "127.0.0.1"
+DECODE_HOST = "127.0.0.1"
 # DECODE_INIT_PORT = "20000"
 DECODE_SSH_PORT = "2222"
 DECODE_SERVE_PORT = "8090"
 
-LB_ADDR = "127.0.0.1"
+LB_HOST = "127.0.0.1"
 LB_SERVE_PORT = "8100"
 
 EXTRA_SSH_ARGS = "" # "-i ~/ytwu/.ssh/id_ed25519"
@@ -51,7 +52,9 @@ SGLANG_COMMON_ARGS = [
   "--mem-fraction-static", "0.70",
   "--disable-overlap-schedule",
   "--chunked-prefill-size 32768",
-  "--allow-auto-truncate" if MODEL == 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B' else ''
+  "--allow-auto-truncate" if MODEL == 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B' else '',
+
+  "--disable-cuda-graph" # For PD.
 ]
 
 # in future we will have multiple nodes in P or D instances.
@@ -60,16 +63,19 @@ SGLANG_COMMON_ARGS = [
 # "--nnodes", "2",
 
 PREFILL_ARGS = [
-  "--tp 1",
+  "--tp 2",
   "--nnodes 1",
   "--disaggregation-mode prefill",
+  f"--disaggregation-bootstrap-port {PREFILL_BOOTSTRAP_PORT}",
+  "--disaggregation-decode-instance-num 1",
   "--port", f"{PREFILL_SERVE_PORT}",
 ]
 
 DECODE_ARGS = [
-  "--tp 1",
+  "--tp 2",
   "--nnodes 1",
   "--disaggregation-mode decode",
+  f"--disaggregation-prefill-bootstrap-addr {PREFILL_HOST}:{PREFILL_BOOTSTRAP_PORT}",
   "--port", f"{DECODE_SERVE_PORT}",
 ]
 
@@ -85,8 +91,8 @@ bench_output_log = open(BENCH_OUTPUT_LOG, 'w')
 lb_output_log = open(LB_OUTPUT_LOG, 'w')
 
 remotes = [
-  (PREFILL_ADDR, PREFILL_SSH_PORT, prefill_output_log),
-  (DECODE_ADDR, DECODE_SSH_PORT, decode_output_log),
+  (PREFILL_HOST, PREFILL_SSH_PORT, prefill_output_log),
+  (DECODE_HOST, DECODE_SSH_PORT, decode_output_log),
 ]
 
 
@@ -150,39 +156,41 @@ def do_exp():
 
     # setup sglang servers.
     sglang_prefill_args = SGLANG_COMMON_ARGS.copy() + PREFILL_ARGS.copy() + [
-      "--max-running-requests 1"
+      "--max-running-requests", f"{bsz}",
     ]
     sglang_decode_args = SGLANG_COMMON_ARGS.copy() + DECODE_ARGS.copy() + [
       "--max-running-requests", f"{bsz}",
     ]
 
     prefill_env = [
-      "CUDA_VISIBLE_DEVICES=0",
+      "CUDA_VISIBLE_DEVICES=0,1",
       "UCX_TLS=tcp,cuda",
       f"UCX_NET_DEVICES={NETDEVICE}",
       "UCX_LOG_LEVEL=info",
+      # "NCCL_DEBUG=INFO",
     ]
 
     decode_env = [
-      "CUDA_VISIBLE_DEVICES=1",
+      "CUDA_VISIBLE_DEVICES=4,5",
       "UCX_TLS=tcp,cuda",
       f"UCX_NET_DEVICES={NETDEVICE}",
       "UCX_LOG_LEVEL=info",
+      # "NCCL_DEBUG=INFO",
     ]
 
-    prefillServer = runCommand([f"{' '.join(prefill_env)} python3 -m sglang.launch_server"] + sglang_prefill_args, (PREFILL_ADDR, PREFILL_SSH_PORT), prefill_output_log)
-    decodeServer = runCommand([f"{' '.join(decode_env)} python3 -m sglang.launch_server"] + sglang_decode_args, (DECODE_ADDR, DECODE_SSH_PORT), decode_output_log)
+    prefillServer = runCommand([f"{' '.join(prefill_env)} python3 -m sglang.launch_server"] + sglang_prefill_args, (PREFILL_HOST, PREFILL_SSH_PORT), prefill_output_log)
+    decodeServer = runCommand([f"{' '.join(decode_env)} python3 -m sglang.launch_server"] + sglang_decode_args, (DECODE_HOST, DECODE_SSH_PORT), decode_output_log)
 
-    wait_server(PREFILL_ADDR, PREFILL_SERVE_PORT)
-    wait_server(DECODE_ADDR, DECODE_SERVE_PORT)
+    wait_server(PREFILL_HOST, PREFILL_SERVE_PORT)
+    wait_server(DECODE_HOST, DECODE_SERVE_PORT)
 
     logger.info("All PD servers are ready! Wait some seconds to let the server warm up.")
     time.sleep(10)
 
     lb = runCommand([
       "python3 -m sglang.srt.disaggregation.mini_lb",
-      "--prefill", f"http://{PREFILL_ADDR}:{PREFILL_SERVE_PORT}",
-      "--decode", f"http://{DECODE_ADDR}:{DECODE_SERVE_PORT}",
+      "--prefill", f"http://{PREFILL_HOST}:{PREFILL_SERVE_PORT}:{PREFILL_BOOTSTRAP_PORT}",
+      "--decode", f"http://{DECODE_HOST}:{DECODE_SERVE_PORT}",
       "--host 0.0.0.0", 
       "--port", f"{LB_SERVE_PORT}", 
     ], outputStream=lb_output_log)
@@ -192,14 +200,14 @@ def do_exp():
 
     BENCHMARK_ARGS = [
       "--model", "default",
-      "--host", f"{LB_ADDR}",
+      "--host", f"{LB_HOST}",
       "--port", f"{LB_SERVE_PORT}",
       "--endpoint", "/v1/chat/completions",
       "--dataset-name", "jsonl",
       "--num-prompts", f"{ bsz * 2 }", 
       # "--dataset-path", "/sgl-workspace/upload/dataset/qa_out_0216_r1_300_max_25k_formatted.jsonl",
-      # "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
-      "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
+      "--dataset-path", "/sgl-workspace/upload/dataset/easy.jsonl",
+      # "--dataset-path", "/sgl-workspace/upload/dataset/long-easy.jsonl",
       "--max-concurrency", f"{ bsz }",
       "--backend", f"openai-chat",
       "--tokenizer", f"{MODEL}",

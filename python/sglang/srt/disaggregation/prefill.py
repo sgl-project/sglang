@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVSender
 from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
@@ -53,7 +54,7 @@ class PrefillBootstrapQueue:
         aux_dtype: torch.dtype,
         tp_rank: int,
         tp_size: int,
-        bootstrap_port: int,
+        server_args: ServerArgs, 
         gloo_group: ProcessGroup,
     ):
         self.token_to_kv_pool = token_to_kv_pool
@@ -63,10 +64,11 @@ class PrefillBootstrapQueue:
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.kv_manager = self._init_kv_manager()
+        self.server_args = server_args
+        self.bootstrap_port = server_args.disaggregation_bootstrap_port + tp_rank
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
-        self.bootstrap_port = bootstrap_port
+        self.kv_manager = self._init_kv_manager()
 
     def allocate_token_id(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
@@ -95,14 +97,15 @@ class PrefillBootstrapQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock"
-        kv_manager = KVManager(kv_args, mode="prefill")
+        kv_manager = KVManager(kv_args, "prefill", bootstrap_port = self.bootstrap_port, decode_instance_number=self.server_args.disaggregation_decode_instance_num)
         return kv_manager
 
     def add(self, req: Req) -> None:
-        logger.info(f"[NIXL PD disagg] Bqueue enqueue. bootstrap_host: {req.bootstrap_host}, bootstrap_room: {req.bootstrap_room}")
+        assert req.bootstrap_room
+
+        logger.info(f"[NIXL PD disagg] Bqueue enqueue. prefill_host: {req.prefill_host}, bootstrap_room: {req.bootstrap_room}")
         req.disagg_kv_sender = KVSender(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            mgr=self.kv_manager, 
             bootstrap_room=req.bootstrap_room,
         )
         self._process_req(req)
@@ -143,6 +146,7 @@ class PrefillBootstrapQueue:
                 break
             req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert req.metadata_buffer_index is not None
+            assert req.disagg_kv_sender
             req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -162,14 +166,14 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     def process_batch_result_disagg_prefill(
-        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult # type: ignore
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         Adapted from process_batch_result_prefill
         """
 
-        next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = result.next_token_ids.tolist() # type: ignore
 
         for req, next_token_id in zip(batch.reqs, next_token_ids, strict=True):
             req: Req
@@ -188,9 +192,10 @@ class SchedulerDisaggregationPrefillMixin:
             batch.next_batch_sampling_info.update_regex_vocab_mask()
             # We need to remove this for overlap schedule.
             self.current_stream.synchronize()
+            assert batch.next_batch_sampling_info.sampling_info_done
             batch.next_batch_sampling_info.sampling_info_done.set()
 
-    def process_disagg_prefill_infight_queue(self: Scheduler) -> None:
+    def process_disagg_prefill_infight_queue(self: Scheduler) -> None: # type: ignore
         """
         Poll the requests in the middle of transfer. If done, return the request.
         """
@@ -226,7 +231,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.disagg_prefill_infight_queue = undone_reqs
 
-    def process_prefill_chunk(self: Scheduler) -> None:
+    def process_prefill_chunk(self: Scheduler) -> None: # type: ignore
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.chunked_req:
                 # Move the chunked request out of the batch so that we can merge
@@ -235,11 +240,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_unfinished_req(self.chunked_req)
                 self.send_kv_chunk(self.chunked_req)
                 # chunked request keeps its rid but will get a new req_pool_idx
+                assert self.req_to_token_pool
+                assert self.chunked_req.req_pool_idx
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
-        self: Scheduler, req: Req, token_id: Optional[int] = None
+        self: Scheduler, req: Req, token_id: Optional[int] = None # type: ignore
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -247,7 +254,9 @@ class SchedulerDisaggregationPrefillMixin:
         token_id is the first output token.
         """
         start_idx = req.start_send_idx
-        end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+        end_idx = min(len(req.fill_ids), len(req.origin_input_ids)) # type: ignore
+        assert self.req_to_token_pool is not None
+        assert self.req_to_token_pool.req_to_token is not None
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx][start_idx:end_idx]
             .cpu()
@@ -259,4 +268,5 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index, token_id
             )
         logger.info(f"[NIXL PD disagg] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
+        assert req.disagg_kv_sender
         req.disagg_kv_sender.send(kv_indices)

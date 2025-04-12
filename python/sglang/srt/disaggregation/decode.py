@@ -72,7 +72,7 @@ class DecodePreallocQueue:
         gloo_group: ProcessGroup,
         tp_rank: int,
         tp_size: int,
-        bootstrap_port: int,
+        server_args: ServerArgs,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -86,7 +86,7 @@ class DecodePreallocQueue:
         self.gloo_group = gloo_group
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.bootstrap_port = bootstrap_port
+        self.server_args  = server_args
 
         self.num_reserved_decode_tokens = 512
 
@@ -115,15 +115,21 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock"
-        kv_manager = KVManager(kv_args, mode="decode")
+        kv_manager = KVManager(kv_args, mode="decode", prefill_bootstrap_addrs=[
+            f'{peer_host}:{int(peer_tp0_bst_port) + self.tp_rank}'
+            for peer_host, peer_tp0_bst_port in zip(
+                self.server_args.disaggregation_prefill_host_list, 
+                self.server_args.disaggregation_prefill_tpworker0_bootstrap_port_list
+            )
+        ])
         return kv_manager
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-
+        assert req.prefill_tpworker0_bootstrap_port
         kv_receiver = KVReceiver(
             mgr=self.kv_manager,
-            memdesc_collector_addr=f"127.0.0.1:9000", #TODO(wyt) currently for 1p1d, we fix it.
+            memdesc_collector_addr=f'{req.prefill_host}:{req.prefill_tpworker0_bootstrap_port + self.tp_rank}',
             bootstrap_room=req.bootstrap_room,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))

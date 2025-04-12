@@ -25,74 +25,75 @@ class MiniLoadBalancer:
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
 
     async def notstream_generate_request(self, request_data):
-        prefill_server, decode_server = self.select_pair()
+        raise NotImplementedError()
+        # prefill_server, decode_server = self.select_pair()
 
-        # Parse and transform prefill_server
-        parsed_url = urllib.parse.urlparse(prefill_server)
-        hostname = parsed_url.hostname
-        bootstrap_host = f"{hostname}"
+        # # Parse and transform prefill_server
+        # parsed_url = urllib.parse.urlparse(prefill_server)
+        # hostname = parsed_url.hostname
+        # bootstrap_addr = f"{hostname}"
 
-        modified_request = request_data.copy()
+        # modified_request = request_data.copy()
 
-        global cnt 
-        cnt += 1
-        modified_request.update(
-            {
-                "bootstrap_host": bootstrap_host,
-                "bootstrap_room": cnt
-            }
-        )
+        # global cnt 
+        # cnt += 1
+        # modified_request.update(
+        #     {
+        #         "bootstrap_addr": bootstrap_addr,
+        #         "bootstrap_room": cnt
+        #     }
+        # )
 
-        async with aiohttp.ClientSession() as session:
-            # Create the tasks
-            tasks = [
-                session.post(f"{prefill_server}/v1/chat/completions", json=modified_request),
-                session.post(f"{decode_server}/v1/chat/completions", json=modified_request),
-            ]
+        # async with aiohttp.ClientSession() as session:
+        #     # Create the tasks
+        #     tasks = [
+        #         session.post(f"{prefill_server}/v1/chat/completions", json=modified_request),
+        #         session.post(f"{decode_server}/v1/chat/completions", json=modified_request),
+        #     ]
 
-            prefill_response = None
-            decode_response = None
+        #     prefill_response = None
+        #     decode_response = None
 
-            # Process responses as they arrive
-            for i, response in enumerate(asyncio.as_completed(tasks)):
-                response = await response
-                # Check if this is the prefill or decode response based on order created
-                if i == 0:  # First completed task
-                    if str(response.url).startswith(prefill_server):
-                        prefill_response = response
-                        if response.status != 200:
-                            raise HTTPException(
-                                status_code=response.status,
-                                detail=f"Prefill server error: Status {response.status} Details: {await response.text()}",
-                            )
-                    else:
-                        decode_response = response
-                        if response.status != 200:
-                            raise HTTPException(
-                                status_code=response.status,
-                                detail=f"Decode server error: Status {response.status} Details: {await response.text()}",
-                            )
-                else:  # Second completed task
-                    if str(response.url).startswith(prefill_server):
-                        prefill_response = response
-                    else:
-                        decode_response = response
+        #     # Process responses as they arrive
+        #     for i, response in enumerate(asyncio.as_completed(tasks)):
+        #         response = await response
+        #         # Check if this is the prefill or decode response based on order created
+        #         if i == 0:  # First completed task
+        #             if str(response.url).startswith(prefill_server):
+        #                 prefill_response = response
+        #                 if response.status != 200:
+        #                     raise HTTPException(
+        #                         status_code=response.status,
+        #                         detail=f"Prefill server error: Status {response.status} Details: {await response.text()}",
+        #                     )
+        #             else:
+        #                 decode_response = response
+        #                 if response.status != 200:
+        #                     raise HTTPException(
+        #                         status_code=response.status,
+        #                         detail=f"Decode server error: Status {response.status} Details: {await response.text()}",
+        #                     )
+        #         else:  # Second completed task
+        #             if str(response.url).startswith(prefill_server):
+        #                 prefill_response = response
+        #             else:
+        #                 decode_response = response
 
-                    if response.status != 200:
-                        raise HTTPException(
-                            status_code=response.status,
-                            detail=f"{'Prefill' if str(response.url).startswith(prefill_server) else 'Decode'} server error: Status {response.status} Details: {await response.text()}",
-                        )
+        #             if response.status != 200:
+        #                 raise HTTPException(
+        #                     status_code=response.status,
+        #                     detail=f"{'Prefill' if str(response.url).startswith(prefill_server) else 'Decode'} server error: Status {response.status} Details: {await response.text()}",
+        #                 )
 
-            return await decode_response.json()
+        #     return await decode_response.json()
 
 
 app = FastAPI()
-load_balancer = None
+load_balancer: MiniLoadBalancer = None # type: ignore
 
 
 @app.get("/health")
-async def health_check():
+async def health_check_simple():
     return Response(status_code=200)
 
 
@@ -163,8 +164,14 @@ async def get_model_info():
 async def handle_generate_request(request_data: dict):
     prefill_server, decode_server = load_balancer.select_pair()
 
+    # prefill_server format:
+    # <host_ip>:<server_port>:<tpworker0_bootstrap_port>
+
+    tpworker0_bootstrap_port = prefill_server.split(":")[-1]
+    prefill_server = ":".join(prefill_server.split(":")[:-1])
+
     # Parse and transform prefill_server for bootstrap data
-    parsed_url = urllib.parse.urlparse(prefill_server)
+    parsed_url = urllib.parse.urlparse(prefill_server) # type: ignore
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
 
@@ -173,7 +180,8 @@ async def handle_generate_request(request_data: dict):
 
     modified_request.update(
         {
-            "bootstrap_host": hostname,
+            "prefill_host": hostname,
+            "prefill_tpworker0_bootstrap_port": tpworker0_bootstrap_port, 
             "bootstrap_room": cnt,
         }
     )
@@ -232,7 +240,7 @@ async def handle_generate_request(request_data: dict):
                                 return
 
                     # Stream successful decode server response
-                    async for line in decode_response.content:
+                    async for line in decode_response.content: # type: ignore
                         yield line
                     yield b"data: [DONE]\n\n"
 
@@ -250,8 +258,9 @@ async def handle_generate_request(request_data: dict):
         )
 
     # Non-streaming case
-    result = await load_balancer.notstream_generate_request(modified_request)
-    return ORJSONResponse(content=result)
+    raise NotImplementedError()
+    # result = await load_balancer.notstream_generate_request(modified_request)
+    # return ORJSONResponse(content=result)
 
 
 @app.get("/v1/models")
@@ -281,7 +290,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
     parser.add_argument(
-        "--prefill", required=True, help="Comma-separated URLs for prefill servers"
+        "--prefill", required=True, help="Comma-separated URLs for prefill servers. <hostip>:<server_port>:<tpworker0_bootstrap_port>,..."
     )
     parser.add_argument(
         "--decode", required=True, help="Comma-separated URLs for decode servers"
@@ -293,4 +302,9 @@ if __name__ == "__main__":
         "--port", type=int, default=8000, help="Port to bind the server (default: 8000)"
     )
     args = parser.parse_args()
+
+    for addr in args.prefill.split(","):
+        if len(addr.split(":")) != 4:
+            raise ValueError(f"Invalid prefill server address: {addr}. Expected format: http://<hostip>:<server_port>:<tpworker0_bootstrap_port>")
+
     run(args.prefill.split(","), args.decode.split(","), args.host, args.port)

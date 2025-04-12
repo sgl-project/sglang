@@ -457,7 +457,8 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
-                bootstrap_host=obj.bootstrap_host,
+                prefill_host=obj.prefill_host,
+                prefill_tpworker0_bootstrap_port=obj.prefill_tpworker0_bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
             )
         elif isinstance(obj, EmbeddingReqInput):
