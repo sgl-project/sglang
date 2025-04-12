@@ -64,7 +64,10 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.patch_torch import (
+    monkey_patch_torch_compile,
+    monkey_patch_torch_reductions,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -87,6 +90,8 @@ logger = logging.getLogger(__name__)
 
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
+
+monkey_patch_torch_compile()
 
 
 class ModelRunner:
@@ -277,7 +282,6 @@ class ModelRunner:
                 f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"because this is a multimodal model."
             )
-
             logger.info(
                 "Automatically turn off --chunked-prefill-size for multimodal model."
             )
@@ -925,6 +929,12 @@ class ModelRunner:
             return
 
         if self.server_args.disable_cuda_graph:
+            logger.warning(
+                "\n\nCUDA Graph is DISABLED.\n"
+                "This will cause significant performance degradation.\n"
+                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
+                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
+            )
             return
 
         tic = time.time()
@@ -1061,7 +1071,8 @@ class ModelRunner:
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
-        return rope_scaling.get("type", None) == "mrope"
+        is_mrope_enabled = "mrope_section" in rope_scaling
+        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
