@@ -1333,6 +1333,7 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         self.forward_metadata = metadata
+        self.forward_metadata_spec_decode_expand = metadata_expand
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -1567,6 +1568,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
 
         self.forward_metadata = metadata
+        self.forward_metadata_spec_decode_expand = metadata_expand
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
