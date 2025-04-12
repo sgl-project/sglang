@@ -932,9 +932,6 @@ class DeepEPMoE(EPMoE):
         else:
             gateup_output = gateup_output_creator.create()
 
-        # NOTE disposed earlier
-        # hidden_states.dispose()
-
         # Act
         down_input = torch.empty(
             gateup_output.shape[0],
