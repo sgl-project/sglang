@@ -273,6 +273,16 @@ class ModelRunner:
             else:
                 raise ValueError(f"MLA optimization not supported on CPU.")
 
+        if (
+            server_args.attention_backend == "fa3"
+            and server_args.kv_cache_dtype == "fp8_e5m2"
+        ):
+            logger.warning(
+                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
+                "Setting attention backend to triton."
+            )
+            server_args.attention_backend = "triton"
+
         if server_args.enable_double_sparsity:
             logger.info(
                 "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
