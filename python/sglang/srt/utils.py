@@ -1890,6 +1890,11 @@ class DisposibleTensor:
             return value.value
         return value
 
+    @staticmethod
+    def maybe_dispose(value: "MaybeDisposibleTensor") -> torch.Tensor:
+        if isinstance(value, DisposibleTensor):
+            value.dispose()
+
     @property
     def shape(self):
         return self._get_metadata("shape")
