@@ -301,12 +301,15 @@ class _DetailAccumulator(_Accumulator):
         single_pass_physical_count: torch.Tensor,
     ):
         single_pass_physical_count = single_pass_physical_count.to("cpu")
+        if self._save_dir is None:
+            single_pass_physical_count = single_pass_physical_count.tolist()
+
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                physical_count=single_pass_physical_count.tolist(),
+                physical_count=single_pass_physical_count,
             )
         )
 
