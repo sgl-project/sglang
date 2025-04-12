@@ -300,6 +300,7 @@ class _DetailAccumulator(_Accumulator):
         gatherer_key: str,
         single_pass_physical_count: torch.Tensor,
     ):
+        single_pass_physical_count = single_pass_physical_count.to("cpu")
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
