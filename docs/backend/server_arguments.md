@@ -45,7 +45,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 Please consult the documentation below to learn more about the parameters you may provide when launching a server.
 
 
-## Model and tokenizer
+## Model, processor and  tokenizer
 
 * `model_path`: Path to the model that will be served.
 * `tokenizer_path`: Defaults to the `model_path`.
@@ -62,6 +62,7 @@ Please consult the documentation below to learn more about the parameters you ma
 * `skip_tokenizer_init`: Set to true to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. Please see this [example for reference](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/).
 * `json_model_override_args`: Override model config with the provided JSON.
 * `delete_ckpt_after_loading`: Delete the model checkpoint after loading the model.
+* `disable_fast_image_processor`: Adopt base image processor instead of fast image processor(which is by default). For more detail, see: https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor
 
 
 ## Serving: HTTP & API
