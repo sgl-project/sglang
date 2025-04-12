@@ -1874,8 +1874,10 @@ class DisposibleTensor:
         assert not self.is_disposed
         return self._value
 
-    def dispose(self, backup_metadata: bool):
+    def dispose(self, backup_metadata: bool = True):
         assert not self.is_disposed
+        if backup_metadata:
+            TODO
         self._value = None
 
     @property
