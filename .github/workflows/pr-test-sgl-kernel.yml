@@ -30,14 +30,19 @@ jobs:
           clangFormatVersion: 18
           style: file
 
-  build-wheel-cu124:
+  build-wheels:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: sgl-kernel-build-node
     strategy:
       matrix:
-        python-version: ['3.9']
-        cuda-version: ['12.4']
-
+        include:
+          - python-version: '3.9'
+            cuda-version: '11.8'
+          - python-version: '3.9'
+            cuda-version: '12.4'
+          - python-version: '3.9'
+            cuda-version: '12.8'
+    name: Build Wheel (CUDA ${{ matrix.cuda-version }})
     steps:
       - name: Cleanup
         run: |
@@ -52,78 +57,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Build wheels for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (only for CUDA 12.4)
+        if: ${{ matrix.cuda-version == '12.4' }}
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
           path: sgl-kernel/dist/*
 
-  build-wheel-cu118:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: sgl-kernel-build-node
-    strategy:
-      matrix:
-        python-version: ['3.9']
-        cuda-version: ['11.8']
-
-    steps:
-      - name: Cleanup
-        run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        run: |
-          cd sgl-kernel
-          chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
-
-  build-wheel-cu128:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: sgl-kernel-build-node
-    strategy:
-      matrix:
-        python-version: ['3.9']
-        cuda-version: ['12.8']
-
-    steps:
-      - name: Cleanup
-        run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        run: |
-          cd sgl-kernel
-          chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
-
-
   unit-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheel-cu124
+    needs: build-wheels
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -155,7 +104,7 @@ jobs:
 
   mla-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheel-cu124
+    needs: build-wheels
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +134,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test, mla-test, lint, build-wheel-cu118, build-wheel-cu128]
+    needs: [unit-test, mla-test, lint, build-wheels]
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
