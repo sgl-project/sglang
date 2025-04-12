@@ -102,7 +102,6 @@ def simulate_execution(
     server_args: MyServerArgs,
 ):
     model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
-    num_physical_expert = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
 
     logical_count_of_batch = simulate_batching(
         logical_count_of_seq=logical_count_of_seq,
@@ -111,6 +110,7 @@ def simulate_execution(
     # print(f"hi {logical_count_of_batch=}")
 
     if server_args.enable_expert_location_by_eplb:
+        num_physical_expert = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
             server_args,
             logical_count=einops.einsum(logical_count_of_seq, "num_seq num_layer num_expert -> num_layer num_expert"),
