@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     DeepEPMode,
     DisposibleTensor,
+    MaybeDisposibleTensor,
     TensorCreator,
     is_cuda,
     is_hip,
@@ -874,7 +875,7 @@ class DeepEPMoE(EPMoE):
 
     def forward_normal(
         self,
-        hidden_states: DisposibleTensor,
+        hidden_states: MaybeDisposibleTensor,
         reorder_topk_ids: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
@@ -882,16 +883,12 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.value.device, use_flashinfer=False  # TODO: use flashinfer
+                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
-
-        hidden_states_device = hidden_states.value.device
-        hidden_states_shape = hidden_states.value.shape
-        hidden_states_dtype = hidden_states.value.dtype
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
             max_value = (
-                torch.max(hidden_states.value)
+                torch.max(DisposibleTensor.maybe_unwrap(hidden_states))
                 .repeat(self.num_experts_per_partition)
                 .to(torch.float32)
             )
@@ -899,21 +896,21 @@ class DeepEPMoE(EPMoE):
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
-            device=hidden_states_device,
+            device=hidden_states.device,
             dtype=torch.int64,
         )
 
         # GroupGemm-0
         gateup_output_creator = TensorCreator(
             lambda: torch.empty(
-                hidden_states_shape[0],
+                hidden_states.shape[0],
                 self.w13_weight.shape[1],
-                device=hidden_states_device,
-                dtype=hidden_states_dtype,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
         )
 
-        if hidden_states.value.shape[0] > 0:
+        if hidden_states.shape[0] > 0:
             gateup_output = self.grouped_gemm_runner(
                 # NOTE pass in box
                 a=hidden_states,
@@ -946,14 +943,14 @@ class DeepEPMoE(EPMoE):
             dtype=(
                 self.fp8_dtype
                 if (self.use_fp8_w8a8 and not self.use_block_quant)
-                else hidden_states_dtype
+                else hidden_states.dtype
             ),
         )
         if self.w2_input_scale is None and not self.use_block_quant:
             self.w2_input_scale = torch.ones(
                 self.num_experts_per_partition,
                 dtype=torch.float32,
-                device=hidden_states_device,
+                device=hidden_states.device,
             )
 
         if self.activation == "silu":
@@ -976,8 +973,8 @@ class DeepEPMoE(EPMoE):
         down_output = torch.empty(
             down_input.shape[0],
             self.w2_weight.shape[1],
-            device=hidden_states_device,
-            dtype=hidden_states_dtype,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         if down_input.shape[0] > 0:
             down_output = self.grouped_gemm_runner(
