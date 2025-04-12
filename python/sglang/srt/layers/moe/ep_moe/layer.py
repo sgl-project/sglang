@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     DeepEPMode,
     DisposibleTensor,
+    TensorCreator,
     is_cuda,
     is_hip,
     set_weight_attrs,
@@ -903,11 +904,13 @@ class DeepEPMoE(EPMoE):
         )
 
         # GroupGemm-0
-        gateup_output_creator = lambda: torch.empty(
-            hidden_states_shape[0],
-            self.w13_weight.shape[1],
-            device=hidden_states_device,
-            dtype=hidden_states_dtype,
+        gateup_output_creator = TensorCreator(
+            lambda: torch.empty(
+                hidden_states_shape[0],
+                self.w13_weight.shape[1],
+                device=hidden_states_device,
+                dtype=hidden_states_dtype,
+            )
         )
 
         if hidden_states.value.shape[0] > 0:
@@ -930,7 +933,7 @@ class DeepEPMoE(EPMoE):
                 block_shape=self.block_shape,
             )
         else:
-            gateup_output = gateup_output_creator()
+            gateup_output = gateup_output_creator.create()
 
         # NOTE disposed earlier
         # hidden_states.dispose()
