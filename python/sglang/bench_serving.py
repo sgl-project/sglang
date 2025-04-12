@@ -665,7 +665,7 @@ def sample_sharegpt_requests(
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
         )
 
-        if prompt_len < 2 or output_len < 2:
+        if prompt_len < 2 or ((fixed_output_len is None) and (output_len < 2)):
             # Prune too short sequences.
             continue
 
