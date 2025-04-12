@@ -1565,7 +1565,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable-expert-distribution-record",
         action="store_true",
-        help="Enable expert distribution recorder",
+        help="Enable expert distribution recording",
     )
     parser.add_argument(
         "--lora-name",
