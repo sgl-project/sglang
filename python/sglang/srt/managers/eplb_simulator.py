@@ -72,10 +72,10 @@ def read_physical_count_of_forward_pass(dir_data: Path):
         ], dim=-1)
         items.append(physical_count_of_rank_tensor)
 
-    logical_count_of_seq = torch.stack(items)
-    print(f"{logical_count_of_seq.shape=}")
+    physical_count_of_forward_pass = torch.stack(items)
+    print(f"{physical_count_of_forward_pass.shape=}")
 
-    return logical_count_of_seq
+    return physical_count_of_forward_pass
 
 
 def scan_combinations(
