@@ -1,0 +1,33 @@
+global:
+  client_cmd: python3 -m sglang.bench_serving \
+    --backend sglang \
+    --dataset-name random \
+    --request-rate 16 \
+    --random-input-len {random_input_len} \
+    --random-output-len {random_output_len}
+  server_cmd: python3 -m sglang.launch_server \
+    --model-path {model_path} \
+    --speculative-algo NEXTN \
+    --speculative-draft {speculative_draft} \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --disable-radix-cache \
+    --attention-backend {attn_backend} \
+    {cudagraph}
+
+attn_backends:
+  - fa3
+  - flashinfer
+
+models_speculative_draft_pairs:
+  - [meta-llama/Llama-3.1-8B-Instruct, SGLang/Llama-3.1-8B-Instruct-NextN]
+
+cudagraphs:
+  - False
+  - True
+
+in_out_len_pairs:
+  - [1000, 1000]
+  - [5000, 1000]
+  - [5000, 5000]
