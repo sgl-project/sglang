@@ -43,8 +43,10 @@ from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+_is_hpu = is_hpu()
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=is_hpu())
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
