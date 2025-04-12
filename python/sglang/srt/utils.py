@@ -1877,7 +1877,7 @@ class DisposibleTensor:
     def dispose(self, backup_metadata: bool = True):
         assert not self.is_disposed
         if backup_metadata:
-            self._backup_metadata = TODO
+            self._backup_metadata = self._compute_backup_metadata(self._value)
         self._value = None
 
     @property
@@ -1907,6 +1907,12 @@ class DisposibleTensor:
             return getattr(self._value, name)
         assert self._backup_metadata is not None, "Use backup_metadata flag if you want to use metadata after dispose"
         return self._backup_metadata[name]
+
+    _BACKUP_METADATA_KEYS = ["shape", "device", "dtype"]
+
+    @staticmethod
+    def _compute_backup_metadata(value: torch.Tensor):
+        return {k: getattr(value, k) for k in DisposibleTensor._BACKUP_METADATA_KEYS}
 
 
 MaybeDisposibleTensor = Union[torch.Tensor, DisposibleTensor]
