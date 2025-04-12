@@ -1,4 +1,6 @@
 # TODO where to put this file?
+import polars as pl
+import dataclasses
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,17 +90,23 @@ def scan_combinations(
                 tp_size=8 * nnodes,
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
-            for ep_num_redundant_experts in [32, 64]
-            for nnodes in [2, 4]
+            for ep_num_redundant_experts in [0, 32, 64]
+            for nnodes in [1, 2, 4]
             for chunked_prefill_size_per_gpu in [1024, 2048, 4096, 8192, 16384]
             for enable_expert_location_by_eplb in [False, True]
         ]
     ]
 
+    rows = []
     for server_args in server_args_list:
         print()
         mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
         print(f"{server_args=} {mean_utilization_rate=:.2f}")
+        rows.append(dict(**dataclasses.asdict(server_args), mean_utilization_rate=mean_utilization_rate))
+        break
+
+    df = pl.DataFrame(rows)
+    return df
 
 
 def simulate_execution(
