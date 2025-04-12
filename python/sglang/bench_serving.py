@@ -606,7 +606,7 @@ def sample_sharegpt_requests(
     apply_chat_template=False,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
+        print("Warn: output_len too small")
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path) and dataset_path == "":
