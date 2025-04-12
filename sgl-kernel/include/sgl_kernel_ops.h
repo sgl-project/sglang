@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <tuple>
 #include <vector>
 
 #define _CONCAT(A, B) A##B
@@ -63,18 +64,14 @@ void register_graph_buffers(
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
 #else
-// TRTLLM custom allreduce
-fptr_t init_custom_ar(
-    int64_t rank_id,
-    int64_t world_size,
-    torch::Tensor& rank_data,
-    const std::vector<fptr_t>& buffers,
-    const std::vector<fptr_t>& tmp_result_buffers,
-    const std::vector<fptr_t>& barrier_in,
-    const std::vector<fptr_t>& barrier_out);
+// custom allreduce
+fptr_t
+init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink);
 void dispose(fptr_t _fa);
-void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+int64_t meta_size();
+void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa);
+void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
 #endif
@@ -90,7 +87,14 @@ void lightning_attention_decode(
     const torch::Tensor& slope,
     torch::Tensor output,
     torch::Tensor new_kv);
-
+void cutlass_mla_decode(
+    torch::Tensor const& out,
+    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& kv_c_and_k_pe_cache,
+    torch::Tensor const& seq_lens,
+    torch::Tensor const& page_table,
+    torch::Tensor const& workspace);
+int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
 /*
  * From csrc/elementwise
  */
@@ -163,13 +167,6 @@ void sgl_per_token_group_quant_int8(
     double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void cublas_grouped_gemm(
-    const std::vector<torch::Tensor>& inputs,
-    const std::vector<torch::Tensor>& weights,
-    const std::vector<torch::Tensor>& outputs,
-    const torch::Dtype& out_dtype,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,

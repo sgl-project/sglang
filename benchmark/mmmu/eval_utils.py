@@ -7,6 +7,7 @@ import os
 import pprint
 import random
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional
 
 import numpy as np
@@ -117,29 +118,38 @@ def prepare_samples(eval_args: EvalArgs):
     # merge all dataset
     dataset = concatenate_datasets(sub_dataset_list)
 
-    ## prepare images
-    samples = []
-    skip_count = 0
-
-    # use image file as input to ensure the consistency between sglang and hf
+    # Prepare images in parallel
     images_path = os.path.expanduser("~/.cache/mmmu/images")
     os.makedirs(images_path, exist_ok=True)
     print(f"Saving images to: {images_path}")
 
-    for i, sample in enumerate(tqdm(dataset)):
+    samples = []
+    skip_count = 0
+
+    def process_sample(i, sample):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
-
         width, height = image.size
         if width * height >= eval_args.image_pixels_limit:
-            skip_count += 1
-            continue
+            return None, True
         image_path = f"{images_path}/image_{i}.png"
         if not os.path.exists(image_path):
             image.save(image_path)
         sample["image_path"] = image_path
-        samples.append(sample)
+        return sample, False
+
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(process_sample, i, sample)
+            for i, sample in enumerate(dataset)
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            sample, skipped = future.result()
+            if skipped:
+                skip_count += 1
+            elif sample:
+                samples.append(sample)
 
     print(
         f"skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
