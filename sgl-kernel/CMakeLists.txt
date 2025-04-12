@@ -197,7 +197,7 @@ set(SOURCES
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_include_directories(common_ops PRIVATE 
+target_include_directories(common_ops PRIVATE
         ${TORCH_INCLUDE_DIRS}
         ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src)
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
@@ -268,7 +268,7 @@ if (SGL_KERNEL_ENABLE_FA3)
     Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
 
     target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
-    target_include_directories(flash_ops PRIVATE 
+    target_include_directories(flash_ops PRIVATE
         ${TORCH_INCLUDE_DIRS}
         ${repo-flash-attention_SOURCE_DIR}/hopper)
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)

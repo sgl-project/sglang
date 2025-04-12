@@ -1,15 +1,11 @@
-import pytest
-import torch
-
 import math
 from typing import List, Optional, Tuple
- 
-from einops import rearrange, repeat 
 
-from sgl_kernel.sparse_flash_attn import (
-    sparse_attn_func,
-    sparse_attn_varlen_func
-)
+import pytest
+import torch
+from einops import rearrange, repeat
+from sgl_kernel.sparse_flash_attn import sparse_attn_func, sparse_attn_varlen_func
+
 
 def ref_attn(
     q,
@@ -61,15 +57,17 @@ def ref_attn(
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
-    
-    lse_ref = scores.logsumexp(dim=-1)    
-    
+
+    lse_ref = scores.logsumexp(dim=-1)
+
     if softcap > 0:
         scores = scores / softcap
         scores = scores.tanh()
         scores = scores * softcap
     if key_padding_mask is not None:
-        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+        scores.masked_fill_(
+            rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
+        )
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -86,11 +84,15 @@ def ref_attn(
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
-        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
+        attention = attention.masked_fill(
+            torch.all(local_mask, dim=-1, keepdim=True), 0.0
+        )
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
-        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+        attention = attention.masked_fill(
+            rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
+        )
     dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
     # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
@@ -126,7 +128,7 @@ def ref_paged_attn(
         query_len = query_lens[i]
         kv_len = kv_lens[i]
         # clone to avoid clobbering the query tensor
-        q = query[start_idx:start_idx + query_len].clone()
+        q = query[start_idx : start_idx + query_len].clone()
         q *= scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
@@ -144,10 +146,13 @@ def ref_paged_attn(
         empty_mask = torch.ones(query_len, kv_len)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if sliding_window is not None:
-            sliding_window_mask = torch.triu(empty_mask,
-                                            diagonal=kv_len -
-                                                    (query_len + sliding_window) +
-                                                    1).bool().logical_not()
+            sliding_window_mask = (
+                torch.triu(
+                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                )
+                .bool()
+                .logical_not()
+            )
             mask |= sliding_window_mask
         if soft_cap is not None:
             attn = soft_cap * torch.tanh(attn / soft_cap)
@@ -162,19 +167,31 @@ def ref_paged_attn(
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("seq_lens", [(1, 1), (1, 1024), (1, 2048), (1023, 2049), (1023, 1023), (32, 32), (65, 65), (129, 129)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        (1, 1),
+        (1, 1024),
+        (1, 2048),
+        (1023, 2049),
+        (1023, 1023),
+        (32, 32),
+        (65, 65),
+        (129, 129),
+    ],
+)
 @pytest.mark.parametrize("num_heads", [1, 2, 4])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("NNZ_S", [0, 1, 2, 3, 7, 15, 32])
 @torch.inference_mode()
 def test_sparse_attention(
-        batch_size,
-        seq_lens,
-        num_heads,
-        head_size,
-        dtype,
-        NNZ_S,
+    batch_size,
+    seq_lens,
+    num_heads,
+    head_size,
+    dtype,
+    NNZ_S,
 ) -> None:
     torch.set_default_device("cuda")
     torch.cuda.manual_seed_all(0)
@@ -194,10 +211,23 @@ def test_sparse_attention(
     if NNZ_S * block_size_N > seqlen_k:
         return
     NNZ_V = seqlen_k - NNZ_S * block_size_N
-    block_count = torch.tensor([NNZ_S] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
-    column_count = torch.tensor([NNZ_V] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
-    block_offset = torch.tensor([[i * block_size_N for i in range(NNZ_S)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
-    column_index = torch.tensor([[NNZ_S * block_size_N + i for i in range(NNZ_V)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
+    block_count = torch.tensor(
+        [NNZ_S] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32
+    ).reshape(batch_size, num_heads, NUM_ROWS)
+    column_count = torch.tensor(
+        [NNZ_V] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32
+    ).reshape(batch_size, num_heads, NUM_ROWS)
+    block_offset = torch.tensor(
+        [[i * block_size_N for i in range(NNZ_S)]] * batch_size * NUM_ROWS * num_heads,
+        dtype=torch.int32,
+    ).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
+    column_index = torch.tensor(
+        [[NNZ_S * block_size_N + i for i in range(NNZ_V)]]
+        * batch_size
+        * NUM_ROWS
+        * num_heads,
+        dtype=torch.int32,
+    ).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
     out, lse = sparse_attn_func(
         q,
         k,
@@ -211,10 +241,12 @@ def test_sparse_attention(
 
     ref_out, ref_lse = ref_attn(q, k, v)
 
-    torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=1e-2), \
-        f"{torch.max(torch.abs(out - ref_out))}"
-    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
-        f"{torch.max(torch.abs(lse - ref_lse))}"
+    torch.testing.assert_close(
+        out, ref_out, atol=2e-2, rtol=1e-2
+    ), f"{torch.max(torch.abs(out - ref_out))}"
+    torch.testing.assert_close(
+        lse, ref_lse, atol=2e-2, rtol=1e-2
+    ), f"{torch.max(torch.abs(lse - ref_lse))}"
 
 
 # @pytest.mark.parametrize("seq_lens", [[(1024, 1328)],
@@ -311,6 +343,6 @@ def test_sparse_attention(
 #         f"{torch.max(torch.abs(out - ref_out))}"
 #     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
 #         f"{torch.max(torch.abs(lse - ref_lse))}"
-        
+
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -1,10 +1,12 @@
-from typing import Optional, Union, Tuple, List
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
 
 def sparse_attn_func(
     q,
@@ -17,7 +19,7 @@ def sparse_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -96,7 +98,7 @@ def sparse_attn_varlen_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -109,7 +111,7 @@ def sparse_attn_varlen_func(
     block_count and block_offset for slash sparsity patterns, and
     column_count and column_index for vertical sparsity patterns.
     For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
-    
+
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
@@ -145,7 +147,7 @@ def sparse_attn_varlen_func(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-        
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse = torch.ops.sgl_kernel.varlen_fwd_sparse.default(
         q,
