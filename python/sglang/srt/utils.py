@@ -1842,8 +1842,14 @@ class DisposibleTensor:
 
     def dispose(self, backup_metadata: bool = True):
         assert not self.is_disposed
+
+        if not torch.compiler.is_compiling():
+            refcount = sys.getrefcount(self._value)
+            assert refcount == 2, f"{refcount=}"
+
         if backup_metadata:
             self._backup_metadata = self._compute_backup_metadata(self._value)
+
         self._value = None
 
     @property
