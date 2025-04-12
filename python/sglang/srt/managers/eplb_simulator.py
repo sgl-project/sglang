@@ -59,7 +59,7 @@ def read_logical_count_of_seq(dir_data: Path):
             assert physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]].get(record["rank"]) is None
             physical_count_of_forward_pass_id_and_rank[record["forward_pass_id"]][record["rank"]] = record[
                 "physical_count"]
-    print(len(physical_count_of_forward_pass_id_and_rank))
+    # print(len(physical_count_of_forward_pass_id_and_rank))
 
     items = []
     for forward_pass_id, physical_count_of_rank in sorted(physical_count_of_forward_pass_id_and_rank.items()):
@@ -71,7 +71,7 @@ def read_logical_count_of_seq(dir_data: Path):
         items.append(physical_count_of_rank_tensor)
 
     logical_count_of_seq = torch.stack(items)
-    print(f"{logical_count_of_seq.shape=}")
+    # print(f"{logical_count_of_seq.shape=}")
 
     return logical_count_of_seq
 
@@ -94,7 +94,7 @@ def scan_combinations(
 
     for server_args in server_args_list:
         mean_utilization_rate = simulate_execution(logical_count_of_seq=logical_count_of_seq, server_args=server_args)
-        print(f"{server_args=} {mean_utilization_rate=:.2f}")
+        # print(f"{server_args=} {mean_utilization_rate=:.2f}")
 
 
 def simulate_execution(
@@ -108,6 +108,7 @@ def simulate_execution(
         logical_count_of_seq=logical_count_of_seq,
         chunked_prefill_size=server_args.chunked_prefill_size,
     )
+    # print(f"hi {logical_count_of_batch=}")
 
     if server_args.enable_expert_location_by_eplb:
         expert_location_metadata = MyExpertLocationMetadata.init_by_eplb(
@@ -115,11 +116,13 @@ def simulate_execution(
             logical_count=einops.einsum(logical_count_of_seq, "num_seq num_layer num_expert -> num_layer num_expert"),
             num_physical_experts=num_physical_expert,
         )
+        # print(f"hi {expert_location_metadata=}")
         physical_count_of_batch = simulate_logical_to_physical(
             logical_count_of_whatever=logical_count_of_batch,
             logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
             num_physical_expert=num_physical_expert,
         )
+        # print(f"hi {physical_count_of_batch=}")
     else:
         physical_count_of_batch = logical_count_of_batch
 
@@ -127,10 +130,12 @@ def simulate_execution(
         physical_count_of_batch=physical_count_of_batch,
         num_gpu=server_args.tp_size,
     )
+    # print(f"hi {gpu_physical_count_of_batch=}")
 
     utilization_rate = compute_utilization_rate(
         gpu_physical_count_of_batch=gpu_physical_count_of_batch,
     )
+    # print(f"hi {utilization_rate=}")
 
     # NOTE: first 3 layers are MLP, thus those parts are not meaningful
     mean_utilization_rate = torch.mean(utilization_rate).item()
@@ -198,7 +203,7 @@ def compute_utilization_rate(
                                            "num_batch num_layer num_gpu -> num_batch num_layer", 'max')
     avg_gpu_physical_count = einops.reduce(gpu_physical_count_of_batch,
                                            "num_batch num_layer num_gpu -> num_batch num_layer", 'mean')
-    return avg_gpu_physical_count / max_gpu_physical_count
+    return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
 
 
 def compute_num_token(whatever_with_num_layer_and_num_expert: torch.Tensor):
