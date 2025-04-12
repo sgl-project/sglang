@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel.flash_attn import flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass
@@ -599,7 +599,6 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
                 # Do multi-head attention with chunked prefix cache
-                from flash_attn_interface import flash_attn_varlen_func
 
                 if forward_batch.attn_attend_prefix_cache:
                     # MHA for chunked prefix kv cache when running model with MLA
@@ -620,6 +619,7 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_k=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
                         softmax_scale=layer.scaling,
                         causal=False,
+                        return_softmax_lse=True,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
@@ -633,6 +633,7 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_k=metadata.max_seq_len_q,
                         softmax_scale=layer.scaling,
                         causal=True,
+                        return_softmax_lse=True,
                     )
                 return output, lse
             else:
