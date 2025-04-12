@@ -30,7 +30,7 @@ jobs:
           clangFormatVersion: 18
           style: file
 
-  build-wheels:
+  build-wheel-cu124:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     runs-on: sgl-kernel-build-node
     strategy:
@@ -123,7 +123,7 @@ jobs:
 
   unit-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheels
+    needs: build-wheel-cu124
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -155,7 +155,7 @@ jobs:
 
   mla-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheels
+    needs: build-wheel-cu124
     runs-on: 1-gpu-runner
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +185,7 @@ jobs:
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test, mla-test, lint]
+    needs: [unit-test, mla-test, lint, build-wheel-cu118, build-wheel-cu128]
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
