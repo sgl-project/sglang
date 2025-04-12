@@ -927,13 +927,15 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
+        # For Draft worker, cuda graph will be captured from Eagle Worker and disable cuda graph for super.__init__
         if self.server_args.disable_cuda_graph:
-            logger.warning(
-                "\n\nCUDA Graph is DISABLED.\n"
-                "This will cause significant performance degradation.\n"
-                "CUDA Graph should almost never be disabled in most usage scenarios.\n"
-                "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
-            )
+            if not self.is_draft_worker:
+                logger.warning(
+                    "\n\nCUDA Graph is DISABLED.\n"
+                    "This will cause significant performance degradation.\n"
+                    "CUDA Graph should almost never be disabled in most usage scenarios.\n"
+                    "If you encounter OOM issues, please try setting --mem-fraction-static to a lower value (such as 0.8 or 0.7) instead of disabling CUDA Graph.\n"
+                )
             return
 
         tic = time.time()
