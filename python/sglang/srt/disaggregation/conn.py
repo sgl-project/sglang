@@ -384,7 +384,9 @@ class KVReceiver:
         socket.connect(endpoint)
         return socket
 
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def notify_pre_alloc(
+        self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
+    ):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, aux_index)
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
