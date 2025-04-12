@@ -1880,3 +1880,9 @@ class DisposibleTensor:
     @property
     def is_disposed(self):
         return self._value is None
+
+    @staticmethod
+    def maybe_unwrap(value: Union[torch.Tensor, "DisposibleTensor"]) -> torch.Tensor:
+        if isinstance(value, DisposibleTensor):
+            return value.value
+        return value
