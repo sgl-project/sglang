@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
@@ -324,7 +325,7 @@ class _DetailAccumulator(_Accumulator):
         if self._save_dir is None:
             return deepcopy(self._records)
         else:
-            path_output = Path(self._save_dir) / TODO
+            path_output = Path(self._save_dir) / f"{time.time()}-{self._rank}.pt"
             torch.save(self._records, str(path_output))
             return [dict(path_output=str(path_output))]
 
