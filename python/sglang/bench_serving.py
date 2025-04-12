@@ -480,7 +480,7 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
-    num_prompts = args.num_prompts
+    num_prompts = args.num_prompts + args.skip_num_prompts
     if args.dataset_name == "sharegpt":
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
@@ -512,6 +512,7 @@ def get_dataset(args, tokenizer):
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
+    input_requests = input_requests[args.skip_num_prompts:]
     return input_requests
 
 
