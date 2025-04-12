@@ -54,7 +54,7 @@ _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION = ModelConfigForExpertLocation(
 )
 
 
-def read_logical_count_of_seq(dir_data: Path):
+def read_physical_count_of_forward_pass(dir_data: Path):
     physical_count_of_forward_pass_id_and_rank = defaultdict(lambda: defaultdict())
     for path in tqdm(list(dir_data.glob("*.pt"))):
         for record in torch.load(path, weights_only=True):
