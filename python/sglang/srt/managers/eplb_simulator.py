@@ -91,8 +91,8 @@ def scan_combinations(
                 enable_expert_location_by_eplb=enable_expert_location_by_eplb,
             )
             for ep_num_redundant_experts in [0, 32, 64]
-            for nnodes in [1, 2, 4]
-            for chunked_prefill_size_per_gpu in [1024, 2048, 4096, 8192, 16384]
+            for nnodes in [4]
+            for chunked_prefill_size_per_gpu in [1024, 4096, 8192, 16384]
             for enable_expert_location_by_eplb in [
                 *([False] if ep_num_redundant_experts == 0 else []),
                 True,
