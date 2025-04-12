@@ -17,7 +17,9 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
+# Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
@@ -34,7 +36,206 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.utils import logger
+
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+
+    has_flash_attn = True
+except:
+    print("FlashAttention2 is not installed.")
+    has_flash_attn = False
+
+
+class FlashAttention(nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+
+    def __init__(
+        self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None
+    ):
+        super().__init__()
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+
+    def forward(
+        self,
+        qkv,
+        key_padding_mask=None,
+        causal=False,
+        cu_seqlens=None,
+        max_s=None,
+        need_weights=False,
+    ):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            qkv: The tensor containing the query, key, and value. (B, S, 3, H, D) if key_padding_mask is None
+                if unpadded: (nnz, 3, h, d)
+            key_padding_mask: a bool tensor of shape (B, S)
+        """
+        assert not need_weights
+        assert qkv.dtype in [torch.float16, torch.bfloat16]
+        assert qkv.is_cuda
+
+        if cu_seqlens is None:
+            batch_size = qkv.shape[0]
+            seqlen = qkv.shape[1]
+            if key_padding_mask is None:
+                qkv = rearrange(qkv, "b s ... -> (b s) ...")
+                max_s = seqlen
+                cu_seqlens = torch.arange(
+                    0,
+                    (batch_size + 1) * seqlen,
+                    step=seqlen,
+                    dtype=torch.int32,
+                    device=qkv.device,
+                )
+                output = flash_attn_varlen_qkvpacked_func(
+                    qkv,
+                    cu_seqlens,
+                    max_s,
+                    self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale,
+                    causal=causal,
+                )
+                output = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
+            else:
+                nheads = qkv.shape[-2]
+                x = rearrange(qkv, "b s three h d -> b s (three h d)")
+                x_unpad, indices, cu_seqlens, max_s = unpad_input(x, key_padding_mask)
+                x_unpad = rearrange(
+                    x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads
+                )
+                output_unpad = flash_attn_varlen_qkvpacked_func(
+                    x_unpad,
+                    cu_seqlens,
+                    max_s,
+                    self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.softmax_scale,
+                    causal=causal,
+                )
+                output = rearrange(
+                    pad_input(
+                        rearrange(output_unpad, "nnz h d -> nnz (h d)"),
+                        indices,
+                        batch_size,
+                        seqlen,
+                    ),
+                    "b s (h d) -> b s h d",
+                    h=nheads,
+                )
+        else:
+            assert max_s is not None
+            output = flash_attn_varlen_qkvpacked_func(
+                qkv,
+                cu_seqlens,
+                max_s,
+                self.dropout_p if self.training else 0.0,
+                softmax_scale=self.softmax_scale,
+                causal=causal,
+            )
+
+        return output, None
+
+
+class InternAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.use_flash_attn = config.use_flash_attn and has_flash_attn
+        if config.use_flash_attn and not has_flash_attn:
+            print(
+                "Warning: Flash Attention is not available, use_flash_attn is set to False."
+            )
+        self.head_dim = self.embed_dim // self.num_heads
+
+        self.scale = self.head_dim**-0.5
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
+        self.attn_drop = nn.Dropout(config.attention_dropout)
+        self.proj_drop = nn.Dropout(config.dropout)
+
+        self.qk_normalization = config.qk_normalization
+
+        if self.qk_normalization:
+            self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+        if self.use_flash_attn:
+            self.inner_attn = FlashAttention(attention_dropout=config.attention_dropout)
+        self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+    def _naive_attn(self, x):
+        B, N, C = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        if self.qk_normalization:
+            B_, H_, N_, D_ = q.shape
+            q = (
+                self.q_norm(q.transpose(1, 2).flatten(-2, -1))
+                .view(B_, N_, H_, D_)
+                .transpose(1, 2)
+            )
+            k = (
+                self.k_norm(k.transpose(1, 2).flatten(-2, -1))
+                .view(B_, N_, H_, D_)
+                .transpose(1, 2)
+            )
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def _flash_attn(self, x, key_padding_mask=None, need_weights=False):
+        qkv = self.qkv(x)
+        qkv = rearrange(
+            qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads
+        )
+
+        if self.qk_normalization:
+            q, k, v = qkv.unbind(2)
+            q = self.q_norm(q.flatten(-2, -1)).view(q.shape)
+            k = self.k_norm(k.flatten(-2, -1)).view(k.shape)
+            qkv = torch.stack([q, k, v], dim=2)
+
+        context, _ = self.inner_attn(
+            qkv,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            causal=False,
+        )
+        outs = self.proj(rearrange(context, "b s h d -> b s (h d)"))
+        outs = self.proj_drop(outs)
+        return outs
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = (
+            self._naive_attn(hidden_states)
+            if not self.use_flash_attn
+            else self._flash_attn(hidden_states)
+        )
+        return x
 
 
 class InternVisionEmbeddings(nn.Module):
@@ -207,16 +408,18 @@ class InternVisionEncoderLayer(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
 
-        self.attn = VisionAttention(
-            embed_dim=self.embed_dim,
-            num_heads=config.num_attention_heads,
-            projection_size=self.embed_dim,
-            use_qkv_parallel=True,
-            quant_config=quant_config,
-            use_context_forward=False,
-            dropout=config.attention_dropout,
-            softmax_in_single_precision=False,
-        )
+        # self.attn = VisionAttention(
+        #     embed_dim=self.embed_dim,
+        #     num_heads=config.num_attention_heads,
+        #     projection_size=self.embed_dim,
+        #     use_qkv_parallel=True,
+        #     quant_config=quant_config,
+        #     use_context_forward=False,
+        #     dropout=config.attention_dropout,
+        #     softmax_in_single_precision=False,
+        # )
+
+        self.attn = InternAttention(config)
         self.mlp = InternMLP(config)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
@@ -444,16 +647,26 @@ class InternVLChatModel(nn.Module):
         has_flash_attn = False
         use_flash_attn = use_flash_attn if has_flash_attn else False
         config.vision_config.use_flash_attn = True if use_flash_attn else False
-        config.llm_config.attn_implementation = (
+        config.llm_config._attn_implementation = (
             "flash_attention_2" if use_flash_attn else "eager"
         )
 
-        self.vision_model = InternVisionModel(
-            config=config.vision_config, quant_config=quant_config
-        )
-        self.language_model = InternLM2ForCausalLM(
-            config=config.llm_config, quant_config=quant_config
-        )
+        logger.info(f"num_image_token: {self.num_image_token}")
+        logger.info(f"ps_version: {self.ps_version}")
+
+        self.vision_model = InternVisionModel(config.vision_config)
+        if config.llm_config.architectures[0] == "Qwen2ForCausalLM":
+            self.language_model = Qwen2ForCausalLM(
+                config=config.llm_config, quant_config=quant_config
+            )
+        elif config.llm_config.architectures[0] == "InternLM2ForCausalLM":
+            self.language_model = InternLM2ForCausalLM(
+                config=config.llm_config, quant_config=quant_config
+            )
+        else:
+            raise NotImplementedError(
+                f"{config.llm_config.architectures[0]} is not implemented."
+            )
 
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
@@ -550,22 +763,26 @@ class InternVLChatModel(nn.Module):
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-        ]
+        if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("gate_up_proj", "w1", 0),
+                ("gate_up_proj", "w3", 1),
+            ]
+        elif "Qwen2ForCausalLM" in self.config.llm_config.architectures:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            # adapt to VisionAttention
-            if "attn" in name and "vision" in name:
-                name = name.replace(r".attn.out_proj", r"self_attn.proj")
-                name = name.replace(r".attn.qkv", r".attn.qkv_proj")
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
