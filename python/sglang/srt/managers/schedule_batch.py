@@ -226,10 +226,10 @@ class MultimodalDataItem:
                 # memoryview() doesn't support PyTorch's BFloat16 dtype
                 tensor = tensor.float()
 
+            assert isinstance(tensor, torch.Tensor)
             if tensor.is_cuda:
-                tensor_cpu = torch.frombuffer(
-                    tensor.storage().untyped(), dtype=tensor.dtype, count=tensor.numel()
-                ).clone()
+                # TODO: improve this
+                tensor_cpu = tensor.cpu()
             else:
                 tensor_cpu = tensor
 
@@ -325,7 +325,6 @@ class MultimodalInputs:
             item.set_pad_value()
 
         optional_args = [
-            "modalities",
             "im_token_id",
             "im_start_id",
             "im_end_id",
