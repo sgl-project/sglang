@@ -111,7 +111,7 @@ def scan_combinations(
     return df
 
 
-def analyze(dir_data: Path, num_gpu: int):
+def analyze_actual_utilization_rate(dir_data: Path, num_gpu: int):
     physical_count_of_forward_pass = read_physical_count_of_forward_pass(dir_data)
     gpu_physical_count_of_forward_pass = compute_gpu_physical_count(
         physical_count_of_whatever=physical_count_of_forward_pass,
