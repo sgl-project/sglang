@@ -132,7 +132,7 @@ class PrefillBootstrapQueue:
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
 
-            # KV.WaitingForInput - init here
+            # KV.WaitingForInput
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break

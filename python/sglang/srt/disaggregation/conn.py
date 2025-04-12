@@ -204,7 +204,9 @@ class KVManager:
         sender_rank_port = KVSENDER_POLLING_PORT + self.kv_args.engine_rank
         self.server_socket.bind("tcp://*:" + str(sender_rank_port))
 
-        def prefill_thread():
+        def bootstrap_thread():
+            # This thread recvs pre-alloc notification from the decode engine
+            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 (
                     endpoint,
@@ -236,7 +238,7 @@ class KVManager:
                 )
                 self.transfer_event.set()
 
-        threading.Thread(target=prefill_thread).start()
+        threading.Thread(target=bootstrap_thread).start()
 
         def transfer_thread():
             while True:
