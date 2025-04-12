@@ -77,7 +77,7 @@ def read_logical_count_of_seq(dir_data: Path):
 
 
 def scan_combinations(
-        logical_count_of_seq: torch.Tensor,
+    logical_count_of_seq: torch.Tensor,
 ):
     server_args_list = [
         *[
@@ -98,8 +98,8 @@ def scan_combinations(
 
 
 def simulate_execution(
-        logical_count_of_seq: torch.Tensor,
-        server_args: MyServerArgs,
+    logical_count_of_seq: torch.Tensor,
+    server_args: MyServerArgs,
 ):
     model_config_for_expert_location = _MY_MODEL_CONFIG_FOR_EXPERT_LOCATION
     num_physical_expert = model_config_for_expert_location.num_logical_experts + server_args.ep_num_redundant_experts
@@ -139,8 +139,8 @@ def simulate_execution(
 
 
 def simulate_batching(
-        logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
-        chunked_prefill_size: int,
+    logical_count_of_seq: torch.Tensor,  # (num_seq, num_layer, num_logical_expert)
+    chunked_prefill_size: int,
 ) -> torch.Tensor:
     """output: (num_batch, num_layer, num_logical_expert)"""
     tensor_chunks = chunker(
@@ -152,9 +152,9 @@ def simulate_batching(
 
 
 def simulate_logical_to_physical(
-        logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
-        logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
-        num_physical_expert: int,
+    logical_count_of_whatever: torch.Tensor,  # (*, num_layer, num_logical_expert)
+    logical_to_all_physical_map: torch.Tensor,  # (num_layer, num_logical_experts, X)
+    num_physical_expert: int,
 ):
     """output: (*, num_layer, num_physical_expert)"""
     num_whatever, num_layer, num_logical_expert = logical_count_of_whatever.shape
@@ -177,8 +177,8 @@ def simulate_logical_to_physical(
 
 
 def compute_gpu_physical_count_of_batch(
-        physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_physical_expert)
-        num_gpu: int,
+    physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_physical_expert)
+    num_gpu: int,
 ):
     """output: gpu_physical_count_of_batch (num_batch, num_layer, num_gpu)"""
     return einops.reduce(
@@ -190,9 +190,10 @@ def compute_gpu_physical_count_of_batch(
 
 
 def compute_utilization_rate(
-        gpu_physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_gpu)
+    gpu_physical_count_of_batch: torch.Tensor,  # (num_batch, num_layer, num_gpu)
 ):
     """output: utilization_rate (num_batch, num_layer)"""
+    gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
     max_gpu_physical_count = einops.reduce(gpu_physical_count_of_batch,
                                            "num_batch num_layer num_gpu -> num_batch num_layer", 'max')
     avg_gpu_physical_count = einops.reduce(gpu_physical_count_of_batch,
