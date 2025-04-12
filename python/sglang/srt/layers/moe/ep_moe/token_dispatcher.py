@@ -35,13 +35,13 @@ class DeepEPBuffer:
 
     @classmethod
     def get_deepep_buffer(
-            cls,
-            group: dist.ProcessGroup,
-            hidden_size: int,
-            param_bytes: int,
-            deepep_mode: DeepEPMode,
-            num_max_dispatch_tokens_per_rank: int = None,
-            num_experts: int = None,
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        param_bytes: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int = None,
+        num_experts: int = None,
     ):
         if cls._buffer is not None:
             return cls._buffer
@@ -54,8 +54,8 @@ class DeepEPBuffer:
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
-                    Buffer.get_dispatch_config(group.size()),
-                    Buffer.get_combine_config(group.size()),
+                Buffer.get_dispatch_config(group.size()),
+                Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
@@ -112,15 +112,15 @@ class DeepEPBuffer:
 
 class _DeepEPDispatcherImplBase:
     def __init__(
-            self,
-            group: torch.distributed.ProcessGroup,
-            router_topk: int,
-            permute_fusion: bool,
-            num_experts: int,
-            num_local_experts: int,
-            hidden_size: int,
-            params_dtype: torch.dtype,
-            deepep_mode: DeepEPMode,
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool,
+        num_experts: int,
+        num_local_experts: int,
+        hidden_size: int,
+        params_dtype: torch.dtype,
+        deepep_mode: DeepEPMode,
     ):
         if not use_deepep:
             raise ImportError(
@@ -143,10 +143,10 @@ class _DeepEPDispatcherImplBase:
         self.handle = None
 
     def dispatch_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -154,10 +154,10 @@ class _DeepEPDispatcherImplBase:
         raise NotImplementedError
 
     def combine_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -176,10 +176,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.src2dst = None
 
     def dispatch_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         topk_idx = topk_idx.to(torch.int64)
         previous_event = Buffer.capture() if self.async_finish else None
@@ -219,11 +219,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         )
 
     def _dispatch_core(
-            self,
-            x: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
-            previous_event,
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event,
     ):
         buffer = self._get_buffer()
         (
@@ -272,12 +272,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         )
 
     def _deepep_permute(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            fp8_dtype: Optional[torch.dtype] = None,
-            use_fp8_w8a8: bool = False,
-            use_block_quant: bool = False,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        fp8_dtype: Optional[torch.dtype] = None,
+        use_fp8_w8a8: bool = False,
+        use_block_quant: bool = False,
     ):
         """
         Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
@@ -311,10 +311,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return reorder_topk_ids, seg_indptr, DisposibleTensor(gateup_input)
 
     def combine_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         if hidden_states.shape[0] > 0:
             num_tokens = self.src2dst.shape[0] // self.router_topk
@@ -383,17 +383,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
 
     def dispatch_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-                             hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-                             + self.num_experts
-                     ) // self.num_experts
+            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            + self.num_experts
+        ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -410,14 +410,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
     def dispatch_b(
-            self,
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            masked_m,
-            expected_m,
-            event,
-            hook,
+        self,
+        hidden_states,
+        topk_idx,
+        topk_weights,
+        masked_m,
+        expected_m,
+        event,
+        hook,
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
@@ -434,10 +434,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
     def _dispatch_core(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            use_fp8: bool = False,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        use_fp8: bool = False,
     ):
         """
         # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'.
@@ -486,10 +486,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
@@ -503,10 +503,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states
 
     def _combine_core(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
         combined_hidden_states, event, hook = buffer.low_latency_combine(
@@ -534,17 +534,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
 class DeepEPDispatcher:
     def __init__(
-            self,
-            group: torch.distributed.ProcessGroup,
-            router_topk: int,
-            permute_fusion: bool = False,
-            num_experts: int = None,
-            num_local_experts: int = None,
-            hidden_size: int = None,
-            params_dtype: torch.dtype = None,
-            deepep_mode: DeepEPMode = DeepEPMode.auto,
-            async_finish: bool = False,
-            return_recv_hook: bool = False,
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        num_experts: int = None,
+        num_local_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        deepep_mode: DeepEPMode = DeepEPMode.auto,
+        async_finish: bool = False,
+        return_recv_hook: bool = False,
     ):
         self.deepep_mode = deepep_mode
 
@@ -575,11 +575,11 @@ class DeepEPDispatcher:
         return self.dispatch_b()
 
     def dispatch_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
-            forward_mode: ForwardMode = None,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode = None,
     ):
         inner_state = self._get_impl(forward_mode).dispatch_a(
             hidden_states=hidden_states,
@@ -598,11 +598,11 @@ class DeepEPDispatcher:
         return self.combine_b()
 
     def combine_a(
-            self,
-            hidden_states: torch.Tensor,
-            topk_idx: torch.Tensor,
-            topk_weights: torch.Tensor,
-            forward_mode: ForwardMode,
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_mode: ForwardMode,
     ):
         inner_state = self._get_impl(forward_mode).combine_a(
             hidden_states=hidden_states,
