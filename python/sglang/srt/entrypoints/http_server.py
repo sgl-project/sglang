@@ -785,13 +785,17 @@ def _wait_and_warmup(
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
-        res = requests.post(
-            url + request_name,
-            json=json_data,
-            headers=headers,
-            timeout=600,
-        )
-        assert res.status_code == 200, f"{res}"
+        if server_args.disaggregation_mode == "null":
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                timeout=600,
+            )
+            assert res.status_code == 200, f"{res}"
+        else:
+            # Warmup request currently hangs in disaggregation mode, so we skip it.
+            logger.info("Skipping warmup request in disaggregation mode")
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
