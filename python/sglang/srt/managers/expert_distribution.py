@@ -3,6 +3,7 @@ import os
 from abc import ABC
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, List, Optional, Type
 
 import torch
@@ -317,7 +318,12 @@ class _DetailAccumulator(_Accumulator):
         self._records.clear()
 
     def dump(self):
-        return deepcopy(self._records)
+        if self._save_dir is None:
+            return deepcopy(self._records)
+        else:
+            path_output = Path(self._save_dir) / TODO
+            torch.save(self._records, str(path_output))
+            return [dict(path_output=str(path_output))]
 
 
 class _StatAccumulator(_Accumulator):
