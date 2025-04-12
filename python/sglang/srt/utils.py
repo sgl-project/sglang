@@ -1867,7 +1867,7 @@ def fast_topk(values, topk, dim):
 class DisposibleTensor:
     def __init__(self, value: torch.Tensor):
         self._value = value
-        self._backedup_metadata: Optional[Dict[str, Any]] = None
+        self._backup_metadata: Optional[Dict[str, Any]] = None
 
     @property
     def value(self):
@@ -1877,7 +1877,7 @@ class DisposibleTensor:
     def dispose(self, backup_metadata: bool = True):
         assert not self.is_disposed
         if backup_metadata:
-            TODO
+            self._backup_metadata = TODO
         self._value = None
 
     @property
@@ -1905,8 +1905,8 @@ class DisposibleTensor:
     def _get_metadata(self, name: str):
         if not self.is_disposed:
             return getattr(self._value, name)
-        assert self._backedup_metadata is not None, "Use backup_metadata flag if you want to use metadata after dispose"
-        return self._backedup_metadata[name]
+        assert self._backup_metadata is not None, "Use backup_metadata flag if you want to use metadata after dispose"
+        return self._backup_metadata[name]
 
 
 MaybeDisposibleTensor = Union[torch.Tensor, DisposibleTensor]
