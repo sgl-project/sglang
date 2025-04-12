@@ -1,9 +1,9 @@
-
-
 from abc import ABC, abstractmethod
 from typing import Optional
+
 import numpy as np
 import numpy.typing as npt
+
 from sglang.python.sglang.srt.disaggregation.utils import DisaggregationMode
 
 
@@ -24,21 +24,21 @@ class KVPoll:
     WaitingForInput = 2
     Transferring = 3
     Success = 4
-    
 
 
 class BaseKVManager(ABC):
     """Base class for managing transfers states"""
+
     @abstractmethod
-    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
-        ...
+    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode): ...
 
 
 class BaseKVSender(ABC):
 
     @abstractmethod
-    def __init__(self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int):
-        ...
+    def __init__(
+        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int
+    ): ...
 
     @abstractmethod
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
@@ -73,9 +73,11 @@ class BaseKVReceiver(ABC):
 
     @abstractmethod
     def __init__(
-        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None
-    ):
-        ...
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: Optional[int] = None,
+    ): ...
 
     @abstractmethod
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
@@ -101,6 +103,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, port: int):
-        
-        ...
+    def __init__(self, port: int): ...

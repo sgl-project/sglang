@@ -28,14 +28,20 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.disaggregation.base import BaseKVManager, BaseKVSender, BaseKVReceiver, KVPoll, KVArgs
+from sglang.srt.disaggregation.base import (
+    BaseKVManager,
+    BaseKVReceiver,
+    BaseKVSender,
+    KVArgs,
+    KVPoll,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    ReqToMetadataIdxAllocator,
-    poll_and_all_reduce,
-    get_kv_class,
-    TransferBackend,
     KVClassType,
+    ReqToMetadataIdxAllocator,
+    TransferBackend,
+    get_kv_class,
+    poll_and_all_reduce,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -100,7 +106,7 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
-        
+
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
